@@ -177,6 +177,11 @@ pub enum PolicyResolution {
     /// Boxed: the pending request carries the full approval prompt.
     Ask(Box<PendingApproval>),
     Deny(PolicyDenial),
+    /// The host cannot enforce a boundary this call requires (a run-level
+    /// network denial on a backend without one, an unsupported destination
+    /// scope). This is neither a user refusal nor a policy deny: the call is
+    /// refused because allowing it would run under a boundary nobody enforces.
+    BoundaryFailure(String),
 }
 
 #[cfg(test)]
@@ -299,6 +304,7 @@ mod resource_grant_tests {
                 paths: Vec::new(),
                 grant: None,
                 write_scope_expanded: widens_write,
+                reason_code: None,
             },
             signature: "sig".into(),
             write: workspace(),

@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use leveler_client_protocol::{ModelRef, PermissionProfile, SessionId};
+use leveler_client_protocol::{ModelRef, PermissionContract, PermissionProfile, SessionId};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Pool, Row, Sqlite};
 
@@ -22,11 +22,18 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 /// One projection for every read of a definition. Keeping the column list in
 /// one place prevents a newly persisted field from being silently dropped by
 /// one of the readers.
+fn contract_code(contract: PermissionContract) -> i64 {
+    match contract {
+        PermissionContract::V1 => 1,
+        PermissionContract::V2 => 2,
+    }
+}
+
 const DEFINITION_COLUMNS: &str = "id, name, workspace, action, command, agent_goal, \
      native_action, native_input, trigger_kind, once_at, anchor_at, every_secs, timezone, \
-     local_time, weekdays, cron_expr, session_policy, overlap_policy, permission_mode, model, \
-     timeout_secs, misfire_policy, misfire_grace_secs, unattended_grant, session_id, enabled, \
-     created_at, updated_at";
+     local_time, weekdays, cron_expr, session_policy, overlap_policy, permission_mode, \
+     permission_contract, model, timeout_secs, misfire_policy, misfire_grace_secs, \
+     unattended_grant, session_id, enabled, created_at, updated_at";
 
 /// The same for runs: the occurrence's `scheduled_for` is joined because the
 /// slot, not the run, owns it.
@@ -283,6 +290,7 @@ impl ScheduleStore {
                     id.clone(),
                     workspace.clone(),
                     new.mode,
+                    new.permission_contract,
                     &new.action,
                     &new.trigger,
                     new.model.clone(),
@@ -319,10 +327,10 @@ impl ScheduleStore {
              (id, name, workspace, action, command, agent_goal, native_action, native_input, \
               trigger_kind, once_at, anchor_at, every_secs, \
               timezone, local_time, weekdays, cron_expr, \
-              session_policy, overlap_policy, permission_mode, model, timeout_secs, \
-              misfire_policy, misfire_grace_secs, unattended_grant, \
+              session_policy, overlap_policy, permission_mode, permission_contract, model, \
+              timeout_secs, misfire_policy, misfire_grace_secs, unattended_grant, \
               session_id, enabled, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
                      NULL, 1, ?, ?)",
         )
         .bind(id.as_str())
@@ -344,6 +352,7 @@ impl ScheduleStore {
         .bind(new.session_policy.as_str())
         .bind(new.overlap.as_str())
         .bind(new.mode.as_str())
+        .bind(contract_code(new.permission_contract))
         .bind(new.model.as_ref().map(|model| model.to_string()))
         .bind(new.timeout.as_secs() as i64)
         .bind(new.misfire.as_str())
@@ -510,6 +519,7 @@ impl ScheduleStore {
             session_policy: update.session_policy,
             overlap: update.overlap,
             mode: update.mode,
+            permission_contract: update.permission_contract,
             model: update.model.clone(),
             timeout: update.timeout,
             misfire: update.misfire,
@@ -532,6 +542,7 @@ impl ScheduleStore {
                 id.clone(),
                 workspace.clone(),
                 update.mode,
+                update.permission_contract,
                 &update.action,
                 &update.trigger,
                 update.model.clone(),
@@ -573,7 +584,8 @@ impl ScheduleStore {
              native_action = ?, native_input = ?, \
              trigger_kind = ?, once_at = ?, anchor_at = ?, every_secs = ?, \
              timezone = ?, local_time = ?, weekdays = ?, cron_expr = ?, \
-             session_policy = ?, overlap_policy = ?, permission_mode = ?, model = ?, \
+             session_policy = ?, overlap_policy = ?, permission_mode = ?, \
+             permission_contract = ?, model = ?, \
              timeout_secs = ?, misfire_policy = ?, misfire_grace_secs = ?, \
              unattended_grant = ?, session_id = ?, updated_at = ? \
              WHERE id = ? AND updated_at = ?",
@@ -596,6 +608,7 @@ impl ScheduleStore {
         .bind(update.session_policy.as_str())
         .bind(update.overlap.as_str())
         .bind(update.mode.as_str())
+        .bind(contract_code(update.permission_contract))
         .bind(update.model.as_ref().map(ModelRef::to_string))
         .bind(update.timeout.as_secs() as i64)
         .bind(update.misfire.as_str())
@@ -2091,6 +2104,12 @@ fn definition_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<ScheduleDefiniti
     let mode = PermissionProfile::parse(&permission_mode).ok_or_else(|| {
         ScheduleError::Invalid(format!("unsupported permission mode `{permission_mode}`"))
     })?;
+    let permission_contract_code: i64 = row.try_get("permission_contract")?;
+    let permission_contract = if permission_contract_code == 2 {
+        PermissionContract::V2
+    } else {
+        PermissionContract::V1
+    };
     let model: Option<String> = row.try_get("model")?;
     let model =
         match model {
@@ -2117,6 +2136,7 @@ fn definition_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<ScheduleDefiniti
         session_policy,
         overlap,
         mode,
+        permission_contract,
         model,
         timeout: Duration::from_secs(timeout_secs.max(1) as u64),
         misfire,
@@ -2468,6 +2488,7 @@ mod tests {
             session_policy: SessionPolicy::Continue,
             overlap: OverlapPolicy::SkipIfRunning,
             mode: PermissionProfile::Assisted,
+            permission_contract: PermissionContract::V2,
             model: None,
             timeout: Duration::from_secs(60),
             misfire: MisfirePolicy::Skip,

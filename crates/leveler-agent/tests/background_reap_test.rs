@@ -1466,6 +1466,7 @@ async fn a_goal_less_chat_session_reaps_goal_lifetime_tasks() {
             goal: String::new(),
             model: Some("mock/m".into()),
             mode: "assisted".into(),
+            permission_contract: 2,
             sandbox: false,
             kind: leveler_engine::ExecutionKind::Direct,
             axes: Some(leveler_engine::NewSessionAxes {

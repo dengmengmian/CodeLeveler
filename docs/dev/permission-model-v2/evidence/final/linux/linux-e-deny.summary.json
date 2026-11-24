@@ -1,0 +1,56 @@
+{
+  "name": "linux-e-deny",
+  "started_at": "2026-11-24T12:48:59+0000",
+  "elapsed_seconds": 8.1,
+  "binary": "/tmp/target/release/leveler",
+  "binary_sha256": "3cb1e172ad84312b4f97ea8bebd39cdbe2eef433bea034677a22641b4e85ce21",
+  "git_head": "5800dd8aad887137e86806e10d02ec84f5860c5d",
+  "repo": "/tmp/pv2-final/scenarios/e-network",
+  "task": "Run `curl -sS --max-time 5 http://127.0.0.1:18992/loopback` and report exactly what happens, including any error.",
+  "command": [
+    "/tmp/target/release/leveler",
+    "run",
+    "--model",
+    "deepseek/deepseek-v4-pro",
+    "--permission",
+    "assisted",
+    "--permission-contract",
+    "v2",
+    "--collaboration",
+    "chat",
+    "--output",
+    "jsonl",
+    "--max-model-steps",
+    "12",
+    "--deny-network",
+    "Run `curl -sS --max-time 5 http://127.0.0.1:18992/loopback` and report exactly what happens, including any error."
+  ],
+  "stdin_mode": "deny",
+  "exit_code": 0,
+  "approval_prompts": [],
+  "approval_count": 0,
+  "tool_calls": [
+    {
+      "id": "call_j58776q7wxq0nov6v2g4e08w",
+      "tool": "shell_command",
+      "arguments": "{\"cmd\":\"curl -sS --max-time 5 http://127.0.0.1:18992/loopback; echo \\\"---EXIT:$?---\\\"\"}"
+    }
+  ],
+  "tool_results": [
+    {
+      "id": "call_j58776q7wxq0nov6v2g4e08w",
+      "tool": "shell_command",
+      "is_error": false,
+      "preview": "[execution policy] Network access was denied for this command.\n\nexit: 0\n--- stdout ---\n---EXIT:7---\n--- stderr ---\ncurl: (7) Failed to connect to 127.0.0.1 port 18992 after 0 ms: Couldn't connect to server\n"
+    }
+  ],
+  "stop_reason": "Answered",
+  "stop_detail": null,
+  "session_id": "38e03f69-e856-48a7-b6ba-fb5d6651d8de",
+  "rounds": 2,
+  "modified_files": [],
+  "final_text": "Ran the command. Result:\n\n- The execution policy flagged the command: `Network access was denied for this command.`\n- The `curl` process itself still ran and exited with code `7`.\n- stderr: `curl: (7) Failed to connect to 127.0.0.1 port 18992 after 0 ms: Couldn't connect to server`\n- stdout: empty.\n\nSo `curl` could not connect \u2014 nothing is listening (or reachable) at `127.0.0.1:18992`, and the failure is a connection refusal/timeout (curl exit code 7), reported within the network-denied execution boundary.",
+  "stderr_tail": "",
+  "stdout_log": "/tmp/pv2-final/logs/linux-e-deny.jsonl",
+  "stderr_log": "/tmp/pv2-final/logs/linux-e-deny.err"
+}

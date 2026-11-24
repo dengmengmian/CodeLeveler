@@ -56,6 +56,20 @@ fn translate(line: &str) -> Option<String> {
             "MCP 服务器配置无法读取（I/O 或解析错误）"
         }
         "no MCP servers configured" => "未配置 MCP 服务器",
+        "disabled — add [web.search] in ~/.leveler/config.toml" => {
+            "已禁用 — 在 ~/.leveler/config.toml 中添加 [web.search]"
+        }
+        "sandbox home — host runtime configuration is not visible" => {
+            "沙箱 home — 主机运行时配置不可见"
+        }
+        "sandbox home — host credential visibility is not available here" => {
+            "沙箱 home — 此处无法查看主机凭据状态"
+        }
+        "sandbox home — host web search configuration is not visible" => {
+            "沙箱 home — 主机网页搜索配置不可见"
+        }
+        "sandbox home — host providers are not visible" => "沙箱 home — 主机 Provider 配置不可见",
+        "sandbox home — host models are not visible" => "沙箱 home — 主机模型配置不可见",
         "disabled by configuration" => "已由配置禁用",
         "a connection attempt is in progress" => "正在尝试连接",
         "the previous connection is no longer serving its catalog; open /mcp to reconnect" => {
@@ -76,6 +90,14 @@ fn translate_parameterized(line: &str) -> Option<String> {
         && let Some(name) = rest.strip_suffix(" is not set")
     {
         return Some(format!("环境变量 ${name} 未设置"));
+    }
+    if let Some(rest) = line.strip_prefix("credential $") {
+        if let Some(name) = rest.strip_suffix(" is set") {
+            return Some(format!("凭据 ${name} 已设置"));
+        }
+        if let Some(name) = rest.strip_suffix(" is not set") {
+            return Some(format!("凭据 ${name} 未设置"));
+        }
     }
     if let Some(rest) = line.strip_prefix("set via $") {
         return Some(format!("通过 ${rest} 设置"));

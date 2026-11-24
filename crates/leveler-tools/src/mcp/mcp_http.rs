@@ -396,6 +396,12 @@ fn tool_info(tool: rmcp::model::Tool) -> Option<McpToolInfo> {
     if name.is_empty() || name.chars().any(|c| c.is_control()) {
         return None;
     }
+    let typed_annotations = leveler_execution::McpAnnotations {
+        read_only_hint: tool.annotations.as_ref().and_then(|a| a.read_only_hint),
+        destructive_hint: tool.annotations.as_ref().and_then(|a| a.destructive_hint),
+        idempotent_hint: tool.annotations.as_ref().and_then(|a| a.idempotent_hint),
+        open_world_hint: tool.annotations.as_ref().and_then(|a| a.open_world_hint),
+    };
     let mut description = tool
         .description
         .as_ref()
@@ -443,6 +449,7 @@ fn tool_info(tool: rmcp::model::Tool) -> Option<McpToolInfo> {
         name,
         description,
         input_schema,
+        annotations: typed_annotations,
     })
 }
 

@@ -59,6 +59,7 @@ fn snapshot(messages: Vec<UiMessage>) -> UiSessionSnapshot {
         title: None,
         model: ModelRef::parse("deepseek/v3"),
         mode: PermissionProfile::Assisted,
+        permission_contract: leveler_client_protocol::PermissionContract::V1,
         branch: Some("main".into()),
         status: "idle".into(),
         finalization_stage: None,

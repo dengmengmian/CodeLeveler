@@ -429,7 +429,7 @@ fn verification_target_override(
 pub(crate) fn should_read_host_caches(request: &ProcessRequest) -> bool {
     !matches!(
         request.effective_network_scope(),
-        crate::NetworkScope::Internet
+        crate::NetworkScope::Internet | crate::NetworkScope::Any
     ) || request.args.iter().any(|arg| {
         arg == "--offline"
             || arg
@@ -1716,7 +1716,9 @@ impl CommandRunner {
         };
         let network_scope = request.effective_network_scope();
         match &network_scope {
-            crate::NetworkScope::None | crate::NetworkScope::Internet => {}
+            crate::NetworkScope::None
+            | crate::NetworkScope::Internet
+            | crate::NetworkScope::Any => {}
             crate::NetworkScope::Loopback if cfg!(target_os = "macos") => {}
             unsupported => {
                 let name = match unsupported {
@@ -1730,7 +1732,10 @@ impl CommandRunner {
                 )));
             }
         }
-        let deny_network = !matches!(network_scope, crate::NetworkScope::Internet);
+        let deny_network = !matches!(
+            network_scope,
+            crate::NetworkScope::Internet | crate::NetworkScope::Any
+        );
         if matches!(request.write_scope, WriteScope::ScopedWorkspace { .. }) {
             let scope = request.write_scope.clone();
             tokio::task::spawn_blocking(move || validate_scoped_write_boundary(&scope))

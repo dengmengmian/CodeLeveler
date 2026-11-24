@@ -12,8 +12,9 @@
 //!
 //! Runtime failures are handled as mechanical facts: a timeout, an unreachable
 //! host, an HTTP error or an unparsable body all return an `is_error` result.
-//! The tool does not retry, does not fall back to another provider, does not
-//! start a model request, and does not advise.
+//! The tool does not retry, does not fall back to another provider, and does not
+//! start a model request. An auth failure names the configured credential
+//! variable (never its value) so the operator can act on it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -87,13 +88,23 @@ impl Tool for WebSearchTool {
         RiskLevel::Network
     }
 
+    /// A search consumes provider quota and can be billed, so it may overlap
+    /// only under the runtime's network bound; its admission stays serial and
+    /// durable before the provider is called.
+    fn supports_network_parallel(&self) -> bool {
+        true
+    }
+
     async fn network_resource(
         &self,
         _input: &serde_json::Value,
     ) -> Result<Option<leveler_execution::NetworkResource>, String> {
-        crate::network::resolve_target(self.provider.endpoint())
-            .await
-            .map(Some)
+        crate::network::resolve_target(
+            self.provider.endpoint(),
+            crate::network::DnsPhase::AdmissionResource,
+        )
+        .await
+        .map(Some)
     }
 
     async fn execute(
@@ -123,6 +134,8 @@ impl Tool for WebSearchTool {
         let network = SearchNetwork {
             scope: &network_scope,
             unrestricted,
+            session: context.session_scope.as_deref(),
+            trace: context.network_trace.as_deref(),
         };
         // Race the request against cancellation so a killed turn returns promptly.
         let result = tokio::select! {

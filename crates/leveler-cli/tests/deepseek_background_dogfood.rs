@@ -517,6 +517,7 @@ async fn create_goal_session(
             goal: goal.to_string(),
             model: None,
             mode: leveler_client_protocol::PermissionProfile::FullAccess,
+            permission_contract: None,
         })
         .await
         .unwrap()

@@ -728,6 +728,9 @@ pub struct AppState {
     /// build the model/mode pickers.
     pub available_models: Vec<ModelRef>,
     pub mode: PermissionProfile,
+    /// The contract the session was created under. An old runtime omits it
+    /// and the client treats the omission as V1, never V2.
+    pub permission_contract: leveler_client_protocol::PermissionContract,
 
     /// Scroll offset (in lines) of the active full-screen view's content.
     pub screen_scroll: usize,
@@ -1091,6 +1094,7 @@ impl AppState {
             restart_requested: false,
             available_models: Vec::new(),
             mode: PermissionProfile::Assisted,
+            permission_contract: leveler_client_protocol::PermissionContract::V1,
             screen_scroll: 0,
             conv: crate::conversation::ConversationView::default(),
             workbench_focus: WorkbenchFocus::Input,

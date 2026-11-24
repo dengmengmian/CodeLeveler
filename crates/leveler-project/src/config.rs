@@ -131,6 +131,11 @@ pub struct ProjectConfig {
     /// Default permission profile (`request_approval` | `assisted` | `full_access`).
     #[serde(default)]
     pub mode: Option<String>,
+    /// Permission contract for `mode` (`v1` | `v2`). Absent means V1: a
+    /// project that predates Permission Model V2 must not silently acquire
+    /// the new Auto. `leveler init` writes `v2`.
+    #[serde(default)]
+    pub permission_contract: Option<String>,
     /// Explicit verification commands.
     #[serde(default)]
     pub verify: VerifySpec,

@@ -191,16 +191,33 @@ fn redact_reason(reason: &str) -> String {
 }
 
 /// The admission projection for the session's current profile.
-pub(crate) fn admission_for(mode: PermissionProfile) -> McpToolAdmission {
-    match mode {
-        PermissionProfile::FullAccess | PermissionProfile::Assisted => McpToolAdmission::Admitted,
-        PermissionProfile::RequestApproval => McpToolAdmission::RequiresNetworkGrant,
+pub(crate) fn admission_for(
+    contract: leveler_client_protocol::PermissionContract,
+    mode: PermissionProfile,
+) -> McpToolAdmission {
+    let kind = leveler_execution::PolicyKind::of(
+        match contract {
+            leveler_client_protocol::PermissionContract::V1 => {
+                leveler_execution::PermissionContract::V1
+            }
+            leveler_client_protocol::PermissionContract::V2 => {
+                leveler_execution::PermissionContract::V2
+            }
+        },
+        mode,
+    );
+    match kind {
+        leveler_execution::PolicyKind::LegacyRestricted => McpToolAdmission::RequiresNetworkGrant,
+        leveler_execution::PolicyKind::LegacyAuto
+        | leveler_execution::PolicyKind::EffectAuto
+        | leveler_execution::PolicyKind::Full => McpToolAdmission::Admitted,
     }
 }
 
 /// Build the authoritative server list.
 pub(crate) async fn servers(
     app: &Application,
+    contract: leveler_client_protocol::PermissionContract,
     mode: PermissionProfile,
 ) -> Result<Vec<McpServerView>, String> {
     let generation = app.config_snapshot();
@@ -209,7 +226,7 @@ pub(crate) async fn servers(
         .states(&generation.loaded.mcp_servers)
         .await;
     let entries = crate::mcp_config::list().map_err(|error| error.to_string())?;
-    let admission = admission_for(mode);
+    let admission = admission_for(contract, mode);
     Ok(entries
         .into_iter()
         .map(|entry| {
@@ -308,11 +325,12 @@ pub(crate) async fn servers(
 /// Run one management request against the runtime.
 pub(crate) async fn manage(
     app: &Application,
+    contract: leveler_client_protocol::PermissionContract,
     mode: PermissionProfile,
     request: McpRequest,
 ) -> McpResponse {
     if matches!(request, McpRequest::List) {
-        return list_response(app, mode).await;
+        return list_response(app, contract, mode).await;
     }
     let result: Result<String, String> = async {
         match request {
@@ -360,7 +378,7 @@ pub(crate) async fn manage(
     }
     .await;
     match result {
-        Ok(_) => match servers(app, mode).await {
+        Ok(_) => match servers(app, contract, mode).await {
             Ok(servers) => McpResponse::Changed {
                 servers,
                 message: "updated".to_string(),
@@ -371,14 +389,18 @@ pub(crate) async fn manage(
             },
         },
         Err(message) => McpResponse::Error {
-            servers: servers(app, mode).await.unwrap_or_default(),
+            servers: servers(app, contract, mode).await.unwrap_or_default(),
             message,
         },
     }
 }
 
-async fn list_response(app: &Application, mode: PermissionProfile) -> McpResponse {
-    match servers(app, mode).await {
+async fn list_response(
+    app: &Application,
+    contract: leveler_client_protocol::PermissionContract,
+    mode: PermissionProfile,
+) -> McpResponse {
+    match servers(app, contract, mode).await {
         Ok(servers) => McpResponse::Snapshot { servers },
         Err(message) => McpResponse::Error {
             servers: Vec::new(),
@@ -500,18 +522,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn admission_follows_the_session_profile() {
+    fn admission_follows_the_contract_and_tier() {
+        use leveler_client_protocol::PermissionContract;
         assert_eq!(
-            admission_for(PermissionProfile::Assisted),
+            admission_for(PermissionContract::V2, PermissionProfile::Assisted),
             McpToolAdmission::Admitted
         );
         assert_eq!(
-            admission_for(PermissionProfile::FullAccess),
+            admission_for(PermissionContract::V2, PermissionProfile::FullAccess),
             McpToolAdmission::Admitted
         );
         assert_eq!(
-            admission_for(PermissionProfile::RequestApproval),
+            admission_for(PermissionContract::V1, PermissionProfile::RequestApproval),
             McpToolAdmission::RequiresNetworkGrant
+        );
+        // The first tier inherits the old Auto: MCP is admitted.
+        assert_eq!(
+            admission_for(PermissionContract::V2, PermissionProfile::RequestApproval),
+            McpToolAdmission::Admitted
         );
     }
 

@@ -671,6 +671,7 @@ pub(super) fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
     match primary {
         "model" => model_slash(state, command),
         "permission" => permission_slash(state, command),
+        "permission-contract" => permission_contract_slash(state, command),
         "thinking" => thinking_slash(state, command),
         "goal" => run_goal(state, command),
         "btw" => run_btw(state, command),
@@ -2000,6 +2001,31 @@ fn permission_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
     vec![Effect::Send(ClientCommand::SetPermissionProfile {
         session_id: state.session_id.clone(),
         mode,
+        contract: None,
+    })]
+}
+
+/// `/permission-contract v2`: explicit V2 adoption.
+///
+/// The tier is unchanged; only the contract moves. Re-selecting the same tier
+/// through `/permission` does NOT adopt V2 — this command is the one explicit
+/// action, so a v1 session cannot be upgraded by muscle memory.
+fn permission_contract_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
+    let rest = command
+        .split_once(char::is_whitespace)
+        .map(|(_, rest)| rest.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    if rest != "v2" {
+        state.notification = Some(Notification {
+            level: NotificationLevel::Warning,
+            message: state.t().permission_contract_usage.to_string(),
+        });
+        return Vec::new();
+    }
+    vec![Effect::Send(ClientCommand::SetPermissionProfile {
+        session_id: state.session_id.clone(),
+        mode: state.mode,
+        contract: Some(leveler_client_protocol::PermissionContract::V2),
     })]
 }
 

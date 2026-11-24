@@ -51,6 +51,7 @@ fn snapshot(model: &str) -> UiSessionSnapshot {
         title: None,
         model: ModelRef::parse(model),
         mode: PermissionProfile::Assisted,
+        permission_contract: leveler_client_protocol::PermissionContract::V1,
         branch: None,
         status: "idle".into(),
         finalization_stage: None,

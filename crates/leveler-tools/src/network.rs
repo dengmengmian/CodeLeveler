@@ -1,11 +1,118 @@
 //! Host HTTP socket mediation. Confined calls enforce their admitted scope;
 //! frozen FullAccess authority bypasses destination restrictions.
 use leveler_execution::NetworkScope;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use crate::network_budget::{NetworkBudget, NetworkLease, NetworkTrace, RequestClass};
+
+/// Identity and diagnostic handles one outbound request carries. The class
+/// chooses the provider budget; the session shares the process-fairness
+/// layer; the optional trace records budget waits for the executor.
+#[derive(Clone, Copy)]
+pub(crate) struct NetworkCall<'a> {
+    pub class: RequestClass<'a>,
+    pub session: Option<&'a str>,
+    pub trace: Option<&'a NetworkTrace>,
+}
+
+/// Only the stage currently being polled can be timed. A dropped future
+/// (e.g. interrupted by an outer select) cannot report a completed stage.
+pub(crate) struct WebPhase {
+    started: Option<Instant>,
+    phase: &'static str,
+    hop: Option<usize>,
+    http_status: Option<u16>,
+}
+
+pub(crate) enum PhaseOutcome {
+    Ok,
+    Error,
+    Timeout,
+    Limit,
+    Interrupted,
+}
+
+impl PhaseOutcome {
+    pub(crate) fn request_error(error: &reqwest::Error) -> Self {
+        if error.is_timeout() {
+            Self::Timeout
+        } else {
+            Self::Error
+        }
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Error => "error",
+            Self::Timeout => "timeout",
+            Self::Limit => "limit",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
+impl WebPhase {
+    pub(crate) fn body(status: reqwest::StatusCode) -> Self {
+        Self::new("http_body", None, Some(status.as_u16()))
+    }
+
+    fn new(phase: &'static str, hop: Option<usize>, http_status: Option<u16>) -> Self {
+        Self {
+            started: tracing::enabled!(target: "leveler_web_latency", tracing::Level::DEBUG)
+                .then(Instant::now),
+            phase,
+            hop,
+            http_status,
+        }
+    }
+
+    pub(crate) fn finish(mut self, outcome: PhaseOutcome) {
+        self.record(outcome);
+    }
+
+    fn record(&mut self, outcome: PhaseOutcome) {
+        if let Some(started) = self.started.take() {
+            tracing::debug!(
+                target: "leveler_web_latency",
+                phase = self.phase,
+                elapsed_us = started.elapsed().as_micros() as u64,
+                outcome = outcome.as_str(),
+                hop = self.hop,
+                http_status = self.http_status,
+                "web HTTP phase"
+            );
+        }
+    }
+}
+
+impl Drop for WebPhase {
+    fn drop(&mut self) {
+        self.record(PhaseOutcome::Interrupted);
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum DnsPhase {
+    AdmissionReason,
+    AdmissionResource,
+    HttpHop(usize),
+}
+
+impl DnsPhase {
+    fn timer(self) -> WebPhase {
+        match self {
+            Self::AdmissionReason => WebPhase::new("admission_reason_dns", None, None),
+            Self::AdmissionResource => WebPhase::new("admission_resource_dns", None, None),
+            Self::HttpHop(hop) => WebPhase::new("http_dns", Some(hop), None),
+        }
+    }
+}
 
 /// Resolve once for admission evidence or the actual next HTTP hop.
 pub(crate) async fn resolve_target(
     url: &str,
+    phase: DnsPhase,
 ) -> Result<leveler_execution::NetworkResource, String> {
     let parsed = reqwest::Url::parse(url).map_err(|e| format!("invalid url: {e}"))?;
     if !matches!(parsed.scheme(), "http" | "https") {
@@ -15,21 +122,102 @@ pub(crate) async fn resolve_target(
         return Err("URL credentials are not supported".into());
     }
     let host = parsed.host_str().ok_or("url missing host")?;
-    tokio::time::timeout(
+    let port = parsed.port_or_known_default().ok_or("url missing port")?;
+    #[cfg(debug_assertions)]
+    if let Some(addresses) = test_dns_rebind(host, port, phase) {
+        return leveler_execution::NetworkResource::from_resolved(
+            host,
+            port,
+            leveler_execution::NetworkTransport::Tcp,
+            addresses,
+        )
+        .map_err(|e| e.to_string());
+    }
+    let timer = phase.timer();
+    let result = tokio::time::timeout(
         Duration::from_secs(5),
         leveler_execution::resolve_network_resource(
             host,
-            parsed.port_or_known_default().ok_or("url missing port")?,
+            port,
             leveler_execution::NetworkTransport::Tcp,
         ),
     )
-    .await
-    .map_err(|_| "DNS resolution timed out".to_string())?
-    .map_err(|e| e.to_string())
+    .await;
+    timer.finish(match &result {
+        Ok(Ok(_)) => PhaseOutcome::Ok,
+        Ok(Err(_)) => PhaseOutcome::Error,
+        Err(_) => PhaseOutcome::Timeout,
+    });
+    result
+        .map_err(|_| "DNS resolution timed out".to_string())?
+        .map_err(|e| e.to_string())
+}
+
+/// A closed-set DNS answer for the address-revalidation test.
+///
+/// A test needs one endpoint that admission sees as an allowed address and
+/// execution sees as a forbidden one. Public DNS cannot be scripted
+/// deterministically, so this hook answers exactly one reserved host,
+/// `rebind.leveler.test`, and only when the test installs it. It mirrors the
+/// existing `leveler_core::test_crash` failpoint: debug builds only, a fixed
+/// closed set with no model/repository input, and no effect in a release
+/// build. It changes no validation: the real scope, SSRF and redirect checks
+/// still run on whatever answer comes back.
+#[cfg(debug_assertions)]
+fn test_dns_rebind(host: &str, port: u16, phase: DnsPhase) -> Option<Vec<std::net::SocketAddr>> {
+    const REBIND_HOST: &str = "rebind.leveler.test";
+    if host != REBIND_HOST {
+        return None;
+    }
+    let blocked = {
+        let slot = test_dns_rebind_slot()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (*slot)?
+    };
+    let address = match phase {
+        // Admission sees a loopback destination, which the Internet scope
+        // admits and the executor may execute without consent.
+        DnsPhase::AdmissionReason | DnsPhase::AdmissionResource => {
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        }
+        // The hop itself sees the forbidden answer.
+        DnsPhase::HttpHop(_) => blocked,
+    };
+    Some(vec![std::net::SocketAddr::new(address, port)])
+}
+
+#[cfg(debug_assertions)]
+fn test_dns_rebind_slot() -> &'static std::sync::Mutex<Option<std::net::IpAddr>> {
+    static SLOT: std::sync::OnceLock<std::sync::Mutex<Option<std::net::IpAddr>>> =
+        std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Install the forbidden answer the next execution hop receives for
+/// `rebind.leveler.test`. Debug builds only; the release build has no such
+/// symbol. Used by the address-revalidation integration test.
+#[cfg(debug_assertions)]
+pub fn install_test_dns_rebind_for_tests(blocked: std::net::IpAddr) {
+    *test_dns_rebind_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(blocked);
+}
+
+/// Remove the test answer. Safe to call when none was installed.
+#[cfg(debug_assertions)]
+pub fn clear_test_dns_rebind_for_tests() {
+    *test_dns_rebind_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 }
 
 /// A client is built for one validated hop only. It cannot discover an
 /// environment proxy, resolve a second DNS answer, or follow a redirect itself.
+///
+/// The returned lease keeps the request's process/session/provider budget
+/// while the caller reads the response body, so a slow body still counts as an
+/// in-flight request.
 pub(crate) async fn send(
     scope: &NetworkScope,
     unrestricted: bool,
@@ -38,31 +226,32 @@ pub(crate) async fn send(
     json: Option<&serde_json::Value>,
     bearer: Option<&str>,
     timeout: Duration,
-) -> Result<reqwest::Response, String> {
+    call: NetworkCall<'_>,
+) -> Result<(reqwest::Response, NetworkLease), String> {
+    let budget = NetworkBudget::global();
+    let logical = budget
+        .acquire_logical(call.class, call.session, call.trace)
+        .await;
     // FullAccess is frozen execution authority, not a larger destination scope.
     // Let the HTTP client perform ordinary DNS/connect/redirect processing;
     // no CodeLeveler scope or SSRF decision runs on this path. A request that
     // carries a credential or a JSON body still refuses redirects: following
     // one could resend the Authorization header to another host.
     if unrestricted {
+        let parsed = reqwest::Url::parse(url).map_err(|e| format!("invalid url: {e}"))?;
+        let host = parsed.host_str().ok_or("url missing host")?;
+        let port = parsed.port_or_known_default().ok_or("url missing port")?;
+        let host_permit = budget.acquire_host(host, port, call.trace).await;
         let redirects = if bearer.is_some() || json.is_some() {
             reqwest::redirect::Policy::none()
         } else {
             reqwest::redirect::Policy::limited(10)
         };
-        let client = reqwest::Client::builder()
+        let builder = reqwest::Client::builder()
             .timeout(timeout)
-            .redirect(redirects)
-            .build()
-            .map_err(|e| format!("http client: {e}"))?;
-        let mut request = client.request(method, url);
-        if let Some(body) = json {
-            request = request.json(body);
-        }
-        if let Some(token) = bearer {
-            request = request.bearer_auth(token);
-        }
-        return request.send().await.map_err(request_error);
+            .redirect(redirects);
+        let response = send_to_headers(builder, method, url, json, bearer, None).await?;
+        return Ok((response, logical.attach_host(host_permit)));
     }
     let mut current = reqwest::Url::parse(url).map_err(|e| format!("invalid url: {e}"))?;
     let mut effective_scope = scope.clone();
@@ -76,7 +265,7 @@ pub(crate) async fn send(
         if matches!(scope, NetworkScope::None) {
             return Err("network scope None denies destination".into());
         }
-        let resource = resolve_target(current.as_str()).await?;
+        let resource = resolve_target(current.as_str(), DnsPhase::HttpHop(hop)).await?;
         // Auto's ordinary local HTTP destination stays local for the whole
         // call. A public initial target never acquires this authority through
         // a redirect, and a localhost redirect cannot widen into LAN/public.
@@ -99,25 +288,30 @@ pub(crate) async fn send(
         {
             return Err("blocked private/loopback address under Internet HTTP scope".into());
         }
-        let client = reqwest::Client::builder()
+        let builder = reqwest::Client::builder()
             .timeout(timeout)
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .resolve_to_addrs(&resource.host, &resource.resolved_addresses)
-            .user_agent(concat!("CodeLeveler/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|e| format!("http client: {e}"))?;
-        let mut request = client.request(method.clone(), current.clone());
-        if let Some(body) = json {
-            request = request.json(body);
-        }
-        if let Some(token) = bearer {
-            request = request.bearer_auth(token);
-        }
-        let response = request.send().await.map_err(request_error)?;
+            .user_agent(concat!("CodeLeveler/", env!("CARGO_PKG_VERSION")));
+        // One hop holds one destination permit. A redirect releases it before
+        // the next host is contacted; the request-wide layers stay held.
+        let host_permit = budget
+            .acquire_host(&resource.host, resource.port, call.trace)
+            .await;
+        let response = send_to_headers(
+            builder,
+            method.clone(),
+            current.clone(),
+            json,
+            bearer,
+            Some(hop),
+        )
+        .await?;
         if !response.status().is_redirection() {
-            return Ok(response);
+            return Ok((response, logical.attach_host(host_permit)));
         }
+        drop(host_permit);
         if hop == 5 {
             return Err("too many redirects (>5)".into());
         }
@@ -135,6 +329,43 @@ pub(crate) async fn send(
             .map_err(|e| format!("bad redirect: {e}"))?;
     }
     Err("too many redirects".into())
+}
+
+async fn send_to_headers(
+    builder: reqwest::ClientBuilder,
+    method: reqwest::Method,
+    url: impl reqwest::IntoUrl,
+    json: Option<&serde_json::Value>,
+    bearer: Option<&str>,
+    hop: Option<usize>,
+) -> Result<reqwest::Response, String> {
+    let prepare = WebPhase::new("http_prepare", hop, None);
+    let client = match builder.build() {
+        Ok(client) => client,
+        Err(error) => {
+            prepare.finish(PhaseOutcome::Error);
+            return Err(format!("http client: {error}"));
+        }
+    };
+    let mut request = client.request(method, url);
+    if let Some(body) = json {
+        request = request.json(body);
+    }
+    if let Some(token) = bearer {
+        request = request.bearer_auth(token);
+    }
+    prepare.finish(PhaseOutcome::Ok);
+
+    // Reqwest exposes response headers as one boundary. This interval
+    // includes connection work and the server response where applicable.
+    let mut send = WebPhase::new("http_to_headers", hop, None);
+    let response = request.send().await;
+    send.http_status = response.as_ref().ok().map(|value| value.status().as_u16());
+    send.finish(match &response {
+        Ok(_) => PhaseOutcome::Ok,
+        Err(error) => PhaseOutcome::request_error(error),
+    });
+    response.map_err(request_error)
 }
 
 /// Preserve the one classification callers need from a reqwest failure. The
@@ -200,7 +431,18 @@ mod tests {
         (format!("http://{address}/"), task)
     }
 
-    async fn get(scope: &NetworkScope, url: &str) -> Result<reqwest::Response, String> {
+    fn call() -> NetworkCall<'static> {
+        NetworkCall {
+            class: RequestClass::Fetch,
+            session: None,
+            trace: None,
+        }
+    }
+
+    async fn get(
+        scope: &NetworkScope,
+        url: &str,
+    ) -> Result<(reqwest::Response, NetworkLease), String> {
         send(
             scope,
             false,
@@ -209,6 +451,7 @@ mod tests {
             None,
             None,
             Duration::from_secs(2),
+            call(),
         )
         .await
     }
@@ -225,12 +468,14 @@ mod tests {
                 None,
                 None,
                 Duration::from_secs(2),
+                call(),
             )
             .await;
             if response.is_err() {
                 task.abort();
             }
-            assert_eq!(response.unwrap().text().await.unwrap(), "ok");
+            let (response, _lease) = response.unwrap();
+            assert_eq!(response.text().await.unwrap(), "ok");
             task.await.unwrap();
         }
     }
@@ -244,7 +489,8 @@ mod tests {
             if result.is_err() {
                 task.abort();
             }
-            assert_eq!(result.unwrap().text().await.unwrap(), "ok");
+            let (response, _lease) = result.unwrap();
+            assert_eq!(response.text().await.unwrap(), "ok");
             task.await.unwrap();
         }
     }
@@ -256,7 +502,8 @@ mod tests {
         if result.is_err() {
             task.abort();
         }
-        assert_eq!(result.unwrap().text().await.unwrap(), "ok");
+        let (response, _lease) = result.unwrap();
+        assert_eq!(response.text().await.unwrap(), "ok");
         task.await.unwrap();
     }
 
@@ -279,6 +526,42 @@ mod tests {
             let error = get(&NetworkScope::Internet, &url).await.unwrap_err();
             task.await.unwrap();
             assert!(error.contains("scope"), "{error}");
+        }
+    }
+
+    /// V2 Auto's `Any` scope carries ordinary private/LAN reachability. The
+    /// public-document SSRF exclusion belongs to `Internet` alone; `Any` still
+    /// validates the destination shape, but does not reject a private address
+    /// before the socket attempt.
+    #[tokio::test]
+    async fn any_scope_reaches_private_destinations_without_the_public_ssrf_fence() {
+        let internet = send(
+            &NetworkScope::Internet,
+            false,
+            "http://192.168.1.10/",
+            reqwest::Method::GET,
+            None,
+            None,
+            Duration::from_millis(200),
+            call(),
+        )
+        .await
+        .unwrap_err();
+        assert!(internet.contains("blocked private/loopback"), "{internet}");
+
+        let any = send(
+            &NetworkScope::Any,
+            false,
+            "http://192.168.1.10/",
+            reqwest::Method::GET,
+            None,
+            None,
+            Duration::from_millis(100),
+            call(),
+        )
+        .await;
+        if let Err(error) = any {
+            assert!(!error.contains("blocked private/loopback"), "{error}");
         }
     }
 

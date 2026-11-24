@@ -269,6 +269,22 @@ pub(crate) fn test_ctx(
     (test_ctx_in(&dir, profile), dir)
 }
 
+/// A context under V2 Auto (the effect-oriented policy). Ordinary writes are
+/// not workspace-fenced; sensitive/trust paths still are.
+#[cfg(test)]
+pub(crate) fn test_ctx_effect_auto(
+    files: &[(&str, &str)],
+) -> (crate::tool::ToolContext, std::path::PathBuf) {
+    let (ctx, dir) = test_ctx(leveler_execution::PermissionProfile::Assisted, files);
+    let ctx = ctx.with_permission_profile(
+        leveler_execution::SharedPermissionProfile::new_with_contract(
+            leveler_execution::PermissionContract::V2,
+            leveler_execution::PermissionProfile::Assisted,
+        ),
+    );
+    (ctx, dir)
+}
+
 /// In-process capability handles for tool tests: a fresh language-server pool
 /// and background registry, no store, no browser.
 #[cfg(test)]

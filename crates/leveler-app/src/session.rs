@@ -596,8 +596,40 @@ impl Application {
         goal: &str,
         mode: PermissionProfile,
     ) -> Result<leveler_core::SessionId, AppError> {
-        self.create_session_with_collaboration(model, goal, mode, self.collaboration())
-            .await
+        self.create_session_with_permission_state(
+            model,
+            goal,
+            leveler_execution::PermissionContract::V2,
+            mode,
+            self.collaboration(),
+        )
+        .await
+    }
+
+    /// Create a session with an explicit `(contract, mode)`.
+    ///
+    /// New sessions use V2. A caller resolving an old project default passes
+    /// V1 explicitly; there is no other way to create a legacy session.
+    pub async fn create_session_with_permission_state(
+        &self,
+        model: &ModelRef,
+        goal: &str,
+        permission_contract: leveler_execution::PermissionContract,
+        mode: PermissionProfile,
+        collaboration: CollaborationMode,
+    ) -> Result<leveler_core::SessionId, AppError> {
+        let db = self.open_database().await?;
+        self.reap_zombie_turns(&db, None).await?;
+        self.insert_session(
+            &db,
+            Some(model),
+            goal,
+            permission_contract,
+            mode,
+            collaboration,
+            true,
+        )
+        .await
     }
 
     /// Create and persist a session whose durable collaboration axis IS
@@ -622,8 +654,16 @@ impl Application {
         // transport's `create_session`, which states `model_pinned: false`;
         // an explicit `/model` pins through `SessionEdit::Model`; a resume
         // keeps the row's stored model.
-        self.insert_session(&db, Some(model), goal, mode, collaboration, true)
-            .await
+        self.insert_session(
+            &db,
+            Some(model),
+            goal,
+            leveler_execution::PermissionContract::V2,
+            mode,
+            collaboration,
+            true,
+        )
+        .await
     }
 
     /// Clear the zombie `running` turns dead boots left behind, optionally
@@ -687,13 +727,22 @@ impl Application {
         &self,
         model: Option<&ModelRef>,
         goal: &str,
+        permission_contract: leveler_execution::PermissionContract,
         mode: PermissionProfile,
         collaboration: leveler_lifecycle::CollaborationMode,
         model_pinned: bool,
     ) -> Result<leveler_core::SessionId, AppError> {
         let db = self.open_database().await?;
-        self.insert_session(&db, model, goal, mode, collaboration, model_pinned)
-            .await
+        self.insert_session(
+            &db,
+            model,
+            goal,
+            permission_contract,
+            mode,
+            collaboration,
+            model_pinned,
+        )
+        .await
     }
 
     async fn insert_session(
@@ -701,6 +750,7 @@ impl Application {
         db: &leveler_storage::Database,
         model: Option<&ModelRef>,
         goal: &str,
+        permission_contract: leveler_execution::PermissionContract,
         mode: PermissionProfile,
         collaboration: leveler_lifecycle::CollaborationMode,
         model_pinned: bool,
@@ -715,6 +765,10 @@ impl Application {
                 goal: goal.to_string(),
                 model: model.map(ToString::to_string),
                 mode: mode.as_str().to_string(),
+                permission_contract: match permission_contract {
+                    leveler_execution::PermissionContract::V1 => 1,
+                    leveler_execution::PermissionContract::V2 => 2,
+                },
                 sandbox: false,
                 kind: ExecutionKind::Direct,
                 axes: Some(leveler_engine::NewSessionAxes {
@@ -805,6 +859,29 @@ impl Application {
         // this is the same value as RUNNING state. A session whose row was
         // rewritten this way must not keep authorizing under the old mode.
         self.set_live_permission_profile(session_id.as_str(), mode);
+        Ok(())
+    }
+
+    /// Persist `(contract, mode)` as one write and apply it to the live cell.
+    ///
+    /// This is the explicit V2 adoption path. The row, the running execution
+    /// and every later snapshot see the same pair.
+    pub async fn set_persisted_permission_state(
+        &self,
+        session_id: &leveler_core::SessionId,
+        permission_contract: leveler_execution::PermissionContract,
+        mode: PermissionProfile,
+    ) -> Result<(), AppError> {
+        let db = self.open_database().await?;
+        let sessions = SessionRepository::new(&db);
+        let code = match permission_contract {
+            leveler_execution::PermissionContract::V1 => 1,
+            leveler_execution::PermissionContract::V2 => 2,
+        };
+        sessions
+            .set_permission_state(session_id, mode.as_str(), code, leveler_core::now())
+            .await?;
+        self.set_live_permission_state(session_id.as_str(), permission_contract, mode);
         Ok(())
     }
 

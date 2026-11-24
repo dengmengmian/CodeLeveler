@@ -606,6 +606,34 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "written\n");
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// The effect-oriented Auto has no workspace write fence: an ordinary
+    /// outside path is written without an approval. Sensitive names remain
+    /// refused by the workspace layer, which is what keeps this distinct from
+    /// Full.
+    #[tokio::test]
+    async fn effect_auto_writes_outside_the_workspace_but_not_a_sensitive_path() {
+        let (ctx, dir) = super::super::test_ctx_effect_auto(&[]);
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("outside.txt");
+        let out = run(
+            ctx.clone(),
+            serde_json::json!({"path": target.to_string_lossy(), "content": "written\n"}),
+        )
+        .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "written\n");
+
+        let secret = outside.path().join(".env");
+        let out = run(
+            ctx,
+            serde_json::json!({"path": secret.to_string_lossy(), "content": "KEY=1\n"}),
+        )
+        .await;
+        assert!(out.is_error, "a credential file must stay refused");
+        assert!(!secret.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 #[cfg(test)]

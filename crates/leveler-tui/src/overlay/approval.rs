@@ -224,6 +224,7 @@ mod tests {
             summary: "run git push".into(),
             command: Some("git push".into()),
             risks: vec!["将访问网络".into()],
+            reason_code: None,
             call_id: None,
             always_persists: true,
         }

@@ -10,7 +10,13 @@ pub enum NetworkScope {
     Loopback,
     LocalLan,
     ConfiguredRemote(Vec<NetworkResource>),
+    /// Public Internet, excluding private/link-local destinations (the SSRF
+    /// contract shared by every existing profile).
     Internet,
+    /// Any destination the host can reach, including private/LAN. V2 Auto's
+    /// ordinary network authority: the OS still applies routing and firewall;
+    /// CodeLeveler imposes no destination class.
+    Any,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,7 +115,7 @@ impl NetworkScope {
                 .resolved_addresses
                 .iter()
                 .all(|a| is_local_lan(a.ip())),
-            Self::Internet => true,
+            Self::Internet | Self::Any => true,
             Self::ConfiguredRemote(resources) => {
                 resource.configured_remote.as_ref().is_some_and(|identity| {
                     !identity.repository_identity.is_empty()
@@ -141,6 +147,7 @@ impl NetworkScope {
             Self::LocalLan => "local_lan",
             Self::ConfiguredRemote(_) => "configured_remote",
             Self::Internet => "internet",
+            Self::Any => "any",
         }
     }
 }

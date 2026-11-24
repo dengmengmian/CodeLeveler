@@ -127,6 +127,7 @@ async fn run(root: &Path) {
             goal: "Windows Host contract".into(),
             model: None,
             mode: PermissionProfile::Assisted,
+            permission_contract: None,
             approval_policy: ApprovalPolicy::Interactive,
         })
         .await

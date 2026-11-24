@@ -14,6 +14,8 @@
 #![deny(unsafe_code)]
 
 pub mod approval;
+pub mod irreversibility;
+pub use irreversibility::{IrreversibleFact, IrreversibleKind, McpAnnotations};
 pub mod artifact;
 pub mod background;
 pub mod checkpoint;
@@ -98,7 +100,10 @@ pub use permission_rules::{
 pub use policy::{
     AuthorizationEvidence, PendingApproval, PolicyDenial, PolicyResolution, ResolvedExecutionPolicy,
 };
-pub use risk::{PermissionProfile, RiskLevel, SharedPermissionProfile, WriteScope};
+pub use risk::{
+    PermissionContract, PermissionProfile, PermissionState, PolicyKind, RiskLevel,
+    SharedPermissionProfile, WriteScope,
+};
 pub use snapshot::{SnapshotError, SnapshotId, WorkspaceSnapshot};
 pub use trust::{
     PROJECT_CONFIG_RELATIVE, TRUSTABLE_PROJECT_FILES, TRUSTED_PROJECT_FILES, TrustError,

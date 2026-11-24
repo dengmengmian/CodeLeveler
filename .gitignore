@@ -68,6 +68,12 @@ leveler-chat-*.md
 # All newly generated documents go here first; only docs confirmed for
 # publication are moved to their public location.
 /docs/dev/
+# Permission Model V2 is a shipped product contract: its design, phase
+# reports and evidence index are version-controlled with the code. Other
+# internal notes under docs/dev stay local.
+!/docs/dev/
+/docs/dev/*
+!/docs/dev/permission-model-v2/
 /docs/ARCHITECTURE.md
 /docs/ARCHITECTURE.zh-CN.md
 /docs/CUA_IMPLEMENTATION.md

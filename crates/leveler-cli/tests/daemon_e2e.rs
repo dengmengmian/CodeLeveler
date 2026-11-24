@@ -992,6 +992,7 @@ async fn sigkill_during_a_task_recovers_on_restart_without_duplication_body() {
             goal: "crash me".to_string(),
             model: None,
             mode: leveler_client_protocol::PermissionProfile::Assisted,
+            permission_contract: None,
         })
         .await
         .unwrap()
@@ -1136,6 +1137,7 @@ async fn live_processes_keep_their_turns_and_only_a_killed_ones_turn_is_reaped_b
             goal: "daemon work".to_string(),
             model: None,
             mode: leveler_client_protocol::PermissionProfile::Assisted,
+            permission_contract: None,
         })
         .await
         .unwrap()
@@ -1283,6 +1285,7 @@ async fn a_live_daemons_user_shell_holds_the_session_only_while_it_runs_body() {
             goal: "shell work".to_string(),
             model: None,
             mode: leveler_client_protocol::PermissionProfile::Assisted,
+            permission_contract: None,
         })
         .await
         .unwrap()
@@ -1390,6 +1393,7 @@ async fn sigkill_after_durable_ack_before_transcript_append_recovers_once_body()
             goal: "deterministic crash".to_string(),
             model: None,
             mode: leveler_client_protocol::PermissionProfile::Assisted,
+            permission_contract: None,
         })
         .await
         .unwrap()
@@ -1541,6 +1545,7 @@ async fn sigkill_before_the_receipt_settles_is_unresolvable_after_restart_body()
             goal: "receipt crash".to_string(),
             model: None,
             mode: leveler_client_protocol::PermissionProfile::Assisted,
+            permission_contract: None,
         })
         .await
         .unwrap()
@@ -1721,6 +1726,7 @@ async fn committed_cancelled_terminal_survives_a_crash_body() {
             goal: "committed cancel crash".to_string(),
             model: None,
             mode: leveler_client_protocol::PermissionProfile::Assisted,
+            permission_contract: None,
         })
         .await
         .unwrap()
@@ -1816,6 +1822,7 @@ async fn sigkill_after_cancel_current_turn_ack_stays_resumable_body() {
             goal: "plain cancel crash".to_string(),
             model: None,
             mode: leveler_client_protocol::PermissionProfile::Assisted,
+            permission_contract: None,
         })
         .await
         .unwrap()
@@ -1931,6 +1938,7 @@ async fn sigkill_after_cancel_task_ack_loses_the_logical_cancel_intent_body() {
             goal: "logical cancel crash".to_string(),
             model: None,
             mode: leveler_client_protocol::PermissionProfile::Assisted,
+            permission_contract: None,
         })
         .await
         .unwrap()
@@ -2332,6 +2340,7 @@ async fn connected_client_recovers_after_daemon_sigkill_scenario(resume_recovere
             goal: "survive the crash".to_string(),
             model: None,
             mode: leveler_client_protocol::PermissionProfile::Assisted,
+            permission_contract: None,
         })
         .await
         .unwrap()
@@ -2553,6 +2562,7 @@ async fn no_workspace_host_durably_admits_and_restores_after_process_restart_bod
             goal: "no workspace persisted task".into(),
             model: None,
             mode: PermissionProfile::Assisted,
+            permission_contract: None,
             approval_policy: ApprovalPolicy::Interactive,
         })
         .await
@@ -2741,6 +2751,7 @@ async fn global_open_resolves_repo_b_owner_while_repo_a_runtime_is_connected_bod
             goal: "A history".into(),
             model: None,
             mode: PermissionProfile::Assisted,
+            permission_contract: None,
             approval_policy: ApprovalPolicy::Interactive,
         })
         .await
@@ -2888,6 +2899,7 @@ async fn collaboration_entry_smoke_body() {
             goal: "smoke: ordinary new session".to_string(),
             model: None,
             mode: leveler_client_protocol::PermissionProfile::Assisted,
+            permission_contract: None,
         })
         .await
         .unwrap()
@@ -3060,6 +3072,7 @@ async fn cancelled_unknown_tool_effect_is_not_replayed_after_sigkill_body() {
             goal: "cancel uncertain external side effect".into(),
             model: None,
             mode: leveler_client_protocol::PermissionProfile::FullAccess,
+            permission_contract: None,
         })
         .await
         .unwrap()
@@ -3390,6 +3403,7 @@ async fn recovered_unknown_tool_requires_reconciliation_without_replaying_effect
             goal: "cancel uncertain external side effect".into(),
             model: None,
             mode: leveler_client_protocol::PermissionProfile::FullAccess,
+            permission_contract: None,
         })
         .await
         .unwrap()
@@ -3819,6 +3833,7 @@ async fn stress_session_isolation() -> serde_json::Value {
             goal: "session isolation".to_string(),
             model: None,
             mode: leveler_client_protocol::PermissionProfile::Assisted,
+            permission_contract: None,
         })
         .await
         .expect("the first client creates a session")

@@ -403,6 +403,7 @@ fn ui_approval_request(request: &ApprovalRequest) -> UiApprovalRequest {
         summary: request.description.clone(),
         command: request.command.clone(),
         risks: consent_bullets(request),
+        reason_code: request.reason_code.clone(),
         // The call this decision is holding, so the UI can stop painting it
         // as work in progress while it waits on the human.
         call_id: Some(request.call_id.clone()),
@@ -758,6 +759,7 @@ mod tests {
             command: Some("rm file".to_string()),
             paths: Vec::new(),
             write_scope_expanded: false,
+            reason_code: None,
         }
     }
 
@@ -813,6 +815,7 @@ mod tests {
                     tool: request.tool.clone(),
                     summary: request.description.clone(),
                     command: request.command.clone(),
+                    reason_code: request.reason_code.clone(),
                     risks: vec![],
                     call_id: Some(request.call_id.clone()),
                     always_persists: true,
@@ -848,6 +851,7 @@ mod tests {
                     tool: request.tool.clone(),
                     summary: request.description.clone(),
                     command: request.command.clone(),
+                    reason_code: request.reason_code.clone(),
                     risks: vec![],
                     call_id: Some(request.call_id.clone()),
                     always_persists: true,
@@ -870,6 +874,7 @@ mod tests {
                     tool: second_request.tool.clone(),
                     summary: second_request.description.clone(),
                     command: second_request.command.clone(),
+                    reason_code: second_request.reason_code.clone(),
                     risks: vec![],
                     call_id: Some(second_request.call_id.clone()),
                     always_persists: true,

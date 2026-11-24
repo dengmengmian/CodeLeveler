@@ -22,6 +22,10 @@ pub struct UiApprovalRequest {
     pub command: Option<String>,
     /// Human-readable risk bullets (paths touched, network, etc.).
     pub risks: Vec<String>,
+    /// Stable machine-readable reason (`irreversible.*`, `boundary.*`). Clients
+    /// display it and audits group by it; never inferred from prose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
     /// The tool call this request is holding, when the runtime knows it.
     ///
     /// A UI needs it to tell "announced, waiting for you" apart from "running":

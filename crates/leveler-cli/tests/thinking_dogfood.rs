@@ -92,6 +92,7 @@ fn blank() -> UiSessionSnapshot {
         title: None,
         model: None,
         mode: leveler_client_protocol::PermissionProfile::Assisted,
+        permission_contract: leveler_client_protocol::PermissionContract::V1,
         branch: None,
         status: "idle".into(),
         finalization_stage: None,

@@ -559,6 +559,7 @@ async fn supersede_live_waiter(
             command: ClientCommand::SetPermissionProfile {
                 session_id: session_id.clone(),
                 mode: WirePermission::FullAccess,
+                contract: None,
             },
         };
         match client.deliver(envelope).await {
@@ -643,6 +644,7 @@ async fn run_case(path: Path, op: &Op, workroot: &std::path::Path) -> (Case, Vec
             goal: "full permission dogfood".to_string(),
             model: Some(model.clone()),
             mode: create_mode,
+            permission_contract: None,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
         })
         .await
@@ -989,6 +991,7 @@ async fn run_mode_persistence(workroot: &std::path::Path) -> (Vec<Case>, Vec<Vio
             goal: "daemon full".to_string(),
             model: Some(model.clone()),
             mode: WirePermission::FullAccess,
+            permission_contract: None,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
         })
         .await
@@ -1039,6 +1042,7 @@ async fn run_mode_persistence(workroot: &std::path::Path) -> (Vec<Case>, Vec<Vio
         .send_observed(ClientCommand::SetPermissionProfile {
             session_id: auto_id.clone(),
             mode: WirePermission::FullAccess,
+            contract: None,
         })
         .await
         .unwrap();
@@ -1168,6 +1172,7 @@ async fn run_live_profile_authority(workroot: &std::path::Path) -> (Vec<Case>, V
         .send_observed(ClientCommand::SetPermissionProfile {
             session_id: session_id.clone(),
             mode: WirePermission::FullAccess,
+            contract: None,
         })
         .await
         .unwrap();
@@ -1344,6 +1349,7 @@ async fn run_auto_operation(
             goal: "auto matrix".to_string(),
             model: Some(model.clone()),
             mode: WirePermission::Assisted,
+            permission_contract: None,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
         })
         .await

@@ -29,6 +29,22 @@ use crate::tool::{ToolContext, ToolError, ToolOutput};
 /// artifact store when there is one).
 pub(super) const MAX_OUTPUT: usize = 32 * 1024;
 
+/// Whether a failed command's stderr reports an OS write refusal. Covers the
+/// seatbelt, Linux read-only bind and Windows ACL wordings; never used as a
+/// permission decision, only to choose which recovery note to show.
+fn filesystem_write_refused(stderr: &str) -> bool {
+    [
+        "Operation not permitted",
+        "operation not permitted",
+        "Read-only file system",
+        "Permission denied",
+        "Access is denied",
+        "Access denied",
+    ]
+    .iter()
+    .any(|needle| stderr.contains(needle))
+}
+
 /// The command runtime both command tools are constructed with.
 ///
 /// Holds the two long-lived services a command needs and nothing else: where
@@ -229,6 +245,26 @@ impl CommandExecution {
             .map_err(|reason| ToolError::Io(format!("frozen Git execution refused: {reason}")))
     }
 
+    /// A local `git push` destination is a mechanical write the workspace fence
+    /// does not know about. Resolve it only for a profile that still carries that
+    /// fence; EffectAuto/Full need no extra root, and ownership-scoped children
+    /// must not inherit one.
+    fn git_local_push_roots(
+        program: &str,
+        args: &[String],
+        cwd: &std::path::Path,
+        context: &ToolContext,
+    ) -> Vec<std::path::PathBuf> {
+        if !matches!(
+            context.write_scope(),
+            leveler_execution::WriteScope::Workspace { .. }
+                | leveler_execution::WriteScope::WorkspaceWithGit { .. }
+        ) {
+            return Vec::new();
+        }
+        leveler_execution::git_isolation::local_push_write_roots(program, args, cwd)
+    }
+
     /// Build a [`ProcessRequest`] for background spawn with the same sandbox fields
     /// as [`Self::run_foreground`] (PR-3a). Non-FullAccess / non-turn-unrestricted
     /// → write confinement; network follows `context.policy.network_denied()`.
@@ -248,7 +284,9 @@ impl CommandExecution {
         req.deny_env = context.policy.deny_env.as_ref().clone();
         req.deny_env.extend(isolation_deny);
         req.authority_env = authority_env;
+        let local_push = Self::git_local_push_roots(program, &req.args, &req.cwd, context);
         req.sandbox_write_roots = isolation_write_roots;
+        req.sandbox_write_roots.extend(local_push);
         req.write_scope = context.write_scope();
         req
     }
@@ -358,6 +396,9 @@ impl CommandExecution {
             .as_ref()
             .map(|iso| vec![iso.root().to_path_buf()])
             .unwrap_or_default();
+        let local_push =
+            Self::git_local_push_roots(&request.program, &request.args, &request.cwd, &context);
+        request.sandbox_write_roots.extend(local_push);
         // OS confinement from the one write boundary (`WriteScope`):
         // - `Workspace`: broad reads on every host, writes limited to
         //   workspace + temp + toolchain caches.
@@ -612,6 +653,18 @@ impl CommandExecution {
         }
         if sandboxed {
             body.push_str(crate::recoverable::sandbox_write_denied());
+            // A scoped write policy belongs to an ownership boundary, not to
+            // the user: name the claim protocol that resolves it so the model
+            // does not turn a claimable denial into an approval request. Only
+            // an actual filesystem refusal earns this guidance — a successful
+            // command under the same scope must not suggest a claim.
+            if !output.success()
+                && !context.policy.unrestricted_execution()
+                && context.policy.command_write_allowlist.is_some()
+                && filesystem_write_refused(&output.stderr)
+            {
+                body.push_str(crate::recoverable::scoped_write_denied());
+            }
         }
         if let Some(note) = snapshot_note {
             body.push_str(&note);

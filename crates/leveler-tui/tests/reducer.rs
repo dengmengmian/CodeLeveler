@@ -152,6 +152,7 @@ fn snapshot() -> UiSessionSnapshot {
         title: None,
         model: leveler_client_protocol::ModelRef::parse("deepseek/v3"),
         mode: PermissionProfile::Assisted,
+        permission_contract: leveler_client_protocol::PermissionContract::V1,
         branch: Some("main".to_string()),
         status: "idle".to_string(),
         finalization_stage: None,
@@ -2354,6 +2355,7 @@ fn an_approval_request_names_the_gated_command_in_its_prompt() {
                 summary: String::new(),
                 command: Some("rm -rf stale".into()),
                 risks: vec!["可能造成破坏性变更".into()],
+                reason_code: None,
                 call_id: Some("rm1".into()),
                 always_persists: true,
             },
@@ -2937,6 +2939,7 @@ fn approval_req() -> UiApprovalRequest {
         summary: "git push".into(),
         command: Some("git push".into()),
         risks: vec!["将访问网络".into()],
+        reason_code: None,
         call_id: None,
         always_persists: true,
     }
@@ -3331,6 +3334,7 @@ fn mode_picker_confirm_sends_set_permission_profile() {
         vec![Effect::Send(ClientCommand::SetPermissionProfile {
             session_id: SessionId::new("s1"),
             mode: PermissionProfile::RequestApproval,
+            contract: None,
         })]
     );
     assert_eq!(
@@ -3590,6 +3594,7 @@ fn second_approval_queues_and_advances_after_first_resolved() {
         summary: "rm -rf tmp".into(),
         command: Some("rm -rf tmp".into()),
         risks: vec![],
+        reason_code: None,
         call_id: None,
         always_persists: true,
     };
@@ -8558,6 +8563,7 @@ fn shift_tab_cycles_the_permission_profile() {
         vec![Effect::Send(ClientCommand::SetPermissionProfile {
             session_id: SessionId::new("s1"),
             mode: PermissionProfile::FullAccess,
+            contract: None,
         })]
     );
 

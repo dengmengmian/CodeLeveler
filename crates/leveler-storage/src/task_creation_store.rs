@@ -19,6 +19,7 @@ pub trait TaskCreationStore: Send + Sync {
         &self,
         record: &SessionRecord,
         mode: &str,
+        permission_contract: i64,
         sandbox: bool,
         kind: &str,
     ) -> Result<TaskId, StorageError>;
@@ -30,6 +31,7 @@ pub trait TaskCreationStore: Send + Sync {
         &self,
         record: &SessionRecord,
         mode: &str,
+        permission_contract: i64,
         sandbox: bool,
         kind: &str,
         request_id: &leveler_core::CommandId,
@@ -43,11 +45,12 @@ impl TaskCreationStore for Database {
         &self,
         record: &SessionRecord,
         mode: &str,
+        permission_contract: i64,
         sandbox: bool,
         kind: &str,
     ) -> Result<TaskId, StorageError> {
         Ok(self
-            .create_task_once(record, mode, sandbox, kind, None)
+            .create_task_once(record, mode, permission_contract, sandbox, kind, None)
             .await?
             .0)
     }
@@ -56,13 +59,21 @@ impl TaskCreationStore for Database {
         &self,
         record: &SessionRecord,
         mode: &str,
+        permission_contract: i64,
         sandbox: bool,
         kind: &str,
         request_id: &leveler_core::CommandId,
         fingerprint: &str,
     ) -> Result<(TaskId, bool), StorageError> {
-        self.create_task_once(record, mode, sandbox, kind, Some((request_id, fingerprint)))
-            .await
+        self.create_task_once(
+            record,
+            mode,
+            permission_contract,
+            sandbox,
+            kind,
+            Some((request_id, fingerprint)),
+        )
+        .await
     }
 }
 
@@ -71,6 +82,7 @@ impl Database {
         &self,
         record: &SessionRecord,
         mode: &str,
+        permission_contract: i64,
         sandbox: bool,
         kind: &str,
         identity: Option<(&leveler_core::CommandId, &str)>,
@@ -96,8 +108,8 @@ impl Database {
         sqlx::query(
             "INSERT INTO sessions \
              (id, repository, goal, status, model, state, created_at, updated_at, \
-              collaboration, work_profile, mode, sandbox, kind, model_pinned) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+              collaboration, work_profile, mode, permission_contract, sandbox, kind, model_pinned) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         )
         .bind(&record.id)
         .bind(&record.repository)
@@ -110,6 +122,7 @@ impl Database {
         .bind(&record.collaboration)
         .bind("single")
         .bind(mode)
+        .bind(permission_contract)
         .bind(sandbox)
         .bind(kind)
         .bind(record.model_pinned)
@@ -151,7 +164,7 @@ mod tests {
         let record = SessionRecord::new("/repo", "goal", "mock/m", leveler_core::now())
             .with_axes("plan", "delivery");
         let task = db
-            .create_task(&record, "read_only", true, "direct")
+            .create_task(&record, "read_only", 2, true, "direct")
             .await
             .unwrap();
         let session = SessionId::new(record.id);
@@ -184,7 +197,7 @@ mod tests {
         let session = SessionId::new(record.id.clone());
 
         assert!(
-            db.create_task(&record, "assisted", false, "direct")
+            db.create_task(&record, "assisted", 2, false, "direct")
                 .await
                 .is_err()
         );
@@ -201,7 +214,7 @@ mod tests {
         let record = SessionRecord::new("/repo", "goal", "mock/m", leveler_core::now());
         let id = leveler_core::CommandId::new("logical-create");
         let (task, inserted) = db
-            .create_task_identified(&record, "read_only", true, "direct", &id, "create:first")
+            .create_task_identified(&record, "read_only", 2, true, "direct", &id, "create:first")
             .await
             .unwrap();
         assert!(inserted);
@@ -214,15 +227,23 @@ mod tests {
         .unwrap();
         let retry = SessionRecord::new("/repo", "goal", "mock/newdefault", leveler_core::now());
         assert_eq!(
-            db.create_task_identified(&retry, "assisted", false, "direct", &id, "create:first")
+            db.create_task_identified(&retry, "assisted", 2, false, "direct", &id, "create:first")
                 .await
                 .unwrap(),
             (task, false)
         );
         assert!(
-            db.create_task_identified(&retry, "assisted", false, "direct", &id, "create:changed")
-                .await
-                .is_err()
+            db.create_task_identified(
+                &retry,
+                "assisted",
+                2,
+                false,
+                "direct",
+                &id,
+                "create:changed"
+            )
+            .await
+            .is_err()
         );
         let stored = SessionRepository::new(&db)
             .get(&SessionId::new(&record.id))
@@ -245,10 +266,18 @@ mod tests {
         assert_eq!(count.0, 1);
         let other = leveler_core::CommandId::new("new-logical-create");
         assert!(
-            db.create_task_identified(&retry, "assisted", false, "direct", &other, "create:first")
-                .await
-                .unwrap()
-                .1
+            db.create_task_identified(
+                &retry,
+                "assisted",
+                2,
+                false,
+                "direct",
+                &other,
+                "create:first"
+            )
+            .await
+            .unwrap()
+            .1
         );
     }
 
@@ -261,6 +290,7 @@ mod tests {
             db.create_task_identified(
                 &record,
                 "assisted",
+                2,
                 false,
                 "direct",
                 &leveler_core::CommandId::new("create"),
@@ -288,8 +318,8 @@ mod tests {
         let two = SessionRecord::new("/repo", "goal", "mock/m", leveler_core::now());
         let id = leveler_core::CommandId::new("create-concurrent");
         let (left, right) = tokio::join!(
-            db.create_task_identified(&one, "assisted", false, "direct", &id, "create:fp"),
-            db.create_task_identified(&two, "assisted", false, "direct", &id, "create:fp")
+            db.create_task_identified(&one, "assisted", 2, false, "direct", &id, "create:fp"),
+            db.create_task_identified(&two, "assisted", 2, false, "direct", &id, "create:fp")
         );
         let (left, right) = (left.unwrap(), right.unwrap());
         assert_eq!(left.0, right.0);
@@ -307,7 +337,7 @@ mod tests {
     async fn creation_identity_cannot_reuse_regular_command_receipt() {
         let db = Database::connect_in_memory().await.unwrap();
         let first = SessionRecord::new("/repo", "first", "mock/m", leveler_core::now());
-        db.create_task(&first, "assisted", false, "direct")
+        db.create_task(&first, "assisted", 2, false, "direct")
             .await
             .unwrap();
         sqlx::query("INSERT INTO command_receipts (command_id, session_id, command_fingerprint, issued_at, admitted_at, status) VALUES ('shared-id', ?1, 'regular-command', ?2, ?2, 'completed')").bind(&first.id).bind(&first.created_at).execute(db.pool()).await.unwrap();
@@ -316,6 +346,7 @@ mod tests {
             db.create_task_identified(
                 &second,
                 "assisted",
+                2,
                 false,
                 "direct",
                 &leveler_core::CommandId::new("shared-id"),

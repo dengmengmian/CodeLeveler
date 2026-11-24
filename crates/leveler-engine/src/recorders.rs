@@ -256,6 +256,7 @@ impl Approver for RecordingApprover {
             summary: request.description.clone(),
             command: request.command.clone(),
             risk: format!("{:?}", request.risk),
+            reason_code: request.reason_code.clone(),
         });
         let outcome = self.inner.decide_or_supersede(&request).await;
         let decision = match &outcome {
@@ -406,6 +407,7 @@ mod tests {
                 }],
             }),
             write_scope_expanded: false,
+            reason_code: None,
         };
         assert_eq!(
             approver.decide(&request).await,

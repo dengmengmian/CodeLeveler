@@ -86,6 +86,18 @@ impl Fixture {
         write_scope: WriteScope,
         unrestricted: bool,
     ) -> ProcessOutput {
+        self.run_with_roots(program, args, write_scope, unrestricted, &[])
+            .await
+    }
+
+    async fn run_with_roots(
+        &self,
+        program: &str,
+        args: &[&str],
+        write_scope: WriteScope,
+        unrestricted: bool,
+        extra_roots: &[PathBuf],
+    ) -> ProcessOutput {
         let mut request = ProcessRequest::new(
             program,
             args.iter().map(|a| a.to_string()).collect(),
@@ -94,6 +106,7 @@ impl Fixture {
         request.timeout = Duration::from_secs(60);
         request.write_scope = write_scope;
         request.unrestricted_execution = unrestricted;
+        request.sandbox_write_roots = extra_roots.to_vec();
         self.runner
             .run(request, CancellationToken::new())
             .await
@@ -409,5 +422,105 @@ async fn auto_external_https_when_the_host_has_egress() {
         auto.success() && auto.stdout.trim() == "200",
         "Auto ALLOW must perform real DNS + TLS, not degrade to a sandbox DNS failure: {}",
         detail(&auto)
+    );
+}
+
+/// P2C. The effect-oriented Auto has no workspace write fence: a policy
+/// ALLOW must not be answered by an OS `EPERM` on an ordinary outside path.
+/// The legacy workspace fence still denies the same script — the two rows are
+/// deliberately in one test so a future "just remove the sandbox" change
+/// cannot pass by making both arms identical.
+#[tokio::test]
+async fn effect_auto_writes_outside_while_the_legacy_fence_still_denies() {
+    let fixture = Fixture::new();
+    let outside = tempfile::tempdir().expect("outside");
+
+    let effect_target = outside.path().join("effect.txt");
+    let effect_script = format!("echo hi > '{}'", effect_target.display());
+    let out = fixture
+        .run(
+            "sh",
+            &["-c", &effect_script],
+            WriteScope::Unrestricted,
+            false,
+        )
+        .await;
+    assert!(out.success(), "unrestricted write: {}", detail(&out));
+    assert_eq!(std::fs::read_to_string(&effect_target).unwrap(), "hi\n");
+
+    let legacy_target = outside.path().join("legacy.txt");
+    let legacy_script = format!("echo hi > '{}'", legacy_target.display());
+    let out = fixture.auto("sh", &["-c", &legacy_script]).await;
+    assert!(
+        !out.success(),
+        "the legacy workspace fence must still deny: {}",
+        detail(&out)
+    );
+    assert!(
+        !legacy_target.exists(),
+        "a denied write must leave no file behind"
+    );
+}
+
+/// P2C. The first tier keeps its workspace fence, but a local `git push`
+/// must not die on `EPERM` for writing the remote it was allowed to write.
+/// The exact remote root is the difference between the two arms.
+#[tokio::test]
+async fn a_local_push_succeeds_only_with_the_resolved_remote_root() {
+    let fixture = Fixture::new();
+    let outside = tempfile::tempdir().expect("outside");
+    let bare = outside.path().join("remote.git");
+    let git = |dir: &Path, args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&fixture.workspace, &["init", "-b", "main"]);
+    git(
+        &fixture.workspace,
+        &["config", "user.email", "test@example.test"],
+    );
+    git(&fixture.workspace, &["config", "user.name", "Test"]);
+    std::fs::write(fixture.workspace.join("a.txt"), "one\n").unwrap();
+    git(&fixture.workspace, &["add", "a.txt"]);
+    git(&fixture.workspace, &["commit", "-m", "one"]);
+    git(outside.path(), &["init", "--bare", bare.to_str().unwrap()]);
+    git(
+        &fixture.workspace,
+        &["remote", "add", "origin", bare.to_str().unwrap()],
+    );
+
+    let scope = WriteScope::Workspace {
+        root: fixture.workspace.clone(),
+    };
+    let without = fixture
+        .run("git", &["push", "origin", "main"], scope.clone(), false)
+        .await;
+    assert!(
+        !without.success(),
+        "the workspace fence alone must deny the outside remote: {}",
+        detail(&without)
+    );
+
+    let with = fixture
+        .run_with_roots(
+            "git",
+            &["push", "origin", "main"],
+            scope,
+            false,
+            &[std::fs::canonicalize(&bare).unwrap()],
+        )
+        .await;
+    assert!(
+        with.success(),
+        "the resolved remote root must make the allowed push execute: {}",
+        detail(&with)
     );
 }

@@ -1100,13 +1100,27 @@ async fn run_eval_case(
             run_bare_case(&app, model, case, &mut collector).await
         } else {
             let _ = direct; // flag retained for CLI compatibility; always direct.
-            match app.create_session(model, &case.task).await {
+            // Eval is pinned to the legacy contract on purpose: the effect
+            // Auto removes the workspace write fence, and an eval agent must
+            // not be able to write outside its fixture. A V2 eval isolation
+            // design is a separate decision.
+            let (contract, profile) = eval_permission_state();
+            match app
+                .create_session_with_permission_state(
+                    model,
+                    &case.task,
+                    contract,
+                    profile,
+                    app.collaboration(),
+                )
+                .await
+            {
                 Ok(session_id) => {
                     let outcome = app
                         .run_in_session_bounded(
                             &session_id,
                             model,
-                            PermissionProfile::Assisted,
+                            profile,
                             &case.task,
                             std::sync::Arc::new(leveler_execution::EvalApprove),
                             false,
@@ -1991,6 +2005,16 @@ mod attribution_provenance_tests {
     }
 }
 
+/// Eval sessions are pinned to the legacy permission contract. V2's effect
+/// Auto removes the workspace write fence, which an eval fixture cannot
+/// tolerate; changing this is a separate isolation design, not a default.
+fn eval_permission_state() -> (leveler_execution::PermissionContract, PermissionProfile) {
+    (
+        leveler_execution::PermissionContract::V1,
+        PermissionProfile::Assisted,
+    )
+}
+
 #[cfg(test)]
 mod expect_output_tests {
     //! The acceptance command is opaque; its exit code alone cannot say why it
@@ -2054,5 +2078,21 @@ mod expect_output_tests {
             || c == 'm'
             || c == 'i'
             || c == 'd'));
+    }
+}
+
+#[cfg(test)]
+mod eval_contract_tests {
+    use super::eval_permission_state;
+    use leveler_execution::{PermissionContract, PermissionProfile};
+
+    /// Eval data must stay comparable across releases and must never gain the
+    /// V2 Auto's unrestricted writes as a side effect of the product default.
+    #[test]
+    fn eval_is_pinned_to_the_legacy_contract() {
+        assert_eq!(
+            eval_permission_state(),
+            (PermissionContract::V1, PermissionProfile::Assisted)
+        );
     }
 }

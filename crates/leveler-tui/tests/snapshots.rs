@@ -27,6 +27,7 @@ fn session_snapshot(collaboration: Option<String>) -> UiSessionSnapshot {
         title: None,
         model: leveler_client_protocol::ModelRef::parse("deepseek/v3"),
         mode: PermissionProfile::Assisted,
+        permission_contract: leveler_client_protocol::PermissionContract::V1,
         branch: Some("main".to_string()),
         status: "idle".to_string(),
         finalization_stage: None,
@@ -139,7 +140,7 @@ fn footer_chip_names_the_axis_the_runtime_recorded() {
         // keeps the assertion independent of the footer's row count.
         let chip = text
             .lines()
-            .find(|line| line.contains(" · auto · "))
+            .find(|line| line.contains(" · auto"))
             .unwrap_or_else(|| panic!("the trust chip must be on screen: {text:?}"));
         assert!(
             chip.contains(axis),
@@ -462,6 +463,7 @@ fn renders_approval_overlay_with_deny_visible() {
                 summary: "run git push".into(),
                 command: Some("git push".into()),
                 risks: vec!["将访问网络".into()],
+                reason_code: None,
                 call_id: None,
                 always_persists: true,
             },
@@ -1484,6 +1486,7 @@ fn the_approval_overlay_sits_where_the_composer_was() {
                 summary: "run git push".into(),
                 command: Some("git push".into()),
                 risks: vec!["将访问网络".into()],
+                reason_code: None,
                 call_id: None,
                 always_persists: true,
             },

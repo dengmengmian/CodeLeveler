@@ -97,6 +97,7 @@ fn snapshot(id: &str, goal: &str, repo: Option<&str>, model: &str) -> UiSessionS
         title: None,
         model: leveler_client_protocol::ModelRef::parse(model),
         mode: leveler_client_protocol::PermissionProfile::Assisted,
+        permission_contract: leveler_client_protocol::PermissionContract::V1,
         branch: Some("main".into()),
         status: "idle".into(),
         finalization_stage: None,

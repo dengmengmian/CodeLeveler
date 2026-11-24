@@ -1,0 +1,5 @@
+
+⚠ approval needed shell_command wants to run a Destructive action:
+    Git history or working-tree changes would be lost (git_metadata.write, git_workspace.write, git_history.destroy)；Git 副作用: git_metadata.write, git_workspace.write, git_history.destroy
+    git reset --hard
+  Approve? [y]es once / this [t]urn / [w]lways for this project / [N]o (default): approval input failed: stdin closed

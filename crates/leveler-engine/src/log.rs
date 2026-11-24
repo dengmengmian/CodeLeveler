@@ -1430,6 +1430,7 @@ mod tests {
                 summary: "rm".into(),
                 command: None,
                 risk: "dangerous".into(),
+                reason_code: None,
             },
             &mut sink,
         )
@@ -1625,6 +1626,7 @@ mod tests {
                 summary: String::new(),
                 command: Some("rm -rf build".into()),
                 risk: "Destructive".into(),
+                reason_code: None,
             },
             &mut |_| {},
         )
@@ -1690,6 +1692,7 @@ mod tests {
                 summary: String::new(),
                 command: None,
                 risk: "Destructive".into(),
+                reason_code: None,
             },
             &mut |_| {},
         )

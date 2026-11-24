@@ -1,0 +1,506 @@
+{
+  "arms": [
+    {
+      "arm": "v1_request_approval",
+      "cases": [
+        {
+          "approvals": 0,
+          "case": "write_inside",
+          "detail": "approvals=0 executed=true file=true",
+          "executed": true,
+          "failure": null,
+          "reason_codes": [],
+          "terminal": true,
+          "tool_ok": true,
+          "tool_preview": "Created inside.txt (1 lines)"
+        },
+        {
+          "approvals": 1,
+          "case": "write_outside",
+          "detail": "approvals=1 executed=true file=false",
+          "executed": true,
+          "failure": null,
+          "reason_codes": [
+            "legacy.restricted"
+          ],
+          "terminal": true,
+          "tool_ok": false,
+          "tool_preview": "action not permitted: denied by user"
+        },
+        {
+          "approvals": 0,
+          "case": "python_script",
+          "detail": "approvals=0 executed=true ran=true",
+          "executed": true,
+          "failure": null,
+          "reason_codes": [],
+          "terminal": true,
+          "tool_ok": true,
+          "tool_preview": "[execution policy] Network access was denied for this command.\n\nexit: 0\n\n[execution policy] Filesystem writes were confined to the granted paths.\n"
+        },
+        {
+          "approvals": 0,
+          "case": "shell_build",
+          "detail": "approvals=0 executed=true built=true",
+          "executed": true,
+          "failure": null,
+          "reason_codes": [],
+          "terminal": true,
+          "tool_ok": true,
+          "tool_preview": "[execution policy] Network access was denied for this command.\n\nexit: 0\n\n[execution policy] Filesystem writes were confined to the granted paths.\n"
+        },
+        {
+          "approvals": 0,
+          "case": "git_push_local",
+          "detail": "approvals=0 executed=true pushed=true",
+          "executed": true,
+          "failure": null,
+          "reason_codes": [],
+          "terminal": true,
+          "tool_ok": true,
+          "tool_preview": "[execution policy] Network access was denied for this command.\n\nexit: 0\n--- stderr ---\nTo /tmp/.tmpbaVDKH/origin-v1_request_approval.git\n * [new branch]      HEAD -> main\n\n[execution policy] Filesystem writes were confined to the granted paths.\n"
+        },
+        {
+          "approvals": 1,
+          "case": "delete_real_file",
+          "detail": "approvals=1 executed=true victim_exists=true",
+          "executed": true,
+          "failure": null,
+          "reason_codes": [
+            "legacy.restricted"
+          ],
+          "terminal": true,
+          "tool_ok": false,
+          "tool_preview": "action not permitted: denied by user"
+        },
+        {
+          "approvals": 1,
+          "case": "git_reset_hard",
+          "detail": "approvals=1 executed=true head_changed=false dirty_survived=true",
+          "executed": true,
+          "failure": null,
+          "reason_codes": [
+            "legacy.restricted"
+          ],
+          "terminal": true,
+          "tool_ok": false,
+          "tool_preview": "action not permitted: denied by user"
+        },
+        {
+          "approvals": 0,
+          "case": "private_network",
+          "detail": "NOT_VERIFIED: no LAN address on this host",
+          "executed": false,
+          "failure": null,
+          "reason_codes": [],
+          "terminal": false,
+          "tool_ok": null,
+          "tool_preview": ""
+        }
+      ],
+      "contract": "v1",
+      "profile": "request_approval"
+    },
+    {
+      "arm": "v1_assisted",
+      "cases": [
+        {
+          "approvals": 0,
+          "case": "write_inside",
+          "detail": "approvals=0 executed=true file=true",
+          "executed": true,
+          "failure": null,
+          "reason_codes": [],
+          "terminal": true,
+          "tool_ok": true,
+          "tool_preview": "Created inside.txt (1 lines)"
+        },
+        {
+          "approvals": 1,
+          "case": "write_outside",
+          "detail": "approvals=1 executed=true file=false",
+          "executed": true,
+          "failure": null,
+          "reason_codes": [
+            "legacy.auto"
+          ],
+          "terminal": true,
+          "tool_ok": false,
+          "tool_preview": "action not permitted: denied by user"
+        },
+        {
+          "approvals": 0,
+          "case": "python_script",
+          "detail": "approvals=0 executed=true ran=true",
+          "executed": true,
+          "failure": null,
+          "reason_codes": [],
+          "terminal": true,
+          "tool_ok": true,
+          "tool_preview": "exit: 0\n\n[execution policy] Filesystem writes were confined to the granted paths.\n"
+        },
+        {
+          "approvals": 0,
+          "case": "shell_build",
+          "detail": "approvals=0 executed=true built=true",
+          "executed": true,
+          "failure": null,
+          "reason_codes": [],
+          "terminal": true,
+          "tool_ok": true,
+          "tool_preview": "exit: 0\n\n[execution policy] Filesystem writes were confined to the granted paths.\n"
+        },
+        {
+          "approvals": 0,
+          "case": "git_push_local",
+          "detail": "approvals=0 executed=true pushed=true",
+          "executed": true,
+          "failure": null,
+          "reason_codes": [],
+          "terminal": true,
+          "tool_ok": true,
+          "tool_preview": "exit: 0\n--- stderr ---\nTo /tmp/.tmpbaVDKH/origin-v1_assisted.git\n * [new branch]      HEAD -> main\n\n[execution policy] Filesystem writes were confined to the granted paths.\n"
+        },
+        {
+          "approvals": 1,
+          "case": "delete_real_file",
+          "detail": "approvals=1 executed=true victim_exists=true",
+          "executed": true,
+          "failure": null,
+          "reason_codes": [
+            "legacy.auto"
+          ],
+          "terminal": true,
+          "tool_ok": false,
+          "tool_preview": "action not permitted: denied by user"
+        },
+        {
+          "approvals": 0,
+          "case": "git_reset_hard",
+          "detail": "approvals=0 executed=true head_changed=false dirty_survived=false",
+          "executed": true,
+          "failure": null,
+          "reason_codes": [],
+          "terminal": true,
+          "tool_ok": true,
+          "tool_preview": "exit: 0\n--- stdout ---\nHEAD is now at 79a3431 seed\n\n[execution policy] Filesystem writes were confined to the granted paths.\n"
+        },
+        {
+          "approvals": 0,
+          "case": "private_network",
+          "detail": "NOT_VERIFIED: no LAN address on this host",
+          "executed": false,
+          "failure": null,
+          "reason_codes": [],
+          "terminal": false,
+          "tool_ok": null,
+          "tool_preview": ""
+        }
+      ],
+      "contract": "v1",
+      "profile": "assisted"
+    },
+    {
+      "arm": "v2_request_approval",
+      "cases": [
+        {
+          "approvals": 0,
+          "case": "write_inside",
+          "detail": "approvals=0 executed=true file=true",
+          "executed": true,
+          "failure": null,
+          "reason_codes": [],
+          "terminal": true,
+          "tool_ok": true,
+          "tool_preview": "Created inside.txt (1 lines)"
+        },
+        {
+          "approvals": 1,
+          "case": "write_outside",
+          "detail": "approvals=1 executed=true file=false",
+          "executed": true,
+          "failure": null,
+          "reason_codes": [
+            "legacy.auto"
+          ],
+          "terminal": true,
+          "tool_ok": false,
+          "tool_preview": "action not permitted: denied by user"
+        },
+        {
+          "approvals": 0,
+          "case": "python_script",
+          "detail": "approvals=0 executed=true ran=true",
+          "executed": true,
+          "failure": null,
+          "reason_codes": [],
+          "terminal": true,
+          "tool_ok": true,
+          "tool_preview": "exit: 0\n\n[execution policy] Filesystem writes were confined to the granted paths.\n"
+        },
+        {
+          "approvals": 0,
+          "case": "shell_build",
+          "detail": "approvals=0 executed=true built=true",
+          "executed": true,
+          "failure": null,
+          "reason_codes": [],
+          "terminal": true,
+          "tool_ok": true,
+          "tool_preview": "exit: 0\n\n[execution policy] Filesystem writes were confined to the granted paths.\n"
+        },
+        {
+          "approvals": 0,
+          "case": "git_push_local",
+          "detail": "approvals=0 executed=true pushed=true",
+          "executed": true,
+          "failure": null,
+          "reason_codes": [],
+          "terminal": true,
+          "tool_ok": true,
+          "tool_preview": "exit: 0\n--- stderr ---\nTo /tmp/.tmpbaVDKH/origin-v2_request_approval.git\n * [new branch]      HEAD -> main\n\n[execution policy] Filesystem writes were confined to the granted paths.\n"
+        },
+        {
+          "approvals": 1,
+          "case": "delete_real_file",
+          "detail": "approvals=1 executed=true victim_exists=true",
+          "executed": true,
+          "failure": null,
+          "reason_codes": [
+            "legacy.auto"
+          ],
+          "terminal": true,
+          "tool_ok": false,
+          "tool_preview": "action not permitted: denied by user"
+        },
+        {
+          "approvals": 0,
+          "case": "git_reset_hard",
+          "detail": "approvals=0 executed=true head_changed=false dirty_survived=false",
+          "executed": true,
+          "failure": null,
+          "reason_codes": [],
+          "terminal": true,
+          "tool_ok": true,
+          "tool_preview": "exit: 0\n--- stdout ---\nHEAD is now at 79a3431 seed\n\n[execution policy] Filesystem writes were confined to the granted paths.\n"
+        },
+        {
+          "approvals": 0,
+          "case": "private_network",
+          "detail": "NOT_VERIFIED: no LAN address on this host",
+          "executed": false,
+          "failure": null,
+          "reason_codes": [],
+          "terminal": false,
+          "tool_ok": null,
+          "tool_preview": ""
+        }
+      ],
+      "contract": "v2",
+      "profile": "request_approval"
+    },
+    {
+      "arm": "v2_assisted",
+      "cases": [
+        {
+          "approvals": 0,
+          "case": "write_inside",
+          "detail": "approvals=0 executed=true file=true",
+          "executed": true,
+          "failure": null,
+          "reason_codes": [],
+          "terminal": true,
+          "tool_ok": true,
+          "tool_preview": "Created inside.txt (1 lines)"
+        },
+        {
+          "approvals": 0,
+          "case": "write_outside",
+          "detail": "approvals=0 executed=true file=true",
+          "executed": true,
+          "failure": null,
+          "reason_codes": [],
+          "terminal": true,
+          "tool_ok": true,
+          "tool_preview": "Created /tmp/.tmpbaVDKH/outside/written-outside.txt (1 lines)"
+        },
+        {
+          "approvals": 0,
+          "case": "python_script",
+          "detail": "approvals=0 executed=true ran=true",
+          "executed": true,
+          "failure": null,
+          "reason_codes": [],
+          "terminal": true,
+          "tool_ok": true,
+          "tool_preview": "exit: 0\n"
+        },
+        {
+          "approvals": 0,
+          "case": "shell_build",
+          "detail": "approvals=0 executed=true built=true",
+          "executed": true,
+          "failure": null,
+          "reason_codes": [],
+          "terminal": true,
+          "tool_ok": true,
+          "tool_preview": "exit: 0\n"
+        },
+        {
+          "approvals": 0,
+          "case": "git_push_local",
+          "detail": "approvals=0 executed=true pushed=true",
+          "executed": true,
+          "failure": null,
+          "reason_codes": [],
+          "terminal": true,
+          "tool_ok": true,
+          "tool_preview": "exit: 0\n--- stderr ---\nTo /tmp/.tmpbaVDKH/origin-v2_assisted.git\n * [new branch]      HEAD -> main\n"
+        },
+        {
+          "approvals": 1,
+          "case": "delete_real_file",
+          "detail": "approvals=1 executed=true victim_exists=true",
+          "executed": true,
+          "failure": null,
+          "reason_codes": [
+            "irreversible.filesystem_delete"
+          ],
+          "terminal": true,
+          "tool_ok": false,
+          "tool_preview": "action not permitted: denied by user"
+        },
+        {
+          "approvals": 1,
+          "case": "git_reset_hard",
+          "detail": "approvals=1 executed=true head_changed=false dirty_survived=true",
+          "executed": true,
+          "failure": null,
+          "reason_codes": [
+            "irreversible.git_history"
+          ],
+          "terminal": true,
+          "tool_ok": false,
+          "tool_preview": "action not permitted: denied by user"
+        },
+        {
+          "approvals": 0,
+          "case": "private_network",
+          "detail": "NOT_VERIFIED: no LAN address on this host",
+          "executed": false,
+          "failure": null,
+          "reason_codes": [],
+          "terminal": false,
+          "tool_ok": null,
+          "tool_preview": ""
+        }
+      ],
+      "contract": "v2",
+      "profile": "assisted"
+    },
+    {
+      "arm": "full",
+      "cases": [
+        {
+          "approvals": 0,
+          "case": "write_inside",
+          "detail": "approvals=0 executed=true file=true",
+          "executed": true,
+          "failure": null,
+          "reason_codes": [],
+          "terminal": true,
+          "tool_ok": true,
+          "tool_preview": "Created inside.txt (1 lines)"
+        },
+        {
+          "approvals": 0,
+          "case": "write_outside",
+          "detail": "approvals=0 executed=true file=true",
+          "executed": true,
+          "failure": null,
+          "reason_codes": [],
+          "terminal": true,
+          "tool_ok": true,
+          "tool_preview": "Created /tmp/.tmpbaVDKH/outside/written-outside.txt (1 lines)"
+        },
+        {
+          "approvals": 0,
+          "case": "python_script",
+          "detail": "approvals=0 executed=true ran=true",
+          "executed": true,
+          "failure": null,
+          "reason_codes": [],
+          "terminal": true,
+          "tool_ok": true,
+          "tool_preview": "exit: 0\n"
+        },
+        {
+          "approvals": 0,
+          "case": "shell_build",
+          "detail": "approvals=0 executed=true built=true",
+          "executed": true,
+          "failure": null,
+          "reason_codes": [],
+          "terminal": true,
+          "tool_ok": true,
+          "tool_preview": "exit: 0\n"
+        },
+        {
+          "approvals": 0,
+          "case": "git_push_local",
+          "detail": "approvals=0 executed=true pushed=true",
+          "executed": true,
+          "failure": null,
+          "reason_codes": [],
+          "terminal": true,
+          "tool_ok": true,
+          "tool_preview": "exit: 0\n--- stderr ---\nTo /tmp/.tmpbaVDKH/origin-full.git\n * [new branch]      HEAD -> main\n"
+        },
+        {
+          "approvals": 0,
+          "case": "delete_real_file",
+          "detail": "approvals=0 executed=true victim_exists=false",
+          "executed": true,
+          "failure": null,
+          "reason_codes": [],
+          "terminal": true,
+          "tool_ok": true,
+          "tool_preview": "exit: 0\n"
+        },
+        {
+          "approvals": 0,
+          "case": "git_reset_hard",
+          "detail": "approvals=0 executed=true head_changed=false dirty_survived=false",
+          "executed": true,
+          "failure": null,
+          "reason_codes": [],
+          "terminal": true,
+          "tool_ok": true,
+          "tool_preview": "exit: 0\n--- stdout ---\nHEAD is now at 79a3431 seed\n"
+        },
+        {
+          "approvals": 0,
+          "case": "private_network",
+          "detail": "NOT_VERIFIED: no LAN address on this host",
+          "executed": false,
+          "failure": null,
+          "reason_codes": [],
+          "terminal": false,
+          "tool_ok": null,
+          "tool_preview": ""
+        }
+      ],
+      "contract": "v2",
+      "profile": "full_access"
+    }
+  ],
+  "failures": [],
+  "generated_at": "2026-11-24T12:53:11.977324293+00:00",
+  "host": {
+    "arch": "aarch64",
+    "os": "linux"
+  },
+  "lan": null,
+  "provider": "deterministic mock model (real runtime, real tools)",
+  "status": "PASS"
+}

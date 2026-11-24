@@ -1,0 +1,69 @@
+=== execution lib ===
+    command::tests::fast_exit_does_not_hang_on_pipe_held_by_detached_grandchild
+    execution_host::tests::real_process_survives_clients_and_preserves_offline_exit_and_logs
+    execution_host::tests::runtime_lifetime_service_survives_generation_replacement
+    execution_host::tests::unrestricted_host_task_control_crosses_sessions_without_owner_spoofing
+
+test result: FAILED. 433 passed; 16 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.75s
+
+error: test failed, to rerun pass `-p leveler-execution --lib`
+=== policy table ===
+test dangerous_commands_keep_asking_in_the_legacy_auto_policies ... ok
+test ordinary_commands_are_auto_in_every_auto_policy ... ok
+test effect_auto_treats_a_wrapped_dangerous_shape_as_ordinary_work ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+=== storage lib ===
+test session_input_repo::tests::a_concurrent_prioritize_and_withdrawal_leave_one_truthful_row ... ok
+test session_input_repo::tests::a_concurrent_save_and_withdrawal_is_atomic_on_the_lease ... ok
+test terminal_repo::tests::sqlite_busy_does_not_create_a_partial_terminal_fact ... ok
+
+test result: ok. 215 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 16.56s
+
+=== storage migration ===
+test upgrading_v1_rows_preserves_mode_and_stamps_v1 ... ok
+test a_new_row_written_through_the_engine_is_v2 ... ok
+test switching_the_tier_never_adopts_v2 ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+=== schedule policies ===
+test skip_if_running_records_a_skipped_slot_and_runs_nothing ... ok
+test deleting_an_active_definition_is_refused_until_the_run_settles ... ok
+test queue_one_waits_for_the_active_run_then_claims_the_slot ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+
+=== v2 dogfood ===
+          "approvals": 0,
+          "case": "private_network",
+          "detail": "NOT_VERIFIED: no LAN address on this host",
+          "executed": false,
+          "failure": null,
+          "reason_codes": [],
+          "terminal": false,
+          "tool_ok": null,
+          "tool_preview": ""
+        }
+      ],
+      "contract": "v2",
+      "profile": "full_access"
+    }
+  ],
+  "failures": [],
+  "generated_at": "2026-11-24T12:53:11.977324293+00:00",
+  "host": {
+    "arch": "aarch64",
+    "os": "linux"
+  },
+  "lan": null,
+  "provider": "deterministic mock model (real runtime, real tools)",
+  "status": "PASS"
+}
+report: /tmp/pv2-final/linux-dogfood.json
+test permission_model_v2_dogfood ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 19.76s
+
+EXIT=0

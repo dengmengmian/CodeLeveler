@@ -1,0 +1,249 @@
+{
+  "program": "Permission Model V2",
+  "generated_at": "2026-11-24T13:00:00+00:00",
+  "source_baseline": "5800dd8a + uncommitted V2/friction/concurrent changes (tree not committed)",
+  "platforms": {
+    "macos": {
+      "status": "PASS",
+      "workspace_tests": {
+        "exit_ok": true,
+        "binaries": 362,
+        "passed": 9586,
+        "failed": 0,
+        "ignored": 111,
+        "failed_tests": [],
+        "log": "evidence/final/workspace-test.log"
+      },
+      "dogfood": {
+        "status": "PASS",
+        "report": "evidence/permission-dogfood-macos.json",
+        "arms": [
+          "v1_request_approval",
+          "v1_assisted",
+          "v2_request_approval",
+          "v2_assisted",
+          "full"
+        ]
+      },
+      "targeted": [
+        {
+          "command": "cargo test -p leveler-execution --test policy_kind_decision_table",
+          "result": "5 passed"
+        },
+        {
+          "command": "cargo test -p leveler-storage --test permission_contract_migration",
+          "result": "3 passed"
+        },
+        {
+          "command": "cargo test -p leveler-schedule --test scheduled_policies",
+          "result": "7 passed"
+        },
+        {
+          "command": "cargo test -p leveler-app --test permission_persistence",
+          "result": "8 passed"
+        },
+        {
+          "command": "cargo test -p leveler-cli --bin leveler common",
+          "result": "13 passed"
+        },
+        {
+          "command": "cargo test -p leveler-cli --bin leveler eval_contract",
+          "result": "1 passed"
+        },
+        {
+          "command": "cargo test -p leveler-agent --lib effect_auto",
+          "result": "4 passed"
+        },
+        {
+          "command": "cargo test -p leveler-agent --lib unclaimed_mutation",
+          "result": "2 passed"
+        },
+        {
+          "command": "cargo test -p leveler-tui --lib",
+          "result": "1892 passed"
+        },
+        {
+          "command": "cargo test -p leveler-tui --test slash_command_surface",
+          "result": "9 passed"
+        },
+        {
+          "command": "cargo test -p leveler-app --test full_permission_acceptance",
+          "result": "6 passed"
+        },
+        {
+          "command": "cargo test -p leveler-app --test full_permission_lifecycle",
+          "result": "8 passed"
+        }
+      ],
+      "real_model": {
+        "status": "PASS",
+        "provider": "deepseek",
+        "base_url": "https://taotoken.net/api/v1",
+        "model": "deepseek/deepseek-v4-pro",
+        "reasoning_effort": "high",
+        "binary_sha256": "2fc46e59e0c7e1236299cec2e82ea46fc59a272813981ffbaf7da6702549540b",
+        "runs": 28,
+        "index": "evidence/final/real-model-index.json",
+        "log_dir": "evidence/final/real-model/"
+      },
+      "integration": {
+        "fmt": "PASS",
+        "check_workspace_all_targets": "PASS",
+        "clippy_libs": "PASS (-D warnings)",
+        "clippy_cli_bin": "PASS (-D warnings)",
+        "evidence": "evidence/final/{fmt-check,clippy,workspace-check,release-build}.log"
+      }
+    },
+    "linux": {
+      "status": "PASS",
+      "environment": "Docker rust:1.90-bookworm, aarch64, privileged, Linux 6.10.14-linuxkit; --init for reaper control",
+      "focused_runs": [
+        {
+          "target": "-p leveler-execution --lib",
+          "no_init": {
+            "passed": 433,
+            "failed": 16
+          },
+          "with_init": {
+            "passed": 449,
+            "failed": 0
+          },
+          "note": "16 failures are PID 1 / process-group environment; log evidence/final/linux/execution-lib-init.log"
+        },
+        {
+          "target": "-p leveler-tools --lib",
+          "with_init": {
+            "passed": 566,
+            "failed": 0,
+            "ignored": 2
+          },
+          "note": "log evidence/final/linux/tools-lib-init.log"
+        },
+        {
+          "target": "-p leveler-execution --test policy_kind_decision_table",
+          "result": {
+            "passed": 5,
+            "failed": 0
+          }
+        },
+        {
+          "target": "-p leveler-storage --lib",
+          "result": {
+            "passed": 215,
+            "failed": 0
+          }
+        },
+        {
+          "target": "-p leveler-storage --test permission_contract_migration",
+          "result": {
+            "passed": 3,
+            "failed": 0
+          }
+        },
+        {
+          "target": "-p leveler-schedule --test scheduled_policies",
+          "result": {
+            "passed": 7,
+            "failed": 0
+          }
+        }
+      ],
+      "tools_full_lib_rerun": [],
+      "first_run": [],
+      "dogfood": {
+        "status": "PASS",
+        "report": "evidence/final/linux/linux-dogfood.json",
+        "arms": 5,
+        "private_network": "NOT_VERIFIED (no ipconfig; real container-private network tested separately)"
+      },
+      "note": "leveler-tools --lib has 6 process-group/task-wait failures under Docker PID 1; not permission-related. auto_permission_sandbox is macOS-only (0 tests on Linux).",
+      "real_model_runs": 9,
+      "real_model": {
+        "status": "PASS",
+        "runs": 9,
+        "log_dir": "evidence/final/linux/",
+        "index": "evidence/final/real-model-index.json"
+      },
+      "user_namespace": {
+        "bwrap_unshare_user": "exit 0",
+        "unshare_Ur": "exit 0",
+        "bwrap_unshare_net": "curl exit 7 (isolated)",
+        "log": "evidence/final/linux/user-namespaces.log"
+      }
+    },
+    "windows": {
+      "status": "BLOCKED_ENVIRONMENT",
+      "reason": "no Windows host, VM, remote desktop or cloud CLI; UTM has no guest; only GNU cross-compile check performed",
+      "host_probes": [
+        "utmctl list empty",
+        "no az/aws/gcloud/doctl",
+        "no Windows/RDP SSH entry",
+        "Docker images Linux-only"
+      ],
+      "compile_check": {
+        "command": "cargo check --workspace --target x86_64-pc-windows-gnu",
+        "exit_ok": true,
+        "elapsed_seconds": 21.51,
+        "log": "evidence/final/windows-gnu-check.log",
+        "is_real_host": false
+      },
+      "verification": "UNVERIFIED"
+    }
+  },
+  "static_checks": {
+    "cargo_check_workspace_all_targets": "PASS (exit 0, 17.99s)",
+    "workspace_tests_macos": "PASS (362 binaries, 9586 passed, 0 failed, 111 ignored)",
+    "clippy_libs_affected_crates": "PASS (-D warnings)",
+    "clippy_cli_bin": "PASS (-D warnings)",
+    "fmt_check": "PASS (exit 0)",
+    "windows_gnu_compile": "PASS (compile only, not acceptance)"
+  },
+  "gates": {
+    "2A": "PASS (macOS)",
+    "2B": "PASS (macOS)",
+    "2C": "PASS (macOS)",
+    "2D": "PASS (macOS)",
+    "2E": "macOS PASS; Linux PASS; Windows BLOCKED",
+    "F1": "PASS (audit)",
+    "F2": "PASS (real DeepSeek)",
+    "F3": "PASS (local MCP + third-party echo)",
+    "F4": "PASS (real spawn + background)",
+    "F5": "BLOCKED_ENVIRONMENT",
+    "F6": "PASS (Linux container)",
+    "integration": "PASS (macOS fmt/check/clippy/workspace)"
+  },
+  "known_gaps": [
+    "Windows real-host V2 verification missing (BLOCKED_ENVIRONMENT)",
+    "Real-model goal completion bookkeeping friction observed (not a permission defect)",
+    "MCP tools without typed destructive annotations can perform destructive work without an ASK (by contract)",
+    "Third-party MCP validated only with server-everything echo",
+    "Linux verification uses Docker LinuxKit container, not a physical desktop Linux host"
+  ],
+  "final_closure": {
+    "date": "2026-11-24",
+    "verdict": "PARTIAL",
+    "v2_behavior": "PASS on macOS and Linux",
+    "formal_closed": false,
+    "blocking_gate": "Windows native V2 acceptance (no host)",
+    "release_ready": "release preparation may proceed; full-platform PASS must not be claimed; Windows must be complete or explicitly excluded and labelled",
+    "notable_findings": [
+      "V2 Auto ordinary work: 0 approvals in real-model daily-dev/scripts/network/Git runs; outside-workspace read and write are both 0 approvals",
+      "Direct irreversible file/dir delete and git reset --hard: exactly 1 ASK each; deny leaves no side effect; approve executes only the approved target",
+      "Full: 0 approvals, real delete executes; unchanged",
+      "V1 project default asks on sudo; explicit V2 does not ask and executes",
+      "MCP typed destructiveHint drives the ASK; denied call never reaches the server; turn grant covers same tool with different arguments",
+      "Unannotated destructive MCP tool executes without approval (documented residual risk)",
+      "Child unclaimed write is a model-visible Deny (0 approvals), then self-corrects and passes its test",
+      "No extra permission-model requests: rounds == usage == stream attempts in every recorded run"
+    ],
+    "open_risks": [
+      "Windows native acceptance blocked",
+      "Goal completion bookkeeping friction (F1 TurnLimitReached after business actions completed)",
+      "MCP servers without trusted destructive annotations are not detected",
+      "Third-party MCP coverage limited to server-everything echo",
+      "Linux is containerized (real kernel, not a desktop host; private network is container 172.17.0.8)",
+      "V1 session live resume not separately rerun (covered by tests and project-default live run)"
+    ],
+    "evidence_index": "evidence/final/real-model-index.json"
+  }
+}

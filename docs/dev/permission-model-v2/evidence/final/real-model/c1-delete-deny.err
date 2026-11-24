@@ -1,0 +1,6 @@
+
+⚠ approval needed shell_command wants to run a Destructive action:
+    `rm` deletes real data: /private/tmp/pv2-final/scenarios/c-destructive/victim.txt
+    rm -f victim.txt
+    path: /private/tmp/pv2-final/scenarios/c-destructive/victim.txt
+  Approve? [y]es once / this [t]urn / [w]lways for this project / [N]o (default): approval input failed: stdin closed

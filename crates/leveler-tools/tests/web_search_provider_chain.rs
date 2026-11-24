@@ -262,7 +262,8 @@ async fn provider_status_errors_keep_the_status_and_never_print_the_key() {
             5,
             Duration::from_secs(2),
         )
-        .unwrap();
+        .unwrap()
+        .with_credential_env("LEVELER_SEARCH_API_KEY");
         let caps = capabilities(Arc::new(provider));
         let registry = registry(&caps);
 
@@ -281,6 +282,13 @@ async fn provider_status_errors_keep_the_status_and_never_print_the_key() {
             "HTTP {status} must be a model-visible failure"
         );
         assert!(output.content.contains(needle), "{}", output.content);
+        if status == 401 {
+            assert!(
+                output.content.contains("LEVELER_SEARCH_API_KEY"),
+                "a 401 must name the credential variable: {}",
+                output.content
+            );
+        }
         assert!(
             output.content.contains("upstream detail"),
             "{}",

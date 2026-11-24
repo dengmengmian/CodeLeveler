@@ -335,6 +335,7 @@ mod tests {
                 summary: "git push".into(),
                 command: Some("git push".into()),
                 risks: vec![],
+                reason_code: None,
                 call_id: None,
                 always_persists: true,
             }),

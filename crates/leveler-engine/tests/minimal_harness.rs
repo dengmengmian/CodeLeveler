@@ -115,6 +115,7 @@ async fn open_session(db: &Database) -> SessionId {
             goal: "process alpha".into(),
             model: Some("mock/minimal".into()),
             mode: "read-only".into(),
+            permission_contract: 2,
             sandbox: false,
             kind: ExecutionKind::Direct,
             axes: None,

@@ -10,7 +10,7 @@ use leveler_execution::RiskLevel;
 use leveler_model::ToolDefinition;
 
 use crate::capabilities::Capabilities;
-use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
+use crate::tool::{ParallelClass, Tool, ToolContext, ToolError, ToolOutput};
 
 /// The canonical observe-class (read-only) tool list. This is THE single
 /// source for "may run without a plan / read-only subset" decisions — the
@@ -180,6 +180,19 @@ impl ToolRegistry {
         self.tools
             .get(name)
             .is_some_and(|t| t.recovery_is_skippable())
+    }
+
+    /// How this tool may share its round with other calls.
+    ///
+    /// `Network` wins if a tool ever claims both classes: the network path is
+    /// the safer one (durable admission, bounded width) and a contradictory
+    /// declaration must not silently buy the pure-read shortcut.
+    pub fn parallel_class(&self, name: &str) -> ParallelClass {
+        match self.tools.get(name) {
+            Some(tool) if tool.supports_network_parallel() => ParallelClass::Network,
+            Some(tool) if tool.supports_parallel() => ParallelClass::ReadOnly,
+            _ => ParallelClass::Serial,
+        }
     }
 
     pub fn runs_command(&self, name: &str) -> bool {
@@ -1101,6 +1114,59 @@ mod tests {
         for def in subset.definitions() {
             let tool = subset.get(&def.name).unwrap();
             assert_eq!(tool.risk(), RiskLevel::Safe, "{}", def.name);
+        }
+    }
+
+    /// A web tool performs an external request, so it cannot use the pure-read
+    /// declaration: that path skips the durable approval barrier. It declares
+    /// the network class instead, which earns the same bounded overlap but
+    /// keeps admission durable and is capped separately from local reads.
+    #[test]
+    fn web_tools_declare_the_network_parallel_class_only() {
+        let registry = model_surface(CapabilityPacks::ALL, &configured_test_capabilities());
+        for name in ["web_fetch", "web_search"] {
+            let tool = registry
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} registered"));
+            assert_eq!(
+                registry.parallel_class(name),
+                crate::tool::ParallelClass::Network,
+                "{name} must be a network-parallel call"
+            );
+            assert!(
+                !tool.supports_parallel(),
+                "{name} must not claim the pure read-only class"
+            );
+        }
+        assert_eq!(
+            registry.parallel_class("read_file"),
+            crate::tool::ParallelClass::ReadOnly
+        );
+        assert_eq!(
+            registry.parallel_class("shell_command"),
+            crate::tool::ParallelClass::Serial
+        );
+        assert_eq!(
+            registry.parallel_class("not_registered"),
+            crate::tool::ParallelClass::Serial
+        );
+    }
+
+    /// Crash recovery must never re-send a web request on its own. A web call
+    /// is neither replay-safe (the request leaves the process) nor skippable
+    /// without acknowledgement (the external effect may already have happened).
+    #[test]
+    fn web_tools_are_never_replayed_or_silently_skipped_after_a_crash() {
+        let registry = model_surface(CapabilityPacks::ALL, &configured_test_capabilities());
+        for name in ["web_fetch", "web_search"] {
+            assert!(
+                !registry.replay_is_side_effect_free(name),
+                "{name} must not be auto-replayed"
+            );
+            assert!(
+                !registry.recovery_is_skippable(name),
+                "{name} needs explicit acknowledgement after a crash"
+            );
         }
     }
 

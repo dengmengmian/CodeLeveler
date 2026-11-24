@@ -100,6 +100,7 @@ fn write_global_config(
     model_base_url: &str,
     search_base_url: &str,
     provider: &str,
+    api_key: Option<&str>,
 ) {
     std::fs::create_dir_all(home).unwrap();
     let models = [
@@ -123,6 +124,9 @@ max_output_tokens = 1024
         )
     })
     .collect::<String>();
+    let api_key_line = api_key
+        .map(|key| format!("api_key = {key:?}"))
+        .unwrap_or_default();
     std::fs::write(
         home.join("config.toml"),
         format!(
@@ -136,6 +140,7 @@ base_url = "{model_base_url}"
 [web.search]
 provider = "{provider}"
 api_key_env = "LEVELER_TEST_SEARCH_KEY"
+{api_key_line}
 base_url = "{search_base_url}"
 max_results = 5
 timeout_ms = 5000
@@ -156,13 +161,14 @@ fn assemble_app(
     model_base_url: &str,
     search_base_url: &str,
 ) -> (tempfile::TempDir, tempfile::TempDir, Arc<Application>) {
-    assemble_app_with_provider(model_base_url, search_base_url, "deepseek")
+    assemble_app_with_provider(model_base_url, search_base_url, "deepseek", None)
 }
 
 fn assemble_app_with_provider(
     model_base_url: &str,
     search_base_url: &str,
     provider: &str,
+    api_key: Option<&str>,
 ) -> (tempfile::TempDir, tempfile::TempDir, Arc<Application>) {
     let global_home = tempfile::tempdir().unwrap();
     let repo = tempfile::tempdir().unwrap();
@@ -178,6 +184,7 @@ fn assemble_app_with_provider(
         model_base_url,
         search_base_url,
         provider,
+        api_key,
     );
     let app = Arc::new(
         Application::assemble(Layout::from_parts(
@@ -400,6 +407,56 @@ async fn the_search_backend_is_identical_across_five_model_identities() {
     }
 }
 
+#[tokio::test]
+async fn configured_search_key_overrides_the_environment_and_blank_keys_fall_back() {
+    let _env = env_lock().await;
+    for (configured_key, expected_key) in [
+        ("  search-key-from-config  ", "search-key-from-config"),
+        ("   ", SEARCH_KEY),
+    ] {
+        let model_server = MockServer::start(vec![
+            capability_enable("web"),
+            tool_call("web_search", serde_json::json!({"query": "search auth"})),
+            text("done"),
+        ])
+        .await;
+        let search_server = MockServer::start_one(MockResponse::json_ok(&search_body())).await;
+        let (_home, _repo, app) = assemble_app_with_provider(
+            &model_server.base_url(),
+            &format!("{}/v1/tools", search_server.base_url()),
+            "deepseek",
+            Some(configured_key),
+        );
+
+        let observed = run_turn(
+            app,
+            ModelRef::new("mock", "deepseek-flash"),
+            PermissionProfile::FullAccess,
+            "search the web",
+        )
+        .await;
+        assert!(observed.tool_completed, "{:?}", observed.failure);
+        let heads = search_server.request_heads().await;
+        assert_eq!(heads.len(), 1, "one search request");
+        let expected_auth = format!("Bearer {expected_key}");
+        assert!(
+            heads[0].lines().any(|line| {
+                line.split_once(": ").is_some_and(|(name, value)| {
+                    name.eq_ignore_ascii_case("authorization") && value == expected_auth
+                })
+            }),
+            "the expected credential must authenticate the search"
+        );
+        let model_requests = model_server.request_bodies().await;
+        assert!(
+            model_requests
+                .iter()
+                .all(|body| !body.contains("search-key-from-config") && !body.contains(SEARCH_KEY)),
+            "search keys must stay out of model requests"
+        );
+    }
+}
+
 /// Auto (替我审批) runs an ordinary internet-scoped search without a second
 /// approval. Restricted (请求批准) still asks when the destination is outside
 /// its current scope; the denied approval never dispatches a request.
@@ -440,10 +497,24 @@ async fn auto_runs_without_a_second_gate_and_restricted_respects_scope() {
     let (_restricted_home, _restricted_repo, restricted_app) =
         assemble_app(&model_server.base_url(), "http://192.0.2.1/v1/tools");
     let model_requests_before = model_server.request_bodies().await.len();
-    let restricted = run_turn(
+    // A V1 session keeps the strict request-approval tier; a new (V2) session
+    // at the same profile name is the old Auto, which allows this search.
+    let restricted_model = ModelRef::new("mock", "deepseek-flash");
+    let restricted_session = restricted_app
+        .create_session_with_permission_state(
+            &restricted_model,
+            "web-search",
+            leveler_execution::PermissionContract::V1,
+            PermissionProfile::RequestApproval,
+            leveler_agent::CollaborationMode::Chat,
+        )
+        .await
+        .unwrap();
+    let restricted = run_on_session(
         restricted_app,
-        ModelRef::new("mock", "deepseek-flash"),
+        restricted_model,
         PermissionProfile::RequestApproval,
+        restricted_session,
         "search the web",
     )
     .await;
@@ -633,6 +704,7 @@ async fn a_non_deepseek_model_uses_tavily_when_configured() {
         &model_server.base_url(),
         &search_server.base_url(),
         "tavily",
+        None,
     );
 
     let observed = run_turn(

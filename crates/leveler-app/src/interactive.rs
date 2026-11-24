@@ -273,6 +273,49 @@ fn protocol_mode(value: PermissionProfile) -> leveler_client_protocol::Permissio
     }
 }
 
+fn execution_contract(
+    value: leveler_client_protocol::PermissionContract,
+) -> leveler_execution::PermissionContract {
+    match value {
+        leveler_client_protocol::PermissionContract::V1 => {
+            leveler_execution::PermissionContract::V1
+        }
+        leveler_client_protocol::PermissionContract::V2 => {
+            leveler_execution::PermissionContract::V2
+        }
+    }
+}
+
+fn protocol_contract(
+    value: leveler_execution::PermissionContract,
+) -> leveler_client_protocol::PermissionContract {
+    match value {
+        leveler_execution::PermissionContract::V1 => {
+            leveler_client_protocol::PermissionContract::V1
+        }
+        leveler_execution::PermissionContract::V2 => {
+            leveler_client_protocol::PermissionContract::V2
+        }
+    }
+}
+
+/// Storage keeps the contract as an integer so a row can be read without the
+/// execution crate. Anything other than 2 is the legacy contract.
+fn contract_code(value: leveler_client_protocol::PermissionContract) -> i64 {
+    match value {
+        leveler_client_protocol::PermissionContract::V1 => 1,
+        leveler_client_protocol::PermissionContract::V2 => 2,
+    }
+}
+
+fn contract_from_code(value: i64) -> leveler_execution::PermissionContract {
+    if value == 2 {
+        leveler_execution::PermissionContract::V2
+    } else {
+        leveler_execution::PermissionContract::V1
+    }
+}
+
 use crate::event_bridge::{EventBridge, turn_runtime_event};
 use crate::prompt_assist::{self, AssistKind};
 use crate::prompt_bridge::{
@@ -1589,6 +1632,9 @@ struct SessionRuntimeConfig {
     /// fail with a clear configuration error. Never a placeholder model.
     model: Option<ModelRef>,
     mode: PermissionProfile,
+    /// The contract this session was created under. Read from the session row
+    /// on hydration; a fresh/unknown client defaults to V2 for new sessions.
+    permission_contract: leveler_execution::PermissionContract,
     sandbox: bool,
     collaboration: String,
     /// Per-session approval policy. `AutoApprove` skips the approval overlay for
@@ -2032,6 +2078,7 @@ impl InProcessRuntimeClient {
             default_runtime: SessionRuntimeConfig {
                 model,
                 mode,
+                permission_contract: leveler_execution::PermissionContract::V2,
                 sandbox,
                 // A session the transport creates resolves its axis from the
                 // request; this is the fallback for a session attached without
@@ -2941,6 +2988,7 @@ impl InProcessRuntimeClient {
         Ok(SessionRuntimeConfig {
             model,
             mode,
+            permission_contract: contract_from_code(settings.permission_contract),
             sandbox: settings.sandbox,
             collaboration: record.collaboration.clone(),
             approval_policy,
@@ -2977,9 +3025,12 @@ impl InProcessRuntimeClient {
                 }
                 SessionEdit::Model(model.to_string())
             }
-            ClientCommand::SetPermissionProfile { mode, .. } => {
-                SessionEdit::Permission(execution_mode(*mode).as_str().to_string())
-            }
+            ClientCommand::SetPermissionProfile { mode, contract, .. } => SessionEdit::Permission {
+                mode: execution_mode(*mode).as_str().to_string(),
+                // Changing the tier alone keeps the stored contract; only an
+                // explicit Some(V2) adopts V2 in the same write.
+                contract: contract.map(contract_code),
+            },
             ClientCommand::SetThinkingLevel { level, .. } => {
                 SessionEdit::Thinking(level.map(|level| level.as_str().to_string()))
             }
@@ -3037,8 +3088,11 @@ impl InProcessRuntimeClient {
         }
         if matches!(command, ClientCommand::SetPermissionProfile { .. }) {
             let config = self.runtime_config(session_id).await?;
-            self.app
-                .set_live_permission_profile(session_id.as_str(), config.mode);
+            self.app.set_live_permission_state(
+                session_id.as_str(),
+                config.permission_contract,
+                config.mode,
+            );
             supersede_pending_approvals(&self.pending, session_id);
         }
         if let ClientCommand::SetDefaultModel { model, .. } = command {
@@ -3281,6 +3335,7 @@ impl InProcessRuntimeClient {
             .create_daemon_session(
                 Some(&model),
                 &title,
+                leveler_execution::PermissionContract::V2,
                 config.mode,
                 leveler_lifecycle::CollaborationMode::Chat,
                 false,
@@ -7294,11 +7349,15 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 query_id,
                 request,
             } => {
-                let mode = self
-                    .runtime_config(&requester_session_id)
-                    .await
+                let runtime = self.runtime_config(&requester_session_id).await;
+                let mode = runtime
+                    .as_ref()
                     .map(|config| config.mode)
                     .unwrap_or(PermissionProfile::Assisted);
+                let contract = runtime
+                    .as_ref()
+                    .map(|config| protocol_contract(config.permission_contract))
+                    .unwrap_or(leveler_client_protocol::PermissionContract::V1);
                 // A configuration write or reconnect under a live turn would
                 // change the tool surface that turn is already using. Reads
                 // stay available; every mutation names the reason it waited.
@@ -7314,7 +7373,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     Some(self.mcp_manage.lock().await)
                 };
                 let response = if !is_list && !self.active.snapshots().is_empty() {
-                    let servers = crate::mcp_service::servers(self.app.as_ref(), mode)
+                    let servers = crate::mcp_service::servers(self.app.as_ref(), contract, mode)
                         .await
                         .unwrap_or_default();
                     leveler_client_protocol::mcp::McpResponse::Error {
@@ -7324,7 +7383,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                                 .into(),
                     }
                 } else {
-                    crate::mcp_service::manage(self.app.as_ref(), mode, *request).await
+                    crate::mcp_service::manage(self.app.as_ref(), contract, mode, *request).await
                 };
                 let _ = self
                     .events_for(&requester_session_id)
@@ -7509,14 +7568,18 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 // plus the project's resolved agent registry. No provider
                 // request, no MCP call, no configuration write.
                 let config = self.app.effective_config();
-                let mode = self
-                    .runtime_config(&requester_session_id)
-                    .await
+                let runtime = self.runtime_config(&requester_session_id).await;
+                let mode = runtime
+                    .as_ref()
                     .map(|runtime| runtime.mode)
                     .unwrap_or(PermissionProfile::Assisted);
+                let contract = runtime
+                    .as_ref()
+                    .map(|runtime| protocol_contract(runtime.permission_contract))
+                    .unwrap_or(leveler_client_protocol::PermissionContract::V1);
                 // The same authority `/mcp` reads. This projection never
                 // connects a server just because diagnostics asked.
-                let mcp = crate::mcp_service::servers(self.app.as_ref(), mode)
+                let mcp = crate::mcp_service::servers(self.app.as_ref(), contract, mode)
                     .await
                     .ok();
                 let chinese = locale
@@ -8060,6 +8123,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     .create_daemon_session(
                         new_model.as_ref(),
                         PLACEHOLDER_GOAL,
+                        config.permission_contract,
                         config.mode,
                         // `/clear` opens a sibling conversation under the
                         // caller's own axis; an unreadable value falls back to
@@ -8264,17 +8328,24 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     // A fork copies the conversation AND its model choice; it
                     // inherits the source's pin state so a later default change
                     // treats both sessions the same way.
-                    let model_pinned = leveler_storage::SessionRepository::new(&db)
+                    let settings = leveler_storage::SessionRepository::new(&db)
                         .settings_snapshot(&session_id)
-                        .await?
+                        .await?;
+                    let model_pinned = settings
+                        .as_ref()
                         .map(|settings| settings.model_pinned)
                         .unwrap_or(true);
+                    let fork_contract = settings
+                        .as_ref()
+                        .map(|settings| settings.permission_contract)
+                        .unwrap_or(1);
                     let fork_id = engine
                         .create_task(&leveler_engine::NewSession {
                             workspace: record.repository.clone(),
                             goal: fork_goal,
                             model: record.model.clone(),
                             mode,
+                            permission_contract: fork_contract,
                             sandbox,
                             kind: leveler_engine::ExecutionKind::parse(&kind)?,
                             axes: Some(leveler_engine::NewSessionAxes {
@@ -9669,6 +9740,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             title: Some(title),
             model,
             mode: protocol_mode(config.mode),
+            permission_contract: protocol_contract(config.permission_contract),
             branch: self
                 .app
                 .layout
@@ -10372,6 +10444,11 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
                         goal: request.goal.clone(),
                         model: model.as_ref().map(ToString::to_string),
                         mode: execution_mode(request.mode).as_str().to_string(),
+                        permission_contract: contract_code(
+                            request
+                                .permission_contract
+                                .unwrap_or(leveler_client_protocol::PermissionContract::V2),
+                        ),
                         sandbox: self.default_runtime.sandbox,
                         kind: leveler_engine::ExecutionKind::Direct,
                         axes: Some(leveler_engine::NewSessionAxes {
@@ -10391,6 +10468,11 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
                     .create_daemon_session(
                         model.as_ref(),
                         &request.goal,
+                        execution_contract(
+                            request
+                                .permission_contract
+                                .unwrap_or(leveler_client_protocol::PermissionContract::V2),
+                        ),
                         execution_mode(request.mode),
                         request.collaboration,
                         request.model.is_some(),
@@ -10404,6 +10486,11 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
             let config = SessionRuntimeConfig {
                 model: model.clone(),
                 mode: execution_mode(request.mode),
+                permission_contract: execution_contract(
+                    request
+                        .permission_contract
+                        .unwrap_or(leveler_client_protocol::PermissionContract::V2),
+                ),
                 sandbox: self.default_runtime.sandbox,
                 collaboration: request.collaboration.as_str().to_string(),
                 approval_policy: request.approval_policy,
@@ -10982,6 +11069,7 @@ async fn compact_conversation(
     };
     let model = config.model;
     let mode = config.mode;
+    let permission_contract = protocol_contract(config.permission_contract);
     let thinking_level = config.thinking;
     let last_sequence = settings.sequence;
     let record = settings.session;
@@ -11082,6 +11170,7 @@ async fn compact_conversation(
                 title: Some(title),
                 model: model.clone(),
                 mode: protocol_mode(mode),
+                permission_contract,
                 branch: app.layout.primary_workspace().and_then(detect_branch_label),
                 status: session_status_wire(record.status, task_status).into(),
                 finalization_stage: live.finalization_stage,
@@ -11639,6 +11728,7 @@ mod approval_policy_tests {
         let initial = SessionRuntimeConfig {
             model: Some(ModelRef::new("mock", "m")),
             mode: PermissionProfile::Assisted,
+            permission_contract: leveler_execution::PermissionContract::V2,
             sandbox: false,
             collaboration: "chat".into(),
             approval_policy: ApprovalPolicy::Interactive,

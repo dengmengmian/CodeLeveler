@@ -376,6 +376,7 @@ async fn create_goal_session(client: &LocalSocketRuntimeClient, goal: &str) -> S
             goal: goal.into(),
             model: None,
             mode: leveler_client_protocol::PermissionProfile::FullAccess,
+            permission_contract: None,
         })
         .await
         .unwrap()

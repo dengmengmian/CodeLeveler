@@ -113,6 +113,7 @@ impl Application {
                 goal: task.to_string(),
                 model: Some(model.to_string()),
                 mode: mode_str(mode).to_string(),
+                permission_contract: 2,
                 sandbox,
                 kind: ExecutionKind::Parallel,
                 axes: Some(leveler_engine::NewSessionAxes {

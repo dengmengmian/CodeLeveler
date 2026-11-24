@@ -266,6 +266,7 @@ async fn start_service(
             goal: "Start this user-requested persistent Python development HTTP service".into(),
             model: None,
             mode: leveler_client_protocol::PermissionProfile::FullAccess,
+            permission_contract: None,
         })
         .await
         .unwrap()

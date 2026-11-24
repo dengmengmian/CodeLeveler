@@ -149,6 +149,7 @@ pub(super) fn handle_overlay_key(state: &mut AppState, key: KeyEvent) -> Vec<Eff
                 vec![Effect::Send(ClientCommand::SetPermissionProfile {
                     session_id: state.session_id.clone(),
                     mode,
+                    contract: None,
                 })]
             }
         },

@@ -56,6 +56,7 @@ fn opened_bare() -> AppState {
         title: None,
         model: leveler_client_protocol::ModelRef::parse("deepseek/v3"),
         mode: leveler_client_protocol::PermissionProfile::Assisted,
+        permission_contract: leveler_client_protocol::PermissionContract::V1,
         branch: Some("main".into()),
         status: "idle".into(),
         finalization_stage: None,

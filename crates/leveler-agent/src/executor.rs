@@ -11,6 +11,7 @@ pub(crate) mod host;
 /// Mechanical completion accounting for the structured requirement set.
 pub(crate) mod scope_gate;
 mod user_authority;
+mod web_latency;
 pub(crate) use user_authority::{ClarificationAnswer, UserAuthority};
 
 use std::sync::Arc;
@@ -210,8 +211,9 @@ pub enum AgentEvent {
         id: String,
         name: String,
         arguments: String,
-        /// True when this call was dispatched into the concurrent read-only
-        /// batch (a UI can render such calls as one parallel group).
+        /// True when this call was dispatched into the concurrent batch: a
+        /// pure read, or a network call that may overlap under its own bound.
+        /// A UI can render such calls as one parallel group.
         parallel: bool,
         /// The 1-based model step whose response requested this call, when the
         /// kernel knows it. Every call from one model response carries the same
@@ -2272,6 +2274,11 @@ impl Executor {
         if !self.registry.mutates_files(&call.name) {
             return None;
         }
+        // A structurally read-only seat has no claim protocol to offer; its
+        // write attempt is a role question, answered by the role reason.
+        if crate::sub_agent::ChildProfile::resolve(self.agent_role).read_only() {
+            return None;
+        }
         match self.effective_write_allowlist() {
             Some(allow) if allow.is_empty() => Some(
                 "Edit rejected: no write scope is currently owned. Read the relevant \
@@ -3006,6 +3013,7 @@ impl Executor {
             .turn_context(TurnContext {
                 model: self.model.clone(),
                 mode: self.tool_context.policy.mode(),
+                policy_kind: self.tool_context.policy.policy_kind(),
                 network_scope: self.tool_context.policy.network_scope(),
                 cwd: root.map(std::path::Path::to_path_buf),
                 project_rules,
@@ -4465,6 +4473,9 @@ mod ownership_authority_tests {
                 PolicyResolution::Allow(resolved) => (false, resolved.write),
                 PolicyResolution::Ask(pending) => (true, pending.write.clone()),
                 PolicyResolution::Deny(denial) => panic!("unexpected denial: {}", denial.reason),
+                PolicyResolution::BoundaryFailure(reason) => {
+                    panic!("unexpected boundary failure: {reason}")
+                }
             }
         }
 

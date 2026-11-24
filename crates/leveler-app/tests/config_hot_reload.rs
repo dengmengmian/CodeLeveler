@@ -152,6 +152,7 @@ async fn create_inherited(client: &InProcessRuntimeClient) -> leveler_core::Sess
             goal: "hello".to_string(),
             model: None,
             mode: WireProfile::FullAccess,
+            permission_contract: None,
         })
         .await
         .unwrap()

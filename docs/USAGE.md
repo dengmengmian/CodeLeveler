@@ -144,7 +144,9 @@ max_results = 5
 timeout_ms = 15000
 ```
 
-Set the named environment variable before starting CodeLeveler. A key alone does not enable search without `[web.search]`. UI links use your system browser.
+Set the named environment variable before starting CodeLeveler, or put `api_key = "your-search-key"` in `[web.search]` in your local `~/.leveler/config.toml`. A non-blank `api_key` takes precedence over the environment variable. If the key is omitted or blank, CodeLeveler uses `api_key_env` or the provider's default variable (`DEEPSEEK_API_KEY` for DeepSeek, `LEVELER_SEARCH_API_KEY` for Tavily). The `[web.search]` table enables search independently of the conversation provider.
+
+`leveler config show` reports the resolved provider, base URL, and credential status with the key value hidden. `leveler doctor` reports a `config: web search` finding. Inside a confined command, both identify the sandbox home as separate from the host runtime configuration. UI links use your system browser.
 
 ## MCP servers
 
@@ -229,3 +231,5 @@ The `report` field of `report_review` is the **formal report body**: complete, s
 ## Troubleshooting
 
 Run `leveler doctor` to check models, terminal support, and system capabilities. Use `leveler trace` to inspect session records. Check for private content before sharing them.
+
+Independent `web_fetch` / `web_search` calls in one model round may run concurrently (at most three requests in flight); results still arrive in the original call order. A process-wide budget sits outside that per-round bound: all sessions together may keep at most 8 requests in flight, one session at most 4, one destination host at most 4, and one search provider at most 2 concurrent requests and 20 starts per second. These are runtime resource bounds, not vendor quotas; the provider's own 429 remains the authoritative quota signal. Waiting for user approval holds no execution permit. If a web call waits too long before execution, in the resource queue, or after completion, the log records one `leveler::web_slow` line with the phase breakdown. Set `RUST_LOG=leveler_web_latency=debug` to see every phase of each call.

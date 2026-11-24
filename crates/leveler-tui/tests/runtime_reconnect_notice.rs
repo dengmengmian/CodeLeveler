@@ -27,6 +27,7 @@ fn idle_snapshot(status: &str) -> UiSessionSnapshot {
         title: None,
         model: None,
         mode: PermissionProfile::Assisted,
+        permission_contract: leveler_client_protocol::PermissionContract::V1,
         branch: None,
         status: status.into(),
         finalization_stage: None,

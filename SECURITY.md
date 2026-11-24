@@ -292,6 +292,15 @@ resource boundary the call was admitted under.
 - Consent to the exact call executes the action the person saw. That can lift
   the workspace write fence for the approved effect, including a foreign-path
   conflict the prompt named; it never clears an explicit `--deny-network`.
+- For an MCP proxy tool (`mcp__<server>__<tool>`), "this turn" covers that
+  configured tool for the rest of the turn, including calls with different
+  arguments. The server is already a trust boundary chosen by configuration,
+  and the grant is in-memory on the turn: it neither persists nor covers a
+  different MCP tool. Every other tool keeps the exact-call meaning.
+- A delegated child's unclaimed or out-of-scope mutation and a delegated MCP
+  call are refusals returned to the model, not questions for the user. The
+  child claims its own scope with `claim_write_scope` or reports what the
+  parent must run; approval is not the ownership authority.
 - When the call itself is a network request (a network-class tool or an MCP
   tool), the approval prompt carries that destination decision; the sandbox
   then enforces what the prompt granted. Ordinary commands under a profile

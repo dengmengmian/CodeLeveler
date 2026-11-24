@@ -147,6 +147,9 @@ pub struct McpToolInfo {
     pub name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
+    /// Typed annotations from the server. They are untrusted metadata: only
+    /// `destructive_hint=true` can add friction.
+    pub annotations: leveler_execution::McpAnnotations,
 }
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<serde_json::Value, String>>>>>;
@@ -851,11 +854,25 @@ fn parse_tools(result: &serde_json::Value) -> Vec<McpToolInfo> {
                         name,
                         description,
                         input_schema,
+                        annotations: annotations_from_json(t.get("annotations")),
                     })
                 })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn annotations_from_json(value: Option<&serde_json::Value>) -> leveler_execution::McpAnnotations {
+    let Some(value) = value else {
+        return leveler_execution::McpAnnotations::default();
+    };
+    let flag = |key: &str| value.get(key).and_then(serde_json::Value::as_bool);
+    leveler_execution::McpAnnotations {
+        read_only_hint: flag("readOnlyHint"),
+        destructive_hint: flag("destructiveHint"),
+        idempotent_hint: flag("idempotentHint"),
+        open_world_hint: flag("openWorldHint"),
+    }
 }
 
 /// Flatten an MCP `tools/call` result's content array into plain text.
@@ -900,6 +917,7 @@ pub struct McpTool {
     exposed_name: String,
     description: String,
     input_schema: serde_json::Value,
+    annotations: leveler_execution::McpAnnotations,
 }
 
 /// The model-facing name for a remote tool: `mcp__<server>__<tool>`.
@@ -926,6 +944,7 @@ impl McpTool {
             exposed_name,
             description,
             input_schema: info.input_schema,
+            annotations: info.annotations,
         }
     }
 }
@@ -950,6 +969,10 @@ impl Tool for McpTool {
         RiskLevel::Network
     }
 
+    fn mcp_annotations(&self) -> Option<leveler_execution::McpAnnotations> {
+        Some(self.annotations)
+    }
+
     fn catalog_changed(&self) -> bool {
         match &self.link {
             McpLink::Http(session) => session.catalog_changed(),
@@ -971,7 +994,7 @@ impl Tool for McpTool {
         // not clear the run owner's denial.
         if !matches!(
             context.policy.network_scope(),
-            leveler_execution::NetworkScope::Internet
+            leveler_execution::NetworkScope::Internet | leveler_execution::NetworkScope::Any
         ) {
             return Ok(ToolOutput::error(
                 "UnsupportedNetworkScope: MCP server processes require Internet scope; destination confinement is unavailable.",
@@ -1248,6 +1271,7 @@ for line in sys.stdin:
                 name: "echo".into(),
                 description: "echo".into(),
                 input_schema: serde_json::json!({}),
+                annotations: Default::default(),
             },
         );
         assert!(!tool.catalog_changed(), "a live child owes no refresh");
@@ -1307,6 +1331,7 @@ for line in sys.stdin:
                 name: "probe".into(),
                 description: "probe".into(),
                 input_schema: serde_json::json!({}),
+                annotations: Default::default(),
             },
         );
         let ctx = ToolContext::new(
@@ -1364,6 +1389,7 @@ for line in sys.stdin:
                 name: "probe".into(),
                 description: "probe".into(),
                 input_schema: serde_json::json!({}),
+                annotations: Default::default(),
             },
         );
         let ws = leveler_execution::Workspace::new(std::env::temp_dir()).unwrap();

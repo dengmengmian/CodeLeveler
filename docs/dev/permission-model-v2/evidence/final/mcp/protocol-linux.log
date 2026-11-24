@@ -1,0 +1,57 @@
+{"event": "server_start", "pid": 5040, "argv": ["/tmp/pv2-final/mcp/server.py", "/tmp/pv2-final/mcp/state"]}
+{"event": "request", "method": "initialize", "id": 1, "params": {"capabilities": {}, "clientInfo": {"name": "leveler", "version": "1.0.29"}, "protocolVersion": "2024-11-05"}}
+{"event": "request", "method": "notifications/initialized", "id": null, "params": {}}
+{"event": "request", "method": "tools/list", "id": 2, "params": {}}
+{"event": "request", "method": "tools/call", "id": 3, "params": {"arguments": {}, "name": "read_resource"}}
+{"event": "server_start", "pid": 22060, "argv": ["/tmp/pv2-final/mcp/server.py", "/tmp/pv2-final/mcp/state"]}
+{"event": "request", "method": "initialize", "id": 1, "params": {"capabilities": {}, "clientInfo": {"name": "leveler", "version": "1.0.29"}, "protocolVersion": "2024-11-05"}}
+{"event": "request", "method": "notifications/initialized", "id": null, "params": {}}
+{"event": "request", "method": "tools/list", "id": 2, "params": {}}
+{"event": "request", "method": "tools/call", "id": 3, "params": {"arguments": {"content": "mcp-write-ok"}, "name": "write_resource"}}
+{"event": "server_start", "pid": 34366, "argv": ["/tmp/pv2-final/mcp/server.py", "/tmp/pv2-final/mcp/state"]}
+{"event": "request", "method": "initialize", "id": 1, "params": {"capabilities": {}, "clientInfo": {"name": "leveler", "version": "1.0.29"}, "protocolVersion": "2024-11-05"}}
+{"event": "request", "method": "notifications/initialized", "id": null, "params": {}}
+{"event": "request", "method": "tools/list", "id": 2, "params": {}}
+{"event": "server_start", "pid": 59656, "argv": ["/tmp/pv2-final/mcp/server.py", "/tmp/pv2-final/mcp/state"]}
+{"event": "request", "method": "initialize", "id": 1, "params": {"capabilities": {}, "clientInfo": {"name": "leveler", "version": "1.0.29"}, "protocolVersion": "2024-11-05"}}
+{"event": "request", "method": "notifications/initialized", "id": null, "params": {}}
+{"event": "request", "method": "tools/list", "id": 2, "params": {}}
+{"event": "server_start", "pid": 67600, "argv": ["/tmp/pv2-final/mcp/server.py", "/tmp/pv2-final/mcp/state"]}
+{"event": "request", "method": "initialize", "id": 1, "params": {"capabilities": {}, "clientInfo": {"name": "leveler", "version": "1.0.29"}, "protocolVersion": "2024-11-05"}}
+{"event": "request", "method": "notifications/initialized", "id": null, "params": {}}
+{"event": "request", "method": "tools/list", "id": 2, "params": {}}
+{"event": "server_start", "pid": 71137, "argv": ["/tmp/pv2-final/mcp/server.py", "/tmp/pv2-final/mcp/state"]}
+{"event": "request", "method": "initialize", "id": 1, "params": {"capabilities": {}, "clientInfo": {"name": "leveler", "version": "1.0.29"}, "protocolVersion": "2024-11-05"}}
+{"event": "request", "method": "notifications/initialized", "id": null, "params": {}}
+{"event": "request", "method": "tools/call", "id": 2, "params": {"arguments": {"target": "victim1.txt"}, "name": "delete_resource"}}
+{"event": "server_start", "pid": 76820, "argv": ["/tmp/pv2-final/mcp/server.py", "/tmp/pv2-final/mcp/state"]}
+{"event": "request", "method": "initialize", "id": 1, "params": {"capabilities": {}, "clientInfo": {"name": "leveler", "version": "1.0.29"}, "protocolVersion": "2024-11-05"}}
+{"event": "request", "method": "notifications/initialized", "id": null, "params": {}}
+{"event": "request", "method": "tools/list", "id": 2, "params": {}}
+{"event": "server_start", "pid": 94503, "argv": ["/tmp/pv2-final/mcp/server.py", "/tmp/pv2-final/mcp/state"]}
+{"event": "request", "method": "initialize", "id": 1, "params": {"capabilities": {}, "clientInfo": {"name": "leveler", "version": "1.0.29"}, "protocolVersion": "2024-11-05"}}
+{"event": "request", "method": "notifications/initialized", "id": null, "params": {}}
+{"event": "request", "method": "tools/call", "id": 2, "params": {"arguments": {"target": "victim1.txt"}, "name": "delete_resource"}}
+{"event": "server_start", "pid": 95649, "argv": ["/tmp/pv2-final/mcp/server.py", "/tmp/pv2-final/mcp/state"]}
+{"event": "request", "method": "initialize", "id": 1, "params": {"capabilities": {}, "clientInfo": {"name": "leveler", "version": "1.0.29"}, "protocolVersion": "2024-11-05"}}
+{"event": "request", "method": "notifications/initialized", "id": null, "params": {}}
+{"event": "request", "method": "tools/call", "id": 2, "params": {"arguments": {"target": "victim2.txt"}, "name": "delete_resource"}}
+{"event": "server_start", "pid": 1148, "argv": ["/tmp/pv2-final/mcp/server.py", "/tmp/pv2-final/mcp/state"]}
+{"event": "request", "method": "initialize", "id": 1, "params": {"capabilities": {}, "clientInfo": {"name": "leveler", "version": "1.0.29"}, "protocolVersion": "2024-11-05"}}
+{"event": "request", "method": "notifications/initialized", "id": null, "params": {}}
+{"event": "request", "method": "tools/list", "id": 2, "params": {}}
+{"event": "request", "method": "tools/call", "id": 3, "params": {"arguments": {"target": "unannotated-victim.txt"}, "name": "unannotated_delete"}}
+{"event": "server_start", "pid": 23874, "argv": ["/tmp/pv2-final/mcp/server.py", "/tmp/pv2-final/mcp/state"]}
+{"event": "request", "method": "initialize", "id": 1, "params": {"capabilities": {}, "clientInfo": {"name": "leveler", "version": "1.0.29"}, "protocolVersion": "2024-11-05"}}
+{"event": "request", "method": "notifications/initialized", "id": null, "params": {}}
+{"event": "request", "method": "tools/list", "id": 2, "params": {}}
+{"event": "request", "method": "tools/call", "id": 3, "params": {"arguments": {}, "name": "fail_resource"}}
+{"event": "server_start", "pid": 7973, "argv": ["/tmp/pv2-final/mcp/server.py", "/tmp/pv2-final/mcp/state"]}
+{"event": "request", "method": "initialize", "id": 1, "params": {"capabilities": {}, "clientInfo": {"name": "leveler", "version": "1.0.29"}, "protocolVersion": "2024-11-05"}}
+{"event": "request", "method": "notifications/initialized", "id": null, "params": {}}
+{"event": "request", "method": "tools/list", "id": 2, "params": {}}
+{"event": "request", "method": "tools/call", "id": 3, "params": {"arguments": {}, "name": "read_resource"}}
+{"event": "server_start", "pid": 7991, "argv": ["/tmp/pv2-final/mcp/server.py", "/tmp/pv2-final/mcp/state"]}
+{"event": "request", "method": "initialize", "id": 1, "params": {"capabilities": {}, "clientInfo": {"name": "leveler", "version": "1.0.29"}, "protocolVersion": "2024-11-05"}}
+{"event": "request", "method": "notifications/initialized", "id": null, "params": {}}
+{"event": "request", "method": "tools/list", "id": 2, "params": {}}

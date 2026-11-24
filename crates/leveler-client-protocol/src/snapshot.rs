@@ -184,6 +184,7 @@ mod tests {
             title: None,
             model: None,
             mode: crate::PermissionProfile::Assisted,
+            permission_contract: crate::PermissionContract::V1,
             branch: None,
             status: "idle".into(),
             finalization_stage: None,
@@ -263,6 +264,7 @@ mod tests {
             title: None,
             model: None,
             mode: crate::PermissionProfile::Assisted,
+            permission_contract: crate::PermissionContract::V1,
             branch: None,
             status: "idle".into(),
             finalization_stage: None,
@@ -876,6 +878,10 @@ pub struct UiSessionSnapshot {
     pub task_terminal: Option<crate::UiTaskTerminal>,
     pub model: Option<ModelRef>,
     pub mode: PermissionProfile,
+    /// The contract the session runs under. An older runtime omits it and the
+    /// client treats the omission as V1 — never as V2.
+    #[serde(default)]
+    pub permission_contract: crate::PermissionContract,
     /// VCS branch, if the repository is a git repo.
     pub branch: Option<String>,
     /// Persisted status string (e.g. "running", "completed").

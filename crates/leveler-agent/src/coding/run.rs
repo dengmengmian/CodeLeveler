@@ -1824,6 +1824,7 @@ impl CodingRuntime {
                 goal: spec.runtime.goal.clone(),
                 model: Some(self.factory.model.to_string()),
                 mode: mode_str(spec.coding.mode).to_string(),
+                permission_contract: 2,
                 sandbox: spec.coding.sandbox,
                 kind: spec.runtime.kind,
                 axes: Some(leveler_engine::NewSessionAxes {

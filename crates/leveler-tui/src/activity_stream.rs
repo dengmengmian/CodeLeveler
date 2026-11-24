@@ -1590,7 +1590,19 @@ fn disclosure_label(visible: &[&ToolCallBlock], failed: usize, t: &UiText) -> St
 /// other, so they add up. `None` unless every visible call reported a
 /// duration — a partial sum would read as a complete one.
 fn group_duration_ms(visible: &[&ToolCallBlock]) -> Option<u64> {
-    if visible.is_empty() || visible.iter().any(|c| c.duration_ms.is_none()) {
+    if visible.is_empty() {
+        return None;
+    }
+    // The runtime's monotonic execution facts are the authority. A live
+    // client's own stamp can be 0 for a deferred batch (observed: a 1.7 s
+    // parallel fetch group rendered as "0s"), while the runtime timing carries
+    // the real span. When every member has a finished timing on one clock, use
+    // that span — it also prices overlapping calls as one burst without
+    // needing the client's batch id.
+    if let Some(span) = runtime_timing_span(visible) {
+        return Some(span);
+    }
+    if visible.iter().any(|c| c.duration_ms.is_none()) {
         return None;
     }
     let mut total = 0u64;
@@ -1614,6 +1626,34 @@ fn group_duration_ms(visible: &[&ToolCallBlock]) -> Option<u64> {
         total = total.saturating_add(burst_max.get(&id).copied().unwrap_or(0));
     }
     Some(total)
+}
+
+/// The wall span of a group whose runtime timings are all present, finished
+/// and on one clock. `None` when any coordinate is missing or disagrees: a
+/// partial span would read as a complete one.
+fn runtime_timing_span(visible: &[&ToolCallBlock]) -> Option<u64> {
+    let mut clock = None;
+    let mut first = u64::MAX;
+    let mut last = 0u64;
+    for call in visible {
+        let timing = call.timing.as_ref()?;
+        if timing.runtime.clock_id.is_empty() || !timing.runtime.finished {
+            return None;
+        }
+        match clock {
+            Some(existing) if existing != timing.runtime.clock_id.as_str() => return None,
+            None => clock = Some(timing.runtime.clock_id.as_str()),
+            _ => {}
+        }
+        first = first.min(timing.runtime.started_ms);
+        last = last.max(
+            timing
+                .runtime
+                .started_ms
+                .checked_add(timing.runtime.elapsed_ms)?,
+        );
+    }
+    last.checked_sub(first)
 }
 
 /// Whether a completed/running call may appear as its own Conversation unit.
@@ -5806,6 +5846,41 @@ mod tests {
             Some(6_500),
             "one 5s burst (not 10s) plus the 1.5s serial call"
         );
+    }
+
+    /// A deferred batch's live client stamps can be zero (observed in a real
+    /// TUI run). The runtime timing is the authority and must keep the real
+    /// span.
+    #[test]
+    fn a_parallel_group_duration_prefers_the_runtime_span() {
+        let mut a = call(
+            "web_fetch",
+            r#"{"url":"https://example.com"}"#,
+            ToolStatus::Ok,
+        );
+        let mut b = call(
+            "web_fetch",
+            r#"{"url":"https://www.iana.org/help/example-domains"}"#,
+            ToolStatus::Ok,
+        );
+        for (call, started, elapsed) in [(&mut a, 1_000u64, 1_500u64), (&mut b, 1_100, 800)] {
+            call.duration_ms = Some(0);
+            call.parallel = true;
+            call.timing = Some(crate::transcript::ToolTiming {
+                runtime: leveler_client_protocol::UiToolTiming {
+                    clock_id: "turn".into(),
+                    started_ms: started,
+                    elapsed_ms: elapsed,
+                    finished: true,
+                },
+                observed_elapsed_secs: None,
+            });
+        }
+        let g = group(vec![a, b]);
+        let visible: Vec<&ToolCallBlock> = g.calls.iter().collect();
+        // The first call spans 1_000..2_500; the second 1_100..1_900. The
+        // group's wall span is 1_500 ms; the zero live stamps are ignored.
+        assert_eq!(group_duration_ms(&visible), Some(1_500));
     }
 
     /// A partial total is not a total: one unreported call makes the stage's

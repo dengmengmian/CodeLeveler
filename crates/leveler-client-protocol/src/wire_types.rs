@@ -26,6 +26,37 @@ pub enum PermissionProfile {
     FullAccess,
 }
 
+/// The permission contract a session was created under.
+///
+/// The three tier names did not change in V2, but their meanings did. A
+/// missing field on a persisted or wire value is V1: legacy data must never
+/// be read as V2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionContract {
+    #[default]
+    V1,
+    V2,
+}
+
+impl PermissionContract {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::V1 => "v1",
+            Self::V2 => "v2",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "v1" | "1" => Some(Self::V1),
+            "v2" | "2" => Some(Self::V2),
+            _ => None,
+        }
+    }
+}
+
 /// Whether a started call acts on the turn's answer.
 ///
 /// A protocol-owned DTO: the runtime decides this once (in its client

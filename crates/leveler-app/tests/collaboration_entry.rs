@@ -150,6 +150,7 @@ fn request(
         goal: goal.to_string(),
         model: None,
         mode: WirePermission::Assisted,
+        permission_contract: None,
         approval_policy: ApprovalPolicy::Interactive,
         collaboration,
     }
@@ -260,6 +261,7 @@ async fn interactive_bootstrap_axis_reaches_row_and_snapshot_as_chat() {
             goal: "interactive session".to_string(),
             model: None,
             mode: WirePermission::Assisted,
+            permission_contract: None,
             approval_policy: ApprovalPolicy::Interactive,
             collaboration: CollaborationMode::Chat,
         })

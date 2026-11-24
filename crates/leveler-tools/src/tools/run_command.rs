@@ -1651,6 +1651,11 @@ mod snapshot_tests {
             "a claimed scope must allow the write: {}",
             out.content
         );
+        assert!(
+            !out.content.contains("claim_write_scope"),
+            "a successful write must not suggest claiming more scope: {}",
+            out.content
+        );
     }
 
     /// macOS seatbelt says EPERM ("not permitted"). Linux read-only bind says
@@ -1709,6 +1714,14 @@ mod snapshot_tests {
         assert!(
             filesystem_boundary_refusal(&out.content),
             "the mutation must fail at the filesystem boundary: {}",
+            out.content
+        );
+        // The model owns the fix: a delegated child gains write authority by
+        // claiming the exact paths it needs, not by asking the user to lift
+        // the ownership fence.
+        assert!(
+            out.content.contains("claim_write_scope"),
+            "a scoped command denial must name the claim protocol: {}",
             out.content
         );
     }

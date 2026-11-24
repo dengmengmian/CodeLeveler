@@ -188,7 +188,16 @@ async fn a_session_grant_is_persisted_then_revocation_makes_the_next_call_ask_ag
             .with_collaboration(leveler_agent::CollaborationMode::Chat),
     );
     let model = ModelRef::new("mock", "m");
-    let session = app.create_session(&model, "修改外部文件").await.unwrap();
+    let session = app
+        .create_session_with_permission_state(
+            &model,
+            "修改外部文件",
+            leveler_execution::PermissionContract::V1,
+            PermissionProfile::Assisted,
+            app.collaboration(),
+        )
+        .await
+        .unwrap();
     let client = Arc::new(InProcessRuntimeClient::new(
         app.clone(),
         model,

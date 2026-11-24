@@ -16,8 +16,11 @@ use leveler_model::{ContentPart, ImageSource, Message, Role, TranscriptOrigin};
 /// Convert one turn range's stored payloads, in durable order.
 ///
 /// The returned items drop the standing system prompt (it is not conversation)
-/// and any harness-authored user-transport row. Reasoning is kept here because
-/// the memory crate discards it first under budget pressure.
+/// and any harness-authored user-transport row. Assistant reasoning is dropped
+/// as well: it is the model's private deliberation, not evidence, and an
+/// observation that promoted a reasoning-only guess ("the date is simulated")
+/// into a project fact is how a session contaminates later ones. The assistant's
+/// delivered text and tool results remain the evidence capture may use.
 pub(crate) fn transcript_items(payloads: &[String]) -> Result<Vec<TranscriptItem>, String> {
     let mut messages = Vec::with_capacity(payloads.len());
     for payload in payloads {
@@ -73,12 +76,8 @@ pub(crate) fn transcript_items(payloads: &[String]) -> Result<Vec<TranscriptItem
                             name: call.name,
                             arguments: call.arguments.to_string(),
                         }),
-                        ContentPart::Reasoning { text } => {
-                            items.push(TranscriptItem::Reasoning { text });
-                        }
-                        ContentPart::SignedReasoning { text, .. } => {
-                            items.push(TranscriptItem::Reasoning { text });
-                        }
+                        ContentPart::Reasoning { .. } => {}
+                        ContentPart::SignedReasoning { .. } => {}
                         ContentPart::RedactedReasoning { .. } => {}
                         ContentPart::Image { source } => {
                             items.push(image_item(source));
@@ -183,6 +182,35 @@ mod tests {
                     is_error: false,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn assistant_reasoning_never_reaches_memory_capture() {
+        let assistant = Message::from_parts(
+            Role::Assistant,
+            vec![
+                ContentPart::Reasoning {
+                    text: "the current date is simulated".to_owned(),
+                },
+                ContentPart::Text {
+                    text: "answer".to_owned(),
+                },
+            ],
+            None,
+        );
+        let items = transcript_items(&[payload(&assistant)]).expect("items");
+        assert!(
+            !items
+                .iter()
+                .any(|item| matches!(item, TranscriptItem::Reasoning { .. })),
+            "assistant reasoning is not evidence and must not reach capture: {items:?}"
+        );
+        assert!(
+            items.iter().any(
+                |item| matches!(item, TranscriptItem::Assistant { text, .. } if text == "answer")
+            ),
+            "the assistant's delivered text still reaches capture: {items:?}"
         );
     }
 

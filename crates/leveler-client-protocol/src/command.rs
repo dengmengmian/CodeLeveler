@@ -318,6 +318,10 @@ pub enum ClientCommand {
     SetPermissionProfile {
         session_id: SessionId,
         mode: PermissionProfile,
+        /// `None` keeps the session's stored contract. `Some(V2)` is an
+        /// explicit adoption; changing the tier alone never adopts V2.
+        #[serde(default)]
+        contract: Option<super::PermissionContract>,
     },
     /// Set or clear this session's Thinking Level.
     ///
@@ -1251,6 +1255,7 @@ mod tests {
             ClientCommand::SetPermissionProfile {
                 session_id: SessionId::new("s1"),
                 mode: PermissionProfile::FullAccess,
+                contract: None,
             },
             "set_permission_profile",
         );

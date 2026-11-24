@@ -25,11 +25,12 @@ use leveler_execution::{
 };
 use leveler_lifecycle::PlanStep;
 use leveler_model::{ContentPart, ToolCall};
-use leveler_tools::{ToolContext, ToolError, ToolRegistry};
+use leveler_tools::{ParallelClass, ToolContext, ToolError, ToolRegistry};
 
 use super::dispatch::{
     collect_modified, extract_applied_diff, extract_executed_commands, extract_image, extract_plan,
 };
+use super::web_latency::WebPhase;
 use super::{AgentError, Executor};
 use crate::authorization::{
     action_fingerprint, approval_signature, call_needs_host_escape, command_line_for_match,
@@ -85,6 +86,19 @@ pub(crate) enum AskOutcome {
 /// against a flapping profile, not a policy: the profile owner drives every
 /// iteration, and reaching this bound is reported as a refusal, never spun on.
 pub(crate) const MAX_SUPERSEDE_RETRIES: usize = 8;
+
+/// The turn-grant key for an MCP tool.
+///
+/// An MCP approval's unit is the configured tool, not one argument vector:
+/// the server is already a trust boundary chosen by configuration, and the
+/// "this turn" choice is the user trusting THAT tool for the turn. Keeping the
+/// key separate from the exact-call signature leaves every other tool on the
+/// exact-call contract. The key never outlives the turn because the set lives
+/// on the turn's `Drive`.
+fn mcp_session_key(tool: &str) -> Option<String> {
+    tool.starts_with("mcp__")
+        .then(|| format!("mcp-tool:{tool}"))
+}
 
 /// A call whose admission ALREADY happened and is on the durable record — a
 /// `ToolCallStarted` the engine found dangling after a crash.
@@ -321,13 +335,14 @@ impl Executor {
         // hooks below are external side effects themselves. A flush failure
         // aborts the run before the tool executes (never a fake success).
         if let Some(barrier) = &self.event_barrier
-            && let Err(error) = barrier.flush().await
+            && let Err(error) = WebPhase::result("persistence_start", barrier.flush()).await
         {
             return Err(AdmitError::Fatal(error.into()));
         }
         leveler_core::test_crash::point("after_tool_started_durable");
         let mut pending_always: Option<PendingStandingGrant> = None;
-        let mut resolved = match self
+        let authorization = WebPhase::begin("authorization");
+        let resolution = self
             .authorize_with_cancellation(
                 &call,
                 &ctx,
@@ -335,8 +350,18 @@ impl Executor {
                 &mut pending_always,
                 cancellation,
             )
-            .await
-        {
+            .await;
+        WebPhase::finish(
+            authorization,
+            if resolution.is_ok() {
+                "ok"
+            } else if cancellation.is_cancelled() {
+                "cancelled"
+            } else {
+                "refused"
+            },
+        );
+        let mut resolved = match resolution {
             Ok(resolved) => resolved,
             Err(reason) => return Err(AdmitError::Refused { call, reason }),
         };
@@ -344,16 +369,20 @@ impl Executor {
         // ApprovalRequested/Resolved — the decision must be durable before
         // the tool it authorized can produce a side effect (else a crash
         // leaves an approved side effect that resume sees as still pending
-        // approval). Parallel-batch tools skip this: read-only and
-        // side-effect-free by declaration.
-        if !parallel
+        // approval). Only a pure-read batch skips this: it is side-effect-free
+        // by declaration. A network call is deferred like a read but is NOT
+        // side-effect-free — the request leaves the process — so it keeps the
+        // barrier even when the executor batches it.
+        let side_effect_free_batch =
+            parallel && self.registry.parallel_class(&call.name) != ParallelClass::Network;
+        if !side_effect_free_batch
             && let Some(barrier) = &self.event_barrier
-            && let Err(error) = barrier.flush().await
+            && let Err(error) = WebPhase::result("persistence_approval", barrier.flush()).await
         {
             return Err(AdmitError::Fatal(error.into()));
         }
         if let Some(expected) = resolved.resource_grant() {
-            match self.resolve_resource_request(&call, &ctx).await {
+            match WebPhase::result("resource_revalidation", self.resolve_resource_request(&call, &ctx)).await {
                 Ok(Some(current)) if &current == expected => {},
                 _ => return Err(AdmitError::Refused { call, reason: "resource identity changed while authorization was pending; request fresh approval".into() }),
             }
@@ -398,7 +427,7 @@ impl Executor {
         // check and the tool's effect; that window belongs to transfer
         // protocols, not P2C).
         if let Some(fence) = &self.execution_fence
-            && let Err(reason) = fence.ensure_current().await
+            && let Err(reason) = WebPhase::result("ownership", fence.ensure_current()).await
         {
             return Err(AdmitError::Fatal(AgentError::StaleOwnership(reason)));
         }
@@ -447,17 +476,30 @@ impl Executor {
             let pending = match self.resolve_policy(call, ctx, cancellation).await {
                 PolicyResolution::Allow(resolved) => return Ok(resolved),
                 PolicyResolution::Deny(PolicyDenial { reason }) => return Err(reason),
+                PolicyResolution::BoundaryFailure(reason) => {
+                    return Err(format!("[execution boundary] {reason}"));
+                }
                 PolicyResolution::Ask(pending) => pending,
             };
-            match self
+            let approval = WebPhase::begin("approval_wait");
+            let outcome = self
                 .ask(
                     &pending,
                     Some(session_approved),
                     Some(pending_always),
                     cancellation,
                 )
-                .await
-            {
+                .await;
+            WebPhase::finish(
+                approval,
+                match &outcome {
+                    AskOutcome::Allowed(_) => "ok",
+                    AskOutcome::DeniedByUser | AskOutcome::DeniedUnattended(_) => "refused",
+                    AskOutcome::Cancelled => "cancelled",
+                    AskOutcome::Superseded => "superseded",
+                },
+            );
+            match outcome {
                 AskOutcome::Allowed(evidence) => return Ok(pending.allowed(evidence)),
                 AskOutcome::DeniedByUser => return Err("denied by user".to_string()),
                 AskOutcome::DeniedUnattended(reason) => return Err(reason),
@@ -495,6 +537,37 @@ impl Executor {
         });
         let command_line = command_line_for_match(call, program.as_deref(), &args);
 
+        // The effect-oriented Auto's only new Ask source. It is a pure
+        // read of the CURRENT call's argv/annotations: no script content, no
+        // model text. It runs before the rules so a deletion target also
+        // feeds `write_path_glob`; the fact itself is consumed after them.
+        let policy = ctx.policy.policy_kind();
+        let risk = self
+            .tool(&call.name)
+            .map(|t| t.risk())
+            .unwrap_or(RiskLevel::Safe);
+        let workspace_root = ctx
+            .execution
+            .workspace
+            .as_deref()
+            .map(|workspace| workspace.root().to_path_buf());
+        let effect_fact = (policy == leveler_execution::PolicyKind::EffectAuto)
+            .then(|| {
+                leveler_execution::irreversibility::analyze(
+                    &leveler_execution::irreversibility::EffectInput {
+                        tool: &call.name,
+                        risk,
+                        command: command_view,
+                        mcp_annotations: self
+                            .tool(&call.name)
+                            .and_then(|tool| tool.mcp_annotations()),
+                        workspace_root: workspace_root.as_deref(),
+                        environment: ctx.execution.environment.as_ref(),
+                    },
+                )
+            })
+            .flatten();
+
         // A review bound to a fixed historical object has no live-worktree
         // authority: those tools answer about a tree that is not the reviewed
         // object. This is a ROLE boundary, so Full does not lift it (the
@@ -519,14 +592,12 @@ impl Executor {
         // Full shortcut: an explicit run-level denial binds every channel,
         // including the one Full cannot sandbox.
         if ctx.policy.network_explicitly_denied() && call.name.starts_with("mcp__") {
-            return PolicyResolution::Deny(PolicyDenial {
-                reason: format!(
-                    "{} is unavailable while network access is denied for this run: an \
-                     MCP server is a separate process outside the sandbox, so the \
-                     denial cannot be enforced on it.",
-                    call.name
-                ),
-            });
+            return PolicyResolution::BoundaryFailure(format!(
+                "{} is unavailable while network access is denied for this run: an \
+                 MCP server is a separate process outside the sandbox, so the \
+                 denial cannot be enforced on it.",
+                call.name
+            ));
         }
 
         // Highest-priority product contract: Full bypasses CodeLeveler
@@ -537,13 +608,11 @@ impl Executor {
         if ctx.policy.unrestricted_execution() {
             let network_scope = if ctx.policy.network_explicitly_denied() {
                 if !self.network_enforceable && self.registry.runs_command(&call.name) {
-                    return PolicyResolution::Deny(PolicyDenial {
-                        reason: format!(
-                            "{} cannot run with network access denied on this host: its \
-                             sandbox backend cannot enforce a network boundary",
-                            call.name
-                        ),
-                    });
+                    return PolicyResolution::BoundaryFailure(format!(
+                        "{} cannot run with network access denied on this host: its \
+                         sandbox backend cannot enforce a network boundary",
+                        call.name
+                    ));
                 }
                 leveler_execution::NetworkScope::None
             } else {
@@ -589,7 +658,10 @@ impl Executor {
             );
         }
         let network_scope = ctx.policy.network_scope();
-        let network_allowed = matches!(network_scope, leveler_execution::NetworkScope::Internet);
+        let network_allowed = matches!(
+            network_scope,
+            leveler_execution::NetworkScope::Internet | leveler_execution::NetworkScope::Any
+        );
         // Denied only because the profile does not reach the network by
         // default (请求批准), not by the run itself: a user approval of a call
         // whose need is the network is the grant for that call.
@@ -598,9 +670,39 @@ impl Executor {
         // The profile denies the network, and this host cannot make a
         // command honour that (Windows). Such a command is asked first and
         // runs open once approved — never under a denial nobody enforces.
-        let network_unenforceable = network_by_profile_default
-            && !self.network_enforceable
-            && self.registry.runs_command(&call.name);
+        // The frozen scope is what must be enforced, not merely why it is not
+        // Internet. A run-level denial is never softened into an approval: if
+        // this host cannot enforce it, the call is an execution-boundary
+        // failure. A profile-default denial keeps the legacy ask (a person may
+        // still grant the call), which is why the distinction is preserved.
+        let network_unenforceable =
+            !network_allowed && !self.network_enforceable && self.registry.runs_command(&call.name);
+        // Loopback is always allowed here: a backend that cannot express it
+        // narrows the process to `None` (deny all network) in
+        // `ProcessRequest::effective_network_scope`, which is stricter than
+        // the requested scope rather than silently open. Only destination
+        // subsets that have no fail-closed equivalent are boundary failures.
+        let unsupported_network_scope = self.registry.runs_command(&call.name)
+            && !matches!(
+                network_scope,
+                leveler_execution::NetworkScope::None
+                    | leveler_execution::NetworkScope::Loopback
+                    | leveler_execution::NetworkScope::Internet
+                    | leveler_execution::NetworkScope::Any
+            );
+        if unsupported_network_scope {
+            return PolicyResolution::BoundaryFailure(format!(
+                "{} requires a network destination scope this host cannot enforce",
+                call.name
+            ));
+        }
+        if network_unenforceable && ctx.policy.network_explicitly_denied() {
+            return PolicyResolution::BoundaryFailure(format!(
+                "{} cannot run with the requested network denial: this host has no \
+                 backend that enforces it",
+                call.name
+            ));
+        }
         let deny = |reason: String| PolicyResolution::Deny(PolicyDenial { reason });
         let allow = |authorization: AuthorizationEvidence| {
             PolicyResolution::Allow(ResolvedExecutionPolicy::new(
@@ -611,19 +713,23 @@ impl Executor {
         };
 
         let args_json = serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".into());
-        match self
+        let pre_hook = WebPhase::begin("pre_hook");
+        let hook_result = self
             .hook_runner
             .run_pre(&call.name, &args_json, cancellation)
-            .await
-        {
+            .await;
+        WebPhase::finish(
+            pre_hook,
+            match &hook_result {
+                leveler_execution::PreHookResult::Allow => "ok",
+                leveler_execution::PreHookResult::Deny(_) => "refused",
+            },
+        );
+        match hook_result {
             leveler_execution::PreHookResult::Allow => {}
             leveler_execution::PreHookResult::Deny(reason) => return deny(reason),
         }
 
-        let risk = self
-            .tool(&call.name)
-            .map(|t| t.risk())
-            .unwrap_or(RiskLevel::Safe);
         let approval_reason = if let Some(tool) = self.tool(&call.name) {
             tokio::select! {
                 biased;
@@ -633,27 +739,49 @@ impl Executor {
         } else {
             None
         };
-        let mut approval_reason = approval_reason
-            .or_else(|| self.role_permission_reason(call))
-            .or_else(|| self.refuse_unboundable_delegated_tool(call))
-            .or_else(|| self.refuse_unscoped_mutation(call))
-            .or_else(|| {
-                let foreign = &ctx.policy.command_foreign_paths;
-                (self.registry.mutates_files(&call.name)
-                    && (foreign.iter().any(|path| path == "." || path.is_empty())
-                        || crate::sub_agent::scopes_overlap(
-                            &crate::authorization::mutation_targets(call),
-                            foreign,
-                        )))
-                .then(|| "修改其他执行者当前拥有的路径，需要批准本次操作".into())
-            });
+        // Structural ownership refusals are decisions the MODEL resolves, not
+        // questions for the user. A user approval here would be the only path
+        // that lets a delegated call bypass the claim (or the delegation
+        // boundary) the refusal exists for. They are checked before the role
+        // reason because a delegated MCP tool is also outside the child's
+        // projected registry, and the role reason would otherwise turn this
+        // refusal into a prompt.
+        if let Some(reason) = self.refuse_unboundable_delegated_tool(call) {
+            return PolicyResolution::Deny(PolicyDenial { reason });
+        }
+        let mut approval_reason = approval_reason.or_else(|| self.role_permission_reason(call));
+        if let Some(reason) = self.refuse_unscoped_mutation(call) {
+            // A delegated call owns its claim protocol: the refusal goes back
+            // to the model, and approval must not be the way around the
+            // ownership fence. A host-owned Node turn has a static allowlist
+            // but no claim protocol, so its out-of-allowlist edit keeps the
+            // old approval path (a human can authorize the exact edit).
+            if self.depth > 0 || self.agent_id.is_some() {
+                return PolicyResolution::Deny(PolicyDenial { reason });
+            }
+            approval_reason.get_or_insert(reason);
+        }
+        approval_reason = approval_reason.or_else(|| {
+            let foreign = &ctx.policy.command_foreign_paths;
+            (self.registry.mutates_files(&call.name)
+                && (foreign.iter().any(|path| path == "." || path.is_empty())
+                    || crate::sub_agent::scopes_overlap(
+                        &crate::authorization::mutation_targets(call),
+                        foreign,
+                    )))
+            .then(|| "修改其他执行者当前拥有的路径，需要批准本次操作".into())
+        });
 
         // The read-only overlay (`leveler plan` / plan collaboration) admits
         // Safe tools only, whatever the profile would otherwise allow. It is
         // orthogonal to the three-tier profile, so it is its own gate.
         if ctx.policy.read_only
             && risk != RiskLevel::Safe
-            && ctx.policy.mode() == leveler_execution::PermissionProfile::Assisted
+            && matches!(
+                ctx.policy.policy_kind(),
+                leveler_execution::PolicyKind::LegacyAuto
+                    | leveler_execution::PolicyKind::EffectAuto
+            )
         {
             approval_reason.get_or_insert_with(|| {
                 "read-only turn requires approval for this exact action".into()
@@ -676,10 +804,10 @@ impl Executor {
         // made the registry a third authorization owner alongside the host and
         // the rules. Same answers, one owner.
         let profile = ctx.policy.mode();
-        if !profile.permits(risk) {
+        if !policy.permits(risk) {
             return deny(format!(
-                "tool `{}` is not permitted in {profile:?} mode (risk {risk:?})",
-                call.name
+                "tool `{}` is not permitted under {} (risk {risk:?})",
+                call.name, policy
             ));
         }
 
@@ -724,6 +852,7 @@ impl Executor {
                     paths: Vec::new(),
                     grant: None,
                     write_scope_expanded: false,
+                    reason_code: None,
                 },
                 signature,
                 write,
@@ -746,6 +875,11 @@ impl Executor {
         // and deriving `ApproveAlways` path rules.
         let mut scoped_paths: Vec<String> = Vec::new();
         crate::authorization::collect_scoped_paths_from_call(call, &mut scoped_paths);
+        if let Some(fact) = &effect_fact {
+            for path in &fact.paths {
+                scoped_paths.push(path.display().to_string());
+            }
+        }
         let rule_paths: Vec<std::path::PathBuf> =
             scoped_paths.iter().map(std::path::PathBuf::from).collect();
 
@@ -839,8 +973,9 @@ impl Executor {
         let requirement =
             match self
                 .approval_policy
-                .evaluate(profile, &call.name, risk, command_view)
+                .evaluate_kind(policy, &call.name, risk, command_view)
             {
+                Requirement::Auto if effect_fact.is_some() => Requirement::NeedApproval,
                 Requirement::Auto if network_unenforceable || approval_reason.is_some() => {
                     Requirement::NeedApproval
                 }
@@ -943,6 +1078,9 @@ impl Executor {
                 // say. "<tool> requested by the model" is filler, and filler in
                 // a decision prompt trains people to stop reading it.
                 let mut notes = Vec::new();
+                if let Some(fact) = &effect_fact {
+                    notes.push(fact.summary.clone());
+                }
                 if let Some(reason) = &approval_reason {
                     notes.push(reason.clone());
                 }
@@ -986,10 +1124,29 @@ impl Executor {
                         paths: rule_paths,
                         grant,
                         write_scope_expanded: widens_write,
+                        reason_code: Some(
+                            effect_fact
+                                .as_ref()
+                                .map(|fact| fact.code())
+                                .unwrap_or(match policy {
+                                    leveler_execution::PolicyKind::LegacyRestricted => {
+                                        "legacy.restricted"
+                                    }
+                                    leveler_execution::PolicyKind::LegacyAuto => "legacy.auto",
+                                    leveler_execution::PolicyKind::EffectAuto => "effect.auto",
+                                    leveler_execution::PolicyKind::Full => "full",
+                                })
+                                .to_string(),
+                        ),
                     },
                     signature: approval_signature(call),
                     write,
-                    network_scope: if network_allowed {
+                    // An approval grants the legacy Internet scope. V2 Auto's
+                    // frozen destination class (`Any`) is already broader and
+                    // must survive the ask unchanged.
+                    network_scope: if network_allowed
+                        && !matches!(network_scope, leveler_execution::NetworkScope::Any)
+                    {
                         leveler_execution::NetworkScope::Internet
                     } else {
                         network_scope.clone()
@@ -1159,9 +1316,10 @@ impl Executor {
         }
         let mut session_approved = session_approved;
         if !human_only
-            && session_approved
-                .as_ref()
-                .is_some_and(|set| set.contains(&pending.signature))
+            && session_approved.as_ref().is_some_and(|set| {
+                set.contains(&pending.signature)
+                    || mcp_session_key(&pending.request.tool).is_some_and(|key| set.contains(&key))
+            })
         {
             return AskOutcome::Allowed(AuthorizationEvidence::SessionGrant {
                 signature: pending.signature.clone(),
@@ -1239,6 +1397,9 @@ impl Executor {
                 // is ApproveAlways writing a permission rule.
                 if let Some(set) = &mut session_approved {
                     set.insert(pending.signature.clone());
+                    if let Some(key) = mcp_session_key(&pending.request.tool) {
+                        set.insert(key);
+                    }
                 }
                 AskOutcome::Allowed(AuthorizationEvidence::SessionGrant {
                     signature: pending.signature.clone(),
@@ -1262,6 +1423,9 @@ impl Executor {
                 // durable rule could be persisted.
                 if let Some(set) = &mut session_approved {
                     set.insert(pending.signature.clone());
+                    if let Some(key) = mcp_session_key(&pending.request.tool) {
+                        set.insert(key);
+                    }
                 }
                 AskOutcome::Allowed(AuthorizationEvidence::ApprovedAlways)
             }
@@ -1370,7 +1534,9 @@ impl Executor {
         Option<String>,
         super::dispatch::CommandFacts,
     ) {
-        let (content, is_error, metadata) = self.dispatch_raw(admitted, cancellation, output).await;
+        let (content, is_error, metadata) = self
+            .dispatch_raw(admitted, cancellation, output, None)
+            .await;
         // The call's own modified paths, BEFORE merging into the epoch set:
         // a re-edit of an already-modified file is invisible in the merged
         // list, and the caller needs to know the call mutated at all (R011-F1).
@@ -1445,6 +1611,7 @@ impl Executor {
         admitted: &AdmittedCall,
         cancellation: &CancellationToken,
         output: Option<tokio::sync::mpsc::Sender<leveler_execution::OutputChunk>>,
+        network_trace: Option<&Arc<leveler_tools::NetworkTrace>>,
     ) -> (String, bool, serde_json::Value) {
         let call = &admitted.call;
         // The tool runs under the policy admission froze — the one place the
@@ -1469,6 +1636,9 @@ impl Executor {
         }
         let mut ctx = admitted.execution_context().clone();
         ctx.tool_call_scope = Some(call.id.as_str().into());
+        if let Some(trace) = network_trace {
+            ctx.network_trace = Some(trace.clone());
+        }
         if let Some(binder) = self.goal_binder() {
             ctx.background_goal = binder.bound();
         }
@@ -1478,9 +1648,19 @@ impl Executor {
         if let Some(barrier) = &self.event_barrier {
             barrier.record_tool_timing(call.id.as_str(), self.agent_id.as_deref(), started, false);
         }
+        let execution = WebPhase::begin("tool_execution");
+        let observed_cancellation = execution.as_ref().map(|_| call_cancel.clone());
         let executed = self
             .execute_tool(&call.name, call.arguments.clone(), ctx, call_cancel)
             .await;
+        WebPhase::finish(
+            execution,
+            match &executed {
+                Ok(output) if !output.is_error => "ok",
+                _ if observed_cancellation.is_some_and(|token| token.is_cancelled()) => "cancelled",
+                _ => "error",
+            },
+        );
         if let Some(barrier) = &self.event_barrier {
             barrier.record_tool_timing(call.id.as_str(), self.agent_id.as_deref(), started, true);
         }
@@ -1744,6 +1924,26 @@ mod authorize_tests {
         .with_approver(approver)
     }
 
+    /// An executor under V2 Auto (the effect-oriented policy).
+    fn executor_effect_auto(dir: &std::path::Path, approver: Arc<FixedApprover>) -> Executor {
+        let workspace = Workspace::new(dir).unwrap();
+        let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted)
+            .with_permission_profile(
+                leveler_execution::SharedPermissionProfile::new_with_contract(
+                    leveler_execution::PermissionContract::V2,
+                    PermissionProfile::Assisted,
+                ),
+            );
+        Executor::new(
+            Arc::new(StubRuntime),
+            Arc::new(default_registry()),
+            tool_context,
+            ModelRef::new("mock", "m"),
+            10,
+        )
+        .with_approver(approver)
+    }
+
     /// An executor under the read-only overlay (`leveler plan` / plan
     /// collaboration): Safe tools only, whatever the profile allows.
     fn read_only_executor(dir: &std::path::Path, approver: Arc<FixedApprover>) -> Executor {
@@ -1811,7 +2011,7 @@ mod authorize_tests {
             } else {
                 let admitted = admitted.ok().unwrap();
                 let (_, error, _) = executor
-                    .dispatch_raw(&admitted, &CancellationToken::new(), None)
+                    .dispatch_raw(&admitted, &CancellationToken::new(), None, None)
                     .await;
                 assert!(!error);
                 assert_eq!(
@@ -1821,6 +2021,77 @@ mod authorize_tests {
                 assert_eq!(*barrier.0.lock().unwrap(), [false, true]);
             }
         }
+    }
+
+    /// A network call deferred into the parallel batch is still an external
+    /// effect. Its approval decision must be durable before the request can
+    /// leave the process, so admission keeps the second barrier that pure
+    /// reads are allowed to skip. Counted rather than asserted by inspection:
+    /// a future refactor that folds the classes back together fails here.
+    #[tokio::test]
+    async fn a_deferred_network_call_keeps_the_durable_approval_barrier() {
+        use leveler_engine::{ChildToolEvent, EventBarrier, PortError};
+        #[derive(Default)]
+        struct CountingBarrier(std::sync::atomic::AtomicUsize);
+        #[async_trait::async_trait]
+        impl EventBarrier for CountingBarrier {
+            async fn flush(&self) -> Result<(), PortError> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+            fn record_child_tool_event(&self, _: ChildToolEvent) {}
+            fn record_tool_timing(&self, _: &str, _: Option<&str>, _: std::time::Instant, _: bool) {
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("note.txt"), "read me\n").unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let barrier = Arc::new(CountingBarrier::default());
+        let exec = executor_at(dir.path(), PermissionProfile::Assisted, approver.clone())
+            .with_event_barrier(barrier.clone());
+
+        let web = call(
+            "web_fetch",
+            serde_json::json!({"url": "http://127.0.0.1:9/"}),
+        );
+        assert!(
+            exec.admit(
+                web,
+                exec.tool_context.clone(),
+                true,
+                &mut HashSet::new(),
+                &CancellationToken::new(),
+            )
+            .await
+            .is_ok(),
+            "loopback fetch is admitted in Auto"
+        );
+        assert_eq!(
+            barrier.0.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "network admission = announcement barrier + approval durability"
+        );
+
+        let read = call("read_file", serde_json::json!({"path": "note.txt"}));
+        assert!(
+            exec.admit(
+                read,
+                exec.tool_context.clone(),
+                true,
+                &mut HashSet::new(),
+                &CancellationToken::new(),
+            )
+            .await
+            .is_ok(),
+            "read is admitted in Auto"
+        );
+        assert_eq!(
+            barrier.0.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "a pure read keeps the single-announcement path"
+        );
+        assert_eq!(approver.asks(), 0, "the loopback fetch needed no prompt");
     }
 
     #[tokio::test]
@@ -1848,7 +2119,7 @@ mod authorize_tests {
             .ok()
             .expect("human can approve Auto readonly action");
         let (_, error, _) = executor
-            .dispatch_raw(&admitted, &CancellationToken::new(), None)
+            .dispatch_raw(&admitted, &CancellationToken::new(), None, None)
             .await;
         assert!(!error);
         assert_eq!(
@@ -3003,6 +3274,236 @@ mod authorize_tests {
         assert_eq!(approver.asks(), 0);
     }
 
+    /// A delegated child that has not claimed a write scope is told to claim
+    /// one. That is a refusal the MODEL must resolve, not a question for the
+    /// user: an approval here would also be the only path that lets the edit
+    /// bypass the ownership fence the claim exists for.
+    #[tokio::test]
+    async fn a_delegated_unclaimed_mutation_is_refused_without_a_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let exec =
+            executor_at(dir.path(), PermissionProfile::Assisted, approver.clone()).with_depth(1);
+        let action = call(
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-a\n+b\n*** End Patch"
+            }),
+        );
+        match resolve(&exec, &action).await {
+            PolicyResolution::Deny(denial) => assert!(
+                denial.reason.contains("claim_write_scope"),
+                "the refusal must name the protocol that resolves it: {}",
+                denial.reason
+            ),
+            other => panic!("an unclaimed child mutation must be refused, not asked: {other:?}"),
+        }
+        assert_eq!(approver.asks(), 0, "the user is not the claim authority");
+    }
+
+    /// The same ownership fence under V2's EffectAuto. Tier 2 removes the
+    /// workspace write fence for the agent's OWN work; it does not turn a
+    /// delegated child's unclaimed edit into a user question. Approval must
+    /// never be the path around the claim protocol.
+    #[tokio::test]
+    async fn effect_auto_does_not_soften_a_delegated_unclaimed_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let exec = executor_effect_auto(dir.path(), approver.clone()).with_depth(1);
+        let action = call(
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-a\n+b\n*** End Patch"
+            }),
+        );
+        match resolve(&exec, &action).await {
+            PolicyResolution::Deny(denial) => assert!(
+                denial.reason.contains("claim_write_scope"),
+                "{}",
+                denial.reason
+            ),
+            other => panic!("EffectAuto must not turn this into an approval: {other:?}"),
+        }
+        assert_eq!(approver.asks(), 0);
+    }
+
+    /// A host-owned turn (a Node with a static allowlist) has no claim
+    /// protocol: its out-of-allowlist edit keeps the approval path a human can
+    /// answer. Only a delegated call resolves ownership without the user.
+    #[tokio::test]
+    async fn a_host_owned_write_allowlist_outside_edit_still_asks() {
+        let dir = tempfile::tempdir().unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let exec = executor_at(dir.path(), PermissionProfile::Assisted, approver.clone())
+            .with_write_allowlist(Some(vec!["src".to_string()]));
+        let action = call(
+            "apply_patch",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Update File: other.txt\n@@\n-a\n+b\n*** End Patch"
+            }),
+        );
+        assert!(
+            matches!(resolve(&exec, &action).await, PolicyResolution::Ask(_)),
+            "a non-delegated host allowlist keeps the human override"
+        );
+        assert_eq!(approver.asks(), 0);
+    }
+
+    /// An MCP server runs outside every boundary a child's claimed scope
+    /// describes. The tool is unavailable to the child, not a question the
+    /// user can answer with a wider grant.
+    #[tokio::test]
+    async fn a_delegated_mcp_call_is_refused_without_a_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let exec =
+            executor_at(dir.path(), PermissionProfile::Assisted, approver.clone()).with_depth(1);
+        let action = call("mcp__srv__echo", serde_json::json!({}));
+        match resolve(&exec, &action).await {
+            PolicyResolution::Deny(denial) => assert!(
+                denial.reason.contains("unavailable to a delegated agent"),
+                "{}",
+                denial.reason
+            ),
+            other => panic!("a delegated MCP call must be refused, not asked: {other:?}"),
+        }
+        assert_eq!(approver.asks(), 0);
+    }
+
+    fn mcp_pending(
+        dir: &std::path::Path,
+        tool: &str,
+        signature: &str,
+    ) -> leveler_execution::PendingApproval {
+        leveler_execution::PendingApproval {
+            request: ApprovalRequest {
+                grant: None,
+                id: leveler_core::ApprovalId::generate(),
+                turn_id: None,
+                call_id: signature.to_string(),
+                agent_id: None,
+                action_fingerprint: signature.to_string(),
+                tool: tool.to_string(),
+                risk: leveler_execution::RiskLevel::Network,
+                description: String::new(),
+                command: None,
+                paths: Vec::new(),
+                write_scope_expanded: true,
+                reason_code: None,
+            },
+            signature: signature.to_string(),
+            write: leveler_execution::WriteScope::Workspace {
+                root: dir.to_path_buf(),
+            },
+            network_scope: leveler_execution::NetworkScope::Internet,
+            command_line: None,
+            scoped_paths: Vec::new(),
+            widens_write: true,
+        }
+    }
+
+    /// "This turn" for an MCP tool is trust in the configured tool, not in one
+    /// argument vector: the next call with different arguments is the same
+    /// authorization unit. A non-MCP call keeps its exact-call meaning.
+    #[tokio::test]
+    async fn an_mcp_turn_approval_covers_the_tool_for_the_rest_of_the_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveSession));
+        let exec = executor_at(dir.path(), PermissionProfile::Assisted, approver.clone());
+        let mut session = HashSet::new();
+        let first = exec
+            .ask(
+                &mcp_pending(dir.path(), "mcp__srv__echo", "args-alpha"),
+                Some(&mut session),
+                None,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(
+            first,
+            AskOutcome::Allowed(leveler_execution::AuthorizationEvidence::SessionGrant { .. })
+        ));
+        let second = exec
+            .ask(
+                &mcp_pending(dir.path(), "mcp__srv__echo", "args-beta"),
+                Some(&mut session),
+                None,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(
+            second,
+            AskOutcome::Allowed(leveler_execution::AuthorizationEvidence::SessionGrant { .. })
+        ));
+        assert_eq!(
+            approver.asks(),
+            1,
+            "the MCP tool is the turn's authorization unit"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_mcp_once_approval_stays_bound_to_the_exact_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let exec = executor_at(dir.path(), PermissionProfile::Assisted, approver.clone());
+        let mut session = HashSet::new();
+        let first = exec
+            .ask(
+                &mcp_pending(dir.path(), "mcp__srv__echo", "args-alpha"),
+                Some(&mut session),
+                None,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(first, AskOutcome::Allowed(_)));
+        let second = exec
+            .ask(
+                &mcp_pending(dir.path(), "mcp__srv__echo", "args-beta"),
+                Some(&mut session),
+                None,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(second, AskOutcome::Allowed(_)));
+        assert_eq!(
+            approver.asks(),
+            2,
+            "a once approval must not become a tool-wide turn grant"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_mcp_turn_approval_stays_bound_to_the_exact_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveSession));
+        let exec = executor_at(dir.path(), PermissionProfile::Assisted, approver.clone());
+        let mut session = HashSet::new();
+        let first = exec
+            .ask(
+                &mcp_pending(dir.path(), "run_command", "alpha"),
+                Some(&mut session),
+                None,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(first, AskOutcome::Allowed(_)));
+        let second = exec
+            .ask(
+                &mcp_pending(dir.path(), "run_command", "beta"),
+                Some(&mut session),
+                None,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(second, AskOutcome::Allowed(_)));
+        assert_eq!(
+            approver.asks(),
+            2,
+            "a command approval must not generalize to another argv"
+        );
+    }
+
     #[tokio::test]
     async fn auto_product_contract_allows_development_and_asks_for_danger() {
         let dir = tempfile::tempdir().unwrap();
@@ -3044,6 +3545,228 @@ mod authorize_tests {
         assert_eq!(approver.asks(), 0, "resolution does not invoke approval");
     }
 
+    /// A typed MCP proxy without a live server, for admission tests.
+    struct FakeMcpTool {
+        name: &'static str,
+        annotations: leveler_execution::McpAnnotations,
+    }
+
+    #[async_trait::async_trait]
+    impl leveler_tools::tool::Tool for FakeMcpTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "fake MCP tool"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn risk(&self) -> RiskLevel {
+            RiskLevel::Network
+        }
+
+        fn mcp_annotations(&self) -> Option<leveler_execution::McpAnnotations> {
+            Some(self.annotations)
+        }
+
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _context: ToolContext,
+            _cancellation: CancellationToken,
+        ) -> Result<leveler_tools::ToolOutput, leveler_tools::ToolError> {
+            Ok(leveler_tools::ToolOutput::ok("ok"))
+        }
+    }
+
+    fn effect_auto_with_mcp(dir: &std::path::Path, approver: Arc<FixedApprover>) -> Executor {
+        let workspace = Workspace::new(dir).unwrap();
+        let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted)
+            .with_permission_profile(
+                leveler_execution::SharedPermissionProfile::new_with_contract(
+                    leveler_execution::PermissionContract::V2,
+                    PermissionProfile::Assisted,
+                ),
+            );
+        let mut registry = leveler_tools::ToolRegistry::new();
+        for (name, destructive) in [("mcp__lab__read", false), ("mcp__lab__drop", true)] {
+            registry.register(Arc::new(FakeMcpTool {
+                name,
+                annotations: leveler_execution::McpAnnotations {
+                    destructive_hint: Some(destructive),
+                    ..leveler_execution::McpAnnotations::default()
+                },
+            }));
+        }
+        Executor::new(
+            Arc::new(StubRuntime),
+            Arc::new(registry),
+            tool_context,
+            ModelRef::new("mock", "m"),
+            10,
+        )
+        .with_approver(approver)
+    }
+
+    /// The effect-oriented Auto: ordinary programs are not inspected; only a
+    /// directly visible irreversible effect asks. `sudo` is NOT such an
+    /// effect — the OS owns its own authorization prompt.
+    #[tokio::test]
+    async fn effect_auto_allows_scripts_and_asks_only_for_direct_irreversible_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("target/debug")).unwrap();
+        std::fs::write(dir.path().join("script.py"), "print('ok')\n").unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let exec = executor_effect_auto(dir.path(), approver.clone());
+
+        for command in [
+            "python script.py",
+            "npm run build",
+            "cargo test",
+            "rm -rf target",
+            "sudo -n true",
+            "git status",
+            "git push origin main",
+            "web_search --query rust",
+        ] {
+            let action = call("shell_command", serde_json::json!({"cmd": command}));
+            assert!(
+                matches!(resolve(&exec, &action).await, PolicyResolution::Allow(_)),
+                "{command} must run without approval"
+            );
+        }
+
+        for (command, code) in [
+            ("rm -rf src", "irreversible.filesystem_delete"),
+            ("git reset --hard", "irreversible.git_history"),
+            ("git clean -fd", "irreversible.git_history"),
+            ("psql -c 'DROP TABLE users'", "irreversible.persistent_data"),
+        ] {
+            let action = call("shell_command", serde_json::json!({"cmd": command}));
+            match resolve(&exec, &action).await {
+                PolicyResolution::Ask(pending) => {
+                    assert_eq!(
+                        pending.request.reason_code.as_deref(),
+                        Some(code),
+                        "{command}"
+                    );
+                }
+                other => panic!("{command} must ask, got {other:?}"),
+            }
+        }
+        assert_eq!(approver.asks(), 0, "resolution does not invoke approval");
+    }
+
+    /// A backend without a loopback-only sandbox narrows the process to
+    /// `None`; that is a stricter boundary, not an unenforceable one. The
+    /// admission must not turn the legacy strict profile's ordinary commands
+    /// into boundary failures on such a host.
+    #[tokio::test]
+    async fn loopback_is_never_an_unsupported_command_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let exec = executor_at(dir.path(), PermissionProfile::RequestApproval, approver);
+        let action = call(
+            "run_command",
+            serde_json::json!({"program": "echo", "args": ["hi"]}),
+        );
+        match resolve(&exec, &action).await {
+            PolicyResolution::Allow(policy) => assert_eq!(
+                policy.network_scope,
+                leveler_execution::NetworkScope::Loopback,
+                "the frozen scope is the profile default; the runner narrows it"
+            ),
+            other => panic!("loopback must not be a boundary failure: {other:?}"),
+        }
+    }
+
+    /// V2 Auto's ordinary network authority is resolved once, as `Any`, and an
+    /// ask for an irreversible effect must not narrow it back to the legacy
+    /// Internet class while the person decides.
+    #[tokio::test]
+    async fn effect_auto_resolves_and_keeps_ordinary_network_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let exec = executor_effect_auto(dir.path(), approver);
+
+        let ordinary = call("shell_command", serde_json::json!({"cmd": "echo hi"}));
+        match resolve(&exec, &ordinary).await {
+            PolicyResolution::Allow(policy) => assert_eq!(
+                policy.network_scope,
+                leveler_execution::NetworkScope::Any,
+                "ordinary V2 Auto work carries private/LAN authority"
+            ),
+            other => panic!("ordinary work must be allowed, got {other:?}"),
+        }
+
+        let destructive = call("shell_command", serde_json::json!({"cmd": "rm -rf src"}));
+        match resolve(&exec, &destructive).await {
+            PolicyResolution::Ask(pending) => assert_eq!(
+                pending.network_scope,
+                leveler_execution::NetworkScope::Any,
+                "the ask is about the deletion, not the destination class"
+            ),
+            other => panic!("a direct deletion must ask, got {other:?}"),
+        }
+    }
+
+    /// An explicit run-level network denial is the user's own boundary. If
+    /// this host cannot enforce it, the answer is a typed boundary failure,
+    /// never a late spawn error and never a question that softens it.
+    #[tokio::test]
+    async fn an_unenforceable_explicit_network_denial_is_a_boundary_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let mut exec = executor_effect_auto(dir.path(), approver);
+        exec.tool_context = exec.tool_context.clone().with_sandbox(true);
+        let exec = exec.with_network_enforceable(false);
+
+        let command = call(
+            "run_command",
+            serde_json::json!({"program":"echo","args":["x"]}),
+        );
+        assert!(matches!(
+            resolve(&exec, &command).await,
+            PolicyResolution::BoundaryFailure(_)
+        ));
+        let mcp = call("mcp__lab__read", serde_json::json!({}));
+        assert!(matches!(
+            resolve(&exec, &mcp).await,
+            PolicyResolution::BoundaryFailure(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn effect_auto_uses_typed_mcp_annotations_not_the_tool_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let exec = effect_auto_with_mcp(dir.path(), approver.clone());
+
+        let ordinary = call("mcp__lab__read", serde_json::json!({}));
+        assert!(
+            matches!(resolve(&exec, &ordinary).await, PolicyResolution::Allow(_)),
+            "ordinary MCP is not gated by being MCP"
+        );
+
+        let destructive = call("mcp__lab__drop", serde_json::json!({"table": "users"}));
+        match resolve(&exec, &destructive).await {
+            PolicyResolution::Ask(pending) => {
+                assert_eq!(
+                    pending.request.reason_code.as_deref(),
+                    Some("irreversible.mcp_destructive")
+                );
+            }
+            other => panic!("a destructive hint must ask, got {other:?}"),
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn auto_approved_exact_call_executes_outside_workspace_without_second_refusal() {
@@ -3074,7 +3797,7 @@ mod authorize_tests {
         assert_eq!(approver.asks(), 1);
         assert!(admitted.resolved().unrestricted_execution());
         let (content, failed, _) = exec
-            .dispatch_raw(&admitted, &CancellationToken::new(), None)
+            .dispatch_raw(&admitted, &CancellationToken::new(), None, None)
             .await;
         assert!(!failed, "{content}");
         assert!(
@@ -3138,7 +3861,7 @@ mod authorize_tests {
             Err(_) => panic!("approved foreign task control must be admitted"),
         };
         let (content, failed, _) = exec
-            .dispatch_raw(&admitted, &CancellationToken::new(), None)
+            .dispatch_raw(&admitted, &CancellationToken::new(), None, None)
             .await;
         assert!(!failed, "{content}");
         assert_eq!(approver.asks(), 1);
@@ -3594,10 +4317,12 @@ mod authorize_tests {
         // ...and refused outright when the run itself denies the network.
         let mut exec = net_executor(dir.path(), PermissionProfile::RequestApproval, true);
         exec.tool_context = exec.tool_context.clone().with_sandbox(true);
-        assert!(matches!(
-            resolve(&exec, &call("mcp__srv__fetch", serde_json::json!({}))).await,
-            PolicyResolution::Deny(_)
-        ));
+        match resolve(&exec, &call("mcp__srv__fetch", serde_json::json!({}))).await {
+            PolicyResolution::BoundaryFailure(reason) => {
+                assert!(reason.contains("network access is denied"), "{reason}");
+            }
+            other => panic!("an unenforceable denial must fail closed, got {other:?}"),
+        }
     }
 
     /// A host that cannot deny a command the network (Windows) must not pretend
@@ -3971,7 +4696,7 @@ mod authorize_tests {
         );
         let admitted = admit_resource(&executor, ordinary).await;
         let (content, failed, _) = executor
-            .dispatch_raw(&admitted, &CancellationToken::new(), None)
+            .dispatch_raw(&admitted, &CancellationToken::new(), None, None)
             .await;
         assert!(!failed, "{content}");
         assert_eq!(

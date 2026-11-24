@@ -16,6 +16,16 @@ pub fn sandbox_write_denied() -> &'static str {
     "\n[execution policy] Filesystem writes were confined to the granted paths.\n"
 }
 
+/// A command under a scoped (ownership-bounded) write policy. The boundary is
+/// not negotiated with the user: the agent that owns the work gains authority
+/// by claiming the paths the command must write.
+pub fn scoped_write_denied() -> &'static str {
+    "\n[execution policy] This call holds a limited write scope. A delegated agent can \
+     name the files or directories this command needs (for example `target/` or \
+     `Cargo.lock`) with claim_write_scope(paths), then retry. A read-only seat must \
+     report the needed write instead.\n"
+}
+
 pub const NETWORK_PERMISSION_REQUIRED: &str = "[execution policy] Network access was denied";
 
 pub fn network_permission_required() -> &'static str {

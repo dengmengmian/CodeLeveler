@@ -32,6 +32,10 @@ impl Default for PromptBuilder {
 pub(crate) struct TurnContext {
     pub(crate) model: ModelRef,
     pub(crate) mode: PermissionProfile,
+    /// The effective policy for this session's contract. The tier name alone
+    /// is ambiguous in V2 (v2 `request_approval` is the old Auto), so the
+    /// model-facing operating rules must read this.
+    pub(crate) policy_kind: leveler_execution::PolicyKind,
     pub(crate) network_scope: NetworkScope,
     pub(crate) cwd: Option<PathBuf>,
     pub(crate) project_rules: Vec<ProjectInstruction>,
@@ -233,7 +237,7 @@ impl TurnContext {
     /// carries the `\n\n` separator the system prompt inserts before it.
     fn segments(&self) -> Vec<PromptSegment> {
         let network = match &self.network_scope {
-            NetworkScope::Internet => "allowed",
+            NetworkScope::Internet | NetworkScope::Any => "allowed",
             NetworkScope::None => "denied",
             scope => scope.label(),
         };
@@ -327,47 +331,65 @@ impl TurnContext {
         segments
     }
 
-    /// Permission facts and the escalation interface for this mode.
+    /// Permission facts and the escalation interface for this policy.
     /// The block states what the sandbox means and which call can ask for
     /// more permission. It does not choose the next edit, retry, or tool.
     fn operating_rules(&self, network_allowed: bool) -> String {
+        use leveler_execution::PolicyKind;
         let mut rules = String::from("Operating rules for this mode:\n");
-        if self.mode == PermissionProfile::FullAccess {
+        if self.policy_kind == PolicyKind::Full {
             rules.push_str("- Full bypasses all CodeLeveler permission and sandbox restrictions. File tools accept external absolute paths, HOME and credentials. Git remotes, network and process control require no approval.\n");
             return rules;
         }
-        rules.push_str(
-            "- File tools take workspace-relative paths. `.` means the cwd. \
-             When the user names the absolute cwd, the tool path is `.`. \
-             A structured file tool does not accept a `~` prefix or a `~/Users/...` path.\n\
-             - Under assisted and request-approval the workspace `.git` is sealed. A command \
-             whose mechanical effects the runtime resolves from its own argv already runs with \
-             `.git` unsealed, so an ordinary `git pull`, `fetch`, `commit` or `rebase` needs no \
-             extra permission. The metadata write is still denied for mutating git commands the \
-             runtime cannot resolve that way (a wrapper, an unknown subcommand); escalate such \
-             a denial on the same command by setting \
-             `escalate` (`filesystem` = `git`, plus `network` = true when the command contacts \
-             a remote). That elevation is one call; there is no separate permission round. \
-             Read-only git (`status`, `diff`, `log`) never needs it.\n\
-             - Host openers (`open`, `xdg-open`, Windows `start`) leave the sandbox and raise \
-             an approval prompt. They are blocked only when that prompt is denied.\n",
-        );
-        match self.mode {
-            PermissionProfile::RequestApproval => rules.push_str(
-                "- Permission: request-approval. Workspace edits may run. External-file \
+        match self.policy_kind {
+            PolicyKind::EffectAuto => rules.push_str(
+                "- File tools accept workspace-relative or absolute paths, including paths \
+                 outside the workspace. Credential files and trust stores are still refused.\n\
+                 - There is no workspace write fence: ordinary writes outside the workspace \
+                 succeed. Git metadata is not sealed by a path fence.\n",
+            ),
+            PolicyKind::LegacyRestricted | PolicyKind::LegacyAuto => rules.push_str(
+                "- File tools take workspace-relative paths. `.` means the cwd. \
+                 When the user names the absolute cwd, the tool path is `.`. \
+                 A structured file tool does not accept a `~` prefix or a `~/Users/...` path.\n\
+                 - The workspace `.git` is sealed. A command whose mechanical effects the \
+                 runtime resolves from its own argv already runs with `.git` unsealed, so an \
+                 ordinary `git pull`, `fetch`, `commit` or `rebase` needs no extra permission. \
+                 The metadata write is still denied for mutating git commands the runtime \
+                 cannot resolve that way (a wrapper, an unknown subcommand); escalate such \
+                 a denial on the same command by setting \
+                 `escalate` (`filesystem` = `git`, plus `network` = true when the command \
+                 contacts a remote). That elevation is one call; there is no separate \
+                 permission round. Read-only git (`status`, `diff`, `log`) never needs it.\n\
+                 - Host openers (`open`, `xdg-open`, Windows `start`) leave the sandbox and \
+                 raise an approval prompt. They are blocked only when that prompt is denied.\n",
+            ),
+            PolicyKind::Full => unreachable!("Full returned above"),
+        }
+        match self.policy_kind {
+            PolicyKind::LegacyRestricted => rules.push_str(
+                "- Permission: legacy request-approval. Workspace edits may run. External-file \
                  intent and network use require user approval, and those actions wait \
                  for the answer.\n",
             ),
-            PermissionProfile::Assisted => rules.push_str(
-                "- Permission: assisted (default). Workspace reads/writes and network tools \
-                 run without an approval prompt. Irreversible, privileged, host-escape, and \
-                 push/publish commands require user approval.\n",
+            PolicyKind::LegacyAuto => rules.push_str(
+                "- Permission: legacy-auto (the old Auto). Workspace reads/writes and network \
+                 tools run without an approval prompt. Irreversible, privileged, host-escape, \
+                 and push/publish commands require user approval.\n",
             ),
-            PermissionProfile::FullAccess => rules.push_str(
-                "- Permission: full-access. Commands run without approval prompts and may \
-                 touch the whole machine. A destructive action the user did not ask for is \
-                 outside this grant.\n",
+            PolicyKind::EffectAuto => rules.push_str(
+                "- Permission: effect-auto. Ordinary reads, writes (including outside the \
+                 workspace), shell commands, builds, tests, dependency installs, ordinary Git, \
+                 ordinary network and ordinary MCP run without an approval prompt. Only a \
+                 directly visible irreversible effect requires approval with the exact target: \
+                 real file deletion, disk/device destruction, database or volume deletion, Git \
+                 history loss, or an MCP tool that declares destructive behavior. `sudo`, \
+                 stored-credential use, definition writes and child ownership remain \
+                 independent boundaries.\n\
+                 - Do not call `request_permissions` for filesystem or network: this mode \
+                 already holds them. Only a `full_access` escalation needs a user decision.\n",
             ),
+            PolicyKind::Full => unreachable!("Full returned above"),
         }
         if !network_allowed {
             if !matches!(self.network_scope, NetworkScope::None) {
@@ -382,18 +404,25 @@ impl TurnContext {
                 rules.push_str(
                     "- Network access is denied by the current permission boundary. A command \
                  that fails on DNS resolution, a package registry, or a dependency download \
-                 is failing because of that boundary.\n\
-                 - A command can request network by setting `escalate` (`network` = true, \
-                 plus `filesystem` = `unrestricted` when the command also writes outside \
-                 the workspace). The approval prompt is the consent mechanism. Prose does \
-                 not grant the permission.\n",
+                 is failing because of that boundary.\n",
                 );
+                if self.policy_kind != PolicyKind::EffectAuto {
+                    rules.push_str(
+                        "- A command can request network by setting `escalate` (`network` = true, \
+                         plus `filesystem` = `unrestricted` when the command also writes outside \
+                         the workspace). The approval prompt is the consent mechanism. Prose does \
+                         not grant the permission.\n",
+                    );
+                }
             }
-            // Under request-approval a network tool asks the user itself; a
-            // `request_permissions` first would ask the same thing twice.
-            rules.push_str(if self.mode == PermissionProfile::RequestApproval {
+            // Under legacy request-approval a network tool asks the user itself;
+            // a `request_permissions` first would ask the same thing twice.
+            rules.push_str(if self.policy_kind == PolicyKind::LegacyRestricted {
                 "- Network tools raise their own approval prompt when they need broader access. \
                  `web_fetch` within the current destination scope needs no Internet grant.\n"
+            } else if self.policy_kind == PolicyKind::EffectAuto {
+                "- The run-level network denial is explicit. A network tool reports the denial; \
+                 it does not raise a second approval question.\n"
             } else {
                 "- For a network tool that is not a command (`web_fetch`, `web_search`), \
                  `request_permissions` with `network` = true is the permission mechanism. \
@@ -435,6 +464,10 @@ mod tests {
             .turn_context(TurnContext {
                 model: leveler_model::ModelRef::new("deepseek", "deepseek-chat"),
                 mode: leveler_execution::PermissionProfile::Assisted,
+                policy_kind: leveler_execution::PolicyKind::of(
+                    leveler_execution::PermissionContract::V1,
+                    leveler_execution::PermissionProfile::Assisted,
+                ),
                 network_scope: NetworkScope::None,
                 cwd: Some(std::path::PathBuf::from("/w")),
                 project_rules: Vec::new(),
@@ -468,6 +501,10 @@ mod tests {
             .turn_context(TurnContext {
                 model: leveler_model::ModelRef::new("deepseek", "deepseek-chat"),
                 mode: leveler_execution::PermissionProfile::Assisted,
+                policy_kind: leveler_execution::PolicyKind::of(
+                    leveler_execution::PermissionContract::V1,
+                    leveler_execution::PermissionProfile::Assisted,
+                ),
                 network_scope: NetworkScope::None,
                 cwd: Some(std::path::PathBuf::from("/repo")),
                 project_rules: Vec::new(),
@@ -492,6 +529,10 @@ mod tests {
             .turn_context(TurnContext {
                 model: leveler_model::ModelRef::new("deepseek", "deepseek-chat"),
                 mode: leveler_execution::PermissionProfile::Assisted,
+                policy_kind: leveler_execution::PolicyKind::of(
+                    leveler_execution::PermissionContract::V1,
+                    leveler_execution::PermissionProfile::Assisted,
+                ),
                 network_scope: NetworkScope::None,
                 cwd: Some(std::path::PathBuf::from("/repo")),
                 project_rules: Vec::new(),
@@ -509,6 +550,10 @@ mod tests {
             .turn_context(TurnContext {
                 model: leveler_model::ModelRef::new("deepseek", "deepseek-chat"),
                 mode: leveler_execution::PermissionProfile::Assisted,
+                policy_kind: leveler_execution::PolicyKind::of(
+                    leveler_execution::PermissionContract::V1,
+                    leveler_execution::PermissionProfile::Assisted,
+                ),
                 network_scope: NetworkScope::None,
                 cwd: Some(std::path::PathBuf::from("/Users/example/project")),
                 project_rules: Vec::new(),
@@ -529,6 +574,10 @@ mod tests {
             .turn_context(TurnContext {
                 model: leveler_model::ModelRef::new("deepseek", "deepseek-chat"),
                 mode: leveler_execution::PermissionProfile::FullAccess,
+                policy_kind: leveler_execution::PolicyKind::of(
+                    leveler_execution::PermissionContract::V1,
+                    leveler_execution::PermissionProfile::FullAccess,
+                ),
                 network_scope: NetworkScope::Internet,
                 cwd: Some(std::path::PathBuf::from("/repo")),
                 project_rules: Vec::new(),
@@ -905,6 +954,10 @@ mod tests {
         TurnContext {
             model: leveler_model::ModelRef::new("mock", "m"),
             mode,
+            policy_kind: leveler_execution::PolicyKind::of(
+                leveler_execution::PermissionContract::V1,
+                mode,
+            ),
             network_scope: if network_allowed || mode == PermissionProfile::FullAccess {
                 NetworkScope::Internet
             } else {
@@ -1142,6 +1195,10 @@ mod tests {
             .turn_context(TurnContext {
                 model: leveler_model::ModelRef::new("mock", "m"),
                 mode: leveler_execution::PermissionProfile::Assisted,
+                policy_kind: leveler_execution::PolicyKind::of(
+                    leveler_execution::PermissionContract::V1,
+                    leveler_execution::PermissionProfile::Assisted,
+                ),
                 network_scope: NetworkScope::None,
                 cwd: Some(std::path::PathBuf::from("/repo")),
                 project_rules: vec![ProjectInstruction {
@@ -1171,6 +1228,10 @@ mod tests {
             .turn_context(TurnContext {
                 model: leveler_model::ModelRef::new("deepseek", "deepseek-chat"),
                 mode: leveler_execution::PermissionProfile::Assisted,
+                policy_kind: leveler_execution::PolicyKind::of(
+                    leveler_execution::PermissionContract::V1,
+                    leveler_execution::PermissionProfile::Assisted,
+                ),
                 network_scope: NetworkScope::None,
                 cwd: Some(std::path::PathBuf::from("/repo")),
                 project_rules: Vec::new(),
@@ -1196,6 +1257,10 @@ mod tests {
             .turn_context(TurnContext {
                 model: leveler_model::ModelRef::new("deepseek", "deepseek-chat"),
                 mode: leveler_execution::PermissionProfile::Assisted,
+                policy_kind: leveler_execution::PolicyKind::of(
+                    leveler_execution::PermissionContract::V1,
+                    leveler_execution::PermissionProfile::Assisted,
+                ),
                 network_scope: NetworkScope::None,
                 cwd: Some(std::path::PathBuf::from("/repo")),
                 project_rules: Vec::new(),

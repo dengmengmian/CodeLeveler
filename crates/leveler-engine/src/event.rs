@@ -916,6 +916,10 @@ pub enum EngineEvent {
         summary: String,
         command: Option<String>,
         risk: String,
+        /// Stable reason code (`irreversible.*`, `boundary.*`). Additive:
+        /// rows written before the field existed have no code.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason_code: Option<String>,
     },
     ApprovalResolved {
         id: ApprovalId,
@@ -1631,6 +1635,7 @@ mod contract_tests {
                 summary: "run tests".into(),
                 command: Some("cargo test".into()),
                 risk: "assisted".into(),
+                reason_code: None,
             }
             .data_class(),
             DataClass::Projectable
@@ -1675,6 +1680,7 @@ mod contract_tests {
                 summary: secret.into(),
                 command: Some(secret.into()),
                 risk: "destructive".into(),
+                reason_code: None,
             },
             EngineEvent::ClarificationRequested {
                 id: ClarificationId::new("clarification-safe"),

@@ -201,6 +201,7 @@ async fn daemon_create_and_restart_keeps_full() {
             goal: "daemon full".to_string(),
             model: Some(model.clone()),
             mode: WirePermission::FullAccess,
+            permission_contract: None,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
         })
         .await
@@ -246,6 +247,7 @@ async fn explicit_full_override_on_a_persisted_auto_session_is_effective_and_per
         .send_observed(ClientCommand::SetPermissionProfile {
             session_id: id.clone(),
             mode: WirePermission::FullAccess,
+            contract: None,
         })
         .await
         .unwrap();
@@ -318,6 +320,7 @@ async fn explicit_assisted_override_downgrades_a_persisted_full_session() {
         .send_observed(ClientCommand::SetPermissionProfile {
             session_id: id.clone(),
             mode: WirePermission::Assisted,
+            contract: None,
         })
         .await
         .unwrap();
@@ -375,5 +378,91 @@ async fn headless_override_persists_and_is_read_back_in_both_directions() {
     assert_eq!(
         effective_mode(&runtime, &full).await,
         WirePermission::Assisted
+    );
+}
+
+// ── CONTRACT: adoption is explicit and never a side effect of reselecting ───
+
+/// A V1 session keeps V1 when the user reselects the same tier, and when they
+/// switch tier without naming a contract. Only an explicit contract upgrades.
+#[tokio::test]
+async fn reselecting_a_v1_tier_does_not_adopt_v2() {
+    use leveler_execution::PermissionContract;
+    let tmp = tempfile::tempdir().unwrap();
+    let model = ModelRef::new("mock", "m");
+    let app = assemble_app(tmp.path());
+    let id = app
+        .create_session_with_permission_state(
+            &model,
+            "legacy session",
+            PermissionContract::V1,
+            PermissionProfile::Assisted,
+            app.collaboration(),
+        )
+        .await
+        .unwrap();
+    let runtime = client(&app, PermissionProfile::Assisted);
+    assert_eq!(
+        runtime.snapshot(&id).await.unwrap().permission_contract,
+        leveler_client_protocol::PermissionContract::V1
+    );
+
+    // Same tier, no contract: this is not adoption.
+    runtime
+        .send_observed(ClientCommand::SetPermissionProfile {
+            session_id: id.clone(),
+            mode: WirePermission::Assisted,
+            contract: None,
+        })
+        .await
+        .unwrap();
+    let same = runtime.snapshot(&id).await.unwrap();
+    assert_eq!(same.mode, WirePermission::Assisted);
+    assert_eq!(
+        same.permission_contract,
+        leveler_client_protocol::PermissionContract::V1,
+        "re-selecting the same tier must not adopt V2"
+    );
+
+    // A different tier without a contract also keeps the session's contract.
+    runtime
+        .send_observed(ClientCommand::SetPermissionProfile {
+            session_id: id.clone(),
+            mode: WirePermission::FullAccess,
+            contract: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime.snapshot(&id).await.unwrap().permission_contract,
+        leveler_client_protocol::PermissionContract::V1
+    );
+
+    // Explicit adoption changes the semantics, not the tier.
+    runtime
+        .send_observed(ClientCommand::SetPermissionProfile {
+            session_id: id.clone(),
+            mode: WirePermission::Assisted,
+            contract: Some(leveler_client_protocol::PermissionContract::V2),
+        })
+        .await
+        .unwrap();
+    let adopted = runtime.snapshot(&id).await.unwrap();
+    assert_eq!(adopted.mode, WirePermission::Assisted);
+    assert_eq!(
+        adopted.permission_contract,
+        leveler_client_protocol::PermissionContract::V2
+    );
+
+    // Adoption is durable.
+    drop(runtime);
+    drop(app);
+    let restarted = assemble_app(tmp.path());
+    let runtime = client(&restarted, PermissionProfile::Assisted);
+    let resumed = runtime.snapshot(&id).await.unwrap();
+    assert_eq!(resumed.mode, WirePermission::Assisted);
+    assert_eq!(
+        resumed.permission_contract,
+        leveler_client_protocol::PermissionContract::V2
     );
 }

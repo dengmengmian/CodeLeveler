@@ -177,6 +177,7 @@ async fn client_disconnect_does_not_cancel_and_explicit_cancel_fires_once() {
             goal: "long task".to_string(),
             model: None,
             mode: WirePermissionProfile::Assisted,
+            permission_contract: None,
         })
         .await
         .unwrap();
@@ -278,6 +279,7 @@ async fn session_scoped_subscription_never_sees_another_sessions_events() {
             goal: "session A".to_string(),
             model: None,
             mode: WirePermissionProfile::Assisted,
+            permission_contract: None,
         })
         .await
         .unwrap()
@@ -292,6 +294,7 @@ async fn session_scoped_subscription_never_sees_another_sessions_events() {
             goal: "session B".to_string(),
             model: None,
             mode: WirePermissionProfile::Assisted,
+            permission_contract: None,
         })
         .await
         .unwrap()
@@ -568,6 +571,7 @@ async fn a_child_that_exited_still_leaves_a_named_stoppable_blocker() {
             goal: "handoff blocker".into(),
             model: None,
             mode: WirePermissionProfile::Assisted,
+            permission_contract: None,
         })
         .await
         .expect("create session")
@@ -771,6 +775,7 @@ async fn registry_background_lifecycle_reaches_the_session_event_stream() {
             goal: "background lifecycle".into(),
             model: None,
             mode: WirePermissionProfile::Assisted,
+            permission_contract: None,
         })
         .await
         .expect("create session")
@@ -860,6 +865,7 @@ async fn cancel_background_task_command_stops_the_owned_task() {
             goal: "cancel background".into(),
             model: None,
             mode: WirePermissionProfile::Assisted,
+            permission_contract: None,
         })
         .await
         .expect("create session")
@@ -1024,6 +1030,7 @@ async fn background_task_output_reaches_the_session_event_stream() {
             goal: "live output".into(),
             model: None,
             mode: WirePermissionProfile::Assisted,
+            permission_contract: None,
         })
         .await
         .expect("create session")
@@ -1101,6 +1108,7 @@ async fn a_running_turn_holds_the_handover_open() {
             goal: "hold the turn open".to_string(),
             model: None,
             mode: WirePermissionProfile::Assisted,
+            permission_contract: None,
         })
         .await
         .unwrap();
@@ -1126,6 +1134,7 @@ async fn a_running_turn_holds_the_handover_open() {
             goal: "must not start during retirement".to_string(),
             model: None,
             mode: WirePermissionProfile::Assisted,
+            permission_contract: None,
         })
         .await
         .unwrap()
@@ -1300,6 +1309,7 @@ async fn active_work_blocks_idle_eviction() {
             goal: "hold the daemon".to_string(),
             model: None,
             mode: WirePermissionProfile::Assisted,
+            permission_contract: None,
         })
         .await
         .unwrap()
@@ -1517,6 +1527,7 @@ async fn retiring_health_names_the_running_turn_as_a_blocker() {
             goal: "name the blocker".to_string(),
             model: None,
             mode: WirePermissionProfile::Assisted,
+            permission_contract: None,
         })
         .await
         .unwrap();
@@ -1582,6 +1593,7 @@ async fn force_retire_ends_a_turn_that_plain_retirement_waits_for() {
             goal: "never finishes".to_string(),
             model: None,
             mode: WirePermissionProfile::Assisted,
+            permission_contract: None,
         })
         .await
         .unwrap();

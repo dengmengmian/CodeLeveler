@@ -148,7 +148,9 @@ max_results = 5
 timeout_ms = 15000
 ```
 
-在启动 CodeLeveler 前设置对应环境变量。只设置 Key、不添加 `[web.search]` 不会启用搜索。界面链接使用系统默认浏览器。
+可以在启动 CodeLeveler 前设置对应环境变量，也可以在本机 `~/.leveler/config.toml` 的 `[web.search]` 中写入 `api_key = "your-search-key"`。非空的 `api_key` 优先。如果省略 `api_key` 或只填空白，CodeLeveler 会读取 `api_key_env` 指定的变量。省略 `api_key_env` 时，DeepSeek 默认使用 `DEEPSEEK_API_KEY`，Tavily 默认使用 `LEVELER_SEARCH_API_KEY`。`[web.search]` 独立于对话供应商启用搜索。
+
+`leveler config show` 显示解析后的供应商、API 基础地址和凭据状态，Key 的值会隐藏。`leveler doctor` 提供 `config: web search` 检查项。在受限命令中，两者都会标明看到的是沙箱内的配置。界面链接使用系统默认浏览器。
 
 ## MCP 服务
 
@@ -233,3 +235,5 @@ X-API-Key = "DEVORDER_MCP_API_KEY"
 ## 排查问题
 
 先运行 `leveler doctor` 检查模型、终端和系统能力；`leveler trace` 查看会话记录。分享记录前请检查是否含有私密内容。
+
+同一模型轮内相互独立的 `web_fetch` / `web_search` 调用可以并发执行，最多同时有 3 个请求在途；结果仍按原始调用顺序返回。整个进程还有更外层的资源预算：所有会话合计最多 8 个请求在途，单会话最多 4 个，同一目标主机最多 4 个，同一搜索供应商最多 2 个并发请求且每秒最多发起 20 次。这些是运行时的资源上限，不是供应商配额；供应商自己的 429 仍是权威的额度信号。等待用户批准时不占用执行许可。若某次 Web 调用在执行前、资源排队或交付阶段等待超过阈值，日志会记录一行 `leveler::web_slow` 阶段摘要。设 `RUST_LOG=leveler_web_latency=debug` 可查看每次调用的完整阶段。

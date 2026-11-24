@@ -78,6 +78,7 @@
         "type": "approval"
       }
     ],
+    "permission_contract": "v1",
     "plan": null,
     "recaps": [],
     "repository": "/repo",

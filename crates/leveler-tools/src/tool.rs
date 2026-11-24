@@ -63,6 +63,10 @@ pub struct ToolContext {
     /// of holding the round for its whole bound. Only observation-only tools
     /// read it; a mutating call must never stop halfway because someone typed.
     pub yield_now: Option<CancellationToken>,
+    /// Network-budget waits observed for this call. The host stamps a fresh
+    /// recorder per web call; tools only record timing into it. `None` on
+    /// paths that do not report budget attribution.
+    pub network_trace: Option<Arc<crate::NetworkTrace>>,
 }
 
 /// Process-wide execution and write-safety infrastructure. Every handle is an
@@ -228,6 +232,18 @@ impl ToolPolicy {
         self.permission_profile.get()
     }
 
+    /// The complete live permission identity (contract + tier).
+    pub fn permission_state(&self) -> leveler_execution::PermissionState {
+        self.permission_profile.state()
+    }
+
+    /// The effective policy for the live identity. Admission reads this, not
+    /// the tier alone: v1 `assisted` and v2 `request_approval` are different
+    /// contracts that deliberately share the old-Auto implementation.
+    pub fn policy_kind(&self) -> leveler_execution::PolicyKind {
+        self.permission_profile.policy_kind()
+    }
+
     /// The live cell itself, for a host that owns the session's profile.
     pub fn permission_profile(&self) -> &SharedPermissionProfile {
         &self.permission_profile
@@ -276,7 +292,10 @@ impl ToolPolicy {
     /// denial or a profile that does not reach the network by default. Reads
     /// the live profile, so a switch lands on the next call.
     pub fn network_denied(&self) -> bool {
-        !matches!(self.network_scope(), NetworkScope::Internet)
+        !matches!(
+            self.network_scope(),
+            NetworkScope::Internet | NetworkScope::Any
+        )
     }
 
     /// The destination boundary, frozen by admission. Legacy `network_denied`
@@ -299,8 +318,15 @@ impl ToolPolicy {
         if self.unrestricted_execution() {
             return NetworkScope::Internet;
         }
-        if self.network_granted || self.mode().network_by_default() {
-            NetworkScope::Internet
+        if self.network_granted || self.policy_kind().network_by_default() {
+            // V2 Auto carries ordinary network authority, including
+            // private/LAN destinations. `Internet` is the legacy scope whose
+            // public-document SSRF exclusion still applies.
+            if self.policy_kind() == leveler_execution::PolicyKind::EffectAuto {
+                NetworkScope::Any
+            } else {
+                NetworkScope::Internet
+            }
         } else {
             NetworkScope::Loopback
         }
@@ -367,12 +393,12 @@ impl ToolPolicy {
             if self.has_zero_write_authority() {
                 return WriteScope::None;
             }
-            return match self.mode().write_scope(workspace_root) {
+            return match self.policy_kind().write_scope(workspace_root) {
                 WriteScope::Workspace { root } => WriteScope::WorkspaceWithGit { root },
                 scope => scope,
             };
         }
-        match self.mode().write_scope(workspace_root) {
+        match self.policy_kind().write_scope(workspace_root) {
             WriteScope::Workspace { .. } if self.has_zero_write_authority() => WriteScope::None,
             scope => scope,
         }
@@ -513,6 +539,7 @@ impl ToolContext {
             command_lease: None,
             output: None,
             yield_now: None,
+            network_trace: None,
         }
     }
 
@@ -631,8 +658,8 @@ impl ToolContext {
         }
         if leveler_definition_trust::is_runtime_control_path(&home, &absolute) {
             return Some(format!(
-                "`{path}` is the runtime control namespace, a security control. File \
-                 tools cannot write or replace its socket, lock or credential."
+                "`{path}` is or contains the runtime control namespace, a security control. \
+                 File tools cannot write or replace its socket, lock or credential."
             ));
         }
         if same_path(&absolute, &leveler_execution::trust_store_path(&home)) {
@@ -669,8 +696,9 @@ impl ToolContext {
         };
         if leveler_definition_trust::is_runtime_control_path(&home, &absolute) {
             return Some(format!(
-                "`{path}` is the runtime control namespace. Reading it would expose the \
-                 trusted-local daemon credential; file tools cannot read this path."
+                "`{path}` is or contains the runtime control namespace. \
+                 Reading it recursively could expose the trusted-local daemon credential; \
+                 file tools cannot read this path."
             ));
         }
         None
@@ -1056,6 +1084,24 @@ pub enum ToolError {
     Io(String),
 }
 
+/// How a registered tool may share its model round with other calls.
+///
+/// The class is a mechanical property of the tool's declaration, read by the
+/// executor. It never depends on the model's words, the arguments or the
+/// configured provider limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParallelClass {
+    /// Runs in call order; the next call starts only after this one returns.
+    Serial,
+    /// Pure local read: may overlap other reads; admission is durable only as
+    /// far as the shared announcement barrier, because there is no external
+    /// effect to lose.
+    ReadOnly,
+    /// An external request: admitted serially and durably, then allowed to
+    /// overlap other network calls under the runtime's network bound.
+    Network,
+}
+
 /// A tool the model can call. Implementations must be stateless (or internally
 /// synchronized) since one instance is shared across the process.
 #[async_trait]
@@ -1100,6 +1146,13 @@ pub trait Tool: Send + Sync {
 
     /// The risk class of this tool.
     fn risk(&self) -> RiskLevel;
+
+    /// Typed MCP annotations, when this tool is an MCP proxy. Only
+    /// `destructive_hint` may raise friction in the effect-oriented Auto; a
+    /// server cannot lower a boundary by omitting or falsifying it.
+    fn mcp_annotations(&self) -> Option<leveler_execution::McpAnnotations> {
+        None
+    }
 
     /// Mechanical preflight for an action that needs explicit consent in Auto.
     /// It is evaluated only at admission; an approved call bypasses the guard.
@@ -1160,6 +1213,25 @@ pub trait Tool: Send + Sync {
     /// commands, plan updates, checkpoints — MUST leave this `false` so the
     /// executor keeps running it in order.
     fn supports_parallel(&self) -> bool {
+        false
+    }
+
+    /// Whether this tool may overlap other independent calls from the same
+    /// round even though it performs an external network request.
+    ///
+    /// This is deliberately separate from [`Self::supports_parallel`]. That
+    /// declaration says "no write, no process, no external call", which is
+    /// what lets admission skip its second durable barrier. A web request has
+    /// an external effect (it leaves the process, can consume a quota and can
+    /// be billed), so its admission record — including the approval that
+    /// authorized it — must be durable before the request is sent. Its overlap
+    /// is bounded by the runtime's network limit, not just the local batch
+    /// width.
+    ///
+    /// A tool that returns `true` must be safe to overlap with other calls of
+    /// the same class: no workspace mutation, no shared mutable state, its own
+    /// cancellation and timeout, and a result keyed by `tool_call_id`.
+    fn supports_network_parallel(&self) -> bool {
         false
     }
 
@@ -1273,6 +1345,47 @@ mod write_scope_tests {
         assert_eq!(c.write_scope(), WriteScope::Unrestricted);
     }
 
+    /// V2 request-approval is the old Auto (workspace fence); V2 assisted is
+    /// the effect-oriented Auto (no fence). The tier name alone is ambiguous,
+    /// so this table passes the contract.
+    #[test]
+    fn the_v2_tiers_map_to_the_intended_write_boundary() {
+        use leveler_execution::{PermissionContract, SharedPermissionProfile};
+        let (c, _d) = ctx(PermissionProfile::Assisted);
+        let root = c.require_workspace().unwrap().root().to_path_buf();
+        let effect = c
+            .clone()
+            .with_permission_profile(SharedPermissionProfile::new_with_contract(
+                PermissionContract::V2,
+                PermissionProfile::Assisted,
+            ));
+        assert_eq!(effect.write_scope(), WriteScope::Unrestricted);
+
+        let first_tier = c.with_permission_profile(SharedPermissionProfile::new_with_contract(
+            PermissionContract::V2,
+            PermissionProfile::RequestApproval,
+        ));
+        assert_eq!(first_tier.write_scope(), WriteScope::Workspace { root });
+    }
+
+    /// Ownership narrows even the effect-oriented Auto: a delegated claim is
+    /// still a fence. The profile preset is read only after this narrowing.
+    #[test]
+    fn a_claim_narrows_the_effect_auto_write_scope() {
+        use leveler_execution::{PermissionContract, SharedPermissionProfile};
+        let (c, _d) = ctx(PermissionProfile::Assisted);
+        let c = c
+            .with_permission_profile(SharedPermissionProfile::new_with_contract(
+                PermissionContract::V2,
+                PermissionProfile::Assisted,
+            ))
+            .with_command_write_constraints(Some(vec!["src".to_string()]), None, Vec::new());
+        assert!(matches!(
+            c.write_scope(),
+            WriteScope::ScopedWorkspace { .. }
+        ));
+    }
+
     /// The network half of the profile: request-approval runs commands with
     /// the network denied until a grant; the others allow. An explicit
     /// `--deny-network` is a run-level restriction the user typed, so it
@@ -1384,6 +1497,38 @@ mod write_scope_tests {
         );
     }
 
+    /// V2 Auto's ordinary network authority includes private/LAN reachability,
+    /// so it reads as [`NetworkScope::Any`]. The legacy Auto scope keeps the
+    /// public-document SSRF exclusion (`Internet`), and an explicit run-level
+    /// denial still wins over both.
+    #[test]
+    fn effect_auto_reads_ordinary_network_authority_as_any() {
+        use leveler_execution::{
+            NetworkScope, PermissionContract, PermissionProfile, SharedPermissionProfile,
+        };
+        let (c, _d) = ctx(PermissionProfile::Assisted);
+        assert_eq!(
+            c.policy.network_scope(),
+            NetworkScope::Internet,
+            "a V1 session keeps the legacy Auto scope"
+        );
+
+        let c = c.with_permission_profile(SharedPermissionProfile::new_with_contract(
+            PermissionContract::V2,
+            PermissionProfile::Assisted,
+        ));
+        assert_eq!(
+            c.policy.network_scope(),
+            NetworkScope::Any,
+            "V2 Auto reaches ordinary private/LAN destinations"
+        );
+        assert!(!c.policy.network_denied());
+
+        let denied = c.with_sandbox(true);
+        assert_eq!(denied.policy.network_scope(), NetworkScope::None);
+        assert!(denied.policy.network_denied());
+    }
+
     /// A standing rule is not a resource grant: the admitted call keeps the
     /// profile's write and destination boundaries.
     #[test]
@@ -1401,5 +1546,50 @@ mod write_scope_tests {
             leveler_execution::NetworkScope::Loopback
         );
         assert_eq!(c.write_scope(), WriteScope::Workspace { root });
+    }
+}
+
+#[cfg(test)]
+mod control_path_tests {
+    use super::*;
+    use leveler_execution::PermissionProfile;
+
+    fn context_with_home(home: &std::path::Path) -> ToolContext {
+        let env = Arc::new(leveler_core::EnvSnapshot::new(
+            [(
+                std::ffi::OsString::from("LEVELER_HOME"),
+                home.as_os_str().to_os_string(),
+            )],
+            std::path::PathBuf::new(),
+            std::env::temp_dir(),
+        ));
+        ToolContext::without_workspace_with_environment(PermissionProfile::Assisted, env)
+    }
+
+    #[test]
+    fn an_ancestor_of_the_control_directory_says_it_contains_the_namespace() {
+        let root = tempfile::tempdir().unwrap();
+        let context = context_with_home(&root.path().join(".leveler"));
+        let reason = context
+            .security_control_read_denied(&root.path().to_string_lossy())
+            .expect("an ancestor of the control directory is denied");
+        assert!(
+            reason.contains("contains"),
+            "an ancestor contains the namespace; the refusal must not claim the \
+             directory itself is the credential store: {reason}"
+        );
+    }
+
+    #[test]
+    fn the_control_directory_itself_is_still_denied() {
+        let root = tempfile::tempdir().unwrap();
+        let context = context_with_home(&root.path().join(".leveler"));
+        assert!(
+            context
+                .security_control_read_denied(
+                    &root.path().join(".leveler/run/sockets").to_string_lossy()
+                )
+                .is_some()
+        );
     }
 }

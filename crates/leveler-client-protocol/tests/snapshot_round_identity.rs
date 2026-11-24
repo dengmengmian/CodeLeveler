@@ -7,7 +7,8 @@
 //! restores the real execution round.
 
 use leveler_client_protocol::{
-    PermissionProfile, RuntimeEvent, SessionId, ToolCallId, UiActiveToolCall, UiSessionSnapshot,
+    PermissionContract, PermissionProfile, RuntimeEvent, SessionId, ToolCallId, UiActiveToolCall,
+    UiSessionSnapshot,
 };
 
 /// The pre-`model_step` shape, exactly as an old runtime wrote it.
@@ -90,6 +91,7 @@ fn a_session_snapshot_carries_the_rounds_of_its_running_calls() {
         title: None,
         model: None,
         mode: PermissionProfile::Assisted,
+        permission_contract: PermissionContract::V1,
         branch: None,
         status: "running".into(),
         finalization_stage: None,

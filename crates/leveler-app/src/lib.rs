@@ -1072,20 +1072,46 @@ impl Application {
     fn permission_profile_for(
         &self,
         scope: Option<&str>,
+        contract: leveler_execution::PermissionContract,
         mode: PermissionProfile,
     ) -> leveler_execution::SharedPermissionProfile {
         let Some(scope) = scope else {
             // No session identity (eval, one-shot CLI): nobody can change the
             // profile mid-run, so a private cell is the whole truth.
-            return leveler_execution::SharedPermissionProfile::new(mode);
+            return leveler_execution::SharedPermissionProfile::new_with_contract(contract, mode);
         };
         let mut map = self
             .permission_profiles
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.entry(scope.to_string())
-            .or_insert_with(|| leveler_execution::SharedPermissionProfile::new(mode))
+            .or_insert_with(|| {
+                leveler_execution::SharedPermissionProfile::new_with_contract(contract, mode)
+            })
             .clone()
+    }
+
+    /// The contract persisted for a session. An absent/unreadable row is the
+    /// legacy contract: a caller that cannot establish V2 must not get it.
+    async fn session_permission_contract(
+        &self,
+        scope: Option<&str>,
+    ) -> leveler_execution::PermissionContract {
+        let Some(scope) = scope else {
+            return leveler_execution::PermissionContract::V1;
+        };
+        let Ok(db) = self.open_database().await else {
+            return leveler_execution::PermissionContract::V1;
+        };
+        let snapshot = leveler_storage::SessionRepository::new(&db)
+            .settings_snapshot(&leveler_core::SessionId::new(scope))
+            .await
+            .ok()
+            .flatten();
+        match snapshot.map(|settings| settings.permission_contract) {
+            Some(2) => leveler_execution::PermissionContract::V2,
+            _ => leveler_execution::PermissionContract::V1,
+        }
     }
 
     /// Apply a permission change to a session's RUNNING execution.
@@ -1101,6 +1127,35 @@ impl Application {
         let live = match map.get(scope) {
             Some(profile) => {
                 profile.set(mode);
+                true
+            }
+            None => false,
+        };
+        drop(map);
+        if let Some(session) = self.definition_trust_session(scope) {
+            session.set_full_adoption(mode == PermissionProfile::FullAccess);
+        }
+        live
+    }
+
+    /// Apply a tier change AND a contract adoption as one live fact.
+    ///
+    /// Used by the explicit V2 adoption path. `set_live_permission_profile`
+    /// remains the tier-only operation: it deliberately preserves the stored
+    /// contract.
+    pub fn set_live_permission_state(
+        &self,
+        scope: &str,
+        contract: leveler_execution::PermissionContract,
+        mode: PermissionProfile,
+    ) -> bool {
+        let map = self
+            .permission_profiles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let live = match map.get(scope) {
+            Some(profile) => {
+                profile.set_state(leveler_execution::PermissionState::new(contract, mode));
                 true
             }
             None => false,
@@ -1851,7 +1906,8 @@ impl Application {
         // live cell, not the value captured here: a user who switches profile
         // while this turn runs must be obeyed by it and by every agent it has
         // already delegated to, at their next authorization decision.
-        let live_profile = self.permission_profile_for(session_scope, mode);
+        let session_contract = self.session_permission_contract(session_scope).await;
+        let live_profile = self.permission_profile_for(session_scope, session_contract, mode);
         let live_mode = live_profile.get();
         let tool_context = tool_context.with_permission_profile(live_profile);
         let tool_context = match session_scope {
@@ -2380,10 +2436,13 @@ fn resolve_search_provider(
     environment: &leveler_core::EnvSnapshot,
 ) -> Option<Arc<dyn SearchProvider>> {
     let settings = settings?;
-    let key = environment
-        .var(&settings.api_key_env)
-        .map(|key| key.trim().to_string())
-        .filter(|key| !key.is_empty());
+    let configured_key = settings.configured_api_key();
+    let key = configured_key.map(str::to_owned).or_else(|| {
+        environment
+            .var(&settings.api_key_env)
+            .map(|key| key.trim().to_string())
+            .filter(|key| !key.is_empty())
+    });
     let Some(key) = key else {
         tracing::warn!(
             provider = settings.provider.as_str(),
@@ -2393,6 +2452,9 @@ fn resolve_search_provider(
         );
         return None;
     };
+    let credential_env = configured_key
+        .is_none()
+        .then_some(settings.api_key_env.as_str());
     let resolved = match settings.provider {
         SearchProviderKind::DeepSeek => DeepSeekSearchProvider::new(
             key,
@@ -2400,14 +2462,24 @@ fn resolve_search_provider(
             settings.max_results,
             settings.timeout,
         )
-        .map(|provider| Arc::new(provider) as Arc<dyn SearchProvider>),
+        .map(|provider| {
+            Arc::new(match credential_env {
+                Some(env) => provider.with_credential_env(env),
+                None => provider,
+            }) as Arc<dyn SearchProvider>
+        }),
         SearchProviderKind::Tavily => TavilySearchProvider::new(
             key,
             settings.base_url.as_deref(),
             settings.max_results,
             settings.timeout,
         )
-        .map(|provider| Arc::new(provider) as Arc<dyn SearchProvider>),
+        .map(|provider| {
+            Arc::new(match credential_env {
+                Some(env) => provider.with_credential_env(env),
+                None => provider,
+            }) as Arc<dyn SearchProvider>
+        }),
     };
     match resolved {
         Ok(provider) => Some(provider),
@@ -2600,6 +2672,7 @@ mod merge_tests {
         let settings = WebSearchSettings {
             provider: SearchProviderKind::DeepSeek,
             api_key_env: "DEEPSEEK_API_KEY".into(),
+            api_key: None,
             base_url: None,
             max_results: 5,
             timeout: std::time::Duration::from_secs(15),
@@ -2622,6 +2695,7 @@ mod merge_tests {
         let settings = WebSearchSettings {
             provider: SearchProviderKind::DeepSeek,
             api_key_env: "DEEPSEEK_API_KEY".into(),
+            api_key: None,
             base_url: None,
             max_results: 5,
             timeout: std::time::Duration::from_secs(15),
@@ -2640,6 +2714,7 @@ mod merge_tests {
         let settings = WebSearchSettings {
             provider: SearchProviderKind::Tavily,
             api_key_env: "LEVELER_SEARCH_API_KEY".into(),
+            api_key: None,
             base_url: None,
             max_results: 5,
             timeout: std::time::Duration::from_secs(15),
@@ -2655,6 +2730,7 @@ mod merge_tests {
         let settings = WebSearchSettings {
             provider: SearchProviderKind::DeepSeek,
             api_key_env: "DEEPSEEK_API_KEY".into(),
+            api_key: None,
             base_url: None,
             max_results: 5,
             timeout: std::time::Duration::from_secs(15),

@@ -1693,6 +1693,7 @@ async fn create_session(
             goal: definition.session_goal(),
             model: definition.model.clone(),
             mode: definition.mode,
+            permission_contract: Some(definition.permission_contract),
             approval_policy,
             collaboration: CollaborationMode::Chat,
         })

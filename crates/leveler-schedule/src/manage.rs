@@ -177,6 +177,7 @@ impl ScheduleManager {
             .store
             .create_definition(NewScheduleDefinition {
                 name: draft.name,
+                permission_contract: leveler_client_protocol::PermissionContract::V2,
                 workspace: PathBuf::from(draft.workspace),
                 action: action_from_wire(draft.action)?,
                 trigger: trigger_from_wire(draft.trigger)?,
@@ -249,6 +250,7 @@ impl ScheduleManager {
         };
         let update = DefinitionUpdate {
             name: patch.name.unwrap_or_else(|| existing.name.clone()),
+            permission_contract: existing.permission_contract,
             workspace: patch
                 .workspace
                 .map(PathBuf::from)
@@ -384,6 +386,7 @@ impl ScheduleManager {
         let definition = self.load(&id).await?;
         let update = DefinitionUpdate {
             name: definition.name.clone(),
+            permission_contract: definition.permission_contract,
             workspace: definition.workspace.clone(),
             action: definition.action.clone(),
             trigger: definition.trigger.clone(),

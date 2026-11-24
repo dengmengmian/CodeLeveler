@@ -33,9 +33,10 @@ use leveler_runtime_host::{
 
 use crate::cli::{OutputFormat, RunMode};
 use crate::common::{
-    build_approver, map_mode, project_default_mode, resolve_mode, resolve_model,
-    resolve_model_with_notice, resolve_optional_model_with_notice, spawn_interrupt_handler,
-    wire_mode,
+    build_approver, map_mode, parse_contract_flag, project_default_mode,
+    project_permission_default, protocol_mode_to_runtime, resolve_contract, resolve_mode,
+    resolve_model, resolve_model_with_notice, resolve_optional_model_with_notice,
+    spawn_interrupt_handler, wire_mode,
 };
 use crate::output::Line;
 use crate::render::{emit_jsonl, render_event};
@@ -46,6 +47,7 @@ pub(crate) async fn cmd_run(
     task: String,
     model: Option<String>,
     mode: Option<RunMode>,
+    permission_contract: Option<String>,
     auto_approve: bool,
     output: OutputFormat,
     ship: leveler_app::ShipOptions,
@@ -61,10 +63,21 @@ pub(crate) async fn cmd_run(
         app = app.with_execution_overrides(overrides);
     }
     let model_ref = resolve_model(&app, model)?;
-    let execution_mode = resolve_mode(mode, project_default_mode(&app.layout));
+    let (default_mode, default_contract) = project_permission_default(&app.layout);
+    let execution_mode = resolve_mode(mode, default_mode);
+    let execution_contract = resolve_contract(
+        parse_contract_flag(permission_contract.as_deref())?,
+        default_contract,
+    );
 
     let session_id = app
-        .create_session_with_mode(&model_ref, &task, execution_mode)
+        .create_session_with_permission_state(
+            &model_ref,
+            &task,
+            execution_contract,
+            execution_mode,
+            collaboration,
+        )
         .await?;
 
     if output == OutputFormat::Text {
@@ -1045,6 +1058,7 @@ fn interactive_session_collaboration() -> leveler_local_transport::Collaboration
 fn interactive_session_request(
     model: Option<leveler_client_protocol::ModelRef>,
     mode: leveler_client_protocol::PermissionProfile,
+    permission_contract: Option<leveler_client_protocol::PermissionContract>,
     auto_approve: bool,
 ) -> CreateSessionRequest {
     CreateSessionRequest {
@@ -1054,6 +1068,7 @@ fn interactive_session_request(
         goal: "interactive session".to_string(),
         model,
         mode,
+        permission_contract,
         // `--auto-approve` becomes this session's policy; the daemon runs the
         // turn and it survives this client disconnecting.
         approval_policy: if auto_approve {
@@ -1071,6 +1086,7 @@ pub(crate) async fn cmd_tui(
     layout: Layout,
     model: Option<String>,
     mode: Option<RunMode>,
+    permission_contract: Option<String>,
     auto_approve: bool,
     in_process: bool,
     socket: Option<PathBuf>,
@@ -1173,16 +1189,19 @@ pub(crate) async fn cmd_tui(
             // An explicit `--permission` overrides the persisted mode; absence
             // keeps it. The command persists AND moves the live cell, so the
             // UI, the row and the running turn cannot disagree.
+            let adopt = parse_contract_flag(permission_contract.as_deref())?;
             if let Some(explicit) = mode {
                 let requested = map_mode(explicit);
-                if requested.as_str() != snap.mode.as_str() {
+                if requested.as_str() != snap.mode.as_str() || adopt.is_some() {
                     // A session setting is snapshot-versioned: the daemon
                     // rejects a raw `send`, so deliver it with the version the
-                    // snapshot above actually observed.
+                    // snapshot above actually observed. A contract adoption is
+                    // one write with the tier it was chosen under.
                     crate::common::deliver_permission_change(
                         client.as_ref(),
                         &session_id,
                         requested,
+                        adopt.map(crate::common::wire_contract),
                         snap.last_sequence.unwrap_or(0),
                     )
                     .await
@@ -1190,6 +1209,16 @@ pub(crate) async fn cmd_tui(
                         anyhow::anyhow!("cannot apply --permission to session {id}: {e}")
                     })?;
                 }
+            } else if let Some(contract) = adopt {
+                crate::common::deliver_permission_change(
+                    client.as_ref(),
+                    &session_id,
+                    protocol_mode_to_runtime(snap.mode),
+                    Some(crate::common::wire_contract(contract)),
+                    snap.last_sequence.unwrap_or(0),
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("cannot adopt V2 on session {id}: {e}"))?;
             }
             // The daemon path has no model registry of its own and the
             // snapshot carries the model's name but not its limits, so the
@@ -1215,10 +1244,16 @@ pub(crate) async fn cmd_tui(
             if let Some(hint) = resumable_session_hint(&layout).await {
                 eprintln!("{hint}");
             }
+            let (default_mode, default_contract) = project_permission_default(&layout);
+            let new_contract = resolve_contract(
+                parse_contract_flag(permission_contract.as_deref())?,
+                default_contract,
+            );
             let bootstrap = client
                 .create_session(interactive_session_request(
                     model,
-                    wire_mode(resolve_mode(mode, project_default_mode(&layout))),
+                    wire_mode(resolve_mode(mode, default_mode)),
+                    Some(crate::common::wire_contract(new_contract)),
                     auto_approve,
                 ))
                 .await?;
@@ -1584,6 +1619,7 @@ pub(crate) async fn cmd_resume(
         layout,
         None,
         None,
+        None,
         false,
         false,
         None,
@@ -1667,6 +1703,7 @@ pub(crate) async fn cmd_run_resume(
     id: String,
     instruction: Option<String>,
     mode: Option<RunMode>,
+    permission_contract: Option<String>,
     auto_approve: bool,
     confirm_recovery: bool,
     output: OutputFormat,
@@ -1692,6 +1729,14 @@ pub(crate) async fn cmd_run_resume(
     // and any later snapshot all agree. Absence keeps the persisted mode.
     if let Some(explicit) = mode {
         app.set_persisted_permission_profile(&session_id, map_mode(explicit))
+            .await?;
+    }
+    if let Some(contract) = parse_contract_flag(permission_contract.as_deref())? {
+        let current = app
+            .persisted_permission_profile(&session_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("session {id} has no persisted permission mode"))?;
+        app.set_persisted_permission_state(&session_id, contract, current)
             .await?;
     }
 
@@ -2865,6 +2910,51 @@ fn context_trace_override(
     }))
 }
 
+/// EVAL ONLY: `LEVELER_EVAL_MAX_PARALLEL_TOOLS` sets the executor's resolved
+/// batch width so one binary can measure the serial control (1) against
+/// bounded arms (2, 3) on identical source and fixtures. This is the runtime
+/// execution width, NOT the model's declared `max_parallel_tool_calls`: it
+/// bounds calls the model has already emitted. Unset leaves production at the
+/// role-resolved default.
+const MAX_PARALLEL_TOOLS_ENV: &str = "LEVELER_EVAL_MAX_PARALLEL_TOOLS";
+
+fn max_parallel_tools_override(
+    raw: Option<String>,
+) -> anyhow::Result<Option<leveler_agent::coding::ExecutionOverrides>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let width: usize = raw.parse().map_err(|_| {
+        anyhow::anyhow!("{MAX_PARALLEL_TOOLS_ENV}: expected a positive integer, got {raw:?}")
+    })?;
+    if width == 0 {
+        anyhow::bail!("{MAX_PARALLEL_TOOLS_ENV}: 0 would mean unbounded; use 1 or more");
+    }
+    Ok(Some(leveler_agent::coding::ExecutionOverrides {
+        max_parallel_tools: Some(width),
+        ..Default::default()
+    }))
+}
+
+#[cfg(test)]
+mod max_parallel_tools_override_tests {
+    use super::*;
+
+    #[test]
+    fn unset_is_none_and_only_positive_widths_are_accepted() {
+        assert!(max_parallel_tools_override(None).unwrap().is_none());
+        let overrides = max_parallel_tools_override(Some("2".into()))
+            .unwrap()
+            .expect("a width produces an override");
+        assert_eq!(overrides.max_parallel_tools, Some(2));
+        assert!(
+            max_parallel_tools_override(Some("0".into())).is_err(),
+            "0 would mean unbounded; the measurement arm must name a bound"
+        );
+        assert!(max_parallel_tools_override(Some("nope".into())).is_err());
+    }
+}
+
 /// Read every eval-only override seam and fold them into ONE override set for
 /// `with_execution_overrides` (which replaces, so the seams must be merged
 /// here rather than applied one after another). `None` when no seam is set.
@@ -2891,6 +2981,10 @@ fn eval_env_overrides() -> anyhow::Result<Option<leveler_agent::coding::Executio
     }
     if let Some(o) = context_trace_override(std::env::var(CONTEXT_TRACE_ENV).ok())? {
         merged.context_trace = o.context_trace;
+        any = true;
+    }
+    if let Some(o) = max_parallel_tools_override(std::env::var(MAX_PARALLEL_TOOLS_ENV).ok())? {
+        merged.max_parallel_tools = o.max_parallel_tools;
         any = true;
     }
     Ok(any.then_some(merged))
@@ -3459,6 +3553,7 @@ mod interactive_bootstrap_tests {
         let request = interactive_session_request(
             None,
             leveler_client_protocol::PermissionProfile::Assisted,
+            None,
             false,
         );
         assert_eq!(
@@ -3491,6 +3586,7 @@ mod interactive_bootstrap_tests {
         let from_the_daemon_request = interactive_session_request(
             None,
             leveler_client_protocol::PermissionProfile::Assisted,
+            None,
             false,
         )
         .collaboration;
@@ -3513,6 +3609,7 @@ mod interactive_bootstrap_tests {
         let request = interactive_session_request(
             Some(leveler_client_protocol::ModelRef::parse("deepseek/v3").unwrap()),
             leveler_client_protocol::PermissionProfile::FullAccess,
+            None,
             true,
         );
         assert_eq!(

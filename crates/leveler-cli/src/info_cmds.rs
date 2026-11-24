@@ -130,6 +130,18 @@ fn exit_for(findings: &[DiagnosticFinding]) -> std::process::ExitCode {
 
 pub(crate) fn cmd_config_show(layout: Layout) -> anyhow::Result<std::process::ExitCode> {
     let config = Application::load_config(&layout)?;
+    // A confined command's LEVELER_HOME is an isolated scratch home, not the
+    // operator's runtime home. Say so instead of presenting the empty sandbox
+    // copy as the resolved host configuration.
+    let sandbox_home = std::env::var_os("LEVELER_SANDBOX_HOME").is_some();
+    if sandbox_home {
+        println!(
+            "{}",
+            Line::warn(
+                "Sandbox home: this CLI is running inside a confined command. Host runtime configuration is not visible."
+            )
+        );
+    }
     println!("{}", Line::heading("Providers"));
     for p in &config.providers {
         println!(
@@ -143,6 +155,33 @@ pub(crate) fn cmd_config_show(layout: Layout) -> anyhow::Result<std::process::Ex
             "  {}/{}  -> model_id={}",
             m.profile.provider, m.profile.id, m.profile.model_id
         );
+    }
+    println!("\n{}", Line::heading("Web Search"));
+    match &config.web_search {
+        Some(search) => {
+            println!("  provider: {}", search.provider.as_str());
+            println!(
+                "  base_url: {}",
+                search.base_url.as_deref().unwrap_or("(provider default)")
+            );
+            if search.has_configured_api_key() {
+                println!("  api_key: configured (value hidden)");
+            } else {
+                let key_state = if sandbox_home {
+                    "not visible from the sandbox home"
+                } else if std::env::var(&search.api_key_env)
+                    .ok()
+                    .is_some_and(|value| !value.trim().is_empty())
+                {
+                    "set"
+                } else {
+                    "not set"
+                };
+                println!("  api_key_env: ${} ({key_state})", search.api_key_env);
+            }
+        }
+        None if sandbox_home => println!("  not visible from the sandbox home"),
+        None => println!("  disabled — add [web.search] in ~/.leveler/config.toml"),
     }
     println!("\n{}", Line::heading("VCS"));
     println!(

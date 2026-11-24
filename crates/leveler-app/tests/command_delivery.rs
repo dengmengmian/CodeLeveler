@@ -254,6 +254,7 @@ async fn permission_switch_accepts_answer_progress_after_observed_snapshot() {
             command: ClientCommand::SetPermissionProfile {
                 session_id: session.clone(),
                 mode: WirePermissionProfile::FullAccess,
+                contract: None,
             },
         })
         .await
@@ -766,6 +767,7 @@ async fn auto_approve_is_per_session_and_restore_is_fail_closed_body() {
             goal: "unattended".to_string(),
             model: None,
             mode: WirePermissionProfile::Assisted,
+            permission_contract: None,
         })
         .await
         .unwrap();
@@ -833,6 +835,7 @@ async fn transport_trust_controls_real_session_approval_policy_body() {
         goal: "transport approval contract".to_string(),
         model: None,
         mode: WirePermissionProfile::FullAccess,
+        permission_contract: None,
     };
     let created = trusted.create_session(request()).await.unwrap();
     assert_eq!(
@@ -897,6 +900,7 @@ async fn daemon_session_runtime_options_are_isolated_per_session_body() {
             goal: "first".to_string(),
             model: None,
             mode: WirePermissionProfile::RequestApproval,
+            permission_contract: None,
         })
         .await
         .unwrap();
@@ -909,6 +913,7 @@ async fn daemon_session_runtime_options_are_isolated_per_session_body() {
             goal: "second".to_string(),
             model: None,
             mode: WirePermissionProfile::FullAccess,
+            permission_contract: None,
         })
         .await
         .unwrap();
@@ -969,6 +974,7 @@ async fn creating_a_daemon_session_does_not_reap_another_live_turn_body() {
             goal: "another session".to_string(),
             model: None,
             mode: WirePermissionProfile::Assisted,
+            permission_contract: None,
         })
         .await
         .unwrap();
@@ -1001,6 +1007,7 @@ async fn daemon_snapshots_keep_checkpoints_scoped_to_their_session_body() {
             goal: "first".to_string(),
             model: None,
             mode: WirePermissionProfile::Assisted,
+            permission_contract: None,
         })
         .await
         .unwrap();
@@ -1013,6 +1020,7 @@ async fn daemon_snapshots_keep_checkpoints_scoped_to_their_session_body() {
             goal: "second".to_string(),
             model: None,
             mode: WirePermissionProfile::Assisted,
+            permission_contract: None,
         })
         .await
         .unwrap();
@@ -1064,6 +1072,7 @@ async fn daemon_event_subscriptions_are_isolated_per_session_body() {
             goal: "first".to_string(),
             model: None,
             mode: WirePermissionProfile::RequestApproval,
+            permission_contract: None,
         })
         .await
         .unwrap();
@@ -1076,6 +1085,7 @@ async fn daemon_event_subscriptions_are_isolated_per_session_body() {
             goal: "second".to_string(),
             model: None,
             mode: WirePermissionProfile::RequestApproval,
+            permission_contract: None,
         })
         .await
         .unwrap();
@@ -1086,6 +1096,7 @@ async fn daemon_event_subscriptions_are_isolated_per_session_body() {
         .send_observed(ClientCommand::SetPermissionProfile {
             session_id: first.session.id.clone(),
             mode: WirePermissionProfile::FullAccess,
+            contract: None,
         })
         .await
         .unwrap();
@@ -1128,6 +1139,7 @@ async fn socket_clients_receive_only_their_session_events_body() {
             goal: "first over socket".to_string(),
             model: None,
             mode: WirePermissionProfile::RequestApproval,
+            permission_contract: None,
         })
         .await
         .unwrap();
@@ -1140,6 +1152,7 @@ async fn socket_clients_receive_only_their_session_events_body() {
             goal: "second over socket".to_string(),
             model: None,
             mode: WirePermissionProfile::RequestApproval,
+            permission_contract: None,
         })
         .await
         .unwrap();
@@ -1150,6 +1163,7 @@ async fn socket_clients_receive_only_their_session_events_body() {
         .send_observed(ClientCommand::SetPermissionProfile {
             session_id: first.session.id,
             mode: WirePermissionProfile::FullAccess,
+            contract: None,
         })
         .await
         .unwrap();
@@ -1325,6 +1339,7 @@ async fn first_message_retitles_a_placeholder_session_body() {
             goal: "interactive session".to_string(),
             model: None,
             mode: WirePermissionProfile::Assisted,
+            permission_contract: None,
         })
         .await
         .unwrap();
@@ -1366,6 +1381,7 @@ async fn first_message_retitles_a_placeholder_session_body() {
             goal: "已有正式目标".to_string(),
             model: None,
             mode: WirePermissionProfile::Assisted,
+            permission_contract: None,
         })
         .await
         .unwrap();
@@ -1668,6 +1684,7 @@ async fn a_new_session_reaches_only_the_tab_that_asked_for_it_body() {
             goal: "onlooker".to_string(),
             model: None,
             mode: WirePermissionProfile::Assisted,
+            permission_contract: None,
         })
         .await
         .unwrap();
@@ -1680,6 +1697,7 @@ async fn a_new_session_reaches_only_the_tab_that_asked_for_it_body() {
             goal: "requester".to_string(),
             model: None,
             mode: WirePermissionProfile::Assisted,
+            permission_contract: None,
         })
         .await
         .unwrap();
@@ -1757,6 +1775,7 @@ async fn resume_reasserts_the_sessions_auto_approve_policy_on_a_fresh_runtime_bo
             goal: "bystander".to_string(),
             model: None,
             mode: WirePermissionProfile::Assisted,
+            permission_contract: None,
         })
         .await
         .unwrap();
@@ -1817,6 +1836,7 @@ async fn a_restored_checkpoint_says_where_it_landed_body() {
             goal: "restore".to_string(),
             model: None,
             mode: WirePermissionProfile::Assisted,
+            permission_contract: None,
         })
         .await
         .unwrap();
@@ -1880,6 +1900,7 @@ async fn a_forked_session_tells_the_session_it_was_forked_from_body() {
             goal: "fork me".to_string(),
             model: None,
             mode: WirePermissionProfile::Assisted,
+            permission_contract: None,
         })
         .await
         .unwrap();
@@ -1924,6 +1945,7 @@ async fn no_workspace_session_persists_none_and_cannot_start_a_user_shell() {
                 goal: "polish this sentence".into(),
                 model: None,
                 mode: WirePermissionProfile::Assisted,
+                permission_contract: None,
                 approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             })
             .await
@@ -2058,6 +2080,7 @@ async fn a_repository_source_refuses_explicit_no_workspace_creation() {
             goal: "must not inherit repository".into(),
             model: None,
             mode: WirePermissionProfile::FullAccess,
+            permission_contract: None,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
         })
         .await;
@@ -2072,6 +2095,7 @@ async fn a_repository_source_refuses_explicit_no_workspace_creation() {
             goal: "legacy repository task".into(),
             model: None,
             mode: WirePermissionProfile::Assisted,
+            permission_contract: None,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
         })
         .await
@@ -2477,6 +2501,7 @@ async fn checkpoint_restore_keeps_one_conversation_through_resync_and_resume() {
             goal: "restore history".into(),
             model: None,
             mode: WirePermissionProfile::Assisted,
+            permission_contract: None,
         })
         .await
         .unwrap();

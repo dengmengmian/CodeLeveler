@@ -305,6 +305,9 @@ struct GlobalWebSearch {
     /// `DEEPSEEK_API_KEY` for DeepSeek and `LEVELER_SEARCH_API_KEY` for Tavily.
     #[serde(default)]
     api_key_env: Option<String>,
+    /// Preferred over the environment variable when non-empty.
+    #[serde(default)]
+    api_key: Option<SearchApiKey>,
     /// Search API base including the path prefix, excluding `/search`.
     #[serde(default)]
     base_url: Option<String>,
@@ -320,9 +323,31 @@ struct GlobalWebSearch {
 pub struct WebSearchSettings {
     pub provider: SearchProviderKind,
     pub api_key_env: String,
+    pub(crate) api_key: Option<SearchApiKey>,
     pub base_url: Option<String>,
     pub max_results: usize,
     pub timeout: Duration,
+}
+
+impl WebSearchSettings {
+    /// Whether the effective credential comes from `[web.search].api_key`.
+    /// Diagnostics report its presence without exposing the value.
+    pub fn has_configured_api_key(&self) -> bool {
+        self.configured_api_key().is_some()
+    }
+
+    pub(crate) fn configured_api_key(&self) -> Option<&str> {
+        self.api_key.as_ref().map(|key| key.0.as_str())
+    }
+}
+
+#[derive(Clone, Deserialize, PartialEq, Eq)]
+pub(crate) struct SearchApiKey(String);
+
+impl std::fmt::Debug for SearchApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[redacted]")
+    }
 }
 
 /// `[assist]`. The two idle, automatic model calls the UI makes on the user's
@@ -765,8 +790,8 @@ impl GlobalConfig {
         }
     }
 
-    /// Parse global config from TOML text. Provider `api_key` may be set as
-    /// plaintext (local convenience) and/or via `api_key_env`. MCP `env`
+    /// Parse global config from TOML text. Model and search API keys may be set
+    /// in `api_key` or referenced through `api_key_env`. MCP `env`
     /// values must still be env-name references (never raw secrets).
     pub fn from_toml_str(text: &str) -> Result<Self, GlobalConfigError> {
         let value: toml::Value = toml::from_str(text).map_err(|error| {
@@ -1408,6 +1433,10 @@ impl GlobalConfig {
                 api_key_env: search
                     .api_key_env
                     .unwrap_or_else(|| default_search_key_env(provider).to_string()),
+                api_key: search.api_key.and_then(|SearchApiKey(key)| {
+                    let key = key.trim();
+                    (!key.is_empty()).then(|| SearchApiKey(key.to_owned()))
+                }),
                 base_url: search
                     .base_url
                     .map(|base| base.trim().trim_end_matches('/').to_string()),
@@ -3112,6 +3141,24 @@ provider = "deepseek"
     }
 
     // ── [web.search]: a search backend independent of every model ───────────
+
+    #[test]
+    fn plaintext_search_api_key_is_accepted_without_debug_exposure() {
+        let cfg = GlobalConfig::from_toml_str(
+            r#"
+            [web.search]
+            provider = "deepseek"
+            api_key = "  search-key-fixture  "
+            api_key_env = "MY_SEARCH_KEY"
+            "#,
+        )
+        .expect("the search backend accepts a configured API key");
+        assert!(!format!("{cfg:?}").contains("search-key-fixture"));
+        let search = cfg.into_bundle().web_search.expect("configured");
+        assert_eq!(search.api_key_env, "MY_SEARCH_KEY");
+        assert_eq!(search.configured_api_key(), Some("search-key-fixture"));
+        assert!(!format!("{search:?}").contains("search-key-fixture"));
+    }
 
     #[test]
     fn a_deepseek_search_section_gets_the_documented_defaults() {

@@ -10,6 +10,7 @@
 pub const RESERVED_SLASH_NAMES: &[&str] = &[
     "model",
     "permission",
+    "permission-contract",
     "mode",
     "thinking",
     "goal",

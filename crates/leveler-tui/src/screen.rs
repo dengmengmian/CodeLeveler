@@ -194,6 +194,15 @@ pub const SLASH_DEFS: &[SlashDef] = &[
         SlashVisibility::Quick,
         BusyPolicy::Always,
     ),
+    // Explicit V2 adoption. Hidden from the bare list: it is a one-time
+    // compatibility action, not a fourth permission tier.
+    slash(
+        "/permission-contract",
+        &[],
+        SlashCategory::Agent,
+        SlashVisibility::Searchable,
+        BusyPolicy::Always,
+    ),
     // The session's Thinking Level. `Always` because it changes the next
     // request's reasoning, not the shape of the turn.
     slash(
@@ -662,6 +671,7 @@ pub fn slash_usage(name: &'static str) -> &'static str {
     match name {
         "/model" => "/model [<provider/model> | default <provider/model>]",
         "/permission" => "/permission [ask|auto|full]",
+        "/permission-contract" => "/permission-contract v2",
         "/thinking" => "/thinking [auto|off|minimal|low|medium|high|max|reset]",
         "/goal" => "/goal <objective> | /goal status | /goal clear",
         "/btw" => "/btw <question>",
@@ -704,6 +714,7 @@ fn slash_copy(name: &str, t: &UiText, brief: bool) -> &'static str {
         "/model" => s.model,
         "/thinking" => s.thinking,
         "/permission" | "/mode" => s.permission,
+        "/permission-contract" => s.permission_contract,
         "/goal" => s.goal,
         "/btw" => s.btw,
         "/recap" => s.recap,
@@ -1267,6 +1278,7 @@ mod surface_tests {
             [
                 "/model",
                 "/permission",
+                "/permission-contract",
                 "/thinking",
                 "/goal",
                 "/btw",

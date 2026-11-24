@@ -342,6 +342,17 @@ impl Executor {
                 for_turn: false,
             });
         }
+        // The effect-oriented Auto already holds every axis this tool can
+        // request: ordinary writes are not fenced, the network is on by
+        // default, and there is no workspace Git seal to lift. Asking here
+        // would be a prompt for access the call already has.
+        if self.tool_context.policy.policy_kind() == leveler_execution::PolicyKind::EffectAuto {
+            return Ok(PermissionRequestOutcome::Granted {
+                message: "当前「替我审批」已默认持有文件与网络权限，无需批准。".to_string(),
+                grants,
+                for_turn: false,
+            });
+        }
         for _ in 0..super::host::MAX_SUPERSEDE_RETRIES {
             // The profile may change while a question waits. Re-check it here so
             // a request superseded by a switch to Full is answered by Full's
@@ -395,6 +406,7 @@ impl Executor {
                 // The description already names the filesystem grant this
                 // request asks for; a second generic bullet would repeat it.
                 write_scope_expanded: false,
+                reason_code: Some("request.permissions".to_string()),
             };
             // Through the host's one ask path (PR 5): the reviewer, the human, and
             // the human-vs-headless distinction mean the same here as for a tool

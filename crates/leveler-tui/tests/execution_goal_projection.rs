@@ -67,6 +67,7 @@ fn snapshot(status: &str, task: Option<UiExecutionTask>) -> UiSessionSnapshot {
         title: None,
         model: ModelRef::parse("deepseek/v3"),
         mode: PermissionProfile::Assisted,
+        permission_contract: leveler_client_protocol::PermissionContract::V1,
         branch: None,
         status: status.to_string(),
         finalization_stage: None,

@@ -3681,6 +3681,7 @@ fn cycle_permission_profile(state: &mut AppState) -> Vec<Effect> {
     vec![Effect::Send(ClientCommand::SetPermissionProfile {
         session_id: state.session_id.clone(),
         mode: next,
+        contract: None,
     })]
 }
 

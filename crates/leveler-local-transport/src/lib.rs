@@ -184,6 +184,12 @@ pub struct CreateSessionRequest {
     pub goal: String,
     pub model: Option<ModelRef>,
     pub mode: PermissionProfile,
+    /// The permission contract to create the session under. `None` lets the
+    /// runtime resolve it: V2 for a new session, V1 when an old project
+    /// default explicitly asks for the legacy contract. A remote request must
+    /// not use this field to widen anything; V1 is the stricter contract.
+    #[serde(default)]
+    pub permission_contract: Option<leveler_client_protocol::PermissionContract>,
     /// Whether this session auto-approves risky actions (unattended) or prompts.
     /// Carried on the trusted local transport so `--auto-approve` selects a
     /// per-session policy instead of forcing an in-process runtime. `default`
@@ -3526,6 +3532,7 @@ mod tests {
                     title: None,
                     model: Some(ModelRef::new("mock", "m")),
                     mode: PermissionProfile::Assisted,
+                    permission_contract: leveler_client_protocol::PermissionContract::V1,
                     branch: None,
                     status: "idle".to_string(),
                     finalization_stage: None,
@@ -4313,6 +4320,7 @@ mod tests {
             "s3cret-token",
             WireRequest::CreateSession {
                 request: CreateSessionRequest {
+                    permission_contract: None,
                     request_id: None,
                     collaboration: CollaborationMode::Chat,
                     workspace: CreateWorkspaceSelection::RuntimeDefault,
@@ -5470,6 +5478,7 @@ mod tests {
 
         let error = client
             .create_session(CreateSessionRequest {
+                permission_contract: None,
                 request_id: None,
                 collaboration: CollaborationMode::Chat,
                 workspace: CreateWorkspaceSelection::RuntimeDefault,
@@ -5692,6 +5701,7 @@ mod tests {
         let received = deadend_server(&path);
         let error = client
             .create_session(CreateSessionRequest {
+                permission_contract: None,
                 request_id: None,
                 collaboration: CollaborationMode::Chat,
                 workspace: CreateWorkspaceSelection::RuntimeDefault,
@@ -5833,6 +5843,7 @@ mod tests {
             goal: "s".to_string(),
             model: None,
             mode: PermissionProfile::Assisted,
+            permission_contract: None,
             approval_policy: policy,
         }
     }
@@ -6099,6 +6110,7 @@ mod tests {
             .unwrap();
         let bootstrap = client
             .create_session(CreateSessionRequest {
+                permission_contract: None,
                 request_id: None,
                 collaboration: CollaborationMode::Chat,
                 workspace: CreateWorkspaceSelection::RuntimeDefault,
@@ -6275,6 +6287,7 @@ mod tests {
         let client = LocalSocketRuntimeClient::connect(&path).await.unwrap();
         let bootstrap = client
             .create_session(CreateSessionRequest {
+                permission_contract: None,
                 request_id: None,
                 collaboration: CollaborationMode::Chat,
                 workspace: CreateWorkspaceSelection::RuntimeDefault,

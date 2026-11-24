@@ -1,0 +1,35 @@
+{"model":"deepseek/deepseek-v4-pro","session_id":"754e14c1-9f85-4766-910f-05903ad029e6","type":"session_started"}
+{"audit":{"policy":{"source":"default"},"report":{"budget_bytes":65536,"clipped_mandatory":[],"delivered_sections":[],"index_bytes":0,"mandatory_bytes":0,"omitted_sections":[],"optional_bytes":0,"undelivered_mandatory":[],"unmatched_mandatory":[]},"sources":[],"turn_id":"3ab3e0dd-f5c1-4110-9c57-0ee7d67084fe","workspace":"/private/tmp/pv2-final/scenarios/d-outside/workspace-a"},"type":"rule_delivery"}
+{"audit":{"agent_use":"not_verifiable","discovered":0,"entries":[],"index_bytes":0,"injected_bytes":0,"surface":"index_only"},"type":"skill_delivery"}
+{"type":"stream_attempt_started"}
+{"type":"reasoning_started"}
+{"delta":"The","type":"reasoning_delta"}
+{"delta":" task is to","type":"reasoning_delta"}
+{"delta":" read a file and report","type":"reasoning_delta"}
+{"delta":" its exact contents,","type":"reasoning_delta"}
+{"delta":" without modifying anything. The path","type":"reasoning_delta"}
+{"delta":" is outside the workspace but","type":"reasoning_delta"}
+{"delta":" reads","type":"reasoning_delta"}
+{"delta":" are allowed. Let me read","type":"reasoning_delta"}
+{"delta":" it.","type":"reasoning_delta"}
+{"elapsed_ms":460,"type":"reasoning_completed"}
+{"closing":false,"no_progress_streak":0,"type":"progress_updated"}
+{"cached_input_tokens":2048,"input_tokens":13576,"output_tokens":94,"reasoning_tokens":33,"type":"usage"}
+{"reasoning":[{"duration_ms":460,"text":"The task is to read a file and report its exact contents, without modifying anything. The path is outside the workspace but reads are allowed. Let me read it."}],"text":"","type":"assistant_text"}
+{"arguments":"{\"path\":\"/tmp/pv2-final/scenarios/d-outside/workspace-b/secret.txt\"}","id":"call_8saphjvi01cnr0iwjawth0eo","tool":"read_file","type":"tool_call"}
+{"execution_status":null,"exit_code":null,"id":"call_8saphjvi01cnr0iwjawth0eo","is_error":false,"preview":"     1 outside-read-ok\n","stop":null,"tool":"read_file","type":"tool_result"}
+{"closing":false,"no_progress_streak":0,"type":"progress_updated"}
+{"type":"stream_attempt_started"}
+{"delta":"The file's exact","type":"assistant_delta"}
+{"delta":" contents are:\n\n```\noutside-read","type":"assistant_delta"}
+{"delta":"-","type":"assistant_delta"}
+{"delta":"ok","type":"assistant_delta"}
+{"delta":"\n","type":"assistant_delta"}
+{"delta":"```","type":"assistant_delta"}
+{"closing":false,"no_progress_streak":0,"type":"progress_updated"}
+{"cached_input_tokens":12288,"input_tokens":13694,"output_tokens":15,"reasoning_tokens":0,"type":"usage"}
+{"reasoning":[],"text":"The file's exact contents are:\n\n```\noutside-read-ok\n```","type":"assistant_text"}
+{"text":"The file's exact contents are:\n\n```\noutside-read-ok\n```","type":"finished"}
+{"model_steps":2,"modified_files":[],"stop":"answered","text":"The file's exact contents are:\n\n```\noutside-read-ok\n```","transcript_ordinal":4,"type":"delivery_committed"}
+{"closing":true,"no_progress_streak":0,"type":"progress_updated"}
+{"modified_files":[],"rounds":2,"session_id":"754e14c1-9f85-4766-910f-05903ad029e6","stop_detail":null,"stop_reason":"Answered","type":"session_completed"}

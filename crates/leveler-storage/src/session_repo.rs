@@ -18,8 +18,16 @@ pub enum SessionEdit {
     Title(String),
     /// Configured provider/model reference.
     Model(String),
-    /// Permission profile wire value.
-    Permission(String),
+    /// Permission profile wire value, optionally adopting a contract version
+    /// in the same atomic edit. `contract = None` keeps the stored contract:
+    /// changing the tier must never adopt V2 by itself.
+    Permission {
+        /// Permission profile wire value.
+        mode: String,
+        /// `Some(2)` adopts V2 in the same transaction; `None` keeps the
+        /// stored contract.
+        contract: Option<i64>,
+    },
     /// Thinking override; None restores inheritance.
     Thinking(Option<String>),
     /// Collaboration mode wire value.
@@ -52,6 +60,8 @@ pub struct SessionSettingsSnapshot {
     pub session: SessionRecord,
     /// Permission profile wire value.
     pub mode: String,
+    /// Persisted permission contract version (`1` = legacy, `2` = V2).
+    pub permission_contract: i64,
     /// Persisted sandbox setting.
     pub sandbox: bool,
     /// Legacy execution kind.
@@ -184,8 +194,8 @@ impl<'a> SessionRepository<'a> {
         sqlx::query(
             "INSERT INTO sessions \
              (id, repository, goal, status, model, state, created_at, updated_at, \
-              collaboration, work_profile, mode, sandbox, kind, model_pinned) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'assisted', 0, 'direct', ?11)",
+              collaboration, work_profile, mode, permission_contract, sandbox, kind, model_pinned) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'assisted', 2, 0, 'direct', ?11)",
         )
         .bind(&record.id)
         .bind(&record.repository)
@@ -429,9 +439,9 @@ impl<'a> SessionRepository<'a> {
                 "model",
                 "model",
             ),
-            SessionEdit::Permission(value) => (
+            SessionEdit::Permission { mode, .. } => (
                 "UPDATE sessions SET mode = ?2, updated_at = ?3 WHERE id = ?1",
-                Some(value.as_str()),
+                Some(mode.as_str()),
                 None,
                 "mode",
                 "mode",
@@ -491,11 +501,28 @@ impl<'a> SessionRepository<'a> {
                 "session {id} not found for metadata edit"
             )));
         }
+        // Adoption is one durable fact with the tier change: the caller wrote
+        // both in the same transaction, so a crash cannot leave a v2 tier
+        // under a v1 contract (or the reverse).
+        if let SessionEdit::Permission {
+            contract: Some(contract),
+            ..
+        } = edit
+        {
+            sqlx::query("UPDATE sessions SET permission_contract = ?2 WHERE id = ?1")
+                .bind(id.as_str())
+                .bind(contract)
+                .execute(&mut *tx)
+                .await?;
+        }
         let mut change = serde_json::json!({
             "field": field,
             "from": old,
             "to": value,
         });
+        if let SessionEdit::Permission { contract, .. } = edit {
+            change["permission_contract"] = serde_json::json!(contract);
+        }
         if let SessionEdit::GoalDeclaration { objective, .. } = edit {
             change["pending_goal"] = serde_json::Value::String(objective.clone());
         }
@@ -523,11 +550,18 @@ impl<'a> SessionRepository<'a> {
         let Some(row) = row else {
             return Ok(None);
         };
-        let (mode, sandbox, kind, thinking): (String, bool, String, Option<String>) =
-            sqlx::query_as("SELECT mode, sandbox, kind, thinking FROM sessions WHERE id = ?1")
-                .bind(id.as_str())
-                .fetch_one(&mut *tx)
-                .await?;
+        let (mode, permission_contract, sandbox, kind, thinking): (
+            String,
+            i64,
+            bool,
+            String,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT mode, permission_contract, sandbox, kind, thinking FROM sessions WHERE id = ?1",
+        )
+        .bind(id.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
         let model_pinned: bool =
             sqlx::query_scalar("SELECT model_pinned FROM sessions WHERE id = ?1")
                 .bind(id.as_str())
@@ -541,6 +575,7 @@ impl<'a> SessionRepository<'a> {
         Ok(Some(SessionSettingsSnapshot {
             session: row.decode()?,
             mode,
+            permission_contract,
             sandbox,
             kind,
             thinking,
@@ -674,6 +709,30 @@ impl<'a> SessionRepository<'a> {
         Ok(())
     }
 
+    /// Persist the permission identity `(mode, contract)` as one fact.
+    ///
+    /// Used by explicit V2 adoption: the tier and the contract must not be
+    /// observable apart.
+    pub async fn set_permission_state(
+        &self,
+        id: &SessionId,
+        mode: &str,
+        permission_contract: i64,
+        now: Timestamp,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "UPDATE sessions SET mode = ?2, permission_contract = ?3, updated_at = ?4 \
+             WHERE id = ?1",
+        )
+        .bind(id.as_str())
+        .bind(mode)
+        .bind(permission_contract)
+        .bind(now.to_rfc3339())
+        .execute(self.db.pool())
+        .await?;
+        Ok(())
+    }
+
     /// Persist this session's Thinking Level override, or clear it.
     ///
     /// `None` clears it: the session inherits the configured level again. An
@@ -721,6 +780,29 @@ impl<'a> SessionRepository<'a> {
             Some((mode, sandbox, kind, outcome)) => {
                 let outcome = outcome.map(|s| TaskOutcome::from_str(&s)).transpose()?;
                 Ok(Some((mode, sandbox, kind, outcome)))
+            }
+        }
+    }
+
+    /// Read back `(mode, permission_contract, sandbox, kind, outcome)`.
+    ///
+    /// The contract is its own fact: `mode` alone cannot distinguish a v1
+    /// `assisted` (old Auto) from a v2 `assisted` (effect-oriented Auto).
+    pub async fn execution_state(
+        &self,
+        id: &SessionId,
+    ) -> Result<Option<(String, i64, bool, String, Option<TaskOutcome>)>, StorageError> {
+        let row: Option<(String, i64, bool, String, Option<String>)> = sqlx::query_as(
+            "SELECT mode, permission_contract, sandbox, kind, outcome FROM sessions WHERE id = ?1",
+        )
+        .bind(id.as_str())
+        .fetch_optional(self.db.pool())
+        .await?;
+        match row {
+            None => Ok(None),
+            Some((mode, contract, sandbox, kind, outcome)) => {
+                let outcome = outcome.map(|s| TaskOutcome::from_str(&s)).transpose()?;
+                Ok(Some((mode, contract, sandbox, kind, outcome)))
             }
         }
     }
@@ -935,7 +1017,10 @@ mod tests {
             repo.edit_at_version(
                 &id,
                 observed.sequence.unwrap_or(0),
-                &SessionEdit::Permission("full_access".into()),
+                &SessionEdit::Permission {
+                    mode: "full_access".into(),
+                    contract: None
+                },
                 leveler_core::now(),
             )
             .await
@@ -968,7 +1053,10 @@ mod tests {
                 repo.edit_at_version(
                     &id,
                     expected,
-                    &SessionEdit::Permission("assisted".into()),
+                    &SessionEdit::Permission {
+                        mode: "assisted".into(),
+                        contract: None
+                    },
                     leveler_core::now(),
                 )
                 .await
@@ -1056,7 +1144,10 @@ mod tests {
             repo.edit_at_version(
                 &id,
                 2,
-                &SessionEdit::Permission("full_access".into()),
+                &SessionEdit::Permission {
+                    mode: "full_access".into(),
+                    contract: None
+                },
                 leveler_core::now()
             )
             .await
@@ -1455,7 +1546,10 @@ mod tests {
         repo.edit_at_version(
             &id,
             0,
-            &SessionEdit::Permission("full_access".into()),
+            &SessionEdit::Permission {
+                mode: "full_access".into(),
+                contract: None,
+            },
             leveler_core::now(),
         )
         .await
@@ -1463,7 +1557,10 @@ mod tests {
         repo.edit_at_version(
             &id,
             1,
-            &SessionEdit::Permission("full_access".into()),
+            &SessionEdit::Permission {
+                mode: "full_access".into(),
+                contract: None,
+            },
             leveler_core::now(),
         )
         .await

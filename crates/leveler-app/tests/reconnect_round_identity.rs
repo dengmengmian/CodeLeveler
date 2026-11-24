@@ -214,6 +214,7 @@ async fn a_reconnect_returns_the_same_running_tool_with_its_round() {
             goal: "keep the round across a reconnect".to_string(),
             model: None,
             mode: WirePermission::Assisted,
+            permission_contract: None,
         })
         .await
         .unwrap();

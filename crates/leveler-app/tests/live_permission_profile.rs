@@ -207,6 +207,7 @@ async fn set_permission_profile_reaches_a_running_engine_before_session_updated(
         .send_observed(ClientCommand::SetPermissionProfile {
             session_id: session_id.clone(),
             mode: WirePermissionProfile::FullAccess,
+            contract: None,
         })
         .await
         .unwrap();
@@ -282,6 +283,7 @@ async fn delivered_permission_selection_persists_only_the_target_session_and_lea
             command: ClientCommand::SetPermissionProfile {
                 session_id: session_id.clone(),
                 mode,
+                contract: None,
             },
         };
         let mut foreign = envelope.clone();

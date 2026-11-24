@@ -186,6 +186,7 @@ async fn create_session(client: &LocalSocketRuntimeClient) -> leveler_core::Sess
             goal: "config hot reload".to_string(),
             model: None,
             mode: PermissionProfile::FullAccess,
+            permission_contract: None,
         })
         .await
         .expect("create a session on the running daemon")

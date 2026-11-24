@@ -173,6 +173,10 @@ pub struct NewSession {
     pub model: Option<String>,
     /// The permission mode's wire string.
     pub mode: String,
+    /// The permission contract version (`1` = legacy, `2` = V2). Persisted
+    /// beside `mode` so a resume never interprets a tier under the wrong
+    /// contract.
+    pub permission_contract: i64,
     pub sandbox: bool,
     pub kind: ExecutionKind,
     /// Product-defined axes persisted opaquely with the session. The engine
@@ -634,6 +638,7 @@ impl TaskEngine {
                 .create_task_identified(
                     &record,
                     &session.mode,
+                    session.permission_contract,
                     session.sandbox,
                     session.kind.as_str(),
                     request_id,
@@ -648,6 +653,7 @@ impl TaskEngine {
             .create_task(
                 &record,
                 &session.mode,
+                session.permission_contract,
                 session.sandbox,
                 session.kind.as_str(),
             )

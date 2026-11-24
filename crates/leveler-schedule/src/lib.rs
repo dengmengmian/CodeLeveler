@@ -34,7 +34,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use leveler_client_protocol::{ModelRef, PermissionProfile, SessionId};
+use leveler_client_protocol::{ModelRef, PermissionContract, PermissionProfile, SessionId};
 use serde::{Deserialize, Serialize};
 
 pub use dispatch::{
@@ -477,6 +477,11 @@ pub struct UnattendedGrant {
     pub definition_id: ScheduleId,
     pub workspace: PathBuf,
     pub permission_mode: PermissionProfile,
+    /// The contract the grant was issued under. A v3 grant lacks the field
+    /// and fails the version check, so an old authorization can never cover
+    /// a V2 session.
+    #[serde(default)]
+    pub permission_contract: PermissionContract,
     /// The exact action text the grant was issued for. A schedule row whose
     /// action (recipient, parameters or goal) changed no longer matches.
     #[serde(default)]
@@ -495,15 +500,16 @@ pub struct UnattendedGrant {
 }
 
 impl UnattendedGrant {
-    /// Version 3 binds the trigger scope in addition to the exact action and
-    /// model. Older grants fail closed rather than being interpreted as
-    /// covering an action or cadence they never named.
-    pub const VERSION: u8 = 3;
+    /// Version 4 binds the permission contract in addition to the trigger
+    /// scope, exact action and model. Older grants fail closed rather than
+    /// being interpreted as covering a contract they never named.
+    pub const VERSION: u8 = 4;
 
     pub fn new(
         definition_id: ScheduleId,
         workspace: PathBuf,
         permission_mode: PermissionProfile,
+        permission_contract: PermissionContract,
         action: &ScheduleAction,
         trigger: &ScheduleTrigger,
         model: Option<ModelRef>,
@@ -515,6 +521,7 @@ impl UnattendedGrant {
             definition_id,
             workspace,
             permission_mode,
+            permission_contract,
             action: action.fingerprint().map_err(|error| {
                 ScheduleError::Invalid(format!("cannot bind the action: {error}"))
             })?,
@@ -561,6 +568,13 @@ impl UnattendedGrant {
                 "the unattended grant was issued for permission mode `{}`, not `{}`",
                 self.permission_mode.as_str(),
                 definition.mode.as_str()
+            ));
+        }
+        if self.permission_contract != definition.permission_contract {
+            return Err(format!(
+                "the unattended grant was issued for permission contract `{}`, not `{}`",
+                self.permission_contract.as_str(),
+                definition.permission_contract.as_str()
             ));
         }
         if !self.actions.contains(&kind) {
@@ -750,6 +764,9 @@ pub struct NewScheduleDefinition {
     /// What to do when the previous run is still active.
     pub overlap: OverlapPolicy,
     pub mode: PermissionProfile,
+    /// The contract this schedule was created under. Old rows are V1; a
+    /// dispatch must not silently run them as V2.
+    pub permission_contract: leveler_client_protocol::PermissionContract,
     pub model: Option<ModelRef>,
     pub timeout: Duration,
     pub misfire: MisfirePolicy,
@@ -790,6 +807,9 @@ pub struct DefinitionUpdate {
     pub session_policy: SessionPolicy,
     pub overlap: OverlapPolicy,
     pub mode: PermissionProfile,
+    /// The contract this schedule was created under. Old rows are V1; a
+    /// dispatch must not silently run them as V2.
+    pub permission_contract: leveler_client_protocol::PermissionContract,
     pub model: Option<ModelRef>,
     pub timeout: Duration,
     pub misfire: MisfirePolicy,
@@ -897,6 +917,9 @@ pub struct ScheduleDefinition {
     pub session_policy: SessionPolicy,
     pub overlap: OverlapPolicy,
     pub mode: PermissionProfile,
+    /// The contract this schedule was created under. Old rows are V1; a
+    /// dispatch must not silently run them as V2.
+    pub permission_contract: leveler_client_protocol::PermissionContract,
     pub model: Option<ModelRef>,
     pub timeout: Duration,
     pub misfire: MisfirePolicy,

@@ -1,0 +1,51 @@
+   Compiling leveler-core v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-core)
+   Compiling form_urlencoded v1.2.3
+   Compiling leveler-lifecycle v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-lifecycle)
+   Compiling leveler-win-confine v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-win-confine)
+   Compiling leveler-media v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-media)
+   Compiling leveler-memory v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-memory)
+   Compiling leveler-cua v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-cua)
+   Compiling crossterm v0.28.1 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/vendor/crossterm)
+   Compiling leveler-eval v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-eval)
+   Compiling url v2.5.9
+   Compiling serde_urlencoded v0.7.1
+   Compiling sqlx-core v0.8.6
+   Compiling tower-http v0.6.11
+   Compiling ratatui v0.29.0
+   Compiling reqwest v0.12.28
+   Compiling reqwest v0.13.5
+   Compiling rmcp v3.9.0
+   Compiling sqlx-sqlite v0.8.6
+   Compiling jsonschema v0.26.2
+   Compiling ratatui-image v8.0.2
+   Compiling leveler-model v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-model)
+   Compiling leveler-definition-trust v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-definition-trust)
+   Compiling leveler-execution v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-execution)
+   Compiling leveler-project v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-project)
+   Compiling sqlx-macros-core v0.8.6
+   Compiling leveler-skills v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-skills)
+   Compiling leveler-lsp v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-lsp)
+   Compiling leveler-foreign-session v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-foreign-session)
+   Compiling leveler-context v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-context)
+   Compiling leveler-client-protocol v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-client-protocol)
+   Compiling leveler-browser v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-browser)
+   Compiling sqlx-macros v0.8.6
+   Compiling leveler-protocol v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-protocol)
+   Compiling leveler-agent-core v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-agent-core)
+   Compiling leveler-update v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-update)
+   Compiling sqlx v0.8.6
+   Compiling leveler-provider v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-provider)
+   Compiling leveler-storage v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-storage)
+   Compiling leveler-native v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-native)
+   Compiling leveler-vcs v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-vcs)
+   Compiling leveler-tools v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-tools)
+   Compiling leveler-engine v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-engine)
+   Compiling leveler-local-transport v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-local-transport)
+   Compiling leveler-tui v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-tui)
+   Compiling leveler-schedule v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-schedule)
+   Compiling leveler-agent v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-agent)
+   Compiling leveler-app v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-app)
+   Compiling leveler-runtime-host v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-runtime-host)
+   Compiling leveler-cli v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-cli)
+    Finished `release` profile [optimized] target(s) in 3m 27s
+EXIT=0

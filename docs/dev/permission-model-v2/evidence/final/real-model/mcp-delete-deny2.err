@@ -1,0 +1,4 @@
+
+⚠ approval needed mcp__fixture__delete_resource wants to run a Network action:
+    MCP tool `mcp__fixture__delete_resource` declares destructive behavior
+  Approve? [y]es once / this [t]urn / [w]lways for this project / [N]o (default): approval input failed: stdin closed

@@ -37,11 +37,32 @@ fn editing_workspace(
     let exact = context
         .execution_workspace()?
         .allows_resource_path(capability, resolved);
-    if context.policy.unrestricted_execution() || exact {
-        let root = resolved
-            .ancestors()
-            .last()
-            .ok_or_else(|| ToolError::Io("target has no filesystem root".into()))?;
+    // The effect-oriented Auto's frozen write scope is Unrestricted: the
+    // editor must select the filesystem root so an outside absolute path can
+    // actually be written. This is NOT `unrestricted_execution`: sensitive and
+    // trust-gated paths keep their checks.
+    let unrestricted_scope = matches!(
+        context.write_scope(),
+        leveler_execution::WriteScope::Unrestricted
+    );
+    if context.policy.unrestricted_execution() || unrestricted_scope || exact {
+        // Full canonicalizes through unrestricted_access, so `/` is safe.
+        // For the other two, the descriptor path uses O_NOFOLLOW on every
+        // component; a root of `/` would fail on a symlinked ancestor such as
+        // macOS `/var`. Anchor on the deepest existing ancestor instead: the
+        // target's parent when it exists, otherwise the nearest real parent.
+        let root = if context.policy.unrestricted_execution() {
+            resolved
+                .ancestors()
+                .last()
+                .ok_or_else(|| ToolError::Io("target has no filesystem root".into()))?
+        } else {
+            resolved
+                .parent()
+                .filter(|parent| parent.exists())
+                .or_else(|| resolved.ancestors().skip(1).find(|parent| parent.exists()))
+                .unwrap_or_else(|| std::path::Path::new("/"))
+        };
         if context.policy.unrestricted_execution() {
             Ok(leveler_execution::Workspace::new(root)?.with_unrestricted_access(true))
         } else {

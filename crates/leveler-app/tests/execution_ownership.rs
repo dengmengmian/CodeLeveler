@@ -1062,6 +1062,7 @@ async fn switching_to_full_access_makes_a_refused_shell_runnable() {
             command: ClientCommand::SetPermissionProfile {
                 session_id: w.session.clone(),
                 mode: leveler_client_protocol::PermissionProfile::FullAccess,
+                contract: None,
             },
         };
         match w.a.client.deliver(envelope).await {

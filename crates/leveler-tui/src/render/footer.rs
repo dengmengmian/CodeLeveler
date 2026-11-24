@@ -1462,6 +1462,7 @@ mod p1_tests {
                 summary: "rm -rf tmp".into(),
                 command: Some("rm -rf tmp".into()),
                 risks: vec!["destructive".into()],
+                reason_code: None,
                 call_id: None,
                 always_persists: true,
             }),
@@ -1531,6 +1532,7 @@ mod p1_tests {
     #[test]
     fn trust_chip_is_model_permission_session() {
         let mut s = state();
+        s.permission_contract = leveler_client_protocol::PermissionContract::V2;
         s.model_label = "deepseek/v4".into();
         s.mode_label = "Assisted".into();
         s.collaboration = "chat".into();

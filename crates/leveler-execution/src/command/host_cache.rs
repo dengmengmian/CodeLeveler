@@ -1091,6 +1091,10 @@ pub(crate) fn apply_sandbox_environment(cmd: &mut Command, paths: &SandboxPaths)
     // confined child resolved the real home and its first runtime write was
     // denied by the very fence the sandbox is supposed to provide.
     cmd.env("LEVELER_HOME", paths.leveler_home());
+    // The redirect is deliberate isolation, not the operator's real home. Mark
+    // it so `leveler doctor`/`config show` can say "sandbox home, host config
+    // not visible" instead of reporting an empty configuration as host truth.
+    cmd.env("LEVELER_SANDBOX_HOME", "1");
 }
 
 #[cfg(test)]
@@ -1350,6 +1354,21 @@ mod tests {
         );
         let paths = prepare_sandbox_paths(&env, &ws, false, false).expect("prepare paths");
         (home, workspace, paths)
+    }
+
+    #[test]
+    fn sandbox_environment_marks_the_redirected_home() {
+        let (_home, _ws, paths) = prepared_paths();
+        let mut cmd = Command::new("leveler-test");
+        apply_sandbox_environment(&mut cmd, &paths);
+        let marked = cmd.as_std().get_envs().any(|(key, value)| {
+            key == std::ffi::OsStr::new("LEVELER_SANDBOX_HOME")
+                && value == Some(std::ffi::OsStr::new("1"))
+        });
+        assert!(
+            marked,
+            "confined children must know their LEVELER_HOME is a sandbox home"
+        );
     }
 
     /// S1 (synchronous): a live `SandboxPaths` holds its lease — the reaper

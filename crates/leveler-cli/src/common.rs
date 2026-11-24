@@ -143,6 +143,50 @@ pub(crate) fn map_mode(mode: RunMode) -> PermissionProfile {
     }
 }
 
+/// The runtime profile for a profile a snapshot carried.
+pub(crate) fn protocol_mode_to_runtime(
+    mode: leveler_client_protocol::PermissionProfile,
+) -> PermissionProfile {
+    match mode {
+        leveler_client_protocol::PermissionProfile::RequestApproval => {
+            PermissionProfile::RequestApproval
+        }
+        leveler_client_protocol::PermissionProfile::Assisted => PermissionProfile::Assisted,
+        leveler_client_protocol::PermissionProfile::FullAccess => PermissionProfile::FullAccess,
+    }
+}
+
+/// The protocol mirror of [`leveler_execution::PermissionContract`].
+pub(crate) fn wire_contract(
+    contract: leveler_execution::PermissionContract,
+) -> leveler_client_protocol::PermissionContract {
+    match contract {
+        leveler_execution::PermissionContract::V1 => {
+            leveler_client_protocol::PermissionContract::V1
+        }
+        leveler_execution::PermissionContract::V2 => {
+            leveler_client_protocol::PermissionContract::V2
+        }
+    }
+}
+
+/// Parse `--permission-contract`. Only V2 can be adopted; V1 has no visible
+/// entry point, so the CLI never creates one from a flag.
+pub(crate) fn parse_contract_flag(
+    raw: Option<&str>,
+) -> anyhow::Result<Option<leveler_execution::PermissionContract>> {
+    raw.map(|value| {
+        leveler_execution::PermissionContract::parse(value)
+            .filter(|contract| *contract == leveler_execution::PermissionContract::V2)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "`{value}` is not an adoptable permission contract; only `v2` is accepted"
+                )
+            })
+    })
+    .transpose()
+}
+
 /// Resolve the permission mode a launch runs under.
 ///
 /// Precedence, highest first:
@@ -183,6 +227,7 @@ pub(crate) fn wire_mode(mode: PermissionProfile) -> leveler_client_protocol::Per
 pub(crate) fn permission_change_envelope(
     session_id: &leveler_core::SessionId,
     mode: PermissionProfile,
+    contract: Option<leveler_client_protocol::PermissionContract>,
     expected_version: i64,
 ) -> leveler_client_protocol::CommandEnvelope {
     leveler_client_protocol::CommandEnvelope {
@@ -193,6 +238,7 @@ pub(crate) fn permission_change_envelope(
         command: leveler_client_protocol::ClientCommand::SetPermissionProfile {
             session_id: session_id.clone(),
             mode: wire_mode(mode),
+            contract,
         },
     }
 }
@@ -206,33 +252,43 @@ pub(crate) async fn deliver_permission_change(
     client: &dyn leveler_client_protocol::InteractiveRuntimeClient,
     session_id: &leveler_core::SessionId,
     mode: PermissionProfile,
+    contract: Option<leveler_client_protocol::PermissionContract>,
     expected_version: i64,
 ) -> Result<(), leveler_client_protocol::ClientError> {
     client
         .deliver(permission_change_envelope(
             session_id,
             mode,
+            contract,
             expected_version,
         ))
         .await
 }
 
-/// The project's configured default permission mode (`.leveler/config.yaml`
-/// `mode:`), else the built-in `assisted`.
+/// Parse a configured mode name and say whether it is a pre-V2 name.
+fn parse_mode_name(raw: &str) -> Option<(PermissionProfile, bool)> {
+    match raw.trim() {
+        "plan" => Some((PermissionProfile::RequestApproval, true)),
+        "workspace_write" => Some((PermissionProfile::Assisted, true)),
+        value => PermissionProfile::parse(value).map(|mode| (mode, false)),
+    }
+}
+
+/// The project's configured `(mode, contract)` default.
 ///
-/// This is the fallback for a NEW session only. A resumed session uses its
-/// persisted mode as the fallback instead, so a project default can never
-/// overwrite a mode the user already chose for that session.
-///
-/// A repository controls this file. Tightening the default (for example to
-/// `request_approval`) needs no trust, but raising it to Full does: otherwise
-/// cloning a repository would be enough to hand its agent unrestricted
-/// execution. The raising decision reads the exact bytes the trust record
-/// covers, so a swap between the trust check and the read cannot substitute a
-/// different mode.
-pub(crate) fn project_default_mode(layout: &Layout) -> PermissionProfile {
+/// - No config, or no `mode:`: the built-in default is a NEW session, so V2.
+/// - A config that predates V2 (no `permission_contract`, or a legacy mode
+///   name): V1. A repository that has not opted in must not silently acquire
+///   the new Auto.
+/// - `permission_contract: v2` with a current mode name: V2.
+/// - An untrusted repository asking for Full falls back to the built-in
+///   default (Assisted, V2); it may not widen authority.
+pub(crate) fn project_permission_default(
+    layout: &Layout,
+) -> (PermissionProfile, leveler_execution::PermissionContract) {
+    use leveler_execution::PermissionContract;
     let Some(root) = layout.primary_workspace() else {
-        return PermissionProfile::Assisted;
+        return (PermissionProfile::Assisted, PermissionContract::V2);
     };
     let trusted = leveler_execution::read_trusted_project_file(
         layout.home().root(),
@@ -244,21 +300,45 @@ pub(crate) fn project_default_mode(layout: &Layout) -> PermissionProfile {
         leveler_execution::TrustedRead::Untrusted { .. }
         | leveler_execution::TrustedRead::Absent => leveler_project::ProjectConfig::load(root),
     };
-    let Some(mode) = configured
-        .and_then(|config| config.mode)
-        .and_then(|raw| PermissionProfile::parse(&raw))
-    else {
-        return PermissionProfile::Assisted;
+    let Some(config) = configured else {
+        return (PermissionProfile::Assisted, PermissionContract::V2);
+    };
+    let Some((mode, legacy_name)) = config.mode.as_deref().and_then(parse_mode_name) else {
+        return (PermissionProfile::Assisted, PermissionContract::V2);
     };
     if mode == PermissionProfile::FullAccess
         && !matches!(trusted, leveler_execution::TrustedRead::Trusted(_))
     {
         // An untrusted repository may ask for a stricter default, never a
-        // wider one. The explicit `--mode full-access` flag still works: it
-        // is the user's own decision and wins over this fallback.
-        return PermissionProfile::Assisted;
+        // wider one. The explicit `--permission full-access` flag still works:
+        // it is the user's own decision and wins over this fallback.
+        return (PermissionProfile::Assisted, PermissionContract::V2);
     }
-    mode
+    if legacy_name {
+        return (mode, PermissionContract::V1);
+    }
+    let contract = config
+        .permission_contract
+        .as_deref()
+        .and_then(PermissionContract::parse)
+        .unwrap_or(PermissionContract::V1);
+    (mode, contract)
+}
+
+/// The project's configured default permission mode. Kept as the mode-only
+/// view for callers that do not create a session; new-session paths must use
+/// [`project_permission_default`] so the contract travels with the tier.
+pub(crate) fn project_default_mode(layout: &Layout) -> PermissionProfile {
+    project_permission_default(layout).0
+}
+
+/// Resolve a contract: an explicit CLI adoption wins; otherwise the fallback
+/// (the session's stored contract, or the project default).
+pub(crate) fn resolve_contract(
+    explicit: Option<leveler_execution::PermissionContract>,
+    fallback: leveler_execution::PermissionContract,
+) -> leveler_execution::PermissionContract {
+    explicit.unwrap_or(fallback)
 }
 
 pub(crate) fn build_approver(auto_approve: bool) -> Arc<dyn Approver> {
@@ -544,7 +624,7 @@ mod mode_resolution_tests {
             delivered: std::sync::Mutex::new(Vec::new()),
         };
         let session_id = leveler_core::SessionId::new("session-a");
-        deliver_permission_change(&client, &session_id, PermissionProfile::FullAccess, 7)
+        deliver_permission_change(&client, &session_id, PermissionProfile::FullAccess, None, 7)
             .await
             .expect("delivery must use deliver(), not send()");
         let delivered = client.delivered.lock().unwrap();
@@ -561,5 +641,68 @@ mod mode_resolution_tests {
             envelope.command,
             leveler_client_protocol::ClientCommand::SetPermissionProfile { .. }
         ));
+    }
+
+    fn layout_with_config(body: &str) -> (Layout, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".leveler")).unwrap();
+        std::fs::write(repo.join(".leveler/config.yaml"), body).unwrap();
+        let layout = Layout::from_parts(repo, tmp.path().join("configs"), tmp.path().join("state"));
+        (layout, tmp)
+    }
+
+    /// An existing project that never heard of V2 stays on the legacy
+    /// contract. The tier names are identical, so only the contract column
+    /// can tell them apart.
+    #[test]
+    fn a_project_config_without_a_contract_is_v1() {
+        let (layout, _tmp) = layout_with_config("mode: assisted\n");
+        assert_eq!(
+            project_permission_default(&layout),
+            (
+                PermissionProfile::Assisted,
+                leveler_execution::PermissionContract::V1
+            )
+        );
+    }
+
+    #[test]
+    fn an_explicit_v2_project_config_is_v2() {
+        let (layout, _tmp) = layout_with_config("mode: assisted\npermission_contract: v2\n");
+        assert_eq!(
+            project_permission_default(&layout),
+            (
+                PermissionProfile::Assisted,
+                leveler_execution::PermissionContract::V2
+            )
+        );
+    }
+
+    /// A legacy mode name is evidence of old data even if the file also says
+    /// v2: the name's meaning is fixed by the v1 contract.
+    #[test]
+    fn a_legacy_mode_name_forces_v1() {
+        let (layout, _tmp) = layout_with_config("mode: workspace_write\npermission_contract: v2\n");
+        assert_eq!(
+            project_permission_default(&layout),
+            (
+                PermissionProfile::Assisted,
+                leveler_execution::PermissionContract::V1
+            )
+        );
+    }
+
+    /// No configured mode means the built-in default for a NEW session, so V2.
+    #[test]
+    fn a_project_without_a_mode_uses_the_v2_builtin() {
+        let (layout, _tmp) = layout_with_config("ignore: []\n");
+        assert_eq!(
+            project_permission_default(&layout),
+            (
+                PermissionProfile::Assisted,
+                leveler_execution::PermissionContract::V2
+            )
+        );
     }
 }

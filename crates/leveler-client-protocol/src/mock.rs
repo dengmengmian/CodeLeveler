@@ -38,6 +38,7 @@ impl MockRuntimeClient {
             title: None,
             model: None,
             mode: PermissionProfile::Assisted,
+            permission_contract: crate::PermissionContract::V1,
             branch: Some("main".to_string()),
             status: "idle".to_string(),
             finalization_stage: None,

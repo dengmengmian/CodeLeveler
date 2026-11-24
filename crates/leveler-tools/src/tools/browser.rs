@@ -179,7 +179,7 @@ impl Tool for BrowserTabTool {
         // not clear it.
         if !matches!(
             context.policy.network_scope(),
-            leveler_execution::NetworkScope::Internet
+            leveler_execution::NetworkScope::Internet | leveler_execution::NetworkScope::Any
         ) {
             return Ok(ToolOutput::error(
                 "UnsupportedNetworkScope: browser processes require Internet scope; destination confinement is unavailable.",
@@ -369,7 +369,7 @@ impl Tool for BrowserActTool {
         // not clear it.
         if !matches!(
             context.policy.network_scope(),
-            leveler_execution::NetworkScope::Internet
+            leveler_execution::NetworkScope::Internet | leveler_execution::NetworkScope::Any
         ) {
             return Ok(ToolOutput::error(
                 "UnsupportedNetworkScope: browser processes require Internet scope; destination confinement is unavailable.",
@@ -501,7 +501,7 @@ impl Tool for BrowserInspectTool {
         // not clear it.
         if !matches!(
             context.policy.network_scope(),
-            leveler_execution::NetworkScope::Internet
+            leveler_execution::NetworkScope::Internet | leveler_execution::NetworkScope::Any
         ) {
             return Ok(ToolOutput::error(
                 "UnsupportedNetworkScope: browser processes require Internet scope; destination confinement is unavailable.",

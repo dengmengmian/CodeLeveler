@@ -1902,6 +1902,7 @@ mod layout_tests {
                 "rm -rf src/main.rs && ls src/ && git status --short && echo done".into(),
             ),
             risks: vec!["可能造成破坏性变更".into()],
+            reason_code: None,
             call_id: None,
             always_persists: true,
         })))
@@ -1917,6 +1918,7 @@ mod layout_tests {
             tool: "shell_command".into(),
             summary: "push origin".into(),
             command: Some("git push github main".into()),
+            reason_code: None,
             risks: vec![
                 "将访问网络".into(),
                 "修改远端仓库 github".into(),
@@ -2148,6 +2150,7 @@ mod layout_tests {
             summary: String::new(),
             command: Some(long.clone()),
             risks: vec![],
+            reason_code: None,
             call_id: None,
             always_persists: true,
         })));
@@ -2186,6 +2189,7 @@ mod layout_tests {
             summary: String::new(),
             command: Some(long.clone()),
             risks: vec![],
+            reason_code: None,
             call_id: None,
             always_persists: true,
         });
@@ -2205,6 +2209,7 @@ mod layout_tests {
             summary: "记住用户偏好".into(),
             command: None,
             risks: vec![],
+            reason_code: None,
             call_id: None,
             always_persists: true,
         })));
@@ -2412,6 +2417,7 @@ mod layout_tests {
             summary: String::new(),
             command: Some(long),
             risks: vec!["风险甲".into(), "风险乙".into()],
+            reason_code: None,
             call_id: None,
             always_persists: true,
         });

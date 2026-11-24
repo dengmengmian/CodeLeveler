@@ -28,6 +28,7 @@ async fn create_parallel_parent(engine: &TaskEngine) -> leveler_core::SessionId 
             goal: "parallel goal".into(),
             model: Some("mock/m".into()),
             mode: "assisted".into(),
+            permission_contract: 2,
             sandbox: false,
             kind: ExecutionKind::Parallel,
             axes: None,

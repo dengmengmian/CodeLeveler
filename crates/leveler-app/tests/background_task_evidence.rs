@@ -138,6 +138,7 @@ async fn fixture() -> Fixture {
             goal: "background evidence".into(),
             model: None,
             mode: WirePermissionProfile::Assisted,
+            permission_contract: None,
         })
         .await
         .expect("create session")

@@ -727,3 +727,219 @@ fn path_string(path: &Path) -> Result<String, String> {
         .map(str::to_string)
         .ok_or_else(|| "non-UTF8 isolation path".to_string())
 }
+
+/// Write roots a `git push` needs when its destination is a LOCAL repository
+/// outside the workspace.
+///
+/// Policy allows ordinary `git push`; the workspace sandbox does not know the
+/// remote's path, so the naive result is "ALLOW, then EPERM, then the model
+/// asks for the whole filesystem". The target is resolved here from the
+/// repository's own config (or an explicit path operand) and handed to the
+/// sandbox as one exact extra root.
+///
+/// Returns nothing when the target is not local, cannot be proven to be a Git
+/// repository, or is a credential/trust path. A missing root keeps the old
+/// Ask/failure path, never a silent widening.
+pub fn local_push_write_roots(program: &str, args: &[String], cwd: &Path) -> Vec<PathBuf> {
+    let base = Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program);
+    if base != "git" || args.first().map(String::as_str) != Some("push") {
+        return Vec::new();
+    }
+    let Some(remote) = push_remote_operand(&args[1..]) else {
+        return Vec::new();
+    };
+    let raw = if looks_like_local_target(&remote) {
+        remote
+    } else {
+        let Some(url) = configured_remote_url(cwd, &remote) else {
+            return Vec::new();
+        };
+        url
+    };
+    let Some(path) = local_target_path(&raw, cwd) else {
+        return Vec::new();
+    };
+    let path = std::fs::canonicalize(&path).unwrap_or(path);
+    if crate::workspace::is_credential_path(&path) {
+        return Vec::new();
+    }
+    let is_repo = path.join(".git").exists() || path.join("HEAD").exists();
+    is_repo.then_some(path).into_iter().collect()
+}
+
+/// The first positional operand after `push`, skipping options and their
+/// values. A refspec (`main`, `+main:other`) is not the remote; the first
+/// positional is.
+fn push_remote_operand(args: &[String]) -> Option<String> {
+    let mut iter = args.iter().peekable();
+    while let Some(arg) = iter.next() {
+        if arg == "--" {
+            return iter.next().cloned();
+        }
+        if arg.starts_with('-') {
+            // Options that take a separate value.
+            if matches!(
+                arg.as_str(),
+                "--repo" | "--push-option" | "--receive-pack" | "--exec" | "-o"
+            ) {
+                iter.next();
+            }
+            continue;
+        }
+        return Some(arg.clone());
+    }
+    None
+}
+
+fn looks_like_local_target(raw: &str) -> bool {
+    raw.starts_with('/')
+        || raw.starts_with("./")
+        || raw.starts_with("../")
+        || raw.starts_with("file://")
+        || raw.starts_with("~/")
+        || raw.as_bytes().get(1) == Some(&b':')
+        || raw.starts_with("\\\\")
+}
+
+/// Minimal `.git/config` reader: the `url` (or `pushurl`) of one remote.
+/// Includes and command-scoped config are deliberately not followed; a value
+/// this reader cannot see leaves the old fail-closed path.
+fn configured_remote_url(cwd: &Path, name: &str) -> Option<String> {
+    let target = name.trim();
+    if target.is_empty() || target.contains(char::is_whitespace) {
+        return None;
+    }
+    let config_paths = [cwd.join(".git/config"), cwd.join("config")];
+    for config_path in config_paths {
+        let Ok(raw) = std::fs::read_to_string(&config_path) else {
+            continue;
+        };
+        let mut section = String::new();
+        let mut regular = None;
+        let mut push = None;
+        for line in raw.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+                continue;
+            }
+            if line.starts_with('[') {
+                section = line.to_string();
+                continue;
+            }
+            if section != format!("[remote \"{target}\"]") {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let key = key.trim();
+            let value = value.trim().trim_matches('"');
+            if key == "pushurl" {
+                push = Some(value.to_string());
+            } else if key == "url" {
+                regular = Some(value.to_string());
+            }
+        }
+        if let Some(url) = push.or(regular) {
+            return Some(url);
+        }
+    }
+    None
+}
+
+fn local_target_path(raw: &str, cwd: &Path) -> Option<PathBuf> {
+    if let Some(rest) = raw.strip_prefix("file://") {
+        let url = url::Url::parse(raw).ok()?;
+        return url
+            .to_file_path()
+            .ok()
+            .or_else(|| Some(PathBuf::from(rest)));
+    }
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        return Some(path.to_path_buf());
+    }
+    if raw.starts_with("./") || raw.starts_with("../") || raw.starts_with("~/") {
+        return Some(cwd.join(path));
+    }
+    // A Windows drive path or UNC path is local even on a non-Windows host
+    // only for the host that can resolve it; leave it to the OS there.
+    if raw.as_bytes().get(1) == Some(&b':') || raw.starts_with("\\\\") {
+        return Some(path.to_path_buf());
+    }
+    None
+}
+
+#[cfg(test)]
+mod local_push_root_tests {
+    use super::*;
+
+    fn repo_with_remote(cwd: &Path, url: &str) -> PathBuf {
+        let git = cwd.join(".git");
+        std::fs::create_dir_all(&git).unwrap();
+        std::fs::write(
+            git.join("config"),
+            format!("[remote \"origin\"]\n\turl = {url}\n"),
+        )
+        .unwrap();
+        git
+    }
+
+    fn bare_repo(path: &Path) {
+        std::fs::create_dir_all(path).unwrap();
+        std::fs::write(path.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    }
+
+    #[test]
+    fn a_local_push_resolves_the_remote_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let bare = tmp.path().join("remote.git");
+        bare_repo(&bare);
+        repo_with_remote(&workspace, &bare.display().to_string());
+        let args = vec!["push".to_string(), "origin".to_string(), "main".to_string()];
+        assert_eq!(
+            local_push_write_roots("git", &args, &workspace),
+            vec![std::fs::canonicalize(&bare).unwrap()]
+        );
+    }
+
+    #[test]
+    fn a_network_remote_needs_no_write_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        repo_with_remote(&workspace, "https://example.test/repo.git");
+        let args = vec!["push".to_string(), "origin".to_string(), "main".to_string()];
+        assert!(local_push_write_roots("git", &args, &workspace).is_empty());
+    }
+
+    #[test]
+    fn a_sensitive_or_non_repo_target_is_not_widened() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let ssh = tmp.path().join(".ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        std::fs::write(ssh.join("HEAD"), "x").unwrap();
+        repo_with_remote(&workspace, &ssh.display().to_string());
+        let args = vec!["push".to_string(), "origin".to_string(), "main".to_string()];
+        assert!(local_push_write_roots("git", &args, &workspace).is_empty());
+    }
+
+    #[test]
+    fn a_non_push_git_command_gets_no_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let bare = tmp.path().join("remote.git");
+        bare_repo(&bare);
+        repo_with_remote(&workspace, &bare.display().to_string());
+        let args = vec!["status".to_string()];
+        assert!(local_push_write_roots("git", &args, &workspace).is_empty());
+    }
+}

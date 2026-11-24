@@ -1,0 +1,42 @@
+{"model":"deepseek/deepseek-v4-pro","session_id":"6515692c-8e15-447b-b48e-d6e50bf04f77","type":"session_started"}
+{"audit":{"policy":{"source":"default"},"report":{"budget_bytes":65536,"clipped_mandatory":[],"delivered_sections":[],"index_bytes":0,"mandatory_bytes":0,"omitted_sections":[],"optional_bytes":0,"undelivered_mandatory":[],"unmatched_mandatory":[]},"sources":[],"turn_id":"f5ab9ce5-3f6d-4f9b-a74a-b4b5ad77c098","workspace":"/private/tmp/pv2-final/scenarios/e-network"},"type":"rule_delivery"}
+{"audit":{"agent_use":"not_verifiable","discovered":0,"entries":[],"index_bytes":0,"injected_bytes":0,"surface":"index_only"},"type":"skill_delivery"}
+{"type":"stream_attempt_started"}
+{"type":"reasoning_started"}
+{"delta":"This","type":"reasoning_delta"}
+{"delta":" is a simple task:","type":"reasoning_delta"}
+{"delta":" run two curl commands and report","type":"reasoning_delta"}
+{"delta":" both bodies. Let me just","type":"reasoning_delta"}
+{"delta":" run them.","type":"reasoning_delta"}
+{"elapsed_ms":276,"type":"reasoning_completed"}
+{"closing":false,"no_progress_streak":0,"type":"progress_updated"}
+{"cached_input_tokens":2048,"input_tokens":13615,"output_tokens":168,"reasoning_tokens":21,"type":"usage"}
+{"reasoning":[{"duration_ms":276,"text":"This is a simple task: run two curl commands and report both bodies. Let me just run them."}],"text":"","type":"assistant_text"}
+{"arguments":"{\"args\":[\"-sS\",\"http://127.0.0.1:18992/loopback\"],\"program\":\"curl\"}","id":"call_xom5ii9dbvwipvassybdjf5l","tool":"run_command","type":"tool_call"}
+{"call_id":"call_xom5ii9dbvwipvassybdjf5l","snapshot":"4054ab99428d437a98b2651174e1d0e57fd9abcf","type":"workspace_snapshot"}
+{"execution_status":null,"exit_code":0,"id":"call_xom5ii9dbvwipvassybdjf5l","is_error":false,"preview":"exit: 0\n--- stdout ---\nok:/loopback","stop":null,"tool":"run_command","type":"tool_result"}
+{"arguments":"{\"args\":[\"-sS\",\"http://10.9.9.108:18994/lan\"],\"program\":\"curl\"}","id":"call_qo0z0wofmag1dt67o4g90so7","tool":"run_command","type":"tool_call"}
+{"call_id":"call_qo0z0wofmag1dt67o4g90so7","snapshot":"4054ab99428d437a98b2651174e1d0e57fd9abcf","type":"workspace_snapshot"}
+{"execution_status":null,"exit_code":0,"id":"call_qo0z0wofmag1dt67o4g90so7","is_error":false,"preview":"exit: 0\n--- stdout ---\nok:/lan","stop":null,"tool":"run_command","type":"tool_result"}
+{"closing":false,"no_progress_streak":0,"type":"progress_updated"}
+{"type":"stream_attempt_started"}
+{"delta":"Both commands","type":"assistant_delta"}
+{"delta":" succeeded:\n\n1. `curl","type":"assistant_delta"}
+{"delta":" -sS http://127","type":"assistant_delta"}
+{"delta":".0.0.1","type":"assistant_delta"}
+{"delta":":18992/loopback","type":"assistant_delta"}
+{"delta":"` → `ok:/loop","type":"assistant_delta"}
+{"delta":"back`\n2. `curl","type":"assistant_delta"}
+{"delta":" -sS http://10","type":"assistant_delta"}
+{"delta":".9.9","type":"assistant_delta"}
+{"delta":".108:18994/l","type":"assistant_delta"}
+{"delta":"an` → `ok:/","type":"assistant_delta"}
+{"delta":"lan","type":"assistant_delta"}
+{"delta":"`","type":"assistant_delta"}
+{"closing":false,"no_progress_streak":0,"type":"progress_updated"}
+{"cached_input_tokens":12288,"input_tokens":13832,"output_tokens":63,"reasoning_tokens":0,"type":"usage"}
+{"reasoning":[],"text":"Both commands succeeded:\n\n1. `curl -sS http://127.0.0.1:18992/loopback` → `ok:/loopback`\n2. `curl -sS http://10.9.9.108:18994/lan` → `ok:/lan`","type":"assistant_text"}
+{"text":"Both commands succeeded:\n\n1. `curl -sS http://127.0.0.1:18992/loopback` → `ok:/loopback`\n2. `curl -sS http://10.9.9.108:18994/lan` → `ok:/lan`","type":"finished"}
+{"model_steps":2,"modified_files":[],"stop":"answered","text":"Both commands succeeded:\n\n1. `curl -sS http://127.0.0.1:18992/loopback` → `ok:/loopback`\n2. `curl -sS http://10.9.9.108:18994/lan` → `ok:/lan`","transcript_ordinal":4,"type":"delivery_committed"}
+{"closing":true,"no_progress_streak":0,"type":"progress_updated"}
+{"modified_files":[],"rounds":2,"session_id":"6515692c-8e15-447b-b48e-d6e50bf04f77","stop_detail":null,"stop_reason":"Answered","type":"session_completed"}

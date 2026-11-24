@@ -30,6 +30,7 @@ async fn pending_approval_survives_a_restart_via_the_event_log() {
                 summary: "run tests".into(),
                 command: Some("cargo test".into()),
                 risk: "assisted".into(),
+                reason_code: None,
             },
             &mut |_| {},
         )

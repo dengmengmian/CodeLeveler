@@ -145,6 +145,7 @@ compatibility: { synthesize_tool_call_ids: true, drop_unsupported_fields: true }
                 PermissionProfile::Assisted => WirePermissionProfile::Assisted,
                 PermissionProfile::FullAccess => WirePermissionProfile::FullAccess,
             },
+            contract: None,
         })
         .await
         .unwrap();

@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 use leveler_context::{
     FoldRequirement, ProjectInstruction, render_instructions, scoped_rule_sources,
@@ -17,7 +18,7 @@ use leveler_model::{
     SegmentLifecycle, ToolCall, ToolResultContent, TranscriptOrigin,
     scoped_rule_paths_in_legacy_system,
 };
-use leveler_tools::ToolRegistry;
+use leveler_tools::{ParallelClass, ToolRegistry};
 
 use super::agent_spawn::SpawnAdmission;
 use super::closeout::{
@@ -29,6 +30,7 @@ use super::dispatch::{
     newly_modified_paths, note_tool_side_effects, preview,
 };
 use super::host::AdmitError;
+use super::web_latency::WebBatchTrace;
 use super::{
     AbortedFacts, AdvisoryKind, AgentError, AgentEvent, AgentOutcome, ChildToolEvent, DriveAborted,
     Executor, ModelRequestRecord, StopReason, TranscriptSink, UserAuthority,
@@ -141,6 +143,19 @@ const MAX_SETTLED_DELIVERY_ROUNDS: u32 = 2;
 /// How many started-but-unresolved commands the completion gate remembers.
 /// Feedback only: the newest starts are the ones a completion can cite.
 const MAX_PENDING_COMMANDS: usize = 16;
+
+/// Hard ceiling on web requests one round may have in flight at once.
+///
+/// This is a runtime resource guard, not the provider's declared
+/// `max_parallel_tool_calls` and not the local read batch width. A round of
+/// independent fetches gains its latency from overlap, but every additional
+/// socket is a quota/billing/abuse risk the model does not own. The effective
+/// bound is the smaller of this ceiling and the resolved executor batch width
+/// (`policy.max_parallel_tools`), so a worker seat that is serial for writes is
+/// serial for requests too. Three was chosen from the controlled latency data:
+/// two and three independent requests cover the observed multi-source rounds,
+/// while four-plus buys little beyond the slowest request's own duration.
+const MAX_NETWORK_PARALLEL: usize = 3;
 
 /// How often the goal gate may return the SAME refusal before the run stops.
 ///
@@ -2547,6 +2562,10 @@ impl<'a> Drive<'a> {
 struct ParallelJob {
     index: usize,
     admitted: crate::executor::host::AdmittedCall,
+    /// The class the tool declared at registration. Local reads share the
+    /// existing batch width; network calls share a separate, smaller bound so
+    /// a round of fetches cannot exceed the request budget the runtime chose.
+    class: ParallelClass,
 }
 
 /// Outcome of applying a `declare_intent` call.
@@ -3631,6 +3650,7 @@ impl Drive<'_> {
         pending_images: &mut Vec<ContentPart>,
         observed_terminal_tasks: &mut Vec<String>,
         cancellation: &CancellationToken,
+        web_batch: Option<&WebBatchTrace>,
     ) -> Result<(), AgentError> {
         if jobs.is_empty() {
             return Ok(());
@@ -3639,24 +3659,70 @@ impl Drive<'_> {
             use futures::stream::{FuturesUnordered, StreamExt};
             let cancellation_ref = cancellation;
             let executor = self.executor;
-            // Leveling knob: bound how many of the batch actually overlap
-            // (policy `max_parallel_tools`; 0 = the whole batch at once).
-            let permits = match self.executor.policy.max_parallel_tools {
+            // Two bounds, not one. The local read batch keeps the executor's
+            // resolved width (`max_parallel_tools`; 0 = unbounded). Network
+            // calls are external requests and take the smaller of that width
+            // and MAX_NETWORK_PARALLEL: a worker seat resolved to 1 stays
+            // serial, and a main seat can never put more than three requests
+            // on the wire from one round. The model's declared
+            // `max_parallel_tool_calls` is not consulted here.
+            let read_limit = match self.executor.policy.max_parallel_tools {
                 0 => jobs.len(),
                 n => n,
             };
-            let sem = Arc::new(tokio::sync::Semaphore::new(permits.max(1)));
+            let network_limit = match self.executor.policy.max_parallel_tools {
+                0 => MAX_NETWORK_PARALLEL,
+                n => n.min(MAX_NETWORK_PARALLEL),
+            };
+            let read_sem = Arc::new(tokio::sync::Semaphore::new(read_limit.max(1)));
+            let network_sem = Arc::new(tokio::sync::Semaphore::new(network_limit.max(1)));
             let mut futs = FuturesUnordered::new();
             for job in jobs.iter() {
-                let sem = sem.clone();
+                let sem = match job.class {
+                    ParallelClass::Network => network_sem.clone(),
+                    _ => read_sem.clone(),
+                };
+                let span = web_batch
+                    .map(|batch| batch.span(job.index))
+                    .unwrap_or_else(tracing::Span::none);
+                // Only a network call can wait in the process-wide budget;
+                // recording the per-call waits here keeps the slow summary
+                // able to separate budget scheduling from HTTP time.
+                let network_trace = (job.class == ParallelClass::Network)
+                    .then(|| Arc::new(leveler_tools::NetworkTrace::default()));
                 futs.push(async move {
+                    if let Some(batch) = web_batch {
+                        batch.phase(job.index, "dispatch_queued", "pending");
+                    }
                     let _permit = sem
                         .acquire()
                         .await
                         .expect("tool-batch semaphore is never closed");
+                    if let Some(batch) = web_batch {
+                        batch.phase(job.index, "dispatch_started", "pending");
+                    }
                     let out = executor
-                        .dispatch_raw(&job.admitted, cancellation_ref, None)
+                        .dispatch_raw(
+                            &job.admitted,
+                            cancellation_ref,
+                            None,
+                            network_trace.as_ref(),
+                        )
+                        .instrument(span)
                         .await;
+                    if let Some(batch) = web_batch {
+                        let outcome = if !out.1 {
+                            "ok"
+                        } else if cancellation_ref.is_cancelled() {
+                            "cancelled"
+                        } else {
+                            "error"
+                        };
+                        batch.phase(job.index, "dispatch_finished", outcome);
+                        if let Some(trace) = &network_trace {
+                            batch.network(job.index, trace);
+                        }
+                    }
                     (job.index, out)
                 });
             }
@@ -4981,6 +5047,21 @@ impl AgentHarness for Drive<'_> {
         messages: &mut Vec<Message>,
     ) -> Result<Flow<AgentOutcome>, AgentError> {
         let model_steps = rt.model_steps();
+        // The provider has already finished and the kernel has parsed this
+        // batch. Use this boundary as the monotonic origin, rather than
+        // guessing at a separate provider-side parse or network timestamp.
+        // The registry's typed class is the one authority for "is this a
+        // network call"; the diagnostic must not keep a second name list.
+        let network_calls: Vec<bool> = calls
+            .iter()
+            .map(|call| self.executor.registry.parallel_class(&call.name) == ParallelClass::Network)
+            .collect();
+        let web_batch = WebBatchTrace::begin(
+            self.tool_context.session_scope(),
+            model_steps,
+            &calls,
+            &network_calls,
+        );
         let cancellation = rt.cancellation().clone();
         let has_next_model_step = rt.has_next_model_step();
         let model_tokens_spent = rt.model_tokens_spent();
@@ -5083,6 +5164,16 @@ impl AgentHarness for Drive<'_> {
                 cancelled_mid_batch = true;
                 break;
             }
+            let web_span = web_batch
+                .as_ref()
+                .map(|batch| batch.span(index))
+                .unwrap_or_else(tracing::Span::none);
+            let mark_web = |phase, outcome| {
+                if let Some(batch) = &web_batch {
+                    batch.phase(index, phase, outcome);
+                }
+            };
+            mark_web("scheduled", "pending");
             if self.executor.capabilities.is_some()
                 && !advertised.contains(&call.name)
                 && !(call.name == "ask_user" && advertised.contains("request_user_input"))
@@ -5132,6 +5223,7 @@ impl AgentHarness for Drive<'_> {
                     },
                 });
                 denied_calls_this_round += 1;
+                mark_web("result_staged", "refused");
                 continue;
             }
             if call.name == "capability" && self.executor.capabilities.is_some() {
@@ -7387,15 +7479,12 @@ impl AgentHarness for Drive<'_> {
                 None
             };
 
-            // Read-only, side-effect-free tools are deferred to the
-            // concurrent batch below; mark the event so a UI can render them
-            // as one parallel group.
-            let parallel = self
-                .executor
-                .registry
-                .get(&call.name)
-                .map(|t| t.supports_parallel())
-                .unwrap_or(false);
+            // A tool may be deferred into the concurrent batch below. Pure
+            // reads have no external effect; network calls do, and their
+            // class carries that distinction into admission and the batch
+            // bound. Neither class is ever inferred from the arguments.
+            let parallel_class = self.executor.registry.parallel_class(&call.name);
+            let parallel = parallel_class != ParallelClass::Serial;
             // Call-order contract (F-17): a deferred read group belongs BEFORE
             // this serial call. Flush it now so `read -> write -> read` sees
             // the write between the reads. Adjacent reads still share a
@@ -7407,9 +7496,11 @@ impl AgentHarness for Drive<'_> {
                     &mut pending_images,
                     &mut observed_terminal_tasks,
                     &cancellation,
+                    web_batch.as_ref(),
                 )
                 .await?;
             }
+            mark_web("register_begin", "pending");
             (self.observer)(AgentEvent::ToolCall {
                 id: call.id.as_str().to_string(),
                 name: call.name.clone(),
@@ -7417,6 +7508,7 @@ impl AgentHarness for Drive<'_> {
                 parallel,
                 model_step: Some(model_steps),
             });
+            mark_web("registered", "pending");
             collect_scoped_paths_from_call(&call, &mut self.scoped_paths);
 
             // A command may carry its own elevation for THIS call. Settling
@@ -7557,6 +7649,8 @@ impl AgentHarness for Drive<'_> {
             // admission recorded anything durable. Nothing can prove the call
             // ran, so recovery may re-drive it; this cut exists to observe that.
             leveler_core::test_crash::point("before_tool_dispatch");
+            mark_web("admission_begin", "pending");
+            let mut refused = false;
             let (
                 content,
                 is_error,
@@ -7578,9 +7672,11 @@ impl AgentHarness for Drive<'_> {
                     &mut self.session_approved,
                     &cancellation,
                 )
+                .instrument(web_span.clone())
                 .await
             {
                 Ok(admitted) if parallel => {
+                    mark_web("admission_end", "ok");
                     if self.executor.registry.runs_command(&admitted.call.name) {
                         self.commands_run += 1;
                     }
@@ -7588,10 +7684,15 @@ impl AgentHarness for Drive<'_> {
                     // last answer; the question it answered no longer covers
                     // a later user-decision block.
                     self.work_since_user_ask = true;
-                    parallel_jobs.push(ParallelJob { index, admitted });
+                    parallel_jobs.push(ParallelJob {
+                        index,
+                        admitted,
+                        class: parallel_class,
+                    });
                     continue;
                 }
                 Ok(admitted) => {
+                    mark_web("admission_end", "ok");
                     if let Some(fingerprint) = super::goal_verification::command_invocation(
                         &admitted.call.name,
                         &admitted.call.arguments,
@@ -7670,12 +7771,16 @@ impl AgentHarness for Drive<'_> {
                             };
                         let mut lines = super::dispatch::OutputLines::default();
                         let started_mutation_ops = self.ledger.total_mutation_ops;
-                        let dispatch_fut = self.executor.dispatch(
-                            &admitted,
-                            &mut self.modified_files,
-                            &cancellation,
-                            output_tx,
-                        );
+                        mark_web("dispatch_started", "pending");
+                        let dispatch_fut = self
+                            .executor
+                            .dispatch(
+                                &admitted,
+                                &mut self.modified_files,
+                                &cancellation,
+                                output_tx,
+                            )
+                            .instrument(web_span.clone());
                         tokio::pin!(dispatch_fut);
                         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
                             COMMAND_HEARTBEAT_SECS,
@@ -7708,6 +7813,7 @@ impl AgentHarness for Drive<'_> {
                                 }
                             }
                         };
+                        mark_web("dispatch_returned", if result.1 { "error" } else { "ok" });
                         // The call returned. Sampled BEFORE this call's own
                         // mutation note is applied below, so the window covers
                         // what the command itself could have observed; the
@@ -7777,12 +7883,16 @@ impl AgentHarness for Drive<'_> {
                     // results and flushes the completed command's spend before
                     // surfacing `Cancelled`.
                     if matches!(error, AgentError::Cancelled) {
+                        mark_web("admission_end", "cancelled");
                         cancelled_mid_batch = true;
                         break;
                     }
+                    mark_web("admission_end", "fatal");
                     return Err(error);
                 }
                 Err(AdmitError::Refused { call, reason }) => {
+                    refused = true;
+                    mark_web("admission_end", "refused");
                     denied_calls_this_round += 1;
                     (
                         format!("action not permitted: {reason}"),
@@ -7945,6 +8055,7 @@ impl AgentHarness for Drive<'_> {
                     &mut *self.observer,
                 );
             }
+            mark_web("result_ready", "pending");
             (self.observer)(AgentEvent::ToolResult {
                 exit_code: command_facts.exit_code,
                 stop: command_facts.stop,
@@ -7957,6 +8068,16 @@ impl AgentHarness for Drive<'_> {
                 // made it. A failed call never carries one.
                 applied_diff: (!is_error).then_some(applied_diff).flatten(),
             });
+            let web_outcome = if refused {
+                "refused"
+            } else if is_error && cancellation.is_cancelled() {
+                "cancelled"
+            } else if is_error {
+                "error"
+            } else {
+                "ok"
+            };
+            mark_web("result_observed", web_outcome);
             // Mechanical verification fact, sampled AFTER this call's own
             // mutation note. The note is emitted before this result, so the
             // replay path sees the same EvidenceLedgerUpdated before
@@ -8074,6 +8195,7 @@ impl AgentHarness for Drive<'_> {
                     is_error,
                 },
             });
+            mark_web("result_staged", web_outcome);
             if cancelled_mid_batch {
                 break;
             }
@@ -8087,6 +8209,7 @@ impl AgentHarness for Drive<'_> {
                 &mut pending_images,
                 &mut observed_terminal_tasks,
                 &cancellation,
+                web_batch.as_ref(),
             )
             .await?;
         }
@@ -8612,6 +8735,9 @@ impl AgentHarness for Drive<'_> {
                         "cancelled by the user before this call ran".to_string(),
                         model_steps,
                     ));
+                    if let Some(batch) = &web_batch {
+                        batch.phase(index, "result_staged", "cancelled");
+                    }
                 }
             }
         }
@@ -8632,6 +8758,9 @@ impl AgentHarness for Drive<'_> {
             route: None,
         };
         messages.push(tool_message.clone());
+        if let Some(batch) = &web_batch {
+            batch.mark("delivery_begin", "pending");
+        }
         // Flush spend BEFORE transcript persistence: tools already ran, so
         // a sink I/O failure must not drop this batch's command/file totals.
         self.flush_epoch(rt);
@@ -8640,9 +8769,31 @@ impl AgentHarness for Drive<'_> {
         // Without it a crash could leave the transcript asserting an exchange
         // the event plane never recorded (or the reverse), which is the F-05
         // window recovery cannot reconcile from one plane alone.
-        self.settlements_durable().await?;
+        let events_flushed = self.settlements_durable().await;
+        if let Some(batch) = &web_batch {
+            batch.mark(
+                "delivery_events_flushed",
+                if events_flushed.is_ok() {
+                    "ok"
+                } else {
+                    "error"
+                },
+            );
+        }
+        events_flushed?;
         leveler_core::test_crash::point("after_tool_finished_before_transcript");
-        self.sink.append(&[assistant, tool_message]).await?;
+        let appended = self.sink.append(&[assistant, tool_message]).await;
+        if let Some(batch) = &web_batch {
+            let outcome = if appended.is_err() {
+                "error"
+            } else if cancelled_mid_batch {
+                "cancelled"
+            } else {
+                "ok"
+            };
+            batch.mark("delivered", outcome);
+        }
+        appended?;
         leveler_core::test_crash::point("after_transcript_before_next_round");
         if let Some(delivered) = self.delivered_background_tasks.as_mut() {
             delivered.extend(observed_terminal_tasks);

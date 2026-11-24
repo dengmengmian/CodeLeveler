@@ -427,6 +427,7 @@ fn runtime_sigkill_with_dangling_mcp_call_resumes_as_unknown() {
                     goal: "Call the configured MCP tool and report what it did".into(),
                     model: None,
                     mode: leveler_client_protocol::PermissionProfile::FullAccess,
+                    permission_contract: None,
                 })
                 .await
                 .unwrap()

@@ -82,6 +82,7 @@ impl AgentRuntime {
             task_terminal: state.task_terminal.clone(),
             model: None,
             mode: PermissionProfile::Assisted,
+            permission_contract: leveler_client_protocol::PermissionContract::V1,
             branch: None,
             status: "idle".into(),
             finalization_stage: None,
@@ -394,6 +395,7 @@ async fn fixture(
     let definition = store
         .create_definition(NewScheduleDefinition {
             name: "scheduled work".into(),
+            permission_contract: leveler_client_protocol::PermissionContract::V2,
             workspace,
             action,
             trigger: ScheduleTrigger::Once {
@@ -863,6 +865,7 @@ async fn run_now_is_not_starved_by_an_unrelated_overdue_slot() {
                     session_policy: SessionPolicy::Continue,
                     overlap: OverlapPolicy::SkipIfRunning,
                     mode: PermissionProfile::Assisted,
+                    permission_contract: leveler_client_protocol::PermissionContract::V2,
                     model: Some(ModelRef::new(PROVIDER, "deepseek-chat")),
                     timeout: Duration::from_secs(30),
                     misfire: leveler_schedule::MisfirePolicy::Skip,
@@ -1327,6 +1330,7 @@ async fn create_agent_definition(
             session_policy: SessionPolicy::Continue,
             overlap: OverlapPolicy::SkipIfRunning,
             mode: PermissionProfile::Assisted,
+            permission_contract: leveler_client_protocol::PermissionContract::V2,
             model: Some(ModelRef::new(PROVIDER, "deepseek-chat")),
             timeout: Duration::from_secs(30),
             misfire: leveler_schedule::MisfirePolicy::Skip,

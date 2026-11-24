@@ -348,6 +348,7 @@ fn runtime_sigkill_recovered_task_is_observed_by_the_same_id() {
                     goal: "Run the long background command and report its durable result".into(),
                     model: None,
                     mode: leveler_client_protocol::PermissionProfile::FullAccess,
+                    permission_contract: None,
                 })
                 .await
                 .unwrap()
@@ -879,6 +880,7 @@ fn cancelling_a_goal_reaps_its_supervised_background_task() {
                     goal: "Start a service that this cancelled goal owns".into(),
                     model: None,
                     mode: leveler_client_protocol::PermissionProfile::FullAccess,
+                    permission_contract: None,
                 })
                 .await
                 .unwrap()
@@ -987,6 +989,7 @@ fn a_restarted_runtime_observes_and_stops_the_same_running_task() {
                     goal: "Keep a supervised task alive across a runtime restart".into(),
                     model: None,
                     mode: leveler_client_protocol::PermissionProfile::FullAccess,
+                    permission_contract: None,
                 })
                 .await
                 .unwrap()

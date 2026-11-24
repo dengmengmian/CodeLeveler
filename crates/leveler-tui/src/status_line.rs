@@ -107,6 +107,15 @@ fn streaming_output_estimate(state: &AppState) -> Option<u32> {
 /// These are the user-facing names of [`PermissionProfile`], not inferred
 /// aliases. There is no standing `deny` profile.
 pub(crate) fn permission_chip_label(state: &AppState) -> &'static str {
+    // A legacy session is visibly marked: its tier name now means something
+    // different from the same name under V2. Full is identical either way.
+    if state.permission_contract == leveler_client_protocol::PermissionContract::V1 {
+        return match state.mode_label.as_str() {
+            "RequestApproval" => "ask·v1",
+            "FullAccess" => "full",
+            _ => "auto·v1",
+        };
+    }
     match state.mode_label.as_str() {
         "RequestApproval" => "ask",
         "FullAccess" => "full",
@@ -1284,6 +1293,7 @@ mod tests {
     #[test]
     fn permission_chip_labels_are_english_product_terms() {
         let mut state = test_state();
+        state.permission_contract = leveler_client_protocol::PermissionContract::V2;
         state.mode_label = "Assisted".into();
         assert_eq!(permission_chip_label(&state), "auto");
         state.mode_label = "RequestApproval".into();
@@ -1292,9 +1302,24 @@ mod tests {
         assert_eq!(permission_chip_label(&state), "full");
     }
 
+    /// A V1 session keeps its old behavior and says so: the same tier name
+    /// means something different under V2, and Full is identical either way.
+    #[test]
+    fn legacy_sessions_mark_the_contract_on_the_tier_chip() {
+        let mut state = test_state();
+        state.permission_contract = leveler_client_protocol::PermissionContract::V1;
+        state.mode_label = "Assisted".into();
+        assert_eq!(permission_chip_label(&state), "auto·v1");
+        state.mode_label = "RequestApproval".into();
+        assert_eq!(permission_chip_label(&state), "ask·v1");
+        state.mode_label = "FullAccess".into();
+        assert_eq!(permission_chip_label(&state), "full");
+    }
+
     #[test]
     fn runtime_chip_strips_provider_and_shows_effort() {
         let mut state = test_state();
+        state.permission_contract = leveler_client_protocol::PermissionContract::V2;
         state.model_label = "deepseek/deepseek-v4-flash".into();
         state.thinking = Some(thinking_state(leveler_model::ThinkingLevel::Max));
         state.mode_label = "RequestApproval".into();
@@ -1331,6 +1356,7 @@ mod tests {
     #[test]
     fn runtime_chip_omits_effort_when_unset() {
         let mut state = test_state();
+        state.permission_contract = leveler_client_protocol::PermissionContract::V2;
         state.model_label = "deepseek/deepseek-v4-flash".into();
         state.thinking = None;
         state.mode_label = "RequestApproval".into();
@@ -1382,6 +1408,7 @@ mod tests {
     #[test]
     fn runtime_chip_keeps_controls_ahead_of_model_decoration() {
         let mut state = test_state();
+        state.permission_contract = leveler_client_protocol::PermissionContract::V2;
         state.model_label = "deepseek/deepseek-v4-flash".into();
         state.thinking = Some(thinking_state(leveler_model::ThinkingLevel::Max));
         state.mode_label = "RequestApproval".into();
@@ -1507,6 +1534,7 @@ mod tests {
                 summary: "git push".into(),
                 command: Some("git push".into()),
                 risks: vec!["network".into()],
+                reason_code: None,
                 call_id: None,
                 always_persists: true,
             }),

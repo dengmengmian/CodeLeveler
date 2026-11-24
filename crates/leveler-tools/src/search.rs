@@ -15,6 +15,9 @@ use tokio_util::sync::CancellationToken;
 
 use leveler_execution::NetworkScope;
 
+use crate::network::{NetworkCall, PhaseOutcome, WebPhase};
+use crate::network_budget::RequestClass;
+
 /// Default DeepSeek Search API base, including the `/v1/tools` prefix.
 /// `/search` is appended.
 pub const DEEPSEEK_SEARCH_BASE_URL: &str = "https://api.deepseek.com/v1/tools";
@@ -69,6 +72,10 @@ impl SearchProviderKind {
 pub struct SearchNetwork<'a> {
     pub scope: &'a NetworkScope,
     pub unrestricted: bool,
+    /// Session identity for the process-wide fairness budget.
+    pub session: Option<&'a str>,
+    /// Optional per-call budget-wait observations, stamped by the host.
+    pub trace: Option<&'a crate::NetworkTrace>,
 }
 
 /// One normalizeable search source.
@@ -138,6 +145,10 @@ pub struct DeepSeekSearchProvider {
     endpoint: String,
     max_results: usize,
     timeout: Duration,
+    /// Name of the environment variable the key came from, when the composition
+    /// root knows it. Used only to make a 401 actionable; the value never
+    /// leaves the provider.
+    credential_env: Option<String>,
 }
 
 impl DeepSeekSearchProvider {
@@ -165,7 +176,18 @@ impl DeepSeekSearchProvider {
             endpoint,
             max_results,
             timeout,
+            credential_env: None,
         })
+    }
+
+    /// Record the variable the key was read from so a 401 can name it.
+    pub fn with_credential_env(mut self, env: impl Into<String>) -> Self {
+        self.credential_env = Some(env.into());
+        self
+    }
+
+    pub fn credential_env(&self) -> Option<&str> {
+        self.credential_env.as_deref()
     }
 
     fn body(&self, query: &str, count: usize) -> serde_json::Value {
@@ -204,7 +226,14 @@ impl SearchProvider for DeepSeekSearchProvider {
         let requested = count;
         let count = count.clamp(1, DEEPSEEK_MAX_RESULTS).min(self.max_results);
         let body = self.body(query, count);
-        let response = tokio::select! {
+        let network_call = NetworkCall {
+            class: RequestClass::Search {
+                provider: self.id(),
+            },
+            session: network.session,
+            trace: network.trace,
+        };
+        let (response, _lease) = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err(SearchError::Cancelled),
             response = crate::network::send(
@@ -215,6 +244,7 @@ impl SearchProvider for DeepSeekSearchProvider {
                 Some(&body),
                 Some(&self.api_key),
                 self.timeout,
+                network_call,
             ) => map_transport(response, &self.api_key)?,
         };
 
@@ -224,7 +254,11 @@ impl SearchProvider for DeepSeekSearchProvider {
         let status = response.status();
         if !status.is_success() {
             let message = redact(&error_detail(response).await, &self.api_key);
-            return Err(http_error(status.as_u16(), message));
+            return Err(http_error_with_env(
+                status.as_u16(),
+                message,
+                self.credential_env.as_deref(),
+            ));
         }
         let bytes = read_body(response).await?;
         if cancellation.is_cancelled() {
@@ -246,6 +280,10 @@ pub struct TavilySearchProvider {
     endpoint: String,
     max_results: usize,
     timeout: Duration,
+    /// Name of the environment variable the key came from, when the composition
+    /// root knows it. Used only to make a 401 actionable; the value never
+    /// leaves the provider.
+    credential_env: Option<String>,
 }
 
 impl TavilySearchProvider {
@@ -271,7 +309,18 @@ impl TavilySearchProvider {
             endpoint,
             max_results,
             timeout,
+            credential_env: None,
         })
+    }
+
+    /// Record the variable the key was read from so a 401 can name it.
+    pub fn with_credential_env(mut self, env: impl Into<String>) -> Self {
+        self.credential_env = Some(env.into());
+        self
+    }
+
+    pub fn credential_env(&self) -> Option<&str> {
+        self.credential_env.as_deref()
     }
 
     fn body(&self, query: &str, count: usize) -> serde_json::Value {
@@ -310,7 +359,14 @@ impl SearchProvider for TavilySearchProvider {
         let requested = count;
         let count = count.clamp(1, 50).min(self.max_results);
         let body = self.body(query, count);
-        let response = tokio::select! {
+        let network_call = NetworkCall {
+            class: RequestClass::Search {
+                provider: self.id(),
+            },
+            session: network.session,
+            trace: network.trace,
+        };
+        let (response, _lease) = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err(SearchError::Cancelled),
             response = crate::network::send(
@@ -321,6 +377,7 @@ impl SearchProvider for TavilySearchProvider {
                 Some(&body),
                 Some(&self.api_key),
                 self.timeout,
+                network_call,
             ) => map_transport(response, &self.api_key)?,
         };
 
@@ -330,7 +387,11 @@ impl SearchProvider for TavilySearchProvider {
         let status = response.status();
         if !status.is_success() {
             let message = redact(&error_detail(response).await, &self.api_key);
-            return Err(http_error(status.as_u16(), message));
+            return Err(http_error_with_env(
+                status.as_u16(),
+                message,
+                self.credential_env.as_deref(),
+            ));
         }
         let bytes = read_body(response).await?;
         if cancellation.is_cancelled() {
@@ -365,10 +426,7 @@ fn endpoint_from(base: &str) -> Result<String, SearchError> {
 
 /// Map a transport failure without collapsing permission denials into
 /// ordinary reachability errors, and without retaining credentials.
-fn map_transport(
-    response: Result<reqwest::Response, String>,
-    api_key: &str,
-) -> Result<reqwest::Response, SearchError> {
+fn map_transport<T>(response: Result<T, String>, api_key: &str) -> Result<T, SearchError> {
     match response {
         Ok(response) => Ok(response),
         Err(reason) => {
@@ -399,19 +457,8 @@ fn redact(text: &str, secret: &str) -> String {
 
 /// Read a successful body without buffering past the cap. Streaming matters:
 /// `Response::bytes()` would buffer an arbitrary body before any length check.
-async fn read_body(mut response: reqwest::Response) -> Result<Vec<u8>, SearchError> {
-    let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|e| SearchError::Transport(e.to_string()))?
-    {
-        if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
-            return Err(SearchError::InvalidResponse);
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
+async fn read_body(response: reqwest::Response) -> Result<Vec<u8>, SearchError> {
+    read_body_capped(response, MAX_RESPONSE_BYTES).await
 }
 
 /// Best-effort provider error text, bounded the same way. The body is
@@ -443,18 +490,46 @@ async fn read_body_capped(
     mut response: reqwest::Response,
     max: usize,
 ) -> Result<Vec<u8>, SearchError> {
+    let timer = WebPhase::body(response.status());
     let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|e| SearchError::Transport(e.to_string()))?
-    {
+    loop {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(error) => {
+                timer.finish(PhaseOutcome::request_error(&error));
+                return Err(SearchError::Transport(error.to_string()));
+            }
+        };
         if body.len() + chunk.len() > max {
+            timer.finish(PhaseOutcome::Limit);
             return Err(SearchError::InvalidResponse);
         }
         body.extend_from_slice(&chunk);
     }
+    timer.finish(PhaseOutcome::Ok);
     Ok(body)
+}
+
+/// As [`http_error`], but names the credential variable for a 401 so the
+/// model can point the operator at the exact thing to fix. The value is never
+/// included, only the variable name.
+fn http_error_with_env(status: u16, detail: String, credential_env: Option<&str>) -> SearchError {
+    if status != 401 {
+        return http_error(status, detail);
+    }
+    let base = match credential_env {
+        Some(env) => {
+            format!("鉴权失败(HTTP 401),请检查搜索 API Key(环境变量 ${env}; 运行时启动时读取)")
+        }
+        None => "鉴权失败(HTTP 401),请检查搜索 API Key".to_string(),
+    };
+    let message = if detail.is_empty() {
+        base
+    } else {
+        format!("{base}:{detail}")
+    };
+    SearchError::Http { status, message }
 }
 
 /// Turn an HTTP status into a model-visible, actionable failure. The status is
@@ -801,6 +876,30 @@ mod tests {
         assert!(
             TavilySearchProvider::new("k", Some("not a url"), 5, Duration::from_secs(1)).is_err()
         );
+    }
+
+    #[test]
+    fn auth_failure_names_the_credential_variable() {
+        let error = http_error_with_env(
+            401,
+            "Authentication Fails".into(),
+            Some("LEVELER_SEARCH_API_KEY"),
+        );
+        let text = error.to_string();
+        assert!(text.contains("LEVELER_SEARCH_API_KEY"), "{text}");
+        assert!(!text.contains("sk-"), "{text}");
+
+        let without = http_error_with_env(401, "Authentication Fails".into(), None);
+        assert!(!without.to_string().contains("LEVELER_SEARCH_API_KEY"));
+    }
+
+    #[test]
+    fn providers_keep_the_credential_variable_for_auth_hints() {
+        let provider = DeepSeekSearchProvider::new("k", None, 5, Duration::from_secs(1))
+            .unwrap()
+            .with_credential_env("LEVELER_SEARCH_API_KEY");
+        assert_eq!(provider.credential_env(), Some("LEVELER_SEARCH_API_KEY"));
+        assert!(!provider.credential_env().unwrap().contains("k"));
     }
 
     #[test]

@@ -576,7 +576,36 @@ impl Workspace {
                 return Ok(path);
             }
         };
-        self.resolve_bounded(input, bound, PathAccess::Write)
+        let resolved = self.resolve_bounded(input, bound, PathAccess::Write)?;
+        if matches!(scope, WriteScope::Unrestricted) {
+            // Descriptor-relative writers open each component with O_NOFOLLOW
+            // and compare the target against their (canonical) root. A
+            // non-existent target must therefore be expressed through its
+            // real ancestor, or macOS `/var` -> `/private/var` makes the
+            // target look outside the root it was just resolved against.
+            let mut lexical = resolved.as_path();
+            loop {
+                if let Ok(real_ancestor) = lexical.canonicalize() {
+                    let suffix = resolved
+                        .strip_prefix(lexical)
+                        .unwrap_or_else(|_| Path::new(""));
+                    // `join("")` leaves a trailing separator, which makes a
+                    // file read hit ENOTDIR. The target itself is the answer.
+                    let real = if suffix.as_os_str().is_empty() {
+                        real_ancestor
+                    } else {
+                        real_ancestor.join(suffix)
+                    };
+                    self.check_sensitive(&real, input, PathAccess::Write)?;
+                    return Ok(real);
+                }
+                let Some(parent) = lexical.parent() else {
+                    break;
+                };
+                lexical = parent;
+            }
+        }
+        Ok(resolved)
     }
 
     /// Revalidate a previously resolved write path immediately before mutation.
@@ -1438,6 +1467,9 @@ mod scope_split_tests {
             .resolve_for_write(other.join("notes.md"), &WriteScope::Unrestricted)
             .expect("unrestricted may write anywhere");
         assert_eq!(p, other.join("notes.md").canonicalize().unwrap());
+        // The resolved spelling must address the file itself. A trailing
+        // separator here turns an ordinary read into ENOTDIR.
+        std::fs::metadata(&p).expect("the resolved path names the existing file");
         // ...but not credentials.
         assert!(matches!(
             ws.resolve_for_write(other.join(".env"), &WriteScope::Unrestricted),

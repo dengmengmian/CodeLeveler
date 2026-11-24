@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use leveler_core::{ApprovalId, TurnId};
 
-use crate::risk::{PermissionProfile, RiskLevel};
+use crate::risk::{PermissionProfile, PolicyKind, RiskLevel};
 use crate::shell_ast;
 
 /// A request for the user to approve a risky action.
@@ -40,6 +40,10 @@ pub struct ApprovalRequest {
     /// consent to an unstated filesystem boundary change.
     #[serde(default)]
     pub write_scope_expanded: bool,
+    /// Stable machine-readable reason (`irreversible.*`, `boundary.*`). The
+    /// UI and audit read this instead of inferring risk from prose.
+    #[serde(default)]
+    pub reason_code: Option<String>,
 }
 
 impl ApprovalRequest {
@@ -94,6 +98,9 @@ pub enum ApprovalDecision {
     ApproveOnce,
     /// Reuse bound capability/resources for this durable session. Legacy
     /// requests without resources retain exact-call approval for this turn.
+    /// An MCP proxy tool is the exception: its authorization unit is the
+    /// configured tool, not one argument vector, so this choice covers that
+    /// tool for the rest of the turn (see `Executor::ask`).
     ApproveSession,
     /// Reuse this capability-resource binding in the same project.
     ApproveProject,
@@ -890,7 +897,7 @@ fn fallback_redirect_is_dangerous(script: &str, windows_cmd: bool) -> bool {
 
 /// If `tokens` is a shell wrapper (`sh`/`bash`/`cmd`/…) with a `-c`/`/C` flag,
 /// return the joined script body after that flag.
-fn nested_shell_c_body(tokens: &[String]) -> Option<String> {
+pub(crate) fn nested_shell_c_body(tokens: &[String]) -> Option<String> {
     let (prog, rest) = tokens.split_first()?;
     if !is_shell_wrapper_program(prog) {
         return None;
@@ -905,7 +912,7 @@ fn nested_shell_c_body(tokens: &[String]) -> Option<String> {
 
 /// Split a shell script into command segments at top-level operators
 /// (`| & ; \n`, incl. `&&`/`||`), ignoring operators inside quotes.
-fn split_shell_segments(script: &str) -> Vec<String> {
+pub(crate) fn split_shell_segments(script: &str) -> Vec<String> {
     let mut segments = Vec::new();
     let mut cur = String::new();
     let mut quote: Option<char> = None;
@@ -962,7 +969,7 @@ fn segment_changes_git_authority(tokens: &[String]) -> bool {
 
 /// Tokenize one command segment on whitespace, stripping surrounding quotes.
 /// Good enough to recover the program name and its first argument.
-fn shell_tokens(segment: &str) -> Vec<String> {
+pub(crate) fn shell_tokens(segment: &str) -> Vec<String> {
     segment
         .split_whitespace()
         .map(|t| t.trim_matches(['\'', '"']).to_string())
@@ -994,8 +1001,11 @@ fn is_mcp_tool(tool: &str) -> bool {
 }
 
 impl ApprovalPolicy {
-    /// Evaluate a tool action. `command` is meaningful for `run_command` and
-    /// `shell_command` (both go through [`classify_command`]).
+    /// Evaluate a tool action under the v1 reading of a profile.
+    ///
+    /// Kept for callers that hold a bare profile and for the long-standing
+    /// decision table. The execution path passes a [`PolicyKind`] instead, so
+    /// a v2 session is never interpreted from its tier alone.
     pub fn evaluate(
         &self,
         profile: PermissionProfile,
@@ -1003,13 +1013,38 @@ impl ApprovalPolicy {
         risk: RiskLevel,
         command: Option<CommandView>,
     ) -> Requirement {
+        self.evaluate_kind(
+            PolicyKind::of(crate::risk::PermissionContract::V1, profile),
+            tool,
+            risk,
+            command,
+        )
+    }
+
+    /// Evaluate a tool action under the effective policy kind.
+    pub fn evaluate_kind(
+        &self,
+        kind: PolicyKind,
+        tool: &str,
+        risk: RiskLevel,
+        command: Option<CommandView>,
+    ) -> Requirement {
         // Full is a top-level product invariant, including current and future
         // tools: consent and sandbox enforcement are bypassed entirely.
-        if profile == PermissionProfile::FullAccess {
+        if kind == PolicyKind::Full {
             return Requirement::Auto;
         }
         if needs_human_consent(tool) {
             return Requirement::NeedApproval;
+        }
+
+        // V2 Auto: no tier/name/risk question. The host adds the ONLY Ask
+        // source this policy has — a directly identifiable irreversible
+        // effect — plus the tool's own concrete admission reasons. An MCP
+        // tool is admitted here and gated later by its typed destructive hint,
+        // not by being MCP.
+        if kind == PolicyKind::EffectAuto {
+            return Requirement::Auto;
         }
 
         // MCP tools bypass the execution sandbox entirely (external process);
@@ -1020,8 +1055,9 @@ impl ApprovalPolicy {
             return Requirement::NeedApproval;
         }
 
-        // 请求批准: always ask for network and anything above workspace writes.
-        if profile == PermissionProfile::RequestApproval {
+        // v1 request_approval: always ask for network and anything above
+        // workspace writes.
+        if kind == PolicyKind::LegacyRestricted {
             if matches!(
                 risk,
                 RiskLevel::Network | RiskLevel::Destructive | RiskLevel::Privileged
@@ -1044,12 +1080,12 @@ impl ApprovalPolicy {
             };
         }
 
-        // 替我审批 (default / "auto"): sandbox-first. Asks for deletion whose
+        // 旧 Auto (LegacyAuto) and, until the effect detector lands, 新 Auto.
+        // The old Auto branch is the compatibility anchor: deletion whose
         // target is not a literal path in the working directory, privilege,
         // host escape, and Git that executes a local program or whose remote
         // credential cannot be brokered. Literal `rm` / `rmdir` and other Git
-        // operations, including push, auto-run. A stored credential still asks
-        // at grant resolution. RequestApproval is the "ask more" profile.
+        // operations, including push, auto-run.
         if is_command_tool(tool) {
             return match command.map(|c| classify_command(&c)) {
                 Some(CommandClass::Dangerous) => Requirement::NeedApproval,
@@ -1153,6 +1189,7 @@ mod tests {
             command: None,
             paths: Vec::new(),
             write_scope_expanded: false,
+            reason_code: None,
         };
 
         // The exact shape observed leaking: request_permissions, Privileged.
@@ -1194,6 +1231,7 @@ mod tests {
             command: Some("cargo test".into()),
             paths: Vec::new(),
             write_scope_expanded: false,
+            reason_code: None,
         };
         assert_eq!(EvalApprove.decide(&request).await, ApprovalDecision::Deny);
         request.description = "read-only, will not modify anything".into();
@@ -1217,6 +1255,7 @@ mod tests {
             command: None,
             paths: Vec::new(),
             write_scope_expanded: false,
+            reason_code: None,
         };
         for (tool, risk) in [
             ("apply_patch", RiskLevel::WorkspaceWrite),
@@ -1264,6 +1303,7 @@ mod tests {
             command: None,
             paths: Vec::new(),
             write_scope_expanded: false,
+            reason_code: None,
         };
         assert_eq!(
             AutoApprove.decide(&request).await,
@@ -1376,6 +1416,7 @@ mod tests {
             command: None,
             paths: Vec::new(),
             write_scope_expanded: false,
+            reason_code: None,
         };
         assert_eq!(AutoApprove.decide(&req).await, ApprovalDecision::Deny);
 

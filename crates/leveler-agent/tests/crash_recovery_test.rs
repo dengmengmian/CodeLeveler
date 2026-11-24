@@ -328,6 +328,7 @@ async fn seed_pending_approval_call(
             tool: name.into(),
             summary: "apply the interrupted patch".into(),
             command: None,
+            reason_code: None,
             risk: "assisted".into(),
         },
         &mut |_| {},

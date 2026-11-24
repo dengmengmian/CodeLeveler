@@ -380,6 +380,7 @@ async fn the_cli_and_the_shared_view_agree_after_an_explicit_reschedule() {
                 session_policy: definition.session_policy,
                 overlap: definition.overlap,
                 mode: definition.mode,
+                permission_contract: definition.permission_contract,
                 model: definition.model.clone(),
                 timeout: definition.timeout,
                 misfire: definition.misfire,

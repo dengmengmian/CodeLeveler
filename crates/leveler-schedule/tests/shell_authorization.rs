@@ -35,6 +35,7 @@ impl RuntimeConnector for CountingConnector {
 
 async fn fixture(
     mode: PermissionProfile,
+    permission_contract: leveler_client_protocol::PermissionContract,
     unattended: Option<UnattendedRequest>,
 ) -> (
     ScheduleStore,
@@ -60,6 +61,7 @@ async fn fixture(
             session_policy: SessionPolicy::Continue,
             overlap: OverlapPolicy::SkipIfRunning,
             mode,
+            permission_contract,
             model: None,
             timeout: Duration::from_secs(30),
             misfire: MisfirePolicy::Skip,
@@ -73,7 +75,12 @@ async fn fixture(
 
 #[tokio::test]
 async fn a_shell_run_without_a_grant_is_blocked_before_delivery() {
-    let (store, id, _tmp) = fixture(PermissionProfile::Assisted, None).await;
+    let (store, id, _tmp) = fixture(
+        PermissionProfile::Assisted,
+        leveler_client_protocol::PermissionContract::V2,
+        None,
+    )
+    .await;
     let attempts = Arc::new(AtomicUsize::new(0));
     let dispatcher = Dispatcher::new(
         store.clone(),
@@ -109,6 +116,7 @@ async fn a_shell_run_without_a_grant_is_blocked_before_delivery() {
 async fn a_repaired_one_off_slot_still_requires_a_covering_grant() {
     let (store, id, _tmp) = fixture(
         PermissionProfile::Assisted,
+        leveler_client_protocol::PermissionContract::V2,
         Some(UnattendedRequest {
             allow_external_side_effects: true,
         }),
@@ -137,6 +145,7 @@ async fn a_repaired_one_off_slot_still_requires_a_covering_grant() {
                 session_policy: definition.session_policy,
                 overlap: definition.overlap,
                 mode: definition.mode,
+                permission_contract: leveler_client_protocol::PermissionContract::V2,
                 model: definition.model.clone(),
                 timeout: definition.timeout,
                 misfire: definition.misfire,
@@ -178,6 +187,7 @@ async fn a_repaired_one_off_slot_still_requires_a_covering_grant() {
 async fn a_shell_run_with_a_matching_grant_reaches_the_runtime() {
     let (store, id, _tmp) = fixture(
         PermissionProfile::Assisted,
+        leveler_client_protocol::PermissionContract::V2,
         Some(UnattendedRequest {
             allow_external_side_effects: true,
         }),
@@ -213,7 +223,12 @@ async fn a_shell_run_with_a_matching_grant_reaches_the_runtime() {
 
 #[tokio::test]
 async fn full_access_without_a_grant_does_not_authorize_a_shell_run() {
-    let (store, id, _tmp) = fixture(PermissionProfile::FullAccess, None).await;
+    let (store, id, _tmp) = fixture(
+        PermissionProfile::FullAccess,
+        leveler_client_protocol::PermissionContract::V2,
+        None,
+    )
+    .await;
     let attempts = Arc::new(AtomicUsize::new(0));
     let dispatcher = Dispatcher::new(
         store.clone(),

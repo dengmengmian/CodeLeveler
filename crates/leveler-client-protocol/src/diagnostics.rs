@@ -131,6 +131,7 @@ pub mod finding_id {
     pub const CONFIG_GLOBAL: &str = "config.global";
     pub const CONFIG_RELOAD: &str = "config.reload";
     pub const CONFIG_RETIRED_INSTRUCTIONS: &str = "config.retired-instructions";
+    pub const WEB_SEARCH: &str = "web.search";
     pub const MODEL_REASONING: &str = "model.reasoning";
     pub const MODEL_THINKING: &str = "model.thinking";
     pub const PROVIDER_API_KEY: &str = "provider.api-key";

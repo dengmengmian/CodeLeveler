@@ -18,6 +18,8 @@ use tokio_util::sync::CancellationToken;
 
 use leveler_execution::RiskLevel;
 
+use crate::network::{DnsPhase, NetworkCall, PhaseOutcome, WebPhase};
+use crate::network_budget::RequestClass;
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 
 const TIMEOUT: Duration = Duration::from_secs(15);
@@ -58,12 +60,23 @@ impl Tool for WebFetchTool {
         RiskLevel::Network
     }
 
+    /// The request leaves the process: overlap is allowed under the runtime's
+    /// network bound, but admission (including a consent prompt) stays durable
+    /// and serial before the request is sent.
+    fn supports_network_parallel(&self) -> bool {
+        true
+    }
+
     async fn admission_reason(
         &self,
         input: &serde_json::Value,
         context: &ToolContext,
     ) -> Option<String> {
         if context.policy.unrestricted_execution()
+            // V2 Auto: a private/LAN destination is ordinary network access.
+            // The explicit run-level denial is still enforced by the network
+            // scope above; the location itself no longer raises a prompt.
+            || context.policy.policy_kind() == leveler_execution::PolicyKind::EffectAuto
             || !matches!(
                 context.policy.network_scope(),
                 leveler_execution::NetworkScope::Internet
@@ -72,7 +85,9 @@ impl Tool for WebFetchTool {
             return None;
         }
         let url = input.get("url")?.as_str()?;
-        let resource = crate::network::resolve_target(url.trim()).await.ok()?;
+        let resource = crate::network::resolve_target(url.trim(), DnsPhase::AdmissionReason)
+            .await
+            .ok()?;
         let loopback = leveler_execution::NetworkScope::Loopback
             .validate_resource(&resource)
             .is_ok();
@@ -92,7 +107,9 @@ impl Tool for WebFetchTool {
             .get("url")
             .and_then(serde_json::Value::as_str)
             .ok_or("web_fetch needs a URL")?;
-        crate::network::resolve_target(url.trim()).await.map(Some)
+        crate::network::resolve_target(url.trim(), DnsPhase::AdmissionResource)
+            .await
+            .map(Some)
     }
 
     async fn execute(
@@ -126,7 +143,14 @@ impl Tool for WebFetchTool {
             _ = cancellation.cancelled() => {
                 return Ok(ToolOutput::error("web_fetch 已取消。"));
             }
-            r = fetch_url(&url, max_bytes, &network_scope, unrestricted) => r,
+            r = fetch_url(
+                &url,
+                max_bytes,
+                &network_scope,
+                unrestricted,
+                context.session_scope.as_deref(),
+                context.network_trace.as_deref(),
+            ) => r,
         };
 
         match result {
@@ -143,8 +167,10 @@ async fn fetch_url(
     max_bytes: usize,
     scope: &leveler_execution::NetworkScope,
     unrestricted: bool,
+    session: Option<&str>,
+    trace: Option<&crate::NetworkTrace>,
 ) -> Result<String, String> {
-    let response = crate::network::send(
+    let (response, _lease) = crate::network::send(
         scope,
         unrestricted,
         url,
@@ -152,6 +178,11 @@ async fn fetch_url(
         None,
         None,
         TIMEOUT,
+        NetworkCall {
+            class: RequestClass::Fetch,
+            session,
+            trace,
+        },
     )
     .await?;
     let status = response.status();
@@ -173,9 +204,18 @@ async fn read_body_capped(
     mut resp: reqwest::Response,
     max_bytes: usize,
 ) -> Result<(String, bool), String> {
+    let timer = WebPhase::body(resp.status());
     let mut collected: Vec<u8> = Vec::new();
     let limit = max_bytes.saturating_add(1);
-    while let Some(chunk) = resp.chunk().await.map_err(|e| format!("read body: {e}"))? {
+    loop {
+        let chunk = match resp.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(error) => {
+                timer.finish(PhaseOutcome::request_error(&error));
+                return Err(format!("read body: {error}"));
+            }
+        };
         let remaining = limit.saturating_sub(collected.len());
         if chunk.len() > remaining {
             collected.extend_from_slice(&chunk[..remaining]);
@@ -187,6 +227,11 @@ async fn read_body_capped(
         }
     }
     let truncated = collected.len() > max_bytes;
+    timer.finish(if truncated {
+        PhaseOutcome::Limit
+    } else {
+        PhaseOutcome::Ok
+    });
     collected.truncate(max_bytes);
     // Lossy UTF-8; binary surfaces as replacement chars rather than panicking.
     Ok((String::from_utf8_lossy(&collected).into_owned(), truncated))
@@ -413,5 +458,38 @@ mod tests {
             .unwrap();
         assert!(out.is_error, "{out:?}");
         assert!(out.content.contains("禁用网络"), "{}", out.content);
+    }
+}
+
+#[cfg(test)]
+mod effect_auto_network_tests {
+    use super::*;
+
+    /// V2 Auto: a private/LAN destination is ordinary network access. The
+    /// location alone must not raise a prompt; the explicit run-level denial
+    /// remains the separate, enforced boundary.
+    #[tokio::test]
+    async fn effect_auto_does_not_ask_for_a_private_destination() {
+        let ws = leveler_execution::Workspace::new(std::env::temp_dir()).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted)
+            .with_permission_profile(
+                leveler_execution::SharedPermissionProfile::new_with_contract(
+                    leveler_execution::PermissionContract::V2,
+                    leveler_execution::PermissionProfile::Assisted,
+                ),
+            );
+        for url in [
+            "http://192.168.1.10/",
+            "http://10.0.0.5/",
+            "http://8.8.8.8/",
+        ] {
+            assert!(
+                WebFetchTool
+                    .admission_reason(&serde_json::json!({ "url": url }), &ctx)
+                    .await
+                    .is_none(),
+                "{url} is ordinary network access in effect-auto"
+            );
+        }
     }
 }

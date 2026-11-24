@@ -2879,6 +2879,7 @@ fn apply_meta(state: &mut AppState, session: &UiSessionSnapshot) {
     }
     state.model_label = model_label;
     state.mode = session.mode;
+    state.permission_contract = session.permission_contract;
     state.mode_label = mode_label(session.mode).to_string();
     state.available_models = session.available_models.clone();
     state.vision = session.vision;

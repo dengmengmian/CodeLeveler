@@ -78,6 +78,9 @@ impl Tool for ShellCommandTool {
          system `/tmp`; other host paths are not writable. Reads of system and toolchain paths \
          are allowed. Writes outside the workspace, other user directories, \
          and readonly roots require approval outside full-access mode. \
+         In a confined command, `LEVELER_HOME` points at an isolated sandbox \
+         home, so `leveler config show` and `leveler doctor` describe that \
+         copy, not the host runtime's configuration. \
          The `background`, `timeout_seconds`, and `background_lifetime` fields \
          describe background and deadline behavior. `&` and nohup require \
          approval outside full-access mode. A `#` comment does \

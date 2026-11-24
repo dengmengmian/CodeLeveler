@@ -116,6 +116,7 @@ async fn a_scheduled_shell_runs_and_calls_no_model() {
             session_policy: leveler_schedule::SessionPolicy::Continue,
             overlap: leveler_schedule::OverlapPolicy::SkipIfRunning,
             mode: PermissionProfile::Assisted,
+            permission_contract: leveler_client_protocol::PermissionContract::V2,
             // The definition itself carries no model: the run is deterministic.
             model: None,
             timeout: Duration::from_secs(15),
@@ -246,6 +247,7 @@ async fn a_model_free_session_is_created_without_an_invented_model() {
             goal: "deterministic".into(),
             model: None,
             mode: PermissionProfile::Assisted,
+            permission_contract: None,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             collaboration: leveler_local_transport::CollaborationMode::Chat,
         })

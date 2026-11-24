@@ -134,11 +134,36 @@ async fn session(
     SessionId,
     broadcast::Receiver<RuntimeEvent>,
 ) {
+    session_with_contract(
+        root,
+        base_url,
+        mode,
+        content,
+        leveler_execution::PermissionContract::V2,
+    )
+    .await
+}
+
+async fn session_with_contract(
+    root: &std::path::Path,
+    base_url: &str,
+    mode: PermissionProfile,
+    content: &str,
+    contract: leveler_execution::PermissionContract,
+) -> (
+    Arc<Application>,
+    Arc<InProcessRuntimeClient>,
+    SessionId,
+    broadcast::Receiver<RuntimeEvent>,
+) {
     write_config(root, base_url);
     let layout = Layout::from_parts(root.to_path_buf(), root.join("configs"), root.join("state"));
     let app = Arc::new(Application::assemble(layout).unwrap());
     let model = ModelRef::new("mock", "m");
-    let session_id = app.create_session(&model, content).await.unwrap();
+    let session_id = app
+        .create_session_with_permission_state(&model, content, contract, mode, app.collaboration())
+        .await
+        .unwrap();
     let client = Arc::new(InProcessRuntimeClient::new(app.clone(), model, mode, false));
     let events = client.subscribe_session(&session_id);
     client
@@ -204,6 +229,7 @@ async fn switch(
             command: ClientCommand::SetPermissionProfile {
                 session_id: session_id.clone(),
                 mode,
+                contract: None,
             },
         };
         match client.deliver(envelope).await {
@@ -566,9 +592,8 @@ fn outside_path(label: &str) -> std::path::PathBuf {
 // ── TEST 6: Auto contract is not weakened by the Full fix ────────────────────
 
 #[tokio::test]
-async fn auto_still_asks_for_privilege_escalation() {
-    // Git — including push — is ordinary development under Auto. The boundary
-    // that still asks is privilege escalation.
+async fn legacy_auto_still_asks_for_privilege_escalation() {
+    // V1 Auto keeps its original behavior: privilege escalation asks.
     let server = MockServer::start(vec![tool_call_sse(
         "run_command",
         serde_json::json!({"program": "sudo", "args": ["rm", "-rf", "/tmp/x"]}),
@@ -576,11 +601,12 @@ async fn auto_still_asks_for_privilege_escalation() {
     .await;
     let tmp = tempfile::tempdir().unwrap();
 
-    let (_app, client, session_id, mut events) = session(
+    let (_app, client, session_id, mut events) = session_with_contract(
         tmp.path(),
         &server.base_url(),
         PermissionProfile::Assisted,
         "push",
+        leveler_execution::PermissionContract::V1,
     )
     .await;
 
@@ -591,7 +617,7 @@ async fn auto_still_asks_for_privilege_escalation() {
             .as_deref()
             .unwrap_or_default()
             .contains("sudo"),
-        "Auto must still ask before privilege escalation: {approval:?}"
+        "V1 Auto must still ask before privilege escalation: {approval:?}"
     );
     // Deny it: Auto's refusal path still works.
     client
@@ -601,5 +627,85 @@ async fn auto_still_asks_for_privilege_escalation() {
         })
         .await
         .unwrap();
+    cancel(&client, &session_id).await;
+}
+
+/// V2 Auto: the `sudo` wrapper alone is not an irreversible effect, so it is
+/// ordinary work. A directly identifiable deletion of real data is what asks,
+/// even when it is wrapped.
+#[tokio::test]
+async fn effect_auto_does_not_ask_for_sudo_alone() {
+    let server = MockServer::start(vec![
+        tool_call_sse(
+            "run_command",
+            serde_json::json!({"program": "sudo", "args": ["-n", "true"]}),
+        ),
+        text("done"),
+    ])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (_app, client, session_id, mut events) = session(
+        tmp.path(),
+        &server.base_url(),
+        PermissionProfile::Assisted,
+        "check",
+    )
+    .await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut terminal = false;
+    while tokio::time::Instant::now() < deadline && !terminal {
+        match events.recv().await {
+            Ok(RuntimeEvent::ApprovalRequested { request }) => {
+                panic!("V2 Auto must not ask for the sudo wrapper alone: {request:?}")
+            }
+            Ok(RuntimeEvent::TurnCompleted)
+            | Ok(RuntimeEvent::TurnCompletedWithWarnings { .. })
+            | Ok(RuntimeEvent::TurnAnswered)
+            | Ok(RuntimeEvent::TurnCancelled)
+            | Ok(RuntimeEvent::TurnFailed { .. })
+            | Ok(RuntimeEvent::TurnIncomplete { .. })
+            | Ok(RuntimeEvent::TurnTruncated { .. }) => terminal = true,
+            Ok(_) => {}
+            Err(error) => panic!("session event stream closed: {error}"),
+        }
+    }
+    assert!(terminal, "the sudo echo turn never reached a terminal");
+    cancel(&client, &session_id).await;
+}
+
+#[tokio::test]
+async fn effect_auto_asks_for_a_real_deletion_even_when_wrapped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let victim = tmp.path().join("victim.txt");
+    std::fs::write(&victim, "x").unwrap();
+    let server = MockServer::start(vec![tool_call_sse(
+        "run_command",
+        serde_json::json!({"program": "sudo", "args": ["rm", "-rf", victim.display().to_string()]}),
+    )])
+    .await;
+
+    let (_app, client, session_id, mut events) = session(
+        tmp.path(),
+        &server.base_url(),
+        PermissionProfile::Assisted,
+        "clean up",
+    )
+    .await;
+
+    let approval = await_approval(&mut events).await;
+    assert_eq!(
+        approval.reason_code.as_deref(),
+        Some("irreversible.filesystem_delete"),
+        "{approval:?}"
+    );
+    client
+        .send(ClientCommand::ApprovalDecision {
+            request_id: approval.id,
+            decision: ApprovalDecision::Deny,
+        })
+        .await
+        .unwrap();
+    assert!(victim.exists(), "a denied deletion must not have run");
     cancel(&client, &session_id).await;
 }

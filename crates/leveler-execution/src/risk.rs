@@ -152,11 +152,159 @@ impl std::fmt::Display for PermissionProfile {
     }
 }
 
+/// The permission contract a session was created under.
+///
+/// The tier names did not change between 1.x and 2.0, but their meanings did:
+/// v1 `request_approval` was the strict profile, v1 `assisted` was the old
+/// Auto, and in v2 `request_approval` inherits the old Auto while `assisted`
+/// becomes the effect-oriented Auto. A stored `mode` alone therefore cannot be
+/// interpreted without this version — doing so would silently widen an old
+/// session on resume.
+///
+/// [`Default`] is V1 on purpose: a persisted row or a wire message that does
+/// not carry the field is legacy data and must never be read as v2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionContract {
+    #[default]
+    V1,
+    V2,
+}
+
+impl PermissionContract {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::V1 => "v1",
+            Self::V2 => "v2",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "v1" | "1" => Some(Self::V1),
+            "v2" | "2" => Some(Self::V2),
+            _ => None,
+        }
+    }
+
+    const fn code(self) -> u16 {
+        match self {
+            Self::V1 => 0,
+            Self::V2 => 1,
+        }
+    }
+
+    const fn from_code(code: u16) -> Self {
+        match code {
+            1 => Self::V2,
+            // Any unreadable contract is the legacy one: a corrupt read can
+            // make a session stricter, never more autonomous.
+            _ => Self::V1,
+        }
+    }
+}
+
+/// The effective authorization policy for one `(contract, profile)` pair.
+///
+/// Four implementations cover the six stored combinations; the execution path
+/// stays one chain. See `docs/dev/permission-model-v2/01-current-and-target-model.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyKind {
+    /// v1 request_approval: the strict pre-V2 profile.
+    LegacyRestricted,
+    /// The old Auto: workspace write sandbox, dangerous-command/MCP/network asks.
+    LegacyAuto,
+    /// V2 Auto: only directly identifiable irreversible effects ask.
+    EffectAuto,
+    /// Unchanged Full contract.
+    Full,
+}
+
+impl PolicyKind {
+    pub const fn of(contract: PermissionContract, profile: PermissionProfile) -> Self {
+        match (contract, profile) {
+            (_, PermissionProfile::FullAccess) => Self::Full,
+            (PermissionContract::V2, PermissionProfile::RequestApproval) => Self::LegacyAuto,
+            (PermissionContract::V2, PermissionProfile::Assisted) => Self::EffectAuto,
+            (PermissionContract::V1, PermissionProfile::Assisted) => Self::LegacyAuto,
+            (PermissionContract::V1, PermissionProfile::RequestApproval) => Self::LegacyRestricted,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LegacyRestricted => "legacy-restricted",
+            Self::LegacyAuto => "legacy-auto",
+            Self::EffectAuto => "effect-auto",
+            Self::Full => "full-access",
+        }
+    }
+
+    /// Whether the registry admits a tool of this declared risk. Only the
+    /// strict v1 profile refuses a class outright; the others route it to
+    /// admission.
+    pub const fn permits(self, risk: RiskLevel) -> bool {
+        match self {
+            Self::LegacyRestricted => {
+                !matches!(risk, RiskLevel::Privileged | RiskLevel::Destructive)
+            }
+            Self::LegacyAuto | Self::EffectAuto | Self::Full => true,
+        }
+    }
+
+    /// The profile preset over [`WriteScope`] at admission.
+    ///
+    /// Ownership (`ScopedWorkspace`/`None`) is applied before this preset in
+    /// `ToolPolicy::write_scope`, so a delegated child's claim still narrows
+    /// even an effect-oriented Auto.
+    pub fn write_scope(self, workspace_root: &Path) -> WriteScope {
+        match self {
+            Self::LegacyRestricted | Self::LegacyAuto => WriteScope::Workspace {
+                root: workspace_root.to_path_buf(),
+            },
+            Self::EffectAuto | Self::Full => WriteScope::Unrestricted,
+        }
+    }
+
+    /// Whether commands reach the network without a call/session grant.
+    pub const fn network_by_default(self) -> bool {
+        !matches!(self, Self::LegacyRestricted)
+    }
+
+    /// Whether an OS write fence is in force for this policy preset.
+    pub const fn confines_workspace(self) -> bool {
+        !matches!(self, Self::EffectAuto | Self::Full)
+    }
+}
+
+impl std::fmt::Display for PolicyKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The complete live permission identity of a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PermissionState {
+    pub contract: PermissionContract,
+    pub profile: PermissionProfile,
+}
+
+impl PermissionState {
+    pub const fn new(contract: PermissionContract, profile: PermissionProfile) -> Self {
+        Self { contract, profile }
+    }
+
+    pub const fn policy_kind(self) -> PolicyKind {
+        PolicyKind::of(self.contract, self.profile)
+    }
+}
+
 impl PermissionProfile {
     /// Stable in-memory code for [`SharedPermissionProfile`]. Not a wire
     /// value — `as_str` owns persistence, and nothing outside this module
     /// may depend on these numbers.
-    const fn code(self) -> u8 {
+    const fn code(self) -> u16 {
         match self {
             Self::RequestApproval => 0,
             Self::Assisted => 1,
@@ -167,7 +315,7 @@ impl PermissionProfile {
     /// Inverse of [`Self::code`]. An unrecognised code cannot come from
     /// `code` — but if one ever did, the answer is the STRICTEST profile, so
     /// a corrupt read can never widen what an agent may do.
-    const fn from_code(code: u8) -> Self {
+    const fn from_code(code: u16) -> Self {
         match code {
             1 => Self::Assisted,
             2 => Self::FullAccess,
@@ -176,7 +324,7 @@ impl PermissionProfile {
     }
 }
 
-/// The permission profile a task is running under, shared live by everything
+/// The permission identity a task is running under, shared live by everything
 /// executing for it.
 ///
 /// A turn used to copy the profile at startup, so a user who switched to
@@ -187,28 +335,65 @@ impl PermissionProfile {
 /// `ToolContext` is cloned into every child, so one cell serves the whole
 /// agent tree with no update to fan out.
 ///
-/// Reads and writes are infallible (no lock to poison) and cheap enough to
-/// sit on every authorization decision.
+/// Contract and profile share one atomic word: a reader must never observe a
+/// v1 contract with a v2 profile (or the reverse) while a session adopts V2.
 #[derive(Debug, Clone)]
-pub struct SharedPermissionProfile(std::sync::Arc<std::sync::atomic::AtomicU8>);
+pub struct SharedPermissionProfile(std::sync::Arc<std::sync::atomic::AtomicU16>);
 
 impl SharedPermissionProfile {
+    /// A context that does not know its session contract. It is the LEGACY
+    /// contract: an unknown caller must not silently acquire v2 autonomy.
+    /// Session construction uses [`Self::new_with_contract`].
     pub fn new(profile: PermissionProfile) -> Self {
-        Self(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
-            profile.code(),
+        Self::new_with_contract(PermissionContract::V1, profile)
+    }
+
+    pub fn new_with_contract(contract: PermissionContract, profile: PermissionProfile) -> Self {
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicU16::new(
+            Self::code(contract, profile),
         )))
+    }
+
+    const fn code(contract: PermissionContract, profile: PermissionProfile) -> u16 {
+        (contract.code() << 8) | profile.code()
+    }
+
+    fn decode(code: u16) -> PermissionState {
+        PermissionState {
+            contract: PermissionContract::from_code(code >> 8),
+            profile: PermissionProfile::from_code(code & 0xff),
+        }
     }
 
     /// The profile in force right now. Every authorization decision reads
     /// this, so a change lands on the NEXT decision — never retroactively on
     /// work already authorized and running.
     pub fn get(&self) -> PermissionProfile {
-        PermissionProfile::from_code(self.0.load(std::sync::atomic::Ordering::Acquire))
+        self.state().profile
     }
 
+    /// The complete identity in force right now.
+    pub fn state(&self) -> PermissionState {
+        Self::decode(self.0.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// The effective policy kind in force right now.
+    pub fn policy_kind(&self) -> PolicyKind {
+        self.state().policy_kind()
+    }
+
+    /// Change only the tier; the contract stays what it was.
     pub fn set(&self, profile: PermissionProfile) {
-        self.0
-            .store(profile.code(), std::sync::atomic::Ordering::Release);
+        let contract = self.state().contract;
+        self.set_state(PermissionState::new(contract, profile));
+    }
+
+    /// Change contract and tier as one atomic fact.
+    pub fn set_state(&self, state: PermissionState) {
+        self.0.store(
+            Self::code(state.contract, state.profile),
+            std::sync::atomic::Ordering::Release,
+        );
     }
 
     /// Whether two handles are the same cell — the property that makes a
@@ -261,7 +446,7 @@ mod tests {
         ] {
             assert_eq!(PermissionProfile::from_code(profile.code()), profile);
         }
-        for code in [3u8, 7, 255] {
+        for code in [3u16, 7, 255] {
             assert_eq!(
                 PermissionProfile::from_code(code),
                 PermissionProfile::RequestApproval,
@@ -325,6 +510,101 @@ mod tests {
             Some(PermissionProfile::Assisted)
         );
         assert_eq!(PermissionProfile::parse("yolo"), None);
+    }
+
+    /// The six stored combinations collapse to four policy implementations.
+    /// This table is the compatibility contract; a new row here is a product
+    /// change, not a refactor.
+    #[test]
+    fn policy_kind_matrix_is_the_compatibility_contract() {
+        use PermissionContract::{V1, V2};
+        use PermissionProfile::{Assisted, FullAccess, RequestApproval};
+        use PolicyKind::{EffectAuto, Full, LegacyAuto, LegacyRestricted};
+        for (contract, profile, expected) in [
+            (V1, RequestApproval, LegacyRestricted),
+            (V1, Assisted, LegacyAuto),
+            (V1, FullAccess, Full),
+            (V2, RequestApproval, LegacyAuto),
+            (V2, Assisted, EffectAuto),
+            (V2, FullAccess, Full),
+        ] {
+            assert_eq!(
+                PolicyKind::of(contract, profile),
+                expected,
+                "{contract:?} + {profile:?}"
+            );
+        }
+    }
+
+    /// An absent persisted contract is legacy data. This is the property that
+    /// stops an old session from being read as v2 on upgrade.
+    #[test]
+    fn an_absent_contract_is_v1() {
+        #[derive(serde::Deserialize)]
+        struct Persisted {
+            #[serde(default)]
+            contract: PermissionContract,
+        }
+        assert_eq!(PermissionContract::default(), PermissionContract::V1);
+        let stored: Persisted = serde_json::from_str("{}").unwrap();
+        assert_eq!(stored.contract, PermissionContract::V1);
+        assert_eq!(
+            serde_json::from_str::<PermissionContract>("\"v2\"").unwrap(),
+            PermissionContract::V2
+        );
+        assert_eq!(PermissionContract::parse("2"), Some(PermissionContract::V2));
+    }
+
+    #[test]
+    fn legacy_restricted_is_the_only_policy_that_refuses_a_risk_class() {
+        assert!(!PolicyKind::LegacyRestricted.permits(RiskLevel::Destructive));
+        assert!(!PolicyKind::LegacyRestricted.permits(RiskLevel::Privileged));
+        for kind in [
+            PolicyKind::LegacyAuto,
+            PolicyKind::EffectAuto,
+            PolicyKind::Full,
+        ] {
+            assert!(kind.permits(RiskLevel::Destructive), "{kind:?}");
+            assert!(kind.permits(RiskLevel::Privileged), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn the_first_tier_keeps_the_old_auto_write_boundary() {
+        let root = Path::new("/ws");
+        assert_eq!(
+            PolicyKind::of(PermissionContract::V2, PermissionProfile::RequestApproval)
+                .write_scope(root),
+            WriteScope::Workspace {
+                root: root.to_path_buf()
+            }
+        );
+        assert_eq!(
+            PolicyKind::EffectAuto.write_scope(root),
+            WriteScope::Unrestricted
+        );
+    }
+
+    /// A tier switch must not adopt v2. The two fields live in one atomic
+    /// word, so a concurrent reader never sees a mixed pair.
+    #[test]
+    fn changing_the_tier_preserves_the_contract() {
+        let shared = SharedPermissionProfile::new_with_contract(
+            PermissionContract::V1,
+            PermissionProfile::Assisted,
+        );
+        shared.set(PermissionProfile::RequestApproval);
+        assert_eq!(
+            shared.state(),
+            PermissionState::new(PermissionContract::V1, PermissionProfile::RequestApproval)
+        );
+        assert_eq!(shared.policy_kind(), PolicyKind::LegacyRestricted);
+
+        shared.set_state(PermissionState::new(
+            PermissionContract::V2,
+            PermissionProfile::RequestApproval,
+        ));
+        assert_eq!(shared.policy_kind(), PolicyKind::LegacyAuto);
     }
 }
 

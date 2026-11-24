@@ -21,8 +21,8 @@
 use std::path::{Path, PathBuf};
 
 use leveler_client_protocol::{
-    ApprovalId, MessageId, NotificationLevel, PermissionProfile, RuntimeEvent, SessionId,
-    UiApprovalRequest, UiMessage, UiPendingInteraction, UiRole, UiSessionSnapshot,
+    ApprovalId, MessageId, NotificationLevel, PermissionContract, PermissionProfile, RuntimeEvent,
+    SessionId, UiApprovalRequest, UiMessage, UiPendingInteraction, UiRole, UiSessionSnapshot,
 };
 
 fn golden_path() -> PathBuf {
@@ -44,6 +44,7 @@ fn snapshot() -> UiSessionSnapshot {
         title: None,
         model: None,
         mode: PermissionProfile::RequestApproval,
+        permission_contract: PermissionContract::V1,
         branch: Some("main".to_string()),
         status: "idle".to_string(),
         finalization_stage: None,
@@ -73,6 +74,7 @@ fn snapshot() -> UiSessionSnapshot {
             summary: "删除 build 目录".to_string(),
             command: Some("rm -rf build".to_string()),
             risks: vec!["会删除文件".to_string()],
+            reason_code: None,
             call_id: None,
             always_persists: true,
         })],

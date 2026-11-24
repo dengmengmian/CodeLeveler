@@ -1,0 +1,6 @@
+
+⚠ approval needed shell_command wants to run a Destructive action:
+    `rm` deletes real data: /tmp/pv2-final/scenarios/c-destructive/approved-target.txt
+    rm -f approved-target.txt
+    path: /tmp/pv2-final/scenarios/c-destructive/approved-target.txt
+  Approve? [y]es once / this [t]urn / [w]lways for this project / [N]o (default): 

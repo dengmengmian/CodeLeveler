@@ -1068,6 +1068,7 @@ mod tests {
                     command: ClientCommand::SetPermissionProfile {
                         session_id: SessionId::new("s1"),
                         mode: PermissionProfile::Assisted,
+                        contract: None,
                     },
                     message: "version conflict: resync required".into(),
                     snapshot: None,

@@ -255,6 +255,7 @@ async fn a_new_session_starts_on_the_persisted_default() {
             goal: "restarted".to_string(),
             model: None,
             mode: WirePermissionProfile::Assisted,
+            permission_contract: None,
             approval_policy: Default::default(),
         })
         .await
@@ -428,6 +429,7 @@ async fn an_unresolvable_persisted_default_substitutes_instead_of_bricking_start
         goal: "interactive session".to_string(),
         model: None,
         mode: leveler_client_protocol::PermissionProfile::Assisted,
+        permission_contract: None,
         approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
     };
     let bootstrap = LocalRuntimeService::create_session(&*client, request.clone())

@@ -186,6 +186,7 @@ pub fn run_with_mcp_locale(
     chinese: bool,
 ) -> Vec<DiagnosticFinding> {
     let mut results = Vec::new();
+    let sandbox_home = std::env::var_os("LEVELER_SANDBOX_HOME").is_some();
 
     // Required tooling.
     for (tool, required) in [("git", true), ("rg", false)] {
@@ -240,14 +241,15 @@ pub fn run_with_mcp_locale(
 
     // Config bundle. First install with no models/providers must fail closed —
     // "Environment looks healthy" with zero models is how new users get stuck.
-    results.extend(check_model_bundle(config));
+    results.extend(check_model_bundle(config, sandbox_home));
     results.extend(check_reasoning(config));
 
     // Surface global-config load failures (incl. MCP plaintext env) even when
     // the rest of doctor runs against a lenient empty LoadedConfig.
-    results.push(check_global_config());
+    results.push(check_global_config(sandbox_home));
     results.push(check_config_reload());
     results.extend(check_retired_model_instructions());
+    results.push(check_web_search(config, sandbox_home));
 
     // Per-provider API key.
     for provider in &config.providers {
@@ -454,21 +456,31 @@ pub fn definitions_check(
 /// Check that at least one provider and model exist, and every model points at
 /// a loaded provider. Empty / orphaned configs are Fail so `leveler doctor`
 /// never green-lights a machine that cannot start a turn.
-fn check_model_bundle(config: &LoadedConfig) -> Vec<DiagnosticFinding> {
+fn check_model_bundle(config: &LoadedConfig, sandbox_home: bool) -> Vec<DiagnosticFinding> {
     let mut results = Vec::new();
     let setup_hint =
         "add providers/models in ~/.leveler/config.toml (or $LEVELER_HOME/config.toml); see README";
 
     if config.providers.is_empty() {
-        results.push(with_action(
-            fail(
+        if sandbox_home {
+            results.push(finding(
                 finding_id::CONFIG_PROVIDERS,
                 None,
                 DiagnosticCategory::Configuration,
-                vec![format!("none loaded — {setup_hint}")],
-            ),
-            action_id::CONFIGURE_PROVIDER_MODEL,
-        ));
+                DiagnosticStatus::NotChecked,
+                vec!["sandbox home — host providers are not visible".into()],
+            ));
+        } else {
+            results.push(with_action(
+                fail(
+                    finding_id::CONFIG_PROVIDERS,
+                    None,
+                    DiagnosticCategory::Configuration,
+                    vec![format!("none loaded — {setup_hint}")],
+                ),
+                action_id::CONFIGURE_PROVIDER_MODEL,
+            ));
+        }
     } else {
         results.push(pass(
             finding_id::CONFIG_PROVIDERS,
@@ -479,15 +491,25 @@ fn check_model_bundle(config: &LoadedConfig) -> Vec<DiagnosticFinding> {
     }
 
     if config.models.is_empty() {
-        results.push(with_action(
-            fail(
+        if sandbox_home {
+            results.push(finding(
                 finding_id::CONFIG_MODELS,
                 None,
                 DiagnosticCategory::Configuration,
-                vec![format!("none loaded — {setup_hint}")],
-            ),
-            action_id::CONFIGURE_PROVIDER_MODEL,
-        ));
+                DiagnosticStatus::NotChecked,
+                vec!["sandbox home — host models are not visible".into()],
+            ));
+        } else {
+            results.push(with_action(
+                fail(
+                    finding_id::CONFIG_MODELS,
+                    None,
+                    DiagnosticCategory::Configuration,
+                    vec![format!("none loaded — {setup_hint}")],
+                ),
+                action_id::CONFIGURE_PROVIDER_MODEL,
+            ));
+        }
     } else {
         results.push(pass(
             finding_id::CONFIG_MODELS,
@@ -496,26 +518,30 @@ fn check_model_bundle(config: &LoadedConfig) -> Vec<DiagnosticFinding> {
             vec![format!("{} loaded", config.models.len())],
         ));
         // Orphan models assemble fine but fail at first request with a late
-        // "unknown provider" — catch them here for first-install clarity.
-        let provider_ids: std::collections::BTreeSet<&str> =
-            config.providers.iter().map(|p| p.id.as_str()).collect();
-        for model in &config.models {
-            if !provider_ids.contains(model.profile.provider.as_str()) {
-                results.push(with_action(
-                    fail(
-                        finding_id::CONFIG_MODEL_PROVIDER,
-                        Some(&format!(
-                            "{}/{}",
-                            model.profile.provider, model.profile.id
-                        )),
-                        DiagnosticCategory::Configuration,
-                        vec![format!(
-                            "provider `{}` is not configured — add [providers.{}] in ~/.leveler/config.toml",
-                            model.profile.provider, model.profile.provider
-                        )],
-                    ),
-                    action_id::CONFIGURE_PROVIDER_MODEL,
-                ));
+        // "unknown provider" — catch them here for first-install clarity. In a
+        // sandbox home the host providers are invisible, so an empty provider
+        // list says nothing about whether a model is orphaned.
+        if !(sandbox_home && config.providers.is_empty()) {
+            let provider_ids: std::collections::BTreeSet<&str> =
+                config.providers.iter().map(|p| p.id.as_str()).collect();
+            for model in &config.models {
+                if !provider_ids.contains(model.profile.provider.as_str()) {
+                    results.push(with_action(
+                        fail(
+                            finding_id::CONFIG_MODEL_PROVIDER,
+                            Some(&format!(
+                                "{}/{}",
+                                model.profile.provider, model.profile.id
+                            )),
+                            DiagnosticCategory::Configuration,
+                            vec![format!(
+                                "provider `{}` is not configured — add [providers.{}] in ~/.leveler/config.toml",
+                                model.profile.provider, model.profile.provider
+                            )],
+                        ),
+                        action_id::CONFIGURE_PROVIDER_MODEL,
+                    ));
+                }
             }
         }
     }
@@ -694,14 +720,18 @@ fn check_api_key(provider: &ProviderConfig) -> DiagnosticFinding {
     }
 }
 
-fn check_global_config() -> DiagnosticFinding {
+fn sandbox_home_note(sandbox_home: bool) -> Option<&'static str> {
+    sandbox_home.then_some("sandbox home — host runtime configuration is not visible")
+}
+
+fn check_global_config(sandbox_home: bool) -> DiagnosticFinding {
     match crate::global_config::GlobalConfig::load() {
         Ok(_) => {
             // Distinguish "file missing → empty defaults" from "file present".
             // First install often has no file; still a pass here (the models
             // check fails), but the evidence must not claim a config exists
             // when it does not.
-            let evidence = match crate::global_config::GlobalConfig::path() {
+            let mut evidence = match crate::global_config::GlobalConfig::path() {
                 Some(path) if path.is_file() => vec![format!("ok ({})", path.display())],
                 Some(path) => vec![format!(
                     "not found at {} — using empty defaults",
@@ -709,6 +739,9 @@ fn check_global_config() -> DiagnosticFinding {
                 )],
                 None => vec!["no path (set HOME, USERPROFILE, or LEVELER_HOME)".into()],
             };
+            if let Some(note) = sandbox_home_note(sandbox_home) {
+                evidence.push(note.into());
+            }
             pass(
                 finding_id::CONFIG_GLOBAL,
                 None,
@@ -717,15 +750,90 @@ fn check_global_config() -> DiagnosticFinding {
             )
         }
         // Display is key-safe for McpSecretInConfig (names field, not value).
-        Err(e) => with_action(
-            fail(
-                finding_id::CONFIG_GLOBAL,
+        Err(e) => {
+            let mut evidence = vec![e.to_string()];
+            if let Some(note) = sandbox_home_note(sandbox_home) {
+                evidence.push(note.into());
+            }
+            with_action(
+                fail(
+                    finding_id::CONFIG_GLOBAL,
+                    None,
+                    DiagnosticCategory::Configuration,
+                    evidence,
+                ),
+                action_id::FIX_CONFIG,
+            )
+        }
+    }
+}
+
+/// Web search is an explicit opt-in, so a configured backend with no visible
+/// credential is a doctor failure, not an invisible capability. In a confined
+/// command the host credential is deliberately not visible; say that instead
+/// of turning the sandbox's scrubbed environment into a false failure.
+fn check_web_search(config: &LoadedConfig, sandbox_home: bool) -> DiagnosticFinding {
+    let Some(search) = config.web_search.as_ref() else {
+        if sandbox_home {
+            return finding(
+                finding_id::WEB_SEARCH,
                 None,
                 DiagnosticCategory::Configuration,
-                vec![e.to_string()],
-            ),
-            action_id::FIX_CONFIG,
-        ),
+                DiagnosticStatus::NotChecked,
+                vec!["sandbox home — host web search configuration is not visible".into()],
+            );
+        }
+        return pass(
+            finding_id::WEB_SEARCH,
+            None,
+            DiagnosticCategory::Configuration,
+            vec!["disabled — add [web.search] in ~/.leveler/config.toml".into()],
+        );
+    };
+    let mut evidence = vec![format!(
+        "provider={} base_url={}",
+        search.provider.as_str(),
+        search.base_url.as_deref().unwrap_or("(provider default)")
+    )];
+    if search.has_configured_api_key() {
+        evidence.push("set via config (api_key)".into());
+        return pass(
+            finding_id::WEB_SEARCH,
+            None,
+            DiagnosticCategory::Configuration,
+            evidence,
+        );
+    }
+    evidence.push(format!("api_key_env=${}", search.api_key_env));
+    if sandbox_home {
+        evidence.push("sandbox home — host credential visibility is not available here".into());
+        return finding(
+            finding_id::WEB_SEARCH,
+            None,
+            DiagnosticCategory::Configuration,
+            DiagnosticStatus::NotChecked,
+            evidence,
+        );
+    }
+    let key_set = std::env::var(&search.api_key_env)
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty());
+    if key_set {
+        evidence.push(format!("credential ${} is set", search.api_key_env));
+        pass(
+            finding_id::WEB_SEARCH,
+            None,
+            DiagnosticCategory::Configuration,
+            evidence,
+        )
+    } else {
+        evidence.push(format!("credential ${} is not set", search.api_key_env));
+        fail(
+            finding_id::WEB_SEARCH,
+            None,
+            DiagnosticCategory::Configuration,
+            evidence,
+        )
     }
 }
 
@@ -1013,6 +1121,7 @@ pub fn label(id: &str) -> &'static str {
         finding_id::CONFIG_GLOBAL => "config: global",
         finding_id::CONFIG_RELOAD => "config: reload",
         finding_id::CONFIG_RETIRED_INSTRUCTIONS => "config: retired instructions",
+        finding_id::WEB_SEARCH => "config: web search",
         finding_id::MODEL_REASONING => "reasoning",
         finding_id::MODEL_THINKING => "thinking",
         finding_id::PROVIDER_API_KEY => "api key",
@@ -1272,6 +1381,24 @@ mod tests {
     }
 
     #[test]
+    fn a_sandbox_home_does_not_fail_an_invisible_host_bundle() {
+        let results = check_model_bundle(&LoadedConfig::default(), true);
+        let providers = find_any(&results, finding_id::CONFIG_PROVIDERS);
+        let models = find_any(&results, finding_id::CONFIG_MODELS);
+        assert_eq!(providers.status, DiagnosticStatus::NotChecked);
+        assert_eq!(models.status, DiagnosticStatus::NotChecked);
+        assert!(
+            providers.evidence.join(" ").contains("sandbox home"),
+            "{providers:?}"
+        );
+        assert!(
+            models.evidence.join(" ").contains("sandbox home"),
+            "{models:?}"
+        );
+        assert!(!has_failure(&results), "{results:?}");
+    }
+
+    #[test]
     fn model_without_matching_provider_is_a_failure() {
         let config = LoadedConfig {
             providers: vec![],
@@ -1296,7 +1423,7 @@ mod tests {
             models: vec![sample_model("deepseek", "deepseek-chat")],
             ..Default::default()
         };
-        let results = check_model_bundle(&config);
+        let results = check_model_bundle(&config, false);
         assert!(
             results.iter().all(|r| r.status == DiagnosticStatus::Pass),
             "{results:?}"
@@ -1535,6 +1662,80 @@ env = { GITHUB_TOKEN = "GITHUB_TOKEN" }
                 .contains("does not prove enforcement"),
             "{verification:?}"
         );
+    }
+
+    #[test]
+    fn global_config_evidence_marks_a_sandbox_home() {
+        let finding = check_global_config(true);
+        assert!(
+            finding
+                .evidence
+                .iter()
+                .any(|line| line.contains("sandbox home") && line.contains("not visible")),
+            "the global-config finding must say the host config is not visible: {finding:?}"
+        );
+    }
+
+    #[test]
+    fn sandbox_home_note_is_explicit() {
+        assert!(sandbox_home_note(false).is_none());
+        let note = sandbox_home_note(true).expect("a sandbox home has a note");
+        assert!(note.contains("sandbox home"), "{note}");
+        assert!(note.contains("not visible"), "{note}");
+    }
+
+    #[test]
+    fn web_search_finding_reports_disabled_missing_and_set_credentials() {
+        let disabled = check_web_search(&LoadedConfig::default(), false);
+        assert_eq!(disabled.id, finding_id::WEB_SEARCH);
+        assert_eq!(disabled.status, DiagnosticStatus::Pass);
+        assert!(disabled.evidence.join(" ").contains("disabled"));
+
+        let sandbox_disabled = check_web_search(&LoadedConfig::default(), true);
+        assert_eq!(
+            sandbox_disabled.status,
+            DiagnosticStatus::NotChecked,
+            "{sandbox_disabled:?}"
+        );
+        assert!(
+            sandbox_disabled
+                .evidence
+                .join(" ")
+                .contains("host web search configuration"),
+            "{sandbox_disabled:?}"
+        );
+
+        let mut search = crate::WebSearchSettings {
+            provider: leveler_tools::search::SearchProviderKind::DeepSeek,
+            api_key_env: "DEFINITELY_UNSET_LEVELER_SEARCH_KEY".into(),
+            api_key: None,
+            base_url: None,
+            max_results: 5,
+            timeout: std::time::Duration::from_secs(15),
+        };
+        let config = LoadedConfig {
+            web_search: Some(search.clone()),
+            ..Default::default()
+        };
+        let missing = check_web_search(&config, false);
+        assert_eq!(missing.status, DiagnosticStatus::Fail, "{missing:?}");
+        assert!(
+            missing
+                .evidence
+                .join(" ")
+                .contains("DEFINITELY_UNSET_LEVELER_SEARCH_KEY"),
+            "{missing:?}"
+        );
+
+        search.api_key_env = "PATH".into();
+        let config = LoadedConfig {
+            web_search: Some(search),
+            ..Default::default()
+        };
+        let set = check_web_search(&config, false);
+        assert_eq!(set.status, DiagnosticStatus::Pass, "{set:?}");
+        let sandbox = check_web_search(&config, true);
+        assert_eq!(sandbox.status, DiagnosticStatus::NotChecked, "{sandbox:?}");
     }
 
     #[test]

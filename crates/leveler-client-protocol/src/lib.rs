@@ -153,7 +153,9 @@ pub use usage::{UiModelUsage, UiUsageReport, UiUsageScope};
 pub use version::{
     PROTOCOL_VERSION, ProtocolCapability, ProtocolEnvelope, ProtocolError, ProtocolVersion,
 };
-pub use wire_types::{AnswerEffect, ApprovalDecision, ApprovalPolicy, PermissionProfile};
+pub use wire_types::{
+    AnswerEffect, ApprovalDecision, ApprovalPolicy, PermissionContract, PermissionProfile,
+};
 
 #[cfg(feature = "testing")]
 pub mod mock;

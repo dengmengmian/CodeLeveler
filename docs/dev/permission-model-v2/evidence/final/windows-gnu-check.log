@@ -1,0 +1,55 @@
+   Compiling leveler-core v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-core)
+    Checking form_urlencoded v1.2.3
+   Compiling url v2.5.9
+   Compiling serde_urlencoded v0.7.1
+    Checking leveler-win-confine v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-win-confine)
+    Checking leveler-lifecycle v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-lifecycle)
+    Checking leveler-memory v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-memory)
+    Checking leveler-media v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-media)
+    Checking leveler-cua v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-cua)
+    Checking leveler-win-local-ipc v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-win-local-ipc)
+    Checking crossterm v0.28.1 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/vendor/crossterm)
+    Checking leveler-eval v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-eval)
+    Checking xtask v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/xtask)
+    Checking leveler-linux-confine v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-linux-confine)
+    Checking ratatui v0.29.0
+    Checking tower-http v0.6.11
+    Checking sqlx-core v0.8.6
+    Checking reqwest v0.12.28
+    Checking reqwest v0.13.5
+    Checking ratatui-image v8.0.2
+    Checking rmcp v3.9.0
+    Checking jsonschema v0.26.2
+    Checking sqlx-sqlite v0.8.6
+    Checking leveler-model v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-model)
+    Checking leveler-definition-trust v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-definition-trust)
+    Checking leveler-execution v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-execution)
+    Checking leveler-project v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-project)
+    Checking leveler-browser v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-browser)
+    Checking leveler-foreign-session v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-foreign-session)
+    Checking leveler-update v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-update)
+    Checking leveler-test-support v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-test-support)
+    Checking leveler-lsp v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-lsp)
+    Checking leveler-skills v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-skills)
+   Compiling sqlx-macros-core v0.8.6
+    Checking leveler-client-protocol v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-client-protocol)
+    Checking leveler-context v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-context)
+    Checking leveler-protocol v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-protocol)
+    Checking leveler-agent-core v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-agent-core)
+   Compiling sqlx-macros v0.8.6
+    Checking leveler-provider v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-provider)
+    Checking sqlx v0.8.6
+    Checking leveler-vcs v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-vcs)
+    Checking leveler-native v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-native)
+    Checking leveler-storage v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-storage)
+    Checking leveler-tools v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-tools)
+    Checking leveler-local-transport v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-local-transport)
+    Checking leveler-tui v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-tui)
+    Checking leveler-engine v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-engine)
+    Checking leveler-schedule v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-schedule)
+    Checking leveler-agent v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-agent)
+    Checking leveler-app v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-app)
+    Checking leveler-runtime-host v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-runtime-host)
+    Checking leveler-cli v1.0.29 (/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/crates/leveler-cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 21.51s
+EXIT=0

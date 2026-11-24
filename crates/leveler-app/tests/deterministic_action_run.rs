@@ -120,6 +120,7 @@ async fn a_deterministic_action_run_succeeds_without_a_model() {
             goal: "deterministic action run".to_string(),
             model: Some(ModelRef::new("mock", "m")),
             mode: WireProfile::Assisted,
+            permission_contract: None,
             approval_policy: ApprovalPolicy::Interactive,
             collaboration: CollaborationMode::Chat,
         })

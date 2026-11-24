@@ -44,6 +44,7 @@ fn snapshot(goal: &str, status: &str) -> UiSessionSnapshot {
         title: None,
         model: ModelRef::parse("deepseek/v3"),
         mode: PermissionProfile::Assisted,
+        permission_contract: leveler_client_protocol::PermissionContract::V1,
         branch: Some("main".to_string()),
         status: status.to_string(),
         finalization_stage: None,

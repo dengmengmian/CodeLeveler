@@ -487,6 +487,7 @@ impl Bridge {
                     .and_then(|layout| layout.primary_workspace());
                 let request = CreateSessionRequest {
                     request_id,
+                    permission_contract: None,
                     collaboration: requested_collaboration(&params)?,
                     workspace: workspace.map_or(CreateWorkspaceSelection::None, |root| {
                         CreateWorkspaceSelection::Workspace {
@@ -956,6 +957,7 @@ mod tests {
             let command = ClientCommand::SetPermissionProfile {
                 session_id: session.clone(),
                 mode,
+                contract: None,
             };
             assert!(validate_command(&session, &command).is_ok());
             assert!(validate_command(&SessionId::new("other"), &command).is_err());

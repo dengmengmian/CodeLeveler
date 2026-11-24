@@ -195,6 +195,7 @@ async fn a_session_survives_its_first_client_and_carries_to_the_next() {
             goal: "relay across clients".to_string(),
             model: None,
             mode: WirePermissionProfile::RequestApproval,
+            permission_contract: None,
         })
         .await
         .unwrap();
@@ -316,6 +317,7 @@ async fn concurrent_clients_share_one_event_stream_for_the_same_session() {
             goal: "two clients".to_string(),
             model: None,
             mode: WirePermissionProfile::RequestApproval,
+            permission_contract: None,
         })
         .await
         .unwrap();
@@ -432,6 +434,7 @@ async fn a_steer_has_one_identity_and_state_for_both_clients() {
             goal: "shared steer".to_string(),
             model: None,
             mode: WirePermissionProfile::RequestApproval,
+            permission_contract: None,
         })
         .await
         .unwrap();

@@ -43,6 +43,7 @@ async fn definition(
             session_policy,
             overlap,
             mode: PermissionProfile::Assisted,
+            permission_contract: leveler_client_protocol::PermissionContract::V2,
             model: Some(ModelRef::new("deepseek", "deepseek-chat")),
             timeout: Duration::from_secs(30),
             misfire: MisfirePolicy::Skip,
@@ -273,4 +274,46 @@ async fn deleting_an_active_definition_is_refused_until_the_run_settles() {
         .await
         .unwrap();
     assert!(store.remove_definition(&definition.id).await.unwrap());
+}
+
+/// A stored unattended grant names the permission contract it was issued
+/// under. Changing the schedule's contract (or reusing an older grant that
+/// never named one) must fail closed, not be interpreted as the new meaning.
+#[tokio::test]
+async fn an_unattended_grant_never_covers_a_different_contract() {
+    use leveler_client_protocol::PermissionContract;
+    let (store, tmp) = store().await;
+    let definition = definition(
+        &store,
+        &workspace(tmp.path()),
+        OverlapPolicy::SkipIfRunning,
+        SessionPolicy::Continue,
+        None,
+    )
+    .await;
+    let grant = leveler_schedule::UnattendedGrant::new(
+        definition.id.clone(),
+        definition.workspace.clone(),
+        definition.mode,
+        PermissionContract::V1,
+        &definition.action,
+        &definition.trigger,
+        definition.model.clone(),
+        UnattendedRequest {
+            allow_external_side_effects: false,
+        },
+        leveler_core::now(),
+    )
+    .unwrap();
+    let error = grant
+        .covers(&definition, ActionKind::Agent, false)
+        .unwrap_err();
+    assert!(error.contains("permission contract"), "{error}");
+
+    let mut legacy = grant.clone();
+    legacy.version = 3;
+    let error = legacy
+        .covers(&definition, ActionKind::Agent, false)
+        .unwrap_err();
+    assert!(error.contains("grant version 3"), "{error}");
 }

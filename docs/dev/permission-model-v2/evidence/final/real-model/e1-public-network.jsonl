@@ -1,0 +1,31 @@
+{"model":"deepseek/deepseek-v4-pro","session_id":"c8295402-4fb1-4a79-a7b1-8aca16c6919f","type":"session_started"}
+{"audit":{"policy":{"source":"default"},"report":{"budget_bytes":65536,"clipped_mandatory":[],"delivered_sections":[],"index_bytes":0,"mandatory_bytes":0,"omitted_sections":[],"optional_bytes":0,"undelivered_mandatory":[],"unmatched_mandatory":[]},"sources":[],"turn_id":"8b3713ca-2f18-4b50-b818-62382526d6c5","workspace":"/private/tmp/pv2-final/scenarios/e-network"},"type":"rule_delivery"}
+{"audit":{"agent_use":"not_verifiable","discovered":0,"entries":[],"index_bytes":0,"injected_bytes":0,"surface":"index_only"},"type":"skill_delivery"}
+{"type":"stream_attempt_started"}
+{"type":"reasoning_started"}
+{"delta":"The","type":"reasoning_delta"}
+{"delta":" user wants","type":"reasoning_delta"}
+{"delta":" me to run a curl command","type":"reasoning_delta"}
+{"delta":" and report the HTTP status code","type":"reasoning_delta"}
+{"delta":". Let me just","type":"reasoning_delta"}
+{"delta":" run it.","type":"reasoning_delta"}
+{"elapsed_ms":336,"type":"reasoning_completed"}
+{"closing":false,"no_progress_streak":0,"type":"progress_updated"}
+{"cached_input_tokens":0,"input_tokens":13567,"output_tokens":85,"reasoning_tokens":22,"type":"usage"}
+{"reasoning":[{"duration_ms":336,"text":"The user wants me to run a curl command and report the HTTP status code. Let me just run it."}],"text":"","type":"assistant_text"}
+{"arguments":"{\"cmd\":\"curl -sS -o /dev/null -w '%{http_code}' https://example.com\"}","id":"call_qmztes1aa0ogi15hp6glyl7e","tool":"shell_command","type":"tool_call"}
+{"call_id":"call_qmztes1aa0ogi15hp6glyl7e","snapshot":"4054ab99428d437a98b2651174e1d0e57fd9abcf","type":"workspace_snapshot"}
+{"execution_status":null,"exit_code":0,"id":"call_qmztes1aa0ogi15hp6glyl7e","is_error":false,"preview":"exit: 0\n--- stdout ---\n200","stop":null,"tool":"shell_command","type":"tool_result"}
+{"closing":false,"no_progress_streak":0,"type":"progress_updated"}
+{"type":"stream_attempt_started"}
+{"delta":"The command returned","type":"assistant_delta"}
+{"delta":" HTTP status code **","type":"assistant_delta"}
+{"delta":"200","type":"assistant_delta"}
+{"delta":"**.","type":"assistant_delta"}
+{"closing":false,"no_progress_streak":0,"type":"progress_updated"}
+{"cached_input_tokens":13056,"input_tokens":13678,"output_tokens":10,"reasoning_tokens":0,"type":"usage"}
+{"reasoning":[],"text":"The command returned HTTP status code **200**.","type":"assistant_text"}
+{"text":"The command returned HTTP status code **200**.","type":"finished"}
+{"model_steps":2,"modified_files":[],"stop":"answered","text":"The command returned HTTP status code **200**.","transcript_ordinal":4,"type":"delivery_committed"}
+{"closing":true,"no_progress_streak":0,"type":"progress_updated"}
+{"modified_files":[],"rounds":2,"session_id":"c8295402-4fb1-4a79-a7b1-8aca16c6919f","stop_detail":null,"stop_reason":"Answered","type":"session_completed"}

@@ -66,6 +66,11 @@ pub enum Command {
         /// explicit override of that persisted profile.
         #[arg(long = "permission", value_enum)]
         mode: Option<RunMode>,
+        /// Adopt the V2 permission contract for this session. New sessions
+        /// are V2 by default; this flag is how an existing V1 session is
+        /// explicitly upgraded. Only `v2` is accepted.
+        #[arg(long = "permission-contract", value_name = "VERSION", value_parser = ["v2"])]
+        permission_contract: Option<String>,
         /// Approve risky actions automatically (no approval overlay). Required
         /// for unattended PTY/expect driving of the interactive UI.
         #[arg(long)]
@@ -274,6 +279,11 @@ pub enum Command {
         /// an explicit override of that persisted profile.
         #[arg(long = "permission", value_enum)]
         mode: Option<RunMode>,
+        /// Adopt the V2 permission contract for this session. New sessions
+        /// are V2 by default; this flag is how an existing V1 session is
+        /// explicitly upgraded. Only `v2` is accepted.
+        #[arg(long = "permission-contract", value_name = "VERSION", value_parser = ["v2"])]
+        permission_contract: Option<String>,
         /// Approve risky actions automatically (no prompts).
         #[arg(long)]
         auto_approve: bool,
@@ -1863,6 +1873,7 @@ mod tests {
             Some(Command::Tui {
                 model,
                 mode,
+                permission_contract: _,
                 auto_approve,
                 in_process,
                 socket,

@@ -1,0 +1,4 @@
+
+⚠ approval needed run_command wants to run a WorkspaceWrite action:
+    sudo -n true
+  Approve? [y]es once / this [t]urn / [w]lways for this project / [N]o (default): approval input failed: stdin closed
