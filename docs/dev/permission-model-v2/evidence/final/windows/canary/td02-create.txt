@@ -1,0 +1,6 @@
+script: echo FORGED> AGENTS.md
+exit: Some(0)
+stdout:
+
+stderr:
+

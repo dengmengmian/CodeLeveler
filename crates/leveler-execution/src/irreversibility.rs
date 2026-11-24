@@ -110,7 +110,27 @@ fn analyze_command(command: &CommandView<'_>, input: &EffectInput<'_>) -> Option
     let cmd_wrapper = basename(program).eq_ignore_ascii_case("cmd")
         || basename(program).eq_ignore_ascii_case("cmd.exe");
     if cmd_wrapper {
-        return shell_c_script(args).and_then(|script| analyze_script(script, true, input));
+        // `cmd /C` takes the whole remainder of the command line, not one
+        // argv word: `cmd /C del /F /Q x` arrives here as four words when a
+        // nested analyzer re-tokenized it. Join them before the cmd lexer.
+        let index = args
+            .iter()
+            .position(|arg| crate::approval::is_shell_c_flag(arg))?;
+        let script = args[index + 1..].join(" ");
+        if script.trim().is_empty() {
+            return None;
+        }
+        return analyze_script(&script, true, input);
+    }
+    // Windows PowerShell's inline `-Command` script is the direct command the
+    // user sees in argv, not an opaque script body: recognize the destructive
+    // cmdlets there with PowerShell's own token boundaries. `-File` and
+    // `-EncodedCommand` remain opaque scripts (accepted Auto risk), as do
+    // script bodies invoked by name.
+    let lower_program = basename(program).to_ascii_lowercase();
+    let stem = lower_program.strip_suffix(".exe").unwrap_or(&lower_program);
+    if matches!(stem, "powershell" | "pwsh") {
+        return analyze_powershell(args, input);
     }
     if crate::approval::is_shell_wrapper_program(program) {
         if let Some(script) = shell_c_script(args) {
@@ -130,6 +150,343 @@ fn analyze_command(command: &CommandView<'_>, input: &EffectInput<'_>) -> Option
         }
     }
     None
+}
+
+/// Analyze Windows PowerShell's inline `-Command` script.
+///
+/// Only the inline command text is read: a `-File` script or an
+/// `-EncodedCommand` payload is an opaque script (the accepted Auto risk), and
+/// an inline command that merely contains destructive words inside a string
+/// argument is not a command position. The parser is deliberately small: it
+/// splits PowerShell's statement separators outside quotes and recognizes the
+/// direct data-loss cmdlets and their aliases. A recognized cmdlet whose
+/// target cannot be resolved asks — the uncertainty is about an action already
+/// visible, the same rule the POSIX deletion classifier follows.
+fn analyze_powershell(args: &[String], input: &EffectInput<'_>) -> Option<IrreversibleFact> {
+    let script = powershell_inline_script(args)?;
+    analyze_powershell_script(&script, input)
+}
+
+/// The inline command text PowerShell will execute, if any.
+///
+/// Windows PowerShell treats everything after `-Command` as the command text,
+/// including later argv words (`-Command Remove-Item -Path x`). No inline
+/// command means no analysis: `-File`/`-EncodedCommand`/`-CommandWithArgs` are
+/// not diagnosed here.
+fn powershell_inline_script(args: &[String]) -> Option<String> {
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let lower = arg.to_ascii_lowercase();
+        match lower.as_str() {
+            "-command" | "-c" => {
+                let script = args[index + 1..].join(" ");
+                return (!script.trim().is_empty()).then_some(script);
+            }
+            "-encodedcommand" | "-e" | "-ec" | "-file" | "-f" | "-commandwithargs" | "-caa" => {
+                return None;
+            }
+            "-noexit" | "-noprofile" | "-noninteractive" | "-nologo" | "-sta" | "-mta"
+            | "-noprofileloadtime" => index += 1,
+            "-executionpolicy" | "-windowstyle" | "-version" | "-inputformat" | "-outputformat"
+            | "-psconsolefile" | "-workingdirectory" => index += 2,
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+/// Split a PowerShell command text into `(segment, consumed a pipeline input)`.
+fn powershell_segments(script: &str) -> Vec<(String, bool)> {
+    fn push(out: &mut Vec<(String, bool)>, cur: &mut String, piped: bool) {
+        let segment = cur.trim().to_string();
+        if !segment.is_empty() {
+            out.push((segment, piped));
+        }
+        cur.clear();
+    }
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut piped_next = false;
+    for c in script.chars() {
+        if escaped {
+            cur.push(c);
+            escaped = false;
+            continue;
+        }
+        if c == '`' {
+            escaped = true;
+            continue;
+        }
+        if let Some(active) = quote {
+            cur.push(c);
+            if c == active {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' => {
+                quote = Some(c);
+                cur.push(c);
+            }
+            '|' => {
+                push(&mut out, &mut cur, piped_next);
+                piped_next = true;
+            }
+            ';' | '&' | '\n' | '\r' | '{' | '}' => {
+                push(&mut out, &mut cur, piped_next);
+                piped_next = false;
+            }
+            _ => cur.push(c),
+        }
+    }
+    push(&mut out, &mut cur, piped_next);
+    out
+}
+
+/// PowerShell word splitting: whitespace outside quotes separates words, and
+/// quotes group a path with spaces into one word.
+fn powershell_tokens(segment: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut started = false;
+    for c in segment.chars() {
+        if escaped {
+            cur.push(c);
+            escaped = false;
+            started = true;
+            continue;
+        }
+        if let Some(active) = quote {
+            if c == active {
+                quote = None;
+            } else {
+                cur.push(c);
+            }
+            continue;
+        }
+        match c {
+            '`' => escaped = true,
+            '\'' | '"' => {
+                quote = Some(c);
+                started = true;
+            }
+            c if c.is_whitespace() => {
+                if started || !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+            }
+            _ => {
+                cur.push(c);
+                started = true;
+            }
+        }
+    }
+    if started || !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+fn analyze_powershell_script(script: &str, input: &EffectInput<'_>) -> Option<IrreversibleFact> {
+    for (segment, piped) in powershell_segments(script) {
+        let mut tokens = powershell_tokens(&segment);
+        // PowerShell's call operator (`. ` or `& `) precedes the command.
+        while tokens
+            .first()
+            .is_some_and(|token| token == "." || token == "&")
+        {
+            tokens.remove(0);
+        }
+        let Some((command, rest)) = tokens.split_first() else {
+            continue;
+        };
+        let lower = command.to_ascii_lowercase();
+        let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
+        if matches!(stem, "cmd" | "cmd.exe") {
+            if let Some(fact) = analyze_command(
+                &CommandView {
+                    program: command,
+                    args: rest,
+                },
+                input,
+            ) {
+                return Some(fact);
+            }
+            continue;
+        }
+        if matches!(stem, "powershell" | "pwsh") {
+            if let Some(fact) = analyze_powershell(rest, input) {
+                return Some(fact);
+            }
+            continue;
+        }
+        if matches!(
+            stem,
+            "remove-item" | "ri" | "rm" | "rmdir" | "del" | "erase" | "rd"
+        ) {
+            if let Some(fact) = classify_powershell_targets(
+                command,
+                rest,
+                IrreversibleKind::FileDelete,
+                piped,
+                input,
+            ) {
+                return Some(fact);
+            }
+            continue;
+        }
+        if matches!(stem, "clear-content" | "clc") {
+            if let Some(fact) = classify_powershell_targets(
+                command,
+                rest,
+                IrreversibleKind::FileDestroy,
+                piped,
+                input,
+            ) {
+                return Some(fact);
+            }
+            continue;
+        }
+        if matches!(stem, "stop-computer" | "restart-computer") {
+            return Some(IrreversibleFact {
+                kind: IrreversibleKind::HostShutdown,
+                summary: format!("`{command}` stops or restarts the host"),
+                paths: Vec::new(),
+            });
+        }
+    }
+    None
+}
+
+/// Parameters that consume the following PowerShell word. Anything else that
+/// starts with `-` is a switch. The list matters only for keeping the value
+/// out of the target set: a value mistaken for a target could hide a dynamic
+/// deletion behind a literal-looking word.
+const POWERSHELL_VALUE_PARAMETERS: &[&str] = &[
+    "-erroraction",
+    "-errorvariable",
+    "-warningaction",
+    "-warningvariable",
+    "-informationaction",
+    "-informationvariable",
+    "-outvariable",
+    "-outbuffer",
+    "-pipelinevariable",
+    "-filter",
+    "-include",
+    "-exclude",
+    "-stream",
+    "-attributes",
+    "-credential",
+];
+
+fn classify_powershell_targets(
+    program: &str,
+    args: &[String],
+    kind: IrreversibleKind,
+    piped: bool,
+    input: &EffectInput<'_>,
+) -> Option<IrreversibleFact> {
+    // `-WhatIf` (and its explicit true form) promises the cmdlet will not
+    // touch the target, so the visible cmdlet has no destructive effect.
+    let what_if = args.iter().any(|arg| {
+        let lower = arg.to_ascii_lowercase();
+        lower == "-whatif" || lower == "-whatif:$true"
+    });
+    if what_if {
+        return None;
+    }
+    let mut literals: Vec<String> = Vec::new();
+    let mut dynamic = false;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let lower = arg.to_ascii_lowercase();
+        if lower == "-path" || lower == "-literalpath" {
+            match args.get(index + 1) {
+                Some(value) => powershell_target(value, &mut literals, &mut dynamic),
+                None => dynamic = true,
+            }
+            index += 2;
+            continue;
+        }
+        if lower.starts_with("-path:") || lower.starts_with("-literalpath:") {
+            let value = arg.split_once(':').map(|(_, value)| value).unwrap_or("");
+            powershell_target(value, &mut literals, &mut dynamic);
+            index += 1;
+            continue;
+        }
+        if lower.starts_with('-') {
+            index += if POWERSHELL_VALUE_PARAMETERS.contains(&lower.as_str()) {
+                2
+            } else {
+                1
+            };
+            continue;
+        }
+        powershell_target(arg, &mut literals, &mut dynamic);
+        index += 1;
+    }
+
+    let mut paths = Vec::new();
+    for literal in &literals {
+        match literal_target(literal, input) {
+            Some(path) if !is_disposable(&path, input) => paths.push(path),
+            Some(_) => {}
+            None => dynamic = true,
+        }
+    }
+    // No named, resolvable target: a piped cmdlet still consumes a target it
+    // did not name (the script shows the destructive action), while a bare
+    // cmdlet without a pipeline deletes nothing.
+    if paths.is_empty() && !dynamic && !piped {
+        return None;
+    }
+    let noun = match kind {
+        IrreversibleKind::FileDestroy => "clears real data",
+        _ => "deletes real data",
+    };
+    let summary = if paths.is_empty() {
+        format!("`{program}` {noun} whose target cannot be resolved before running")
+    } else {
+        format!(
+            "`{program}` {noun}: {}",
+            paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    Some(IrreversibleFact {
+        kind,
+        summary,
+        paths,
+    })
+}
+
+fn powershell_target(value: &str, literals: &mut Vec<String>, dynamic: &mut bool) {
+    let value = value.trim();
+    if value.is_empty() {
+        return;
+    }
+    if value.starts_with('$')
+        || value.starts_with('(')
+        || value.starts_with('@')
+        || value.contains(',')
+        || value.contains(['$', '`', '*', '?', '[', ']'])
+    {
+        *dynamic = true;
+    } else {
+        literals.push(value.to_string());
+    }
 }
 
 /// Analyze one executed argv, peeling a transparent wrapper (`sudo`, `env`,
@@ -275,6 +632,28 @@ fn analyze_fallback(
             }
             continue;
         }
+        // PowerShell in a shell line keeps its own quoting rules: the generic
+        // whitespace tokenizer would split a quoted `-Command` script (and the
+        // path inside it), hiding the deletion. Tokenize this segment with the
+        // PowerShell rules instead.
+        let first_stem = segment
+            .split_whitespace()
+            .next()
+            .map(|word| basename(word).to_ascii_lowercase())
+            .unwrap_or_default();
+        let first_stem = first_stem
+            .strip_suffix(".exe")
+            .unwrap_or(&first_stem)
+            .to_string();
+        if matches!(first_stem.as_str(), "powershell" | "pwsh") {
+            let tokens = powershell_tokens(&segment);
+            if let Some((_program, rest)) = tokens.split_first()
+                && let Some(fact) = analyze_powershell(rest, input)
+            {
+                return Some(fact);
+            }
+            continue;
+        }
         let Some((program, _rest)) = tokens.split_first() else {
             continue;
         };
@@ -392,6 +771,16 @@ fn analyze_argv(words: &[String], input: &EffectInput<'_>) -> Option<Irreversibl
     let program = basename(program);
     let lower = program.to_ascii_lowercase();
     let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
+
+    // A nested shell is a wrapper, not the effect. The outer `cmd /C` and
+    // `powershell -Command` paths already unwrap themselves; this covers a
+    // shell invoked from inside an already-analyzed script.
+    if matches!(stem, "cmd" | "cmd.exe") {
+        return analyze_command(&CommandView { program, args }, input);
+    }
+    if matches!(stem, "powershell" | "pwsh") {
+        return analyze_powershell(args, input);
+    }
 
     if matches!(stem, "shutdown" | "reboot" | "halt" | "poweroff")
         || matches!(stem, "stop-computer" | "restart-computer")
@@ -931,6 +1320,165 @@ mod tests {
         assert!(analyze_shell(&f, "git push --force origin main").is_some());
         assert!(analyze_shell(&f, "git status").is_none());
         assert!(analyze_shell(&f, "git push origin main").is_none());
+    }
+
+    fn analyze_powershell_argv(f: &Fixture, words: &[&str]) -> Option<IrreversibleFact> {
+        let args = args(words);
+        analyze(&EffectInput {
+            tool: "run_command",
+            risk: RiskLevel::WorkspaceWrite,
+            command: Some(CommandView {
+                program: "powershell.exe",
+                args: &args,
+            }),
+            mcp_annotations: None,
+            workspace_root: Some(&f.root),
+            environment: &f.env,
+        })
+    }
+
+    fn analyze_powershell_command(f: &Fixture, command: &str) -> Option<IrreversibleFact> {
+        analyze_powershell_argv(f, &["-NoProfile", "-Command", command])
+    }
+
+    /// The `shell_command` shape on Windows: one line through `cmd /C`.
+    fn analyze_cmd_line(f: &Fixture, line: &str) -> Option<IrreversibleFact> {
+        let args = args(&["/C", line]);
+        analyze(&EffectInput {
+            tool: "shell_command",
+            risk: RiskLevel::WorkspaceWrite,
+            command: Some(CommandView {
+                program: "cmd",
+                args: &args,
+            }),
+            mcp_annotations: None,
+            workspace_root: Some(&f.root),
+            environment: &f.env,
+        })
+    }
+
+    /// Windows PowerShell's inline `-Command` text is a direct command, not an
+    /// opaque script body: its visible destructive cmdlets must ask under the
+    /// effect-oriented Auto. Quoted output that merely contains the words must
+    /// not.
+    #[test]
+    fn powershell_direct_data_loss_asks_and_ordinary_cmdlets_do_not() {
+        let f = fixture();
+        let victim = f.root.join("real.txt");
+        std::fs::write(&victim, "precious\n").unwrap();
+        let spaced = f.root.join("验收 目录");
+        std::fs::create_dir_all(&spaced).unwrap();
+        let spaced_file = spaced.join("real.txt");
+        std::fs::write(&spaced_file, "precious\n").unwrap();
+        let dir = f.root.join("real-dir");
+        std::fs::create_dir_all(dir.join("inner")).unwrap();
+
+        let delete = analyze_powershell_command(
+            &f,
+            &format!("Remove-Item -LiteralPath '{}' -Force", victim.display()),
+        )
+        .expect("a literal PowerShell delete is real data loss");
+        assert_eq!(delete.kind, IrreversibleKind::FileDelete);
+        assert!(delete.paths.iter().any(|path| path.ends_with("real.txt")));
+
+        assert!(
+            analyze_powershell_command(
+                &f,
+                &format!(
+                    "Remove-Item -LiteralPath '{}' -Recurse -Force",
+                    dir.display()
+                )
+            )
+            .is_some()
+        );
+
+        let clear = analyze_powershell_command(
+            &f,
+            &format!("Clear-Content -LiteralPath '{}'", spaced_file.display()),
+        )
+        .expect("clearing real content is data loss");
+        assert_eq!(clear.kind, IrreversibleKind::FileDestroy);
+
+        let quoted = format!(
+            "Write-Output 'Remove-Item -Recurse -Force {}'",
+            victim.display()
+        );
+        assert!(
+            analyze_powershell_command(&f, &quoted).is_none(),
+            "a destructive word inside a string argument is not a command"
+        );
+        for ordinary in [
+            format!("Get-Content -LiteralPath '{}'", victim.display()),
+            "Set-Content -LiteralPath out.txt -Value ok".to_string(),
+            "New-Item -ItemType Directory -Path new-dir".to_string(),
+            "Get-ChildItem | Select-Object Name".to_string(),
+        ] {
+            assert!(
+                analyze_powershell_command(&f, &ordinary).is_none(),
+                "{ordinary}"
+            );
+        }
+        assert!(
+            analyze_powershell_argv(&f, &["-File", "script.ps1"]).is_none(),
+            "a script body invoked by path is opaque Auto risk"
+        );
+        assert!(
+            analyze_powershell_argv(&f, &["-EncodedCommand", "ZgBvAG8A"]).is_none(),
+            "an encoded script body is opaque Auto risk"
+        );
+        let dynamic =
+            analyze_powershell_command(&f, "Remove-Item -LiteralPath $env:TEMP\\victim.txt")
+                .expect("an unresolvable deletion target still asks");
+        assert!(dynamic.paths.is_empty());
+        assert!(
+            analyze_powershell_command(
+                &f,
+                &format!("Remove-Item -LiteralPath '{}' -WhatIf", victim.display())
+            )
+            .is_none(),
+            "a -WhatIf invocation does not touch the target"
+        );
+        assert!(
+            analyze_powershell_command(&f, "Remove-Item").is_none(),
+            "a bare cmdlet has no target and deletes nothing"
+        );
+        assert!(
+            analyze_powershell_command(&f, "Get-ChildItem | Remove-Item").is_some(),
+            "a piped delete consumes a target it did not name"
+        );
+        assert!(
+            analyze_powershell_command(&f, &format!("cmd /C del /F /Q '{}'", victim.display()))
+                .is_some(),
+            "a cmd wrapper inside PowerShell keeps the visible deletion"
+        );
+        // The outer shell wrapper (the shape `shell_command` produces on
+        // Windows) must not hide the same deletion.
+        let nested = "cmd /C \"powershell -NoProfile -Command Remove-Item -LiteralPath real.txt\""
+            .to_string();
+        assert!(
+            analyze_shell(&f, &nested).is_some(),
+            "a cmd wrapper around PowerShell keeps the visible deletion"
+        );
+        let spaced_line = format!(
+            "powershell -NoProfile -Command \"Remove-Item -LiteralPath '{}' -Force\"",
+            spaced_file.display().to_string().replace('\\', "/")
+        );
+        assert!(
+            analyze_cmd_line(&f, &spaced_line).is_some(),
+            "cmd /C keeps a quoted PowerShell deletion with a spaced path"
+        );
+    }
+
+    #[test]
+    fn powershell_deletion_of_build_output_does_not_ask() {
+        let f = fixture();
+        std::fs::write(f.root.join("Cargo.toml"), "[package]\n").unwrap();
+        std::fs::create_dir_all(f.root.join("target/debug")).unwrap();
+        let command = format!(
+            "Remove-Item -LiteralPath '{}' -Recurse -Force",
+            f.root.join("target").display()
+        );
+        assert!(analyze_powershell_command(&f, &command).is_none());
     }
 
     #[test]

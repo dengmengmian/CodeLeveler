@@ -1,0 +1,15 @@
+task: LevelerCanary_7488
+task_exists_after: false
+schtasks query:
+����: ϵͳ�Ҳ���ָ����·����
+QUERY_EXIT=1 
+
+schtasks create:
+����: ϵͳ�Ҳ���ָ����·����
+CREATE_EXIT=1 
+
+cim:
+CIM_DENIED: �ܾ����� 
+CIM_EXIT=0 
+
+cim_proof_exists: false

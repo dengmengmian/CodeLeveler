@@ -127,7 +127,7 @@ pub struct EffectInput<'a> {
 命令解析复用：
 
 - `leveler_execution::shell_ast::executed_commands(program, args)`：已解析的完整命令列表、`complete` 标志。
-- **Windows `cmd /C` 不走 bash AST。** 它使用与 `classify_shell_script_fallback(script, true)` 相同的 cmd 词法（引号、`^` 转义、`%NAME%` 展开不可读）；`del`/`erase`/`rd` 等 cmd 内建命令按程序名识别。PowerShell 脚本体仍不解析，属于文档化缺口。
+- **Windows `cmd /C` 不走 bash AST。** 它使用与 `classify_shell_script_fallback(script, true)` 相同的 cmd 词法（引号、`^` 转义、`%NAME%` 展开不可读）；`del`/`erase`/`rd` 等 cmd 内建命令按程序名识别。PowerShell 的 `-Command` 内联文本按 PowerShell 词法解析：引号分组，`;`/`|`/`&` 分段，只识别段首的 `Remove-Item` 别名（`ri`/`rm`/`rmdir`/`del`/`erase`/`rd`）和 `Clear-Content`（`clc`）；`cmd /C` 内嵌 PowerShell、PowerShell 内嵌 `cmd /C` 都继续解析。`-File`、`-EncodedCommand` 与脚本正文仍不解析，属于文档化缺口。
 - 对 `complete == false` 的脚本，使用同一 tree-sitter AST 的专用 walker，保留 `(program, Vec<Option<String>>)`；不读取脚本体。
 - AST 完全失败时，使用 literal token fallback：只识别「段首是已识别破坏程序」的段；引号内的文本不当作命令。
 
@@ -135,9 +135,9 @@ pub struct EffectInput<'a> {
 
 | 类别 | 程序 / 形态 | 结构化判据 | 结果 |
 |---|---|---|---|
-| 文件删除 | Unix：`rm`、`rmdir`、`unlink`；Windows cmd：`del`、`erase`、`rd`、`rmdir /s` | 目标全部可读且全部可重建 → Allow；否则 Ask | 见 4.3 |
+| 文件删除 | Unix：`rm`、`rmdir`、`unlink`；Windows cmd：`del`、`erase`、`rd`、`rmdir /s`；PowerShell 内联：`Remove-Item` 及其别名 | 目标全部可读且全部可重建 → Allow；否则 Ask | 见 4.3 |
 | 覆盖删除 | `shred` | 同 rm 的目标分析 | 同上 |
-| 清空文件 | `truncate -s 0` / `--size=0` | 目标可重建 → Allow；否则 Ask | — |
+| 清空文件 | `truncate -s 0` / `--size=0`；PowerShell 内联 `Clear-Content`/`clc` | 目标可重建 → Allow；否则 Ask | `-WhatIf` 不 Ask |
 | 查找删除 | `find … -delete`；`find … -exec[dir] rm/rmdir/unlink/shred` | 目标集合动态，无法枚举 → Ask | 列出 `find` 表达式 |
 | 管道删除 | `xargs rm/rmdir/unlink/shred` | 目标来自 stdin → Ask | 列出 xargs 命令 |
 | 同步删除 | `rsync --delete*` | 目标树可能很大 → Ask | 列出 destination |
@@ -313,6 +313,7 @@ MCP 在显式 `--deny-network` 下仍是 `ExecutionBoundaryFailure`（进程不�
 
 - 脚本/构建工具/包管理器内部的行为：`python script.py`、`make clean`、`npm run postinstall`、`cargo clean`。
 - 语言内嵌 payload：`python -c`、`node -e`、`eval`、`sh -c` 之外的字符串重构。
+- PowerShell 的 `-File` / `-EncodedCommand`、`.ps1` 脚本正文，以及同名函数/别名覆盖；只解析 `-Command` 内联文本中段首的闭集 cmdlet。
 - 通过文件执行的 SQL：`psql -f drop.sql`、`mysql < dump.sql`。
 - 未列入闭集的同步/部署/IaC 工具：`aws`、`gcloud`、`ansible`、`helm`、`rsync`（无 `--delete`）等。
 - 普通文件覆盖：`cp`、`mv`、`write_file`、`apply_patch`、shell 重定向。

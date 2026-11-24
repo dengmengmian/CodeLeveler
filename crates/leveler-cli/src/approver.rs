@@ -241,6 +241,7 @@ mod tests {
                 grant: None,
                 write_scope_expanded: false,
                 reason_code: None,
+                exact_call_only: false,
             };
             assert!(
                 tokio::time::timeout(
@@ -317,6 +318,7 @@ mod tests {
                 grant: None,
                 write_scope_expanded: false,
                 reason_code: None,
+                exact_call_only: false,
             };
             let task = tokio::spawn(async move { CliApprover.decide(&request).await });
             // This is a shutdown timing test: let the OS input read begin.
@@ -388,6 +390,7 @@ mod tests {
             }),
             write_scope_expanded: false,
             reason_code: None,
+            exact_call_only: false,
         };
         let details = request_details(&request);
         assert!(details.contains("push origin"), "{details}");
@@ -432,6 +435,7 @@ mod tests {
             paths: Vec::new(),
             write_scope_expanded: false,
             reason_code: None,
+            exact_call_only: false,
         };
         let details = request_details(&request);
         assert!(details.contains(&request.description), "{details}");

@@ -1,0 +1,64 @@
+{
+  "program": "Permission Model V2 - Windows real-model dogfood",
+  "generated_at": "2026-11-25T00:15:00+08:00",
+  "host": "Windows 11 x86_64, Medium integrity, non-elevated",
+  "source_head": "9c569b3d6cd27b27bb776284a4d7f480b73d09dc",
+  "binary": {
+    "path": "target/debug/leveler.exe",
+    "sha256": "0fe9531d663794ffc59364c3a2bb6827b2a6885cdba4959eacc7383dfc5e013b",
+    "version": "1.0.29 (9c569b3d6cd2-dirty) UNTRUSTED: built from a modified working tree",
+    "note": "debug source build containing both final-closure fixes"
+  },
+  "provider": {
+    "id": "taotoken",
+    "base_url": "https://taotoken.net/api/v1",
+    "model": "taotoken/deepseek-v4.1-flash-1017",
+    "reasoning_effort": "high",
+    "note": "real DeepSeek through the real CodeLeveler runtime; no mock provider"
+  },
+  "isolation": "fresh LEVELER_HOME with only the provider/model config; separate workspace per scenario",
+  "runs": {
+    "A_ordinary_dev": {
+      "session": "76f5a7c3-369d-4b20-bd5a-ae1830bc43a7",
+      "exit": 0,
+      "stop": "Completed",
+      "approvals": 0,
+      "tools": ["read_file", "apply_patch", "run_command", "git_status", "declare_scope", "update_goal"],
+      "outcome": "calc.py fixed (add returns a + b); python -m unittest -v => OK (1 test)",
+      "evidence": "A/"
+    },
+    "B_irreversible_denied": {
+      "session": "3a701551-2899-4202-af03-9870fb75239a",
+      "exit": 3,
+      "stop": "Blocked",
+      "approvals": 1,
+      "approval_prompt": "`Remove-Item` deletes real data: <workspace>\precious.txt",
+      "decision": "deny (stdin)",
+      "tool_result": "action not permitted: denied by user",
+      "outcome": "precious.txt still exists",
+      "evidence": "B/"
+    },
+    "C_git": {
+      "session": "7147581d-5e27-4f62-b127-7e1f44fe743d",
+      "exit": 0,
+      "stop": "Completed",
+      "approvals": 0,
+      "tools": ["run_command(git status --short)", "run_command(git add -A)", "run_command(git commit -m acceptance)", "run_command(git log -1 --format=%H%n%s)", "run_command(git status --short --branch)"],
+      "outcome": "commit b25d790 acceptance created; working tree clean",
+      "evidence": "C/"
+    },
+    "D2_sub_agent_ownership": {
+      "session": "d5e033dc-cbb6-457d-90d9-fafdddfc8a02",
+      "exit": 0,
+      "stop": "Completed",
+      "approvals": 0,
+      "sub_agent": "Euclid (run_in_background=false)",
+      "outcome": "unclaimed owned/unclaimed.txt write refused (Edit rejected: no write scope is currently owned); claim_write_scope owned/ granted; owned/child.txt = child-ok; python readback exit 0 stdout child-ok; no unclaimed.txt",
+      "evidence": "D2/"
+    }
+  },
+  "notes": [
+    "B stops Blocked after the denied irreversible action; no side effect.",
+    "D2's first D run used a non-git workspace and was superseded; the recorded D2 is a git workspace."
+  ]
+}

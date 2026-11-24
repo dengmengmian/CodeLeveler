@@ -1,7 +1,7 @@
 {
   "program": "Permission Model V2",
-  "generated_at": "2026-11-24T13:00:00+00:00",
-  "source_baseline": "5800dd8a + uncommitted V2/friction/concurrent changes (tree not committed)",
+  "generated_at": "2026-11-25T00:20:00+08:00",
+  "source_baseline": "9c569b3d + Windows final-closure fixes (working tree, not committed)",
   "platforms": {
     "macos": {
       "status": "PASS",
@@ -172,22 +172,139 @@
       }
     },
     "windows": {
-      "status": "BLOCKED_ENVIRONMENT",
-      "reason": "no Windows host, VM, remote desktop or cloud CLI; UTM has no guest; only GNU cross-compile check performed",
-      "host_probes": [
-        "utmctl list empty",
-        "no az/aws/gcloud/doctl",
-        "no Windows/RDP SSH entry",
-        "Docker images Linux-only"
-      ],
-      "compile_check": {
-        "command": "cargo check --workspace --target x86_64-pc-windows-gnu",
-        "exit_ok": true,
-        "elapsed_seconds": 21.51,
-        "log": "evidence/final/windows-gnu-check.log",
-        "is_real_host": false
+      "status": "PASS",
+      "verification": "REAL_WINDOWS_HOST",
+      "host": {
+        "os": "Windows 11",
+        "build": "10.0.26300.9711",
+        "arch": "x86_64",
+        "user": "desktop-6egc57e\\code",
+        "token": "Medium integrity S-1-16-8192; BUILTIN\\Administrators deny-only; non-elevated",
+        "powershell": "5.1.26100.9711",
+        "git": "2.56.0.windows.4",
+        "rust": "1.90.0"
       },
-      "verification": "UNVERIFIED"
+      "binaries": {
+        "prefix_release": {
+          "sha256": "7c8e88083933b700a4824b8875d28643ee23463951989261498e409f14bc8162",
+          "version": "1.0.29 (9c569b3d6cd2-dirty)",
+          "note": "built before the PowerShell detector; used for the pre-fix comparison"
+        },
+        "postfix_debug": {
+          "sha256": "0fe9531d663794ffc59364c3a2bb6827b2a6885cdba4959eacc7383dfc5e013b",
+          "version": "1.0.29 (9c569b3d6cd2-dirty)",
+          "note": "both fixes; used for post-fix CLI and real-model runs"
+        },
+        "confine": {
+          "sha256": "3c1716f3f6acccd1b2ebabd6cd0ef238797db08fbe536112b7d1642373303434"
+        },
+        "environment": "evidence/final/windows/environment.txt",
+        "identity": "evidence/final/windows/binary-identity.txt"
+      },
+      "matrix": {
+        "report": "evidence/final/windows/windows-permission-v2-matrix.json",
+        "arms": [
+          "v1_request_approval",
+          "v1_assisted",
+          "v2_request_approval",
+          "v2_assisted",
+          "full"
+        ],
+        "cases_per_arm": 10,
+        "resolved_policy_kinds": [
+          "legacy-restricted",
+          "legacy-auto",
+          "effect-auto",
+          "full-access"
+        ],
+        "tier_compat": "PASS (v1_assisted == v2_request_approval per case)",
+        "full_execution": "PASS (delete and git reset executed, 0 approvals)"
+      },
+      "shell": {
+        "report": "evidence/final/windows/windows-permission-v2-shell.json",
+        "powershell_inline_detection": "PASS",
+        "clear_content": "PASS (irreversible.filesystem_destroy)",
+        "cmd_forms": "PASS (del/erase/rd, shell_command wrapper)",
+        "quoted_chinese_space_path": "PASS",
+        "approved_delete_executes": "PASS",
+        "indirect_script_delete_not_scanned": "PASS",
+        "prefix_postfix_comparison": "pre-fix: 0 prompts, victim deleted despite deny; post-fix: 1 prompt, deny keeps victim, approve deletes"
+      },
+      "filesystem": {
+        "report": "evidence/final/windows/windows-permission-v2-filesystem.json",
+        "outside_write": "PASS",
+        "protected_system32_write": "OS denied, honest tool error, file absent",
+        "chinese_space": "PASS",
+        "relative_escape": "PASS",
+        "junction_write": "PASS (created via PowerShell New-Item Junction)",
+        "second_drive": "NOT_VERIFIED (no second drive)"
+      },
+      "network": {
+        "report": "evidence/final/windows/windows-permission-v2-network.json",
+        "explicit_deny_web_fetch": "PASS (served=false, 0 approvals, honest tool refusal)",
+        "explicit_deny_run_command": "PASS (served=false, BoundaryFailure)",
+        "loopback_effect_auto": "PASS (served=true, 0 approvals)",
+        "windows_network_deny_backend": "unsupported; explicit denial fails closed"
+      },
+      "security_canary": {
+        "result": "5 passed, 0 failed",
+        "evidence": "evidence/final/windows/canary/"
+      },
+      "scheduler": {
+        "result": "1 passed",
+        "evidence": "evidence/final/windows/scheduler/"
+      },
+      "real_model": {
+        "status": "PASS",
+        "provider": "taotoken",
+        "model": "taotoken/deepseek-v4.1-flash-1017",
+        "index": "evidence/final/real-model-windows/index.json",
+        "runs": {
+          "A_ordinary_dev": {
+            "session": "76f5a7c3-369d-4b20-bd5a-ae1830bc43a7",
+            "stop": "Completed",
+            "approvals": 0,
+            "outcome": "calc.py fixed; unittest OK"
+          },
+          "B_irreversible_denied": {
+            "session": "3a701551-2899-4202-af03-9870fb75239a",
+            "stop": "Blocked",
+            "approvals": 1,
+            "outcome": "precious.txt preserved after deny"
+          },
+          "C_git": {
+            "session": "7147581d-5e27-4f62-b127-7e1f44fe743d",
+            "stop": "Completed",
+            "approvals": 0,
+            "outcome": "commit b25d790 acceptance"
+          },
+          "D2_sub_agent": {
+            "session": "d5e033dc-cbb6-457d-90d9-fafdddfc8a02",
+            "stop": "Completed",
+            "approvals": 0,
+            "outcome": "unclaimed write refused; claim granted; child-ok written"
+          }
+        }
+      },
+      "integration": {
+        "fmt": "PASS (EXIT=0)",
+        "check_workspace": "PASS (19.04s, EXIT=0)",
+        "clippy_libs": "PASS (-D warnings, EXIT=0)",
+        "clippy_cli_bin": "PASS (-D warnings, CLI_EXIT=0)",
+        "workspace_tests": {
+          "exit_ok": true,
+          "targets": 364,
+          "passed": 8957,
+          "failed": 0,
+          "ignored": 114,
+          "log": "evidence/final/windows/workspace-test.log"
+        },
+        "gate_failures_before_green": [
+          "first run: compile error in leveler-engine test (missing exact_call_only); not counted as PASS",
+          "second run: 4 junction fixture setup failures (host direct cmd /c mklink argv form) and 2 load-sensitive timing tests; fixed/rerun",
+          "third run: EXIT=0"
+        ]
+      }
     }
   },
   "static_checks": {
@@ -196,54 +313,88 @@
     "clippy_libs_affected_crates": "PASS (-D warnings)",
     "clippy_cli_bin": "PASS (-D warnings)",
     "fmt_check": "PASS (exit 0)",
-    "windows_gnu_compile": "PASS (compile only, not acceptance)"
+    "windows_gnu_compile": "historical compile-only check; superseded by real Windows host",
+    "workspace_tests_windows": "PASS (364 targets, 8957 passed, 0 failed, 114 ignored, EXIT=0)"
   },
   "gates": {
     "2A": "PASS (macOS)",
     "2B": "PASS (macOS)",
     "2C": "PASS (macOS)",
     "2D": "PASS (macOS)",
-    "2E": "macOS PASS; Linux PASS; Windows BLOCKED",
+    "2E": "macOS PASS; Linux PASS; Windows PASS (2026-11-25)",
     "F1": "PASS (audit)",
     "F2": "PASS (real DeepSeek)",
     "F3": "PASS (local MCP + third-party echo)",
     "F4": "PASS (real spawn + background)",
-    "F5": "BLOCKED_ENVIRONMENT",
+    "F5": "PASS (Windows 11 real host)",
     "F6": "PASS (Linux container)",
-    "integration": "PASS (macOS fmt/check/clippy/workspace)"
+    "integration": "PASS (Windows fmt/check/clippy/workspace 8957)",
+    "W0": "PASS (Windows host found and reused)",
+    "W1": "PASS (identity recorded)",
+    "W2": "PASS (5 arms x 10 cases)",
+    "W3": "PASS (PowerShell/CMD; defect fixed)",
+    "W4": "PASS (second drive NOT_VERIFIED)",
+    "W5": "PASS (explicit deny served=false)",
+    "W6": "PASS (Git/Session; tier-1 MSYS boundary documented)",
+    "W7": "PASS (real DeepSeek A/B/C/D2)",
+    "M1": "PASS (fixed and verified)",
+    "M2": "Windows platform-neutral regression PASS; macOS/Linux re-run BLOCKED_ENVIRONMENT"
   },
   "known_gaps": [
-    "Windows real-host V2 verification missing (BLOCKED_ENVIRONMENT)",
-    "Real-model goal completion bookkeeping friction observed (not a permission defect)",
+    "macOS/Linux re-execution of the changed shared authorization paths was not possible on this Windows-only host (no WSL/Docker); exact commands recorded in 22 §3",
     "MCP tools without typed destructive annotations can perform destructive work without an ASK (by contract)",
+    "Windows tier-1 local Git push is refused by the Low-integrity MSYS named-object boundary (pre-existing execution limitation; V2 Auto/Full work)",
+    "Windows has no per-command network-deny backend; explicit denial fails closed",
+    "No second drive on this host; second-drive write NOT_VERIFIED",
+    "No pure standard-user account on this host (Medium deny-only Administrators token); no ACL was modified to fabricate one",
+    "PowerShell -File/-EncodedCommand/script bodies remain unparsed",
     "Third-party MCP validated only with server-everything echo",
-    "Linux verification uses Docker LinuxKit container, not a physical desktop Linux host"
+    "Linux verification uses a Docker LinuxKit container, not a physical desktop Linux host"
   ],
   "final_closure": {
-    "date": "2026-11-24",
-    "verdict": "PARTIAL",
-    "v2_behavior": "PASS on macOS and Linux",
-    "formal_closed": false,
-    "blocking_gate": "Windows native V2 acceptance (no host)",
-    "release_ready": "release preparation may proceed; full-platform PASS must not be claimed; Windows must be complete or explicitly excluded and labelled",
+    "date": "2026-11-25",
+    "verdict": "CLOSED",
+    "v2_behavior": "PASS on macOS, Linux (prior evidence) and Windows (native, this round)",
+    "formal_closed": true,
+    "windows_blocking_gate": "cleared",
+    "cross_platform_regression_gap": "changed shared paths not re-executed on macOS/Linux in this session; BLOCKED_ENVIRONMENT; platform-neutral tests pass on Windows",
+    "release_ready": "yes for the next unified release preparation; run the macOS/Linux affected tests before shipping those platform artifacts",
+    "mcp_destructive_grant_scope": "defective before this round; fixed and verified",
     "notable_findings": [
-      "V2 Auto ordinary work: 0 approvals in real-model daily-dev/scripts/network/Git runs; outside-workspace read and write are both 0 approvals",
-      "Direct irreversible file/dir delete and git reset --hard: exactly 1 ASK each; deny leaves no side effect; approve executes only the approved target",
-      "Full: 0 approvals, real delete executes; unchanged",
-      "V1 project default asks on sudo; explicit V2 does not ask and executes",
-      "MCP typed destructiveHint drives the ASK; denied call never reaches the server; turn grant covers same tool with different arguments",
-      "Unannotated destructive MCP tool executes without approval (documented residual risk)",
-      "Child unclaimed write is a model-visible Deny (0 approvals), then self-corrects and passes its test",
-      "No extra permission-model requests: rounds == usage == stream attempts in every recorded run"
+      "Windows V2 Auto ordinary work: 0 approvals incl. outside writes, PowerShell/CMD, Python scripts, go test, local push, loopback",
+      "Windows V2 Auto direct cmd del and git reset --hard: exactly 1 approval each; deny has no side effect; Full executes",
+      "PowerShell inline Remove-Item/Clear-Content were not detected before the fix; real CLI pre/post comparison provides evidence",
+      "Destructive MCP approval is now exact-call scoped; approving A no longer authorizes B; always does not persist a tool-wide rule",
+      "Full: 0 approvals, deletes/resets execute; tier 1 keeps old Auto semantics",
+      "Real DeepSeek Windows: A/C/D2 Completed with 0 approvals; B triggered one approval and preserved the file after denial",
+      "Child unclaimed write is a model-visible Deny; claim then write/command completes"
     ],
     "open_risks": [
-      "Windows native acceptance blocked",
-      "Goal completion bookkeeping friction (F1 TurnLimitReached after business actions completed)",
-      "MCP servers without trusted destructive annotations are not detected",
-      "Third-party MCP coverage limited to server-everything echo",
-      "Linux is containerized (real kernel, not a desktop host; private network is container 172.17.0.8)",
-      "V1 session live resume not separately rerun (covered by tests and project-default live run)"
+      "Windows tier-1 local push MSYS boundary (pre-existing)",
+      "MCP without trusted destructive annotations is not detected",
+      "macOS/Linux re-execution gap for the changed shared paths",
+      "PowerShell script bodies / -File remain opaque",
+      "Linux evidence is containerized"
     ],
-    "evidence_index": "evidence/final/real-model-index.json"
+    "evidence_index": "evidence/final/real-model-windows/index.json"
+  },
+  "mcp_grant_scope": {
+    "status": "FIXED_AND_VERIFIED",
+    "defect": "destructive MCP turn/always grants were keyed by tool name; approving resource A also authorized resource B",
+    "prefix_red_test": "evidence/final/windows/m1-prefix-unit-red.txt",
+    "fix": "ApprovalRequest.exact_call_only; exact argument-vector signature; no durable tool-wide rule; always not offered",
+    "live_v2": "evidence/final/mcp-grant-scope/mcp-grant-scope-v2-assisted.json",
+    "live_tier1_full": "evidence/final/mcp-grant-scope/mcp-grant-scope-full-and-tier1.json",
+    "unannotated": "evidence/final/mcp-grant-scope/mcp-grant-scope-unannotated.json",
+    "real_cli": "evidence/final/mcp-grant-scope/mcp-cli-{run.jsonl,run.stderr,protocol.log}",
+    "results": {
+      "resource_a_approved_deleted": true,
+      "resource_b_denied_preserved": true,
+      "protocol_b_call": false,
+      "same_argument_repeat": "covered by the turn signature, no re-ask",
+      "tier1_destructive_exact_call": true,
+      "tier1_ordinary_tool_wide_turn_grant_preserved": true,
+      "full_unchanged": true
+    }
   }
 }

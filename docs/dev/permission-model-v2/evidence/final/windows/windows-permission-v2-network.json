@@ -1,0 +1,47 @@
+{
+  "cases": [
+    {
+      "case": "deny_network_web_fetch",
+      "observed": {
+        "approvals": 0,
+        "failure": null,
+        "stop": "Stalled",
+        "tool_results": [
+          {
+            "ok": true,
+            "preview": "web enabled; tools available on the following request.",
+            "tool": "capability"
+          },
+          {
+            "ok": false,
+            "preview": "web_fetch 不可用:当前模式/沙箱已禁用网络。",
+            "tool": "web_fetch"
+          }
+        ]
+      },
+      "served": false
+    },
+    {
+      "case": "deny_network_run_command",
+      "observed": {
+        "approvals": 0,
+        "failure": null,
+        "stop": "Stalled",
+        "tool_results": [
+          {
+            "ok": false,
+            "preview": "action not permitted: [execution boundary] run_command cannot run with the requested network denial: this host has no backend that enforces it",
+            "tool": "run_command"
+          }
+        ]
+      },
+      "served": false
+    }
+  ],
+  "gate": "W5",
+  "host": {
+    "arch": "x86_64",
+    "os": "windows"
+  },
+  "url": "http://127.0.0.1:58840/denied"
+}

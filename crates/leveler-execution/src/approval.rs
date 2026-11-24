@@ -44,6 +44,14 @@ pub struct ApprovalRequest {
     /// UI and audit read this instead of inferring risk from prose.
     #[serde(default)]
     pub reason_code: Option<String>,
+    /// This decision authorizes exactly one argument vector, not a tool.
+    ///
+    /// A destructive MCP operation is identified by the server's typed
+    /// `destructiveHint`; the runtime cannot express its target in the durable
+    /// rule language, so neither the turn grant nor a standing rule may
+    /// generalize the approval to another call of the same tool.
+    #[serde(default)]
+    pub exact_call_only: bool,
 }
 
 impl ApprovalRequest {
@@ -82,7 +90,7 @@ impl ApprovalRequest {
     /// rule. `false` means the runtime can only honour it for this turn
     /// (consent tools, calls with no safe rule shape), so no prompt may offer it.
     pub fn always_persists(&self) -> bool {
-        if self.grant.is_some() || self.requires_human_consent() {
+        if self.grant.is_some() || self.requires_human_consent() || self.exact_call_only {
             return false;
         }
         let paths: Vec<String> = self.paths.iter().map(|p| p.display().to_string()).collect();
@@ -100,7 +108,9 @@ pub enum ApprovalDecision {
     /// requests without resources retain exact-call approval for this turn.
     /// An MCP proxy tool is the exception: its authorization unit is the
     /// configured tool, not one argument vector, so this choice covers that
-    /// tool for the rest of the turn (see `Executor::ask`).
+    /// tool for the rest of the turn. A tool that declares destructive
+    /// behavior stays exact-call scoped: one approval must not cover another
+    /// argument vector (see `Executor::ask`).
     ApproveSession,
     /// Reuse this capability-resource binding in the same project.
     ApproveProject,
@@ -1190,6 +1200,7 @@ mod tests {
             paths: Vec::new(),
             write_scope_expanded: false,
             reason_code: None,
+            exact_call_only: false,
         };
 
         // The exact shape observed leaking: request_permissions, Privileged.
@@ -1232,6 +1243,7 @@ mod tests {
             paths: Vec::new(),
             write_scope_expanded: false,
             reason_code: None,
+            exact_call_only: false,
         };
         assert_eq!(EvalApprove.decide(&request).await, ApprovalDecision::Deny);
         request.description = "read-only, will not modify anything".into();
@@ -1256,6 +1268,7 @@ mod tests {
             paths: Vec::new(),
             write_scope_expanded: false,
             reason_code: None,
+            exact_call_only: false,
         };
         for (tool, risk) in [
             ("apply_patch", RiskLevel::WorkspaceWrite),
@@ -1304,6 +1317,7 @@ mod tests {
             paths: Vec::new(),
             write_scope_expanded: false,
             reason_code: None,
+            exact_call_only: false,
         };
         assert_eq!(
             AutoApprove.decide(&request).await,
@@ -1417,6 +1431,7 @@ mod tests {
             paths: Vec::new(),
             write_scope_expanded: false,
             reason_code: None,
+            exact_call_only: false,
         };
         assert_eq!(AutoApprove.decide(&req).await, ApprovalDecision::Deny);
 

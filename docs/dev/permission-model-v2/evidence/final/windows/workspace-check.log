@@ -1,0 +1,12 @@
+    Checking leveler-win-confine v1.0.29 (C:\CodeLeveler\crates\leveler-win-confine)
+    Checking leveler-execution v1.0.29 (C:\CodeLeveler\crates\leveler-execution)
+    Checking leveler-vcs v1.0.29 (C:\CodeLeveler\crates\leveler-vcs)
+    Checking leveler-native v1.0.29 (C:\CodeLeveler\crates\leveler-native)
+    Checking leveler-engine v1.0.29 (C:\CodeLeveler\crates\leveler-engine)
+    Checking leveler-tools v1.0.29 (C:\CodeLeveler\crates\leveler-tools)
+    Checking leveler-agent v1.0.29 (C:\CodeLeveler\crates\leveler-agent)
+    Checking leveler-app v1.0.29 (C:\CodeLeveler\crates\leveler-app)
+    Checking leveler-runtime-host v1.0.29 (C:\CodeLeveler\crates\leveler-runtime-host)
+    Checking leveler-cli v1.0.29 (C:\CodeLeveler\crates\leveler-cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 19.04s
+EXIT=0

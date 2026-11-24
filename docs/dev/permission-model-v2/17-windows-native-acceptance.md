@@ -4,6 +4,8 @@
 结论：**BLOCKED_ENVIRONMENT / UNVERIFIED**
 没有 Windows 实机、VM 或可远程使用的 Windows 主机。未用交叉编译、Wine、静态分析或 CI 配置冒充 Windows 实机 PASS。
 
+> 后续：本文记录的是首轮无 Windows 主机时的结论。Windows 11 实机上的原生验收已在同一验收系列完成，结论见 [20 · Windows 原生最终验收](20-windows-native-final-closure.md)；本文保留为历史记录，不再代表最终状态。
+
 ## 1. 环境探测
 
 | 检查 | 结果 |

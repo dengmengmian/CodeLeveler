@@ -23,11 +23,10 @@
 //! ```
 //!
 //! The JSON report is the machine-readable evidence indexed under
-//! `docs/dev/permission-model-v2/`. This harness is macOS/Linux-only: its LAN
-//! fixture asks `ipconfig` for a private address and uses a local bare Git
-//! remote. Windows results are reported separately as UNVERIFIED.
-
-#![cfg(unix)]
+//! `docs/dev/permission-model-v2/`. The harness runs on macOS, Linux and
+//! Windows; on Windows the ordinary build/delete cases use native `cmd`
+//! and `python`, and the LAN fixture reads the first non-loopback IPv4 from
+//! PowerShell.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -142,9 +141,18 @@ impl Fixture {
             "#!/bin/sh\necho built > build-out.txt\n",
         )
         .unwrap();
+        std::fs::write(
+            repo.join("build.cmd"),
+            "@echo off\r\necho built> build-out.txt\r\n",
+        )
+        .unwrap();
         std::fs::write(repo.join("real-data.txt"), "precious\n").unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(repo.join("build.sh"), PermissionsExt::from_mode(0o755));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ =
+                std::fs::set_permissions(repo.join("build.sh"), PermissionsExt::from_mode(0o755));
+        }
         run(&["add", "-A"]);
         run(&["commit", "-qm", "seed", "--no-gpg-sign"]);
         Self {
@@ -335,6 +343,20 @@ async fn run_turn(
 }
 
 fn lan_ip() -> Option<String> {
+    if cfg!(windows) {
+        let output = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "(Get-NetIPAddress -AddressFamily IPv4 | Where-Object { \
+                 $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } \
+                 | Select-Object -First 1).IPAddress",
+            ])
+            .output()
+            .ok()?;
+        let ip = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return (output.status.success() && !ip.is_empty()).then_some(ip);
+    }
     for service in ["en0", "en1", "en2"] {
         let output = Command::new("ipconfig")
             .args(["getifaddr", service])
@@ -455,7 +477,10 @@ async fn permission_model_v2_dogfood() {
             arm,
             "python_script",
             "run_command",
-            serde_json::json!({"program": "python3", "args": ["script.py"]}),
+            serde_json::json!({
+                "program": if cfg!(windows) { "python" } else { "python3" },
+                "args": ["script.py"]
+            }),
             false,
         )
         .await;
@@ -474,7 +499,11 @@ async fn permission_model_v2_dogfood() {
             arm,
             "shell_build",
             "run_command",
-            serde_json::json!({"program": "sh", "args": ["build.sh"]}),
+            if cfg!(windows) {
+                serde_json::json!({"program": "cmd", "args": ["/C", "build.cmd"]})
+            } else {
+                serde_json::json!({"program": "sh", "args": ["build.sh"]})
+            },
             false,
         )
         .await;
@@ -540,10 +569,17 @@ async fn permission_model_v2_dogfood() {
             arm,
             "delete_real_file",
             "run_command",
-            serde_json::json!({
-                "program": "rm",
-                "args": ["-rf", victim.display().to_string()]
-            }),
+            if cfg!(windows) {
+                serde_json::json!({
+                    "program": "cmd",
+                    "args": ["/C", format!("del /F /Q \"{}\"", victim.display())]
+                })
+            } else {
+                serde_json::json!({
+                    "program": "rm",
+                    "args": ["-rf", victim.display().to_string()]
+                })
+            },
             false,
         )
         .await;

@@ -1,0 +1,37 @@
+[
+  {
+    "tool": "capability",
+    "arguments": {
+      "action": "enable",
+      "id": "external_tools"
+    }
+  },
+  {
+    "tool": "mcp__fixture__write_resource",
+    "arguments": {
+      "target": "note.txt",
+      "content": "ordinary-mcp"
+    }
+  },
+  {
+    "tool": "mcp__fixture__delete_resource",
+    "arguments": {
+      "target": "resource-a.txt"
+    }
+  },
+  {
+    "tool": "mcp__fixture__delete_resource",
+    "arguments": {
+      "target": "resource-a.txt"
+    }
+  },
+  {
+    "tool": "mcp__fixture__delete_resource",
+    "arguments": {
+      "target": "resource-b.txt"
+    }
+  },
+  {
+    "text": "done"
+  }
+]

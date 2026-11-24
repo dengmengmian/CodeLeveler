@@ -1,0 +1,103 @@
+{
+  "cases": [
+    {
+      "case": "outside_write",
+      "file": true,
+      "observed": {
+        "approvals": [],
+        "decisions": [],
+        "failure": null,
+        "policy_kind": "effect-auto",
+        "terminal": true,
+        "tool_results": [
+          {
+            "ok": true,
+            "preview": "Created C:\\Users\\code\\AppData\\Local\\Temp\\.tmpcZIslB\\outside\\ordinary.txt (1 lines)",
+            "tool": "write_file"
+          }
+        ]
+      }
+    },
+    {
+      "case": "protected_write",
+      "file": false,
+      "observed": {
+        "approvals": [],
+        "decisions": [],
+        "failure": null,
+        "policy_kind": "effect-auto",
+        "terminal": true,
+        "tool_results": [
+          {
+            "ok": false,
+            "preview": "tool error: io error: create temp \\\\?\\C:\\Windows\\System32\\.leveler-v2-acceptance-3344.txt.b5f16017-44b4-40f8-bb2e-14c9d0d9922b.leveler-tmp: 拒绝访问。 (os error 5)",
+            "tool": "write_file"
+          }
+        ]
+      }
+    },
+    {
+      "case": "chinese_space_write",
+      "file": true,
+      "observed": {
+        "approvals": [],
+        "decisions": [],
+        "failure": null,
+        "policy_kind": "effect-auto",
+        "terminal": true,
+        "tool_results": [
+          {
+            "ok": true,
+            "preview": "Created C:\\Users\\code\\AppData\\Local\\Temp\\.tmpcZIslB\\repo\\验收 目录\\中文 文件.txt (1 lines)",
+            "tool": "write_file"
+          }
+        ]
+      }
+    },
+    {
+      "case": "relative_escape",
+      "file": true,
+      "observed": {
+        "approvals": [],
+        "decisions": [],
+        "failure": null,
+        "policy_kind": "effect-auto",
+        "terminal": true,
+        "tool_results": [
+          {
+            "ok": true,
+            "preview": "Created ../escaped.txt (1 lines)",
+            "tool": "write_file"
+          }
+        ]
+      }
+    },
+    {
+      "case": "junction_write",
+      "observed": {
+        "approvals": [],
+        "decisions": [],
+        "failure": null,
+        "policy_kind": "effect-auto",
+        "terminal": true,
+        "tool_results": [
+          {
+            "ok": true,
+            "preview": "Created C:\\Users\\code\\AppData\\Local\\Temp\\.tmpcZIslB\\repo\\junction-outside\\through-junction.txt (1 lines)",
+            "tool": "write_file"
+          }
+        ]
+      },
+      "target_file": true
+    },
+    {
+      "case": "second_drive_write",
+      "status": "NOT_VERIFIED: no second drive"
+    }
+  ],
+  "gate": "W4",
+  "host": {
+    "arch": "x86_64",
+    "os": "windows"
+  }
+}

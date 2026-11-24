@@ -1,0 +1,7 @@
+script: echo PWNED>> hard-AGENTS.md & del hard-AGENTS.md
+exit: Some(0)
+stdout:
+
+stderr:
+拒绝访问。
+

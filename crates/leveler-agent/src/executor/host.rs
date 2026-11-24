@@ -95,9 +95,18 @@ pub(crate) const MAX_SUPERSEDE_RETRIES: usize = 8;
 /// key separate from the exact-call signature leaves every other tool on the
 /// exact-call contract. The key never outlives the turn because the set lives
 /// on the turn's `Drive`.
-fn mcp_session_key(tool: &str) -> Option<String> {
-    tool.starts_with("mcp__")
-        .then(|| format!("mcp-tool:{tool}"))
+///
+/// A tool that declares destructive behavior gets no such key: one approval
+/// must cover exactly the argument vector the user saw, never another target.
+/// The exact-call signature still covers a repeat of that same call.
+fn mcp_session_key(request: &leveler_execution::ApprovalRequest) -> Option<String> {
+    if request.exact_call_only {
+        return None;
+    }
+    request
+        .tool
+        .starts_with("mcp__")
+        .then(|| format!("mcp-tool:{}", request.tool))
 }
 
 /// A call whose admission ALREADY happened and is on the durable record — a
@@ -853,6 +862,7 @@ impl Executor {
                     grant: None,
                     write_scope_expanded: false,
                     reason_code: None,
+                    exact_call_only: false,
                 },
                 signature,
                 write,
@@ -1110,6 +1120,14 @@ impl Executor {
                     && (self.registry.runs_command(&call.name)
                         || self.registry.mutates_files(&call.name)
                         || call.name.starts_with("mcp__"));
+                // Typed, tool-declared destructiveness. The decision binds to
+                // this exact argument vector: a different target is a
+                // different irreversible operation and needs its own approval.
+                let exact_call_only = self
+                    .tool(&call.name)
+                    .and_then(|tool| tool.mcp_annotations())
+                    .and_then(|annotations| annotations.destructive_hint)
+                    == Some(true);
                 PolicyResolution::Ask(Box::new(PendingApproval {
                     request: ApprovalRequest {
                         id: ApprovalId::generate(),
@@ -1138,6 +1156,7 @@ impl Executor {
                                 })
                                 .to_string(),
                         ),
+                        exact_call_only,
                     },
                     signature: approval_signature(call),
                     write,
@@ -1318,7 +1337,7 @@ impl Executor {
         if !human_only
             && session_approved.as_ref().is_some_and(|set| {
                 set.contains(&pending.signature)
-                    || mcp_session_key(&pending.request.tool).is_some_and(|key| set.contains(&key))
+                    || mcp_session_key(&pending.request).is_some_and(|key| set.contains(&key))
             })
         {
             return AskOutcome::Allowed(AuthorizationEvidence::SessionGrant {
@@ -1397,7 +1416,7 @@ impl Executor {
                 // is ApproveAlways writing a permission rule.
                 if let Some(set) = &mut session_approved {
                     set.insert(pending.signature.clone());
-                    if let Some(key) = mcp_session_key(&pending.request.tool) {
+                    if let Some(key) = mcp_session_key(&pending.request) {
                         set.insert(key);
                     }
                 }
@@ -1412,7 +1431,14 @@ impl Executor {
                 // while the event log still shows the approval unresolved.
                 // `admit` writes it after the barrier confirms the resolution
                 // landed.
-                if let Some(slot) = pending_always {
+                //
+                // An exact-call-only request (a destructive MCP operation) has
+                // no expressible rule scope. A client that still sends
+                // "always" gets this turn's exact-call grant, never a durable
+                // tool-wide rule.
+                if !pending.request.exact_call_only
+                    && let Some(slot) = pending_always
+                {
                     *slot = Some(PendingStandingGrant::Legacy {
                         tool: pending.request.tool.clone(),
                         command_line: pending.command_line.clone(),
@@ -1423,9 +1449,14 @@ impl Executor {
                 // durable rule could be persisted.
                 if let Some(set) = &mut session_approved {
                     set.insert(pending.signature.clone());
-                    if let Some(key) = mcp_session_key(&pending.request.tool) {
+                    if let Some(key) = mcp_session_key(&pending.request) {
                         set.insert(key);
                     }
+                }
+                if pending.request.exact_call_only {
+                    return AskOutcome::Allowed(AuthorizationEvidence::SessionGrant {
+                        signature: pending.signature.clone(),
+                    });
                 }
                 AskOutcome::Allowed(AuthorizationEvidence::ApprovedAlways)
             }
@@ -2757,6 +2788,11 @@ mod authorize_tests {
         let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
         let mut exec = executor_for(dir.path(), approver.clone());
         exec.tool_context = exec.tool_context.clone().with_sandbox(true);
+        // This test measures admission's handling of a run-level denial that
+        // the backend CAN enforce. The capability is a property of the host
+        // (false on Windows, which has no network-deny backend), so inject it
+        // instead of letting the probe decide which branch is measured.
+        let exec = exec.with_network_enforceable(true);
         let admitted = match exec
             .admit(
                 rm_rf_call(),
@@ -3390,6 +3426,7 @@ mod authorize_tests {
                 paths: Vec::new(),
                 write_scope_expanded: true,
                 reason_code: None,
+                exact_call_only: false,
             },
             signature: signature.to_string(),
             write: leveler_execution::WriteScope::Workspace {
@@ -3439,6 +3476,126 @@ mod authorize_tests {
             approver.asks(),
             1,
             "the MCP tool is the turn's authorization unit"
+        );
+    }
+
+    /// A tool that declares destructive behavior is the exception to the
+    /// tool-scoped turn grant: approving `delete_resource` on Resource A must
+    /// not silently authorize Resource B. The exact argument vector stays
+    /// reusable for the rest of the turn.
+    #[tokio::test]
+    async fn a_destructive_mcp_turn_approval_covers_only_the_exact_arguments() {
+        let dir = tempfile::tempdir().unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveSession));
+        let exec = effect_auto_with_mcp(dir.path(), approver.clone());
+        let mut session = HashSet::new();
+        let cancellation = CancellationToken::new();
+        let resource_a = call(
+            "mcp__lab__drop",
+            serde_json::json!({"target": "resource-a"}),
+        );
+        let resource_b = call(
+            "mcp__lab__drop",
+            serde_json::json!({"target": "resource-b"}),
+        );
+
+        let first = match resolve(&exec, &resource_a).await {
+            leveler_execution::PolicyResolution::Ask(pending) => pending,
+            other => panic!("a destructive MCP call must ask, got {other:?}"),
+        };
+        assert!(matches!(
+            exec.ask(&first, Some(&mut session), None, &cancellation)
+                .await,
+            AskOutcome::Allowed(_)
+        ));
+
+        // The same operation again is covered by the decision within this
+        // turn: the user approved that exact argument vector.
+        let repeat = match resolve(&exec, &resource_a).await {
+            leveler_execution::PolicyResolution::Ask(pending) => pending,
+            other => panic!("a destructive MCP call must ask, got {other:?}"),
+        };
+        assert!(matches!(
+            exec.ask(&repeat, Some(&mut session), None, &cancellation)
+                .await,
+            AskOutcome::Allowed(_)
+        ));
+        assert_eq!(
+            approver.asks(),
+            1,
+            "the exact approved call is not re-asked"
+        );
+
+        let second = match resolve(&exec, &resource_b).await {
+            leveler_execution::PolicyResolution::Ask(pending) => pending,
+            other => panic!("a destructive MCP call must ask, got {other:?}"),
+        };
+        assert!(matches!(
+            exec.ask(&second, Some(&mut session), None, &cancellation)
+                .await,
+            AskOutcome::Allowed(_)
+        ));
+        assert_eq!(
+            approver.asks(),
+            2,
+            "approving Resource A must not authorize Resource B"
+        );
+    }
+
+    /// "Always" cannot be expressed as a standing rule for a destructive MCP
+    /// tool: the rule language has no resource identity for it, and a rule
+    /// keyed by tool name alone would cover every future target. The decision
+    /// therefore stays exact-call scoped and persists nothing.
+    #[tokio::test]
+    async fn a_destructive_mcp_always_approval_persists_no_tool_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveAlways));
+        let exec = effect_auto_with_mcp(dir.path(), approver.clone());
+        let mut session = HashSet::new();
+        let cancellation = CancellationToken::new();
+        let resource_a = call(
+            "mcp__lab__drop",
+            serde_json::json!({"target": "resource-a"}),
+        );
+        let resource_b = call(
+            "mcp__lab__drop",
+            serde_json::json!({"target": "resource-b"}),
+        );
+
+        let first = match resolve(&exec, &resource_a).await {
+            leveler_execution::PolicyResolution::Ask(pending) => pending,
+            other => panic!("a destructive MCP call must ask, got {other:?}"),
+        };
+        assert!(!first.request.always_persists());
+        let mut pending_always = None;
+        assert!(matches!(
+            exec.ask(
+                &first,
+                Some(&mut session),
+                Some(&mut pending_always),
+                &cancellation,
+            )
+            .await,
+            AskOutcome::Allowed(_)
+        ));
+        assert!(
+            pending_always.is_none(),
+            "a destructive MCP approval must not persist a tool-wide rule"
+        );
+
+        let second = match resolve(&exec, &resource_b).await {
+            leveler_execution::PolicyResolution::Ask(pending) => pending,
+            other => panic!("a destructive MCP call must ask, got {other:?}"),
+        };
+        assert!(matches!(
+            exec.ask(&second, Some(&mut session), None, &cancellation)
+                .await,
+            AskOutcome::Allowed(_)
+        ));
+        assert_eq!(
+            approver.asks(),
+            2,
+            "the always decision must not cover a different target"
         );
     }
 
@@ -3671,7 +3828,12 @@ mod authorize_tests {
     async fn loopback_is_never_an_unsupported_command_scope() {
         let dir = tempfile::tempdir().unwrap();
         let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
-        let exec = executor_at(dir.path(), PermissionProfile::RequestApproval, approver);
+        // Windows has no network-deny backend (the probe says so). This test
+        // measures scope support, not that capability, so pin the capability
+        // true: on a host without it, an ordinary command under 请求批准 is
+        // asked first by contract, which is a different case.
+        let exec = executor_at(dir.path(), PermissionProfile::RequestApproval, approver)
+            .with_network_enforceable(true);
         let action = call(
             "run_command",
             serde_json::json!({"program": "echo", "args": ["hi"]}),

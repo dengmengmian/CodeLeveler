@@ -1,0 +1,40 @@
+{
+  "full": {
+    "approvals": 0,
+    "arm": "full",
+    "delete_tool_calls": 3,
+    "failure": null,
+    "resource_a_deleted": true,
+    "resource_b_deleted": true,
+    "terminal": true
+  },
+  "gate": "M1",
+  "tier1_destructive": {
+    "approvals": 2,
+    "arm": "v2_request_approval_destructive",
+    "decisions": [
+      "approve_session",
+      "deny"
+    ],
+    "delete_targets": [
+      "resource-a.txt",
+      "resource-a.txt"
+    ],
+    "failure": null,
+    "reason_codes": [
+      "legacy.auto",
+      "legacy.auto"
+    ],
+    "resource_a_deleted": true,
+    "resource_b_deleted": false,
+    "terminal": true
+  },
+  "tier1_ordinary": {
+    "approvals": 1,
+    "arm": "v2_request_approval_ordinary",
+    "failure": null,
+    "note": "second",
+    "terminal": true,
+    "write_tool_calls": 2
+  }
+}

@@ -408,6 +408,7 @@ mod tests {
             }),
             write_scope_expanded: false,
             reason_code: None,
+            exact_call_only: false,
         };
         assert_eq!(
             approver.decide(&request).await,

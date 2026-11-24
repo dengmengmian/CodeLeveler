@@ -1,0 +1,21 @@
+script: echo PWNED>> AGENTS.md & echo PWNED> AGENTS.MD & copy /Y src\business.rs AGENTS.md & move /Y src\business.rs AGENTS.md & del AGENTS.md & ren AGENTS.md root-moved.md & del .leveler\config.yaml & ren .leveler leveler-moved & rd /s /q .git & ren .git git-moved
+exit: Some(1)
+stdout:
+已复制         0 个文件。
+移动了         0 个文件。
+C:\Users\code\AppData\Local\Temp\leveler-sec-canary-7488\workspace\AGENTS.md
+C:\Users\code\AppData\Local\Temp\leveler-sec-canary-7488\workspace\.leveler\config.yaml
+
+stderr:
+拒绝访问。
+拒绝访问。
+拒绝访问。
+拒绝访问。
+另一个程序正在使用此文件，进程无法访问。
+另一个程序正在使用此文件，进程无法访问。
+拒绝访问。
+另一个程序正在使用此文件，进程无法访问。
+.git\HEAD - 拒绝访问。
+另一个程序正在使用此文件，进程无法访问。
+另一个程序正在使用此文件，进程无法访问。
+

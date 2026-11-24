@@ -1,0 +1,6 @@
+script: echo FORGED> src\deep\AGENTS.md & echo FORGED> src\AGENTS.MD
+exit: Some(0)
+stdout:
+
+stderr:
+

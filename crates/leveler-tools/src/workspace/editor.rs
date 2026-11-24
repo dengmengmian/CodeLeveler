@@ -1136,12 +1136,21 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("victim.txt"), "outside\n").unwrap();
         let junction = root.path().join("escape");
+        // The direct `cmd /c mklink /J <link> <target>` argv form is rejected
+        // on this host with "Access is denied"; the same line in a batch file
+        // succeeds. This test needs the junction, not cmd's argument
+        // reconstruction.
+        let script = outside.path().join("mklink-escape.cmd");
+        std::fs::write(&script, "@echo off\r\nmklink /J \"%~1\" \"%~2\"\r\n").unwrap();
         let status = std::process::Command::new("cmd.exe")
-            .args(["/D", "/C", "mklink", "/J"])
+            .arg("/D")
+            .arg("/C")
+            .arg(&script)
             .arg(&junction)
             .arg(outside.path())
             .status()
             .expect("launch mklink junction canary");
+        let _ = std::fs::remove_file(&script);
         assert!(status.success(), "mklink /J canary setup failed: {status}");
 
         let workspace = leveler_execution::Workspace::new(root.path()).unwrap();

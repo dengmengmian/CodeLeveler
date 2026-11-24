@@ -1,0 +1,7 @@
+script: echo PWNED>> src\deep\AGENTS.md
+exit: Some(1)
+stdout:
+
+stderr:
+拒绝访问。
+

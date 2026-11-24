@@ -1,0 +1,7 @@
+{"id": 1, "jsonrpc": "2.0", "method": "initialize", "params": {"capabilities": {}, "clientInfo": {"name": "leveler", "version": "1.0.29"}, "protocolVersion": "2024-11-05"}}
+{"id": 2, "jsonrpc": "2.0", "method": "tools/list", "params": {}}
+{"id": 3, "jsonrpc": "2.0", "method": "tools/call", "params": {"arguments": {"content": "ordinary-mcp", "target": "note.txt"}, "name": "write_resource"}}
+{"id": 1, "jsonrpc": "2.0", "method": "initialize", "params": {"capabilities": {}, "clientInfo": {"name": "leveler", "version": "1.0.29"}, "protocolVersion": "2024-11-05"}}
+{"id": 2, "jsonrpc": "2.0", "method": "tools/call", "params": {"arguments": {"target": "resource-a.txt"}, "name": "delete_resource"}}
+{"id": 1, "jsonrpc": "2.0", "method": "initialize", "params": {"capabilities": {}, "clientInfo": {"name": "leveler", "version": "1.0.29"}, "protocolVersion": "2024-11-05"}}
+{"id": 2, "jsonrpc": "2.0", "method": "tools/call", "params": {"arguments": {"target": "resource-a.txt"}, "name": "delete_resource"}}

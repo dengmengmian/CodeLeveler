@@ -305,6 +305,7 @@ mod resource_grant_tests {
                 grant: None,
                 write_scope_expanded: widens_write,
                 reason_code: None,
+                exact_call_only: false,
             },
             signature: "sig".into(),
             write: workspace(),

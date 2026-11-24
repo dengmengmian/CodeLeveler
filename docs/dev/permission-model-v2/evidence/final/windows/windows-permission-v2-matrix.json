@@ -1,0 +1,1188 @@
+{
+  "arms": [
+    {
+      "arm": "v1_request_approval",
+      "cases": [
+        {
+          "case": "write_inside",
+          "file": true,
+          "observed": {
+            "approvals": [],
+            "decisions": [],
+            "failure": null,
+            "policy_kind": "legacy-restricted",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": true,
+                "preview": "Created inside.txt (1 lines)",
+                "tool": "write_file"
+              }
+            ]
+          },
+          "policy_kind": "legacy-restricted"
+        },
+        {
+          "case": "write_outside",
+          "file": false,
+          "observed": {
+            "approvals": [
+              {
+                "always_persists": false,
+                "reason_code": "legacy.restricted",
+                "summary": "path `C:\\Users\\code\\AppData\\Local\\Temp\\.tmpAii2vS\\outside\\written-outside.txt` is outside the workspace root `\\\\?\\C:\\Users\\code\\AppData\\Local\\Temp\\.tmpAii2vS\\repo`. Use a path relative to that root (e.g. `src/lib.rs`), or start leveler inside the target repository. Writes outside the write scope are blocked by design; reading any path is allowed.",
+                "tool": "write_file"
+              }
+            ],
+            "decisions": [
+              "deny"
+            ],
+            "failure": null,
+            "policy_kind": "legacy-restricted",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": false,
+                "preview": "action not permitted: denied by user",
+                "tool": "write_file"
+              }
+            ]
+          },
+          "policy_kind": "legacy-restricted"
+        },
+        {
+          "case": "powershell_ordinary",
+          "file": false,
+          "observed": {
+            "approvals": [
+              {
+                "always_persists": true,
+                "reason_code": "legacy.restricted",
+                "summary": "此平台无法断网：批准后该命令可以联网运行",
+                "tool": "run_command"
+              }
+            ],
+            "decisions": [
+              "deny"
+            ],
+            "failure": null,
+            "policy_kind": "legacy-restricted",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": false,
+                "preview": "action not permitted: denied by user",
+                "tool": "run_command"
+              }
+            ]
+          },
+          "policy_kind": "legacy-restricted"
+        },
+        {
+          "case": "cmd_ordinary",
+          "file": false,
+          "observed": {
+            "approvals": [
+              {
+                "always_persists": true,
+                "reason_code": "legacy.restricted",
+                "summary": "此平台无法断网：批准后该命令可以联网运行",
+                "tool": "run_command"
+              }
+            ],
+            "decisions": [
+              "deny"
+            ],
+            "failure": null,
+            "policy_kind": "legacy-restricted",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": false,
+                "preview": "action not permitted: denied by user",
+                "tool": "run_command"
+              }
+            ]
+          },
+          "policy_kind": "legacy-restricted"
+        },
+        {
+          "case": "python_indirect",
+          "deleted": false,
+          "observed": {
+            "approvals": [
+              {
+                "always_persists": true,
+                "reason_code": "legacy.restricted",
+                "summary": "此平台无法断网：批准后该命令可以联网运行",
+                "tool": "run_command"
+              }
+            ],
+            "decisions": [
+              "deny"
+            ],
+            "failure": null,
+            "policy_kind": "legacy-restricted",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": false,
+                "preview": "action not permitted: denied by user",
+                "tool": "run_command"
+              }
+            ]
+          },
+          "policy_kind": "legacy-restricted",
+          "ran": false
+        },
+        {
+          "case": "go_test",
+          "observed": {
+            "approvals": [
+              {
+                "always_persists": true,
+                "reason_code": "legacy.restricted",
+                "summary": "此平台无法断网：批准后该命令可以联网运行",
+                "tool": "run_command"
+              }
+            ],
+            "decisions": [
+              "deny"
+            ],
+            "failure": null,
+            "policy_kind": "legacy-restricted",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": false,
+                "preview": "action not permitted: denied by user",
+                "tool": "run_command"
+              }
+            ]
+          },
+          "policy_kind": "legacy-restricted"
+        },
+        {
+          "case": "git_push_local",
+          "observed": {
+            "approvals": [
+              {
+                "always_persists": true,
+                "reason_code": "legacy.restricted",
+                "summary": "Git 副作用: git_metadata.read, git_metadata.write, git_remote.write；此平台无法断网：批准后该命令可以联网运行",
+                "tool": "run_command"
+              }
+            ],
+            "decisions": [
+              "deny"
+            ],
+            "failure": null,
+            "policy_kind": "legacy-restricted",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": false,
+                "preview": "action not permitted: denied by user",
+                "tool": "run_command"
+              }
+            ]
+          },
+          "policy_kind": "legacy-restricted",
+          "pushed": false
+        },
+        {
+          "case": "delete_cmd_denied",
+          "observed": {
+            "approvals": [
+              {
+                "always_persists": true,
+                "reason_code": "legacy.restricted",
+                "summary": "此平台无法断网：批准后该命令可以联网运行",
+                "tool": "shell_command"
+              }
+            ],
+            "decisions": [
+              "deny"
+            ],
+            "failure": null,
+            "policy_kind": "legacy-restricted",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": false,
+                "preview": "action not permitted: denied by user",
+                "tool": "shell_command"
+              }
+            ]
+          },
+          "policy_kind": "legacy-restricted",
+          "victim_exists": true
+        },
+        {
+          "case": "git_reset_denied",
+          "dirty_survived": true,
+          "observed": {
+            "approvals": [
+              {
+                "always_persists": true,
+                "reason_code": "legacy.restricted",
+                "summary": "Git 副作用: git_metadata.write, git_workspace.write, git_history.destroy；此平台无法断网：批准后该命令可以联网运行",
+                "tool": "run_command"
+              }
+            ],
+            "decisions": [
+              "deny"
+            ],
+            "failure": null,
+            "policy_kind": "legacy-restricted",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": false,
+                "preview": "action not permitted: denied by user",
+                "tool": "run_command"
+              }
+            ]
+          },
+          "policy_kind": "legacy-restricted"
+        },
+        {
+          "case": "network_loopback",
+          "observed": {
+            "approvals": [],
+            "decisions": [],
+            "failure": null,
+            "policy_kind": "legacy-restricted",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": true,
+                "preview": "web enabled; tools available on the following request.",
+                "tool": "capability"
+              },
+              {
+                "ok": false,
+                "preview": "web_fetch 不可用:request failed: error sending request for url (http://127.0.0.1:52836/probe)。请基于已有知识继续,或改用其他工具。",
+                "tool": "web_fetch"
+              }
+            ]
+          },
+          "policy_kind": "legacy-restricted",
+          "served": true
+        }
+      ],
+      "contract": "v1",
+      "expected_policy_kind": "legacy-restricted",
+      "profile": "request_approval"
+    },
+    {
+      "arm": "v1_assisted",
+      "cases": [
+        {
+          "case": "write_inside",
+          "file": true,
+          "observed": {
+            "approvals": [],
+            "decisions": [],
+            "failure": null,
+            "policy_kind": "legacy-auto",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": true,
+                "preview": "Created inside.txt (1 lines)",
+                "tool": "write_file"
+              }
+            ]
+          },
+          "policy_kind": "legacy-auto"
+        },
+        {
+          "case": "write_outside",
+          "file": false,
+          "observed": {
+            "approvals": [
+              {
+                "always_persists": false,
+                "reason_code": "legacy.auto",
+                "summary": "path `C:\\Users\\code\\AppData\\Local\\Temp\\.tmpAii2vS\\outside\\written-outside.txt` is outside the workspace root `\\\\?\\C:\\Users\\code\\AppData\\Local\\Temp\\.tmpAii2vS\\repo`. Use a path relative to that root (e.g. `src/lib.rs`), or start leveler inside the target repository. Writes outside the write scope are blocked by design; reading any path is allowed.",
+                "tool": "write_file"
+              }
+            ],
+            "decisions": [
+              "deny"
+            ],
+            "failure": null,
+            "policy_kind": "legacy-auto",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": false,
+                "preview": "action not permitted: denied by user",
+                "tool": "write_file"
+              }
+            ]
+          },
+          "policy_kind": "legacy-auto"
+        },
+        {
+          "case": "powershell_ordinary",
+          "file": false,
+          "observed": {
+            "approvals": [
+              {
+                "always_persists": true,
+                "reason_code": "legacy.auto",
+                "summary": "",
+                "tool": "run_command"
+              }
+            ],
+            "decisions": [
+              "deny"
+            ],
+            "failure": null,
+            "policy_kind": "legacy-auto",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": false,
+                "preview": "action not permitted: denied by user",
+                "tool": "run_command"
+              }
+            ]
+          },
+          "policy_kind": "legacy-auto"
+        },
+        {
+          "case": "cmd_ordinary",
+          "file": true,
+          "observed": {
+            "approvals": [],
+            "decisions": [],
+            "failure": null,
+            "policy_kind": "legacy-auto",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": true,
+                "preview": "exit: 0\n\n[execution policy] Filesystem writes were confined to the granted paths.\n",
+                "tool": "run_command"
+              }
+            ]
+          },
+          "policy_kind": "legacy-auto"
+        },
+        {
+          "case": "python_indirect",
+          "deleted": true,
+          "observed": {
+            "approvals": [],
+            "decisions": [],
+            "failure": null,
+            "policy_kind": "legacy-auto",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": true,
+                "preview": "exit: 0\n\n[execution policy] Filesystem writes were confined to the granted paths.\n",
+                "tool": "run_command"
+              }
+            ]
+          },
+          "policy_kind": "legacy-auto",
+          "ran": true
+        },
+        {
+          "case": "go_test",
+          "observed": {
+            "approvals": [],
+            "decisions": [],
+            "failure": null,
+            "policy_kind": "legacy-auto",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": true,
+                "preview": "exit: 0\n--- stdout ---\nok   acceptance 0.536s\n\n[execution policy] Filesystem writes were confined to the granted paths.\n",
+                "tool": "run_command"
+              }
+            ]
+          },
+          "policy_kind": "legacy-auto"
+        },
+        {
+          "case": "git_push_local",
+          "observed": {
+            "approvals": [],
+            "decisions": [],
+            "failure": null,
+            "policy_kind": "legacy-auto",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": false,
+                "preview": "exit: 128\n--- stderr ---\n      0 [main] sh (8580) C:\\Program Files\\Git\\usr\\bin\\sh.exe: *** fatal error - NtCreateDirectoryObject(\\BaseNamedObjects\\msys-2.0S5-1888ae32e00d56aa): 0xC0000022\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.\n\n[execution policy] Filesystem writes were confined to the granted paths.\n",
+                "tool": "run_command"
+              }
+            ]
+          },
+          "policy_kind": "legacy-auto",
+          "pushed": false
+        },
+        {
+          "case": "delete_cmd_denied",
+          "observed": {
+            "approvals": [],
+            "decisions": [],
+            "failure": null,
+            "policy_kind": "legacy-auto",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": true,
+                "preview": "exit: 0\n\n[execution policy] Filesystem writes were confined to the granted paths.\n",
+                "tool": "shell_command"
+              }
+            ]
+          },
+          "policy_kind": "legacy-auto",
+          "victim_exists": false
+        },
+        {
+          "case": "git_reset_denied",
+          "dirty_survived": false,
+          "observed": {
+            "approvals": [],
+            "decisions": [],
+            "failure": null,
+            "policy_kind": "legacy-auto",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": true,
+                "preview": "exit: 0\n--- stdout ---\nHEAD is now at 954fd75 seed\n\n[execution policy] Filesystem writes were confined to the granted paths.\n",
+                "tool": "run_command"
+              }
+            ]
+          },
+          "policy_kind": "legacy-auto"
+        },
+        {
+          "case": "network_loopback",
+          "observed": {
+            "approvals": [],
+            "decisions": [],
+            "failure": null,
+            "policy_kind": "legacy-auto",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": true,
+                "preview": "web enabled; tools available on the following request.",
+                "tool": "capability"
+              },
+              {
+                "ok": false,
+                "preview": "web_fetch 不可用:request failed: error sending request for url (http://127.0.0.1:52836/probe)。请基于已有知识继续,或改用其他工具。",
+                "tool": "web_fetch"
+              }
+            ]
+          },
+          "policy_kind": "legacy-auto",
+          "served": true
+        }
+      ],
+      "contract": "v1",
+      "expected_policy_kind": "legacy-auto",
+      "profile": "assisted"
+    },
+    {
+      "arm": "v2_request_approval",
+      "cases": [
+        {
+          "case": "write_inside",
+          "file": true,
+          "observed": {
+            "approvals": [],
+            "decisions": [],
+            "failure": null,
+            "policy_kind": "legacy-auto",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": true,
+                "preview": "Created inside.txt (1 lines)",
+                "tool": "write_file"
+              }
+            ]
+          },
+          "policy_kind": "legacy-auto"
+        },
+        {
+          "case": "write_outside",
+          "file": false,
+          "observed": {
+            "approvals": [
+              {
+                "always_persists": false,
+                "reason_code": "legacy.auto",
+                "summary": "path `C:\\Users\\code\\AppData\\Local\\Temp\\.tmpAii2vS\\outside\\written-outside.txt` is outside the workspace root `\\\\?\\C:\\Users\\code\\AppData\\Local\\Temp\\.tmpAii2vS\\repo`. Use a path relative to that root (e.g. `src/lib.rs`), or start leveler inside the target repository. Writes outside the write scope are blocked by design; reading any path is allowed.",
+                "tool": "write_file"
+              }
+            ],
+            "decisions": [
+              "deny"
+            ],
+            "failure": null,
+            "policy_kind": "legacy-auto",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": false,
+                "preview": "action not permitted: denied by user",
+                "tool": "write_file"
+              }
+            ]
+          },
+          "policy_kind": "legacy-auto"
+        },
+        {
+          "case": "powershell_ordinary",
+          "file": false,
+          "observed": {
+            "approvals": [
+              {
+                "always_persists": true,
+                "reason_code": "legacy.auto",
+                "summary": "",
+                "tool": "run_command"
+              }
+            ],
+            "decisions": [
+              "deny"
+            ],
+            "failure": null,
+            "policy_kind": "legacy-auto",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": false,
+                "preview": "action not permitted: denied by user",
+                "tool": "run_command"
+              }
+            ]
+          },
+          "policy_kind": "legacy-auto"
+        },
+        {
+          "case": "cmd_ordinary",
+          "file": true,
+          "observed": {
+            "approvals": [],
+            "decisions": [],
+            "failure": null,
+            "policy_kind": "legacy-auto",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": true,
+                "preview": "exit: 0\n\n[execution policy] Filesystem writes were confined to the granted paths.\n",
+                "tool": "run_command"
+              }
+            ]
+          },
+          "policy_kind": "legacy-auto"
+        },
+        {
+          "case": "python_indirect",
+          "deleted": true,
+          "observed": {
+            "approvals": [],
+            "decisions": [],
+            "failure": null,
+            "policy_kind": "legacy-auto",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": true,
+                "preview": "exit: 0\n\n[execution policy] Filesystem writes were confined to the granted paths.\n",
+                "tool": "run_command"
+              }
+            ]
+          },
+          "policy_kind": "legacy-auto",
+          "ran": true
+        },
+        {
+          "case": "go_test",
+          "observed": {
+            "approvals": [],
+            "decisions": [],
+            "failure": null,
+            "policy_kind": "legacy-auto",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": true,
+                "preview": "exit: 0\n--- stdout ---\nok   acceptance (cached)\n\n[execution policy] Filesystem writes were confined to the granted paths.\n",
+                "tool": "run_command"
+              }
+            ]
+          },
+          "policy_kind": "legacy-auto"
+        },
+        {
+          "case": "git_push_local",
+          "observed": {
+            "approvals": [],
+            "decisions": [],
+            "failure": null,
+            "policy_kind": "legacy-auto",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": false,
+                "preview": "exit: 128\n--- stderr ---\n      0 [main] sh (15868) C:\\Program Files\\Git\\usr\\bin\\sh.exe: *** fatal error - NtCreateDirectoryObject(\\BaseNamedObjects\\msys-2.0S5-1888ae32e00d56aa): 0xC0000022\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.\n\n[execution policy] Filesystem writes were confined to the granted paths.\n",
+                "tool": "run_command"
+              }
+            ]
+          },
+          "policy_kind": "legacy-auto",
+          "pushed": false
+        },
+        {
+          "case": "delete_cmd_denied",
+          "observed": {
+            "approvals": [],
+            "decisions": [],
+            "failure": null,
+            "policy_kind": "legacy-auto",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": true,
+                "preview": "exit: 0\n\n[execution policy] Filesystem writes were confined to the granted paths.\n",
+                "tool": "shell_command"
+              }
+            ]
+          },
+          "policy_kind": "legacy-auto",
+          "victim_exists": false
+        },
+        {
+          "case": "git_reset_denied",
+          "dirty_survived": false,
+          "observed": {
+            "approvals": [],
+            "decisions": [],
+            "failure": null,
+            "policy_kind": "legacy-auto",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": true,
+                "preview": "exit: 0\n--- stdout ---\nHEAD is now at 954fd75 seed\n\n[execution policy] Filesystem writes were confined to the granted paths.\n",
+                "tool": "run_command"
+              }
+            ]
+          },
+          "policy_kind": "legacy-auto"
+        },
+        {
+          "case": "network_loopback",
+          "observed": {
+            "approvals": [],
+            "decisions": [],
+            "failure": null,
+            "policy_kind": "legacy-auto",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": true,
+                "preview": "web enabled; tools available on the following request.",
+                "tool": "capability"
+              },
+              {
+                "ok": false,
+                "preview": "web_fetch 不可用:request failed: error sending request for url (http://127.0.0.1:52836/probe)。请基于已有知识继续,或改用其他工具。",
+                "tool": "web_fetch"
+              }
+            ]
+          },
+          "policy_kind": "legacy-auto",
+          "served": true
+        }
+      ],
+      "contract": "v2",
+      "expected_policy_kind": "legacy-auto",
+      "profile": "request_approval"
+    },
+    {
+      "arm": "v2_assisted",
+      "cases": [
+        {
+          "case": "write_inside",
+          "file": true,
+          "observed": {
+            "approvals": [],
+            "decisions": [],
+            "failure": null,
+            "policy_kind": "effect-auto",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": true,
+                "preview": "Created inside.txt (1 lines)",
+                "tool": "write_file"
+              }
+            ]
+          },
+          "policy_kind": "effect-auto"
+        },
+        {
+          "case": "write_outside",
+          "file": true,
+          "observed": {
+            "approvals": [],
+            "decisions": [],
+            "failure": null,
+            "policy_kind": "effect-auto",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": true,
+                "preview": "Created C:\\Users\\code\\AppData\\Local\\Temp\\.tmpAii2vS\\outside\\written-outside.txt (1 lines)",
+                "tool": "write_file"
+              }
+            ]
+          },
+          "policy_kind": "effect-auto"
+        },
+        {
+          "case": "powershell_ordinary",
+          "file": true,
+          "observed": {
+            "approvals": [],
+            "decisions": [],
+            "failure": null,
+            "policy_kind": "effect-auto",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": true,
+                "preview": "exit: 0\n",
+                "tool": "run_command"
+              }
+            ]
+          },
+          "policy_kind": "effect-auto"
+        },
+        {
+          "case": "cmd_ordinary",
+          "file": true,
+          "observed": {
+            "approvals": [],
+            "decisions": [],
+            "failure": null,
+            "policy_kind": "effect-auto",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": true,
+                "preview": "exit: 0\n",
+                "tool": "run_command"
+              }
+            ]
+          },
+          "policy_kind": "effect-auto"
+        },
+        {
+          "case": "python_indirect",
+          "deleted": true,
+          "observed": {
+            "approvals": [],
+            "decisions": [],
+            "failure": null,
+            "policy_kind": "effect-auto",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": true,
+                "preview": "exit: 0\n",
+                "tool": "run_command"
+              }
+            ]
+          },
+          "policy_kind": "effect-auto",
+          "ran": true
+        },
+        {
+          "case": "go_test",
+          "observed": {
+            "approvals": [],
+            "decisions": [],
+            "failure": null,
+            "policy_kind": "effect-auto",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": true,
+                "preview": "exit: 0\n--- stdout ---\nok   acceptance 0.549s\n",
+                "tool": "run_command"
+              }
+            ]
+          },
+          "policy_kind": "effect-auto"
+        },
+        {
+          "case": "git_push_local",
+          "observed": {
+            "approvals": [],
+            "decisions": [],
+            "failure": null,
+            "policy_kind": "effect-auto",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": true,
+                "preview": "exit: 0\n--- stderr ---\nTo C:\\Users\\code\\AppData\\Local\\Temp\\.tmpAii2vS\\remote.git\n * [new branch]      HEAD -> main\n",
+                "tool": "run_command"
+              }
+            ]
+          },
+          "policy_kind": "effect-auto",
+          "pushed": true
+        },
+        {
+          "case": "delete_cmd_denied",
+          "observed": {
+            "approvals": [
+              {
+                "always_persists": true,
+                "reason_code": "irreversible.filesystem_delete",
+                "summary": "`del` deletes real data: C:\\Users\\code\\AppData\\Local\\Temp\\.tmpAii2vS\\repo\\real-data.txt",
+                "tool": "shell_command"
+              }
+            ],
+            "decisions": [
+              "deny"
+            ],
+            "failure": null,
+            "policy_kind": "effect-auto",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": false,
+                "preview": "action not permitted: denied by user",
+                "tool": "shell_command"
+              }
+            ]
+          },
+          "policy_kind": "effect-auto",
+          "victim_exists": true
+        },
+        {
+          "case": "git_reset_denied",
+          "dirty_survived": true,
+          "observed": {
+            "approvals": [
+              {
+                "always_persists": true,
+                "reason_code": "irreversible.git_history",
+                "summary": "Git history or working-tree changes would be lost (git_metadata.write, git_workspace.write, git_history.destroy)；Git 副作用: git_metadata.write, git_workspace.write, git_history.destroy",
+                "tool": "run_command"
+              }
+            ],
+            "decisions": [
+              "deny"
+            ],
+            "failure": null,
+            "policy_kind": "effect-auto",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": false,
+                "preview": "action not permitted: denied by user",
+                "tool": "run_command"
+              }
+            ]
+          },
+          "policy_kind": "effect-auto"
+        },
+        {
+          "case": "network_loopback",
+          "observed": {
+            "approvals": [],
+            "decisions": [],
+            "failure": null,
+            "policy_kind": "effect-auto",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": true,
+                "preview": "web enabled; tools available on the following request.",
+                "tool": "capability"
+              },
+              {
+                "ok": false,
+                "preview": "web_fetch 不可用:request failed: error sending request for url (http://127.0.0.1:52836/probe)。请基于已有知识继续,或改用其他工具。",
+                "tool": "web_fetch"
+              }
+            ]
+          },
+          "policy_kind": "effect-auto",
+          "served": true
+        }
+      ],
+      "contract": "v2",
+      "expected_policy_kind": "effect-auto",
+      "profile": "assisted"
+    },
+    {
+      "arm": "full",
+      "cases": [
+        {
+          "case": "write_inside",
+          "file": true,
+          "observed": {
+            "approvals": [],
+            "decisions": [],
+            "failure": null,
+            "policy_kind": "full-access",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": true,
+                "preview": "Created inside.txt (1 lines)",
+                "tool": "write_file"
+              }
+            ]
+          },
+          "policy_kind": "full-access"
+        },
+        {
+          "case": "write_outside",
+          "file": true,
+          "observed": {
+            "approvals": [],
+            "decisions": [],
+            "failure": null,
+            "policy_kind": "full-access",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": true,
+                "preview": "Created C:\\Users\\code\\AppData\\Local\\Temp\\.tmpAii2vS\\outside\\written-outside.txt (1 lines)",
+                "tool": "write_file"
+              }
+            ]
+          },
+          "policy_kind": "full-access"
+        },
+        {
+          "case": "powershell_ordinary",
+          "file": true,
+          "observed": {
+            "approvals": [],
+            "decisions": [],
+            "failure": null,
+            "policy_kind": "full-access",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": true,
+                "preview": "exit: 0\n",
+                "tool": "run_command"
+              }
+            ]
+          },
+          "policy_kind": "full-access"
+        },
+        {
+          "case": "cmd_ordinary",
+          "file": true,
+          "observed": {
+            "approvals": [],
+            "decisions": [],
+            "failure": null,
+            "policy_kind": "full-access",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": true,
+                "preview": "exit: 0\n",
+                "tool": "run_command"
+              }
+            ]
+          },
+          "policy_kind": "full-access"
+        },
+        {
+          "case": "python_indirect",
+          "deleted": true,
+          "observed": {
+            "approvals": [],
+            "decisions": [],
+            "failure": null,
+            "policy_kind": "full-access",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": true,
+                "preview": "exit: 0\n",
+                "tool": "run_command"
+              }
+            ]
+          },
+          "policy_kind": "full-access",
+          "ran": true
+        },
+        {
+          "case": "go_test",
+          "observed": {
+            "approvals": [],
+            "decisions": [],
+            "failure": null,
+            "policy_kind": "full-access",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": true,
+                "preview": "exit: 0\n--- stdout ---\nok   acceptance (cached)\n",
+                "tool": "run_command"
+              }
+            ]
+          },
+          "policy_kind": "full-access"
+        },
+        {
+          "case": "git_push_local",
+          "observed": {
+            "approvals": [],
+            "decisions": [],
+            "failure": null,
+            "policy_kind": "full-access",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": true,
+                "preview": "exit: 0\n--- stderr ---\nTo C:\\Users\\code\\AppData\\Local\\Temp\\.tmpAii2vS\\remote.git\n * [new branch]      HEAD -> main\n",
+                "tool": "run_command"
+              }
+            ]
+          },
+          "policy_kind": "full-access",
+          "pushed": true
+        },
+        {
+          "case": "delete_cmd_denied",
+          "observed": {
+            "approvals": [],
+            "decisions": [],
+            "failure": null,
+            "policy_kind": "full-access",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": true,
+                "preview": "exit: 0\n",
+                "tool": "shell_command"
+              }
+            ]
+          },
+          "policy_kind": "full-access",
+          "victim_exists": false
+        },
+        {
+          "case": "git_reset_denied",
+          "dirty_survived": false,
+          "observed": {
+            "approvals": [],
+            "decisions": [],
+            "failure": null,
+            "policy_kind": "full-access",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": true,
+                "preview": "exit: 0\n--- stdout ---\nHEAD is now at 954fd75 seed\n",
+                "tool": "run_command"
+              }
+            ]
+          },
+          "policy_kind": "full-access"
+        },
+        {
+          "case": "network_loopback",
+          "observed": {
+            "approvals": [],
+            "decisions": [],
+            "failure": null,
+            "policy_kind": "full-access",
+            "terminal": true,
+            "tool_results": [
+              {
+                "ok": true,
+                "preview": "web enabled; tools available on the following request.",
+                "tool": "capability"
+              },
+              {
+                "ok": false,
+                "preview": "web_fetch 不可用:request failed: error sending request for url (http://127.0.0.1:52836/probe)。请基于已有知识继续,或改用其他工具。",
+                "tool": "web_fetch"
+              }
+            ]
+          },
+          "policy_kind": "full-access",
+          "served": true
+        }
+      ],
+      "contract": "v2",
+      "expected_policy_kind": "full-access",
+      "profile": "full_access"
+    }
+  ],
+  "full_execution": {
+    "delete": {
+      "observed": {
+        "approvals": [],
+        "decisions": [],
+        "failure": null,
+        "policy_kind": "full-access",
+        "terminal": true,
+        "tool_results": [
+          {
+            "ok": true,
+            "preview": "exit: 0\n",
+            "tool": "shell_command"
+          }
+        ]
+      },
+      "victim_exists": false
+    },
+    "reset": {
+      "dirty_survived": false,
+      "observed": {
+        "approvals": [],
+        "decisions": [],
+        "failure": null,
+        "policy_kind": "full-access",
+        "terminal": true,
+        "tool_results": [
+          {
+            "ok": true,
+            "preview": "exit: 0\n--- stdout ---\nHEAD is now at 954fd75 seed\n",
+            "tool": "run_command"
+          }
+        ]
+      }
+    }
+  },
+  "gate": "W2/W6",
+  "host": {
+    "arch": "x86_64",
+    "os": "windows"
+  },
+  "network_url": "http://127.0.0.1:52836/probe",
+  "provider": "deterministic mock model (real runtime, real Windows tools)"
+}

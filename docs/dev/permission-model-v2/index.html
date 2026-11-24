@@ -129,9 +129,9 @@
       第三档完全访问冻结。内部用权限契约版本区分历史 Session，防止恢复时静默提权。
     </p>
     <div class="meta">
-      <span>审计基线 <code>5800dd8a</code></span>
-      <span>2026-11-24</span>
-      <span>macOS PASS · Linux PASS · Windows BLOCKED</span>
+      <span>审计基线 <code>9c569b3d</code></span>
+      <span>2026-11-25</span>
+      <span>macOS PASS · Linux PASS · Windows PASS</span>
       <span>设计 + 实现 + 证据</span>
     </div>
   </header>
@@ -181,7 +181,7 @@
   <div class="flow">
     <div class="step"><div class="n">1</div><div><b>显式配置优先</b><span>用户 <code>deny</code> / <code>ask</code> 规则、pre-hook、只读角色、所有权拒绝。规则永远先于自主判断。</span></div></div>
     <div class="step"><div class="n">2</div><div><b>工具声明的具体副作用</b><span>定义写入需真人；邮件发送、桌面控制、私有网络、其他执行者的任务按工具自己的 admission。</span></div></div>
-    <div class="step"><div class="n">3</div><div><b>不可逆检测（唯一新增的 Ask 来源）</b><span>删除真实数据、磁盘销毁、数据库/卷删除、Git 历史丢失、MCP <code>destructiveHint</code>。只看当前调用的结构化 argv/AST/effects。</span></div></div>
+    <div class="step"><div class="n">3</div><div><b>不可逆检测（唯一新增的 Ask 来源）</b><span>删除真实数据、磁盘销毁、数据库/卷删除、Git 历史丢失、MCP <code>destructiveHint</code>、Windows PowerShell 内联 <code>Remove-Item</code>/<code>Clear-Content</code>。只看当前调用的结构化 argv/AST/effects。</span></div></div>
     <div class="step"><div class="n">4</div><div><b>独立边界</b><span>已存凭据使用、凭据库读取、<code>sudo</code>、私有网络。这些不是不可逆损失，但属于不能由 Auto 自主绕过的资源/OS 边界。</span></div></div>
     <div class="step"><div class="n">5</div><div><b>边界无法强制 → 明确失败</b><span>Windows 断网命令、Linux 无 user namespace、不可表达的 Loopback。返回 <code>ExecutionBoundaryFailure</code>，不假装允许。</span></div></div>
     <div class="step"><div class="n">6</div><div><b>其余 → 自动执行</b><span>未知程序、复杂 Shell、<code>python script.py</code>、<code>npm run build</code>、普通 Git、普通网络、普通 MCP。</span></div></div>
@@ -207,6 +207,7 @@
         <tr><td><code>git reset --hard</code> / <code>clean -fd</code></td><td class="ok">Allow</td><td class="ask">Ask</td><td class="ok">Allow</td></tr>
         <tr><td><code>rm -rf src</code>（真实数据）</td><td class="ok">Allow（工作区内）</td><td class="ask">Ask</td><td class="ok">Allow</td></tr>
         <tr><td><code>rm -rf target</code>（可重建）</td><td class="ok">Allow</td><td class="ok">Allow</td><td class="ok">Allow</td></tr>
+        <tr><td>PowerShell 内联 <code>Remove-Item</code> / <code>Clear-Content</code></td><td class="ok">Allow（旧 Auto 工作区内）</td><td class="ask">Ask</td><td class="ok">Allow</td></tr>
         <tr><td>普通 MCP</td><td class="ask">Ask（首次）</td><td class="ok">Allow</td><td class="ok">Allow</td></tr>
         <tr><td>不可逆 MCP（destructiveHint）</td><td class="ask">Ask</td><td class="ask">Ask</td><td class="ok">Allow</td></tr>
         <tr><td>普通网络</td><td class="ok">Allow</td><td class="ok">Allow</td><td class="ok">Allow</td></tr>
@@ -254,10 +255,10 @@
     <div class="phase"><div class="label">2B</div><div class="body"><b>新 Auto 决策引擎</b><span>PASS · 不可逆检测器、可重建目标、Git effects、MCP annotations、理由码。</span></div></div>
     <div class="phase"><div class="label">2C</div><div class="body"><b>执行边界一致性</b><span>PASS · 无写围栏真实执行、私有 LAN、本地 Git push、BoundaryFailure、Linux Loopback 收窄。</span></div></div>
     <div class="phase"><div class="label">2D</div><div class="body"><b>真实 Dogfood</b><span>PASS · 5 臂 × 8 case；普通工作 0 审批；真实删除/Git 历史 ASK 且拒绝后无副作用。</span></div></div>
-    <div class="phase"><div class="label">2E</div><div class="body"><b>跨平台与收尾</b><span>macOS PASS · Linux PASS · Windows BLOCKED；最终收尾补齐真实 DeepSeek、MCP、子 Agent 与全量门禁证据。</span></div></div>
+    <div class="phase"><div class="label">2E</div><div class="body"><b>跨平台与收尾</b><span>macOS PASS · Linux PASS · Windows PASS（2026-11-25 实机）；Windows 收尾补齐 PowerShell 检测、MCP 授权范围、真实 DeepSeek 与全量门禁证据。</span></div></div>
   </div>
 
-  <h2>Final Closure（2026-11-24）</h2>
+  <h2>Final Closure（2026-11-25）</h2>
   <div class="grid g3">
     <div class="card">
       <span class="tag">F2 真实模型</span>
@@ -265,14 +266,14 @@
       <p>28 次真实运行：日常开发、脚本、删除、工作区外写、公网/Loopback/LAN、Git、Full、V1/V2 对照。普通工作 0 审批；真实删除与 Git 历史各 1 次 ASK。</p>
     </div>
     <div class="card">
-      <span class="tag">F3 / F4</span>
-      <h3>MCP + 子 Agent PASS</h3>
-      <p>本地 fixture 与第三方 server-everything 均通过真实 transport；子 Agent claim → 越界 Deny → 自修正 → 测试 exit 0；后台任务真实返回。</p>
+      <span class="tag">F3 / F4 / M1</span>
+      <h3>MCP 授权范围修复 + 子 Agent PASS</h3>
+      <p>真实 MCP transport / ToolHost：destructive 工具的批准只覆盖精确参数，A 的批准不再授权 B，Always 不持久化工具级规则；普通 MCP 与 Full 语义不变。子 Agent claim → 越界 Deny → 自修正 → 命令完成。</p>
     </div>
     <div class="card">
-      <span class="tag warn">F5 Windows</span>
-      <h3>BLOCKED_ENVIRONMENT</h3>
-      <p>无 Windows 实机/VM/远程主机；只做 GNU 编译检查，不冒充实机 PASS。全平台 CLOSED 因此不能成立。</p>
+      <span class="tag">F5 / W2–W7</span>
+      <h3>Windows 原生 PASS</h3>
+      <p>Windows 11 实机：5 臂 × 10 case 矩阵、PowerShell/CMD、文件系统、显式断网、Git/Session、安全 canary、调度实机与真实 DeepSeek A/B/C/D2。</p>
     </div>
   </div>
 
@@ -282,18 +283,20 @@
       <tbody>
         <tr><td>F1 工作区 / 集成审计</td><td class="ok">PASS</td><td>14 · 并发修改已隔离</td></tr>
         <tr><td>F2 真实 DeepSeek Dogfood</td><td class="ok">PASS</td><td>15 · 28 runs · real-model-index.json</td></tr>
-        <tr><td>F3 真实 MCP</td><td class="ok">PASS</td><td>16 · protocol-macos/linux.log</td></tr>
-        <tr><td>F4 子 Agent / 后台</td><td class="ok">PASS</td><td>16 · real spawn + wait_task</td></tr>
-        <tr><td>F5 Windows 实机</td><td class="no">BLOCKED</td><td>17 · 无主机，只有 GNU check</td></tr>
+        <tr><td>F3 / M1 真实 MCP 与授权范围</td><td class="ok">PASS（缺陷已修复）</td><td>21 · 证据见 mcp-grant-scope/</td></tr>
+        <tr><td>F4 子 Agent / 后台</td><td class="ok">PASS</td><td>16 · real spawn + wait_task；Windows D2</td></tr>
+        <tr><td>F5 / W2–W7 Windows 实机</td><td class="ok">PASS</td><td>20 · 矩阵、Shell、FS、网络、canary、真实模型</td></tr>
         <tr><td>F6 Linux 补测</td><td class="ok">PASS</td><td>18 · --init 下 execution 449、tools 566</td></tr>
-        <tr><td>macOS 全量测试</td><td class="ok">362 binaries / 9586 passed</td><td>workspace-test.log</td></tr>
-        <tr><td>fmt / check / clippy</td><td class="ok">PASS</td><td>clippy -D warnings；CLI bin 通过</td></tr>
+        <tr><td>Windows 全量测试</td><td class="ok">364 targets / 8957 passed / 0 failed / 114 ignored</td><td>workspace-test.log（EXIT=0）</td></tr>
+        <tr><td>Windows fmt / check / clippy</td><td class="ok">PASS</td><td>fmt-check / workspace-check / clippy（-D warnings）</td></tr>
+        <tr><td>macOS/Linux 改动共享路径复验</td><td class="ask">BLOCKED_ENVIRONMENT</td><td>本机无 macOS/Linux 宿主；命令见 22 §3</td></tr>
       </tbody>
     </table>
   </div>
 
-  <div class="callout warn">
-    <p><strong>总体结论：PARTIAL / BLOCKED。</strong>V2 在 macOS/Linux 的行为验收通过；Windows 原生门禁未完成，因此不能给出全平台 PASS，也不能宣称正式 CLOSED。可以进入下一次 Release 准备，但发布范围必须明确：包含 Windows 时需先补齐实机矩阵，只发布 macOS/Linux 时必须在说明中标注 Windows UNVERIFIED。</p>
+  <div class="callout">
+    <p><strong>总体结论：CLOSED。</strong>Windows 原生阻断已消除；MCP 破坏性授权范围缺陷已修复并真实复验；V1/V2 契约、Full、子 Agent 所有权与普通开发 0 审批均保持。
+      macOS/Linux 历史 PASS 对未改动路径继续有效；本轮改动的共享授权路径无法在本 Windows-only 会话重新执行，已如实记录为环境性复验缺口，并给出可直接执行的命令。可以进入下一次统一 Release 的准备流程。</p>
   </div>
 
   <h2>已确认的产品决定</h2>
@@ -302,7 +305,7 @@
       <thead><tr><th>#</th><th>决定</th><th>实现结果</th></tr></thead>
       <tbody>
         <tr><td>1</td><td>第二档私有/局域网网络是否 Ask</td><td>不 Ask；属于普通网络。第一档仍按旧 Auto Ask</td></tr>
-        <tr><td>2</td><td>第一档 MCP 的 “this turn” 授权</td><td>继续按工具复用（旧 Auto 行为）</td></tr>
+        <tr><td>2</td><td>第一档 MCP 的 “this turn” 授权</td><td>普通 MCP 继续按工具复用（旧 Auto 行为）；<code>destructiveHint=true</code> 的工具按精确参数，不持久化工具级 Always</td></tr>
         <tr><td>3</td><td>可重建目录的识别</td><td>生态系统锚点 + 真实路径；不能只凭目录名</td></tr>
         <tr><td>4</td><td>Full 是否尊重用户 <code>deny</code></td><td>不改变；显式 <code>--deny-network</code> 仍生效</td></tr>
         <tr><td>5</td><td>v1 重选同档位是否采纳 V2</td><td>不采纳；必须显式 <code>/permission-contract v2</code> 或命令行</td></tr>
@@ -327,10 +330,13 @@
     <p>Final Closure：<a href="14-final-integration-audit.md">14 集成审计</a> ·
       <a href="15-real-deepseek-dogfood.md">15 真实 DeepSeek</a> ·
       <a href="16-live-mcp-and-agent.md">16 MCP / 子 Agent</a> ·
-      <a href="17-windows-native-acceptance.md">17 Windows</a> ·
+      <a href="17-windows-native-acceptance.md">17 Windows（历史）</a> ·
       <a href="18-linux-completion.md">18 Linux</a> ·
-      <a href="19-final-closure.md">19 最终收尾</a></p>
-    <p>工作区实现，未 commit / push / tag / release。macOS PASS · Linux PASS · Windows BLOCKED；总体 PARTIAL，正式 CLOSED 需补 Windows 实机，详见 19。</p>
+      <a href="19-final-closure.md">19 最终收尾</a> ·
+      <a href="20-windows-native-final-closure.md">20 Windows 原生收尾</a> ·
+      <a href="21-mcp-destructive-grant-scope.md">21 MCP 授权范围</a> ·
+      <a href="22-permission-v2-official-closure.md">22 正式收尾</a></p>
+    <p>工作区实现，未 commit / push / tag / release。macOS PASS · Linux PASS · Windows PASS；Permission Model V2 正式 CLOSED。macOS/Linux 改动共享路径复验受本机平台限制，命令与残余风险见 22 §3。</p>
   </footer>
 </main>
 </body>

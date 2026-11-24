@@ -1,0 +1,7 @@
+case=postfix-deny
+binary=C:/CodeLeveler/target/debug/leveler.exe
+binary_sha256=488d0bd5f8d6f9420af1c3d07fa63b63900ea4f96e248bd51b6a7c6f1b23a119
+version=1.0.29 (9c569b3d6cd2-dirty) UNTRUSTED: built from a modified working tree
+commit=9c569b3d6cd27b27bb776284a4d7f480b73d09dc
+worktree_dirty=12
+started=2026-11-24T14:20:33Z

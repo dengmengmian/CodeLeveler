@@ -1,0 +1,6 @@
+case=mcp-cli-prefix
+binary=C:/qlab/permission-v2-final/bin/leveler-prefix.exe
+binary_sha256=7c8e88083933b700a4824b8875d28643ee23463951989261498e409f14bc8162
+version=1.0.29 (9c569b3d6cd2-dirty) UNTRUSTED: built from a modified working tree
+commit=9c569b3d6cd27b27bb776284a4d7f480b73d09dc
+started=2026-11-24T14:17:34Z
