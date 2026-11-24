@@ -1,0 +1,6 @@
+script: C:\Users\code\AppData\Local\Temp\leveler-sec-canary-7488\workspace\pipe-client.cmd
+exit: Some(0)
+stdout:
+
+stderr:
+

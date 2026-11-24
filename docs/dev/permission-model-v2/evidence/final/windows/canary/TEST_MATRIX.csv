@@ -1,0 +1,2 @@
+id,verdict,detail
+TD-10,PASS,"store intact=true; snapshot intact=true; forged=false; moved=false; dir=false; stdout='WRITE_DENIED,APPEND_DENIED,DELETE_DENIED,RENAME_DENIED,CREATE_DENIED,MKDIR_DENIED,SNAPSHOT_DENIED'"

@@ -1,0 +1,14 @@
+captured=2026-11-24T14:36:27Z
+head=9c569b3d6cd27b27bb776284a4d7f480b73d09dc
+dirty_paths=14
+
+--- pre-fix release (built before the PowerShell detector) ---
+7c8e88083933b700a4824b8875d28643ee23463951989261498e409f14bc8162 */c/qlab/permission-v2-final/bin/leveler-prefix.exe
+1.0.29 (9c569b3d6cd2-dirty) UNTRUSTED: built from a modified working tree
+
+--- post-fix debug (both fixes) ---
+488d0bd5f8d6f9420af1c3d07fa63b63900ea4f96e248bd51b6a7c6f1b23a119 */c/CodeLeveler/target/debug/leveler.exe
+1.0.29 (9c569b3d6cd2-dirty) UNTRUSTED: built from a modified working tree
+
+--- confine launcher ---
+3c1716f3f6acccd1b2ebabd6cd0ef238797db08fbe536112b7d1642373303434 */c/CodeLeveler/target/release/leveler-confine.exe

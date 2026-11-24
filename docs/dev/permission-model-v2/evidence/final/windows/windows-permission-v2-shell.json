@@ -1,0 +1,370 @@
+{
+  "cases": [
+    {
+      "case": "ps_get_content",
+      "observed": {
+        "approvals": [],
+        "decisions": [],
+        "failure": null,
+        "policy_kind": "effect-auto",
+        "terminal": true,
+        "tool_results": [
+          {
+            "ok": true,
+            "preview": "exit: 0\n--- stdout ---\nprecious \n",
+            "tool": "run_command"
+          }
+        ]
+      }
+    },
+    {
+      "case": "ps_set_content",
+      "file": true,
+      "observed": {
+        "approvals": [],
+        "decisions": [],
+        "failure": null,
+        "policy_kind": "effect-auto",
+        "terminal": true,
+        "tool_results": [
+          {
+            "ok": true,
+            "preview": "exit: 0\n",
+            "tool": "run_command"
+          }
+        ]
+      }
+    },
+    {
+      "case": "ps_new_item",
+      "dir": true,
+      "observed": {
+        "approvals": [],
+        "decisions": [],
+        "failure": null,
+        "policy_kind": "effect-auto",
+        "terminal": true,
+        "tool_results": [
+          {
+            "ok": true,
+            "preview": "exit: 0\n",
+            "tool": "run_command"
+          }
+        ]
+      }
+    },
+    {
+      "case": "cmd_echo_ordinary",
+      "file": true,
+      "observed": {
+        "approvals": [],
+        "decisions": [],
+        "failure": null,
+        "policy_kind": "effect-auto",
+        "terminal": true,
+        "tool_results": [
+          {
+            "ok": true,
+            "preview": "exit: 0\n",
+            "tool": "run_command"
+          }
+        ]
+      }
+    },
+    {
+      "case": "ps_remove_item",
+      "observed": {
+        "approvals": [
+          {
+            "always_persists": true,
+            "reason_code": "irreversible.filesystem_delete",
+            "summary": "`Remove-Item` deletes real data: C:\\Users\\code\\AppData\\Local\\Temp\\.tmpYhdzWk\\repo\\victim-del.txt",
+            "tool": "run_command"
+          }
+        ],
+        "decisions": [
+          "deny"
+        ],
+        "failure": null,
+        "policy_kind": "effect-auto",
+        "terminal": true,
+        "tool_results": [
+          {
+            "ok": false,
+            "preview": "action not permitted: denied by user",
+            "tool": "run_command"
+          }
+        ]
+      },
+      "target_exists": true
+    },
+    {
+      "case": "ps_remove_item_recurse",
+      "observed": {
+        "approvals": [
+          {
+            "always_persists": true,
+            "reason_code": "irreversible.filesystem_delete",
+            "summary": "`Remove-Item` deletes real data: C:\\Users\\code\\AppData\\Local\\Temp\\.tmpYhdzWk\\repo\\victim-dir",
+            "tool": "run_command"
+          }
+        ],
+        "decisions": [
+          "deny"
+        ],
+        "failure": null,
+        "policy_kind": "effect-auto",
+        "terminal": true,
+        "tool_results": [
+          {
+            "ok": false,
+            "preview": "action not permitted: denied by user",
+            "tool": "run_command"
+          }
+        ]
+      },
+      "target_exists": true
+    },
+    {
+      "case": "ps_remove_item_force",
+      "observed": {
+        "approvals": [
+          {
+            "always_persists": true,
+            "reason_code": "irreversible.filesystem_delete",
+            "summary": "`Remove-Item` deletes real data: C:\\Users\\code\\AppData\\Local\\Temp\\.tmpYhdzWk\\repo\\victim-force.txt",
+            "tool": "run_command"
+          }
+        ],
+        "decisions": [
+          "deny"
+        ],
+        "failure": null,
+        "policy_kind": "effect-auto",
+        "terminal": true,
+        "tool_results": [
+          {
+            "ok": false,
+            "preview": "action not permitted: denied by user",
+            "tool": "run_command"
+          }
+        ]
+      },
+      "target_exists": true
+    },
+    {
+      "case": "ps_clear_content",
+      "content": "precious\n",
+      "observed": {
+        "approvals": [
+          {
+            "always_persists": true,
+            "reason_code": "irreversible.filesystem_destroy",
+            "summary": "`Clear-Content` clears real data: C:\\Users\\code\\AppData\\Local\\Temp\\.tmpYhdzWk\\repo\\victim-clear.txt",
+            "tool": "run_command"
+          }
+        ],
+        "decisions": [
+          "deny"
+        ],
+        "failure": null,
+        "policy_kind": "effect-auto",
+        "terminal": true,
+        "tool_results": [
+          {
+            "ok": false,
+            "preview": "action not permitted: denied by user",
+            "tool": "run_command"
+          }
+        ]
+      }
+    },
+    {
+      "case": "cmd_erase",
+      "observed": {
+        "approvals": [
+          {
+            "always_persists": true,
+            "reason_code": "irreversible.filesystem_delete",
+            "summary": "`erase` deletes real data: \\\\?\\C:\\Users\\code\\AppData\\Local\\Temp\\.tmpYhdzWk\\repo\\victim-erase.txt",
+            "tool": "run_command"
+          }
+        ],
+        "decisions": [
+          "deny"
+        ],
+        "failure": null,
+        "policy_kind": "effect-auto",
+        "terminal": true,
+        "tool_results": [
+          {
+            "ok": false,
+            "preview": "action not permitted: denied by user",
+            "tool": "run_command"
+          }
+        ]
+      },
+      "target_exists": true
+    },
+    {
+      "case": "cmd_rd_s",
+      "observed": {
+        "approvals": [
+          {
+            "always_persists": true,
+            "reason_code": "irreversible.filesystem_delete",
+            "summary": "`rd` deletes real data: \\\\?\\C:\\Users\\code\\AppData\\Local\\Temp\\.tmpYhdzWk\\repo\\victim-rd",
+            "tool": "run_command"
+          }
+        ],
+        "decisions": [
+          "deny"
+        ],
+        "failure": null,
+        "policy_kind": "effect-auto",
+        "terminal": true,
+        "tool_results": [
+          {
+            "ok": false,
+            "preview": "action not permitted: denied by user",
+            "tool": "run_command"
+          }
+        ]
+      },
+      "target_exists": true
+    },
+    {
+      "case": "ps_chinese_space_path",
+      "observed": {
+        "approvals": [
+          {
+            "always_persists": true,
+            "reason_code": "irreversible.filesystem_delete",
+            "summary": "`Remove-Item` deletes real data: C:\\Users\\code\\AppData\\Local\\Temp\\.tmpYhdzWk\\repo\\验收 目录\\victim.txt",
+            "tool": "run_command"
+          }
+        ],
+        "decisions": [
+          "deny"
+        ],
+        "failure": null,
+        "policy_kind": "effect-auto",
+        "terminal": true,
+        "tool_results": [
+          {
+            "ok": false,
+            "preview": "action not permitted: denied by user",
+            "tool": "run_command"
+          }
+        ]
+      },
+      "target_exists": true
+    },
+    {
+      "case": "ps_compound",
+      "observed": {
+        "approvals": [
+          {
+            "always_persists": true,
+            "reason_code": "irreversible.filesystem_delete",
+            "summary": "`Remove-Item` deletes real data: C:\\Users\\code\\AppData\\Local\\Temp\\.tmpYhdzWk\\repo\\victim-force.txt",
+            "tool": "run_command"
+          }
+        ],
+        "decisions": [
+          "deny"
+        ],
+        "failure": null,
+        "policy_kind": "effect-auto",
+        "terminal": true,
+        "tool_results": [
+          {
+            "ok": false,
+            "preview": "action not permitted: denied by user",
+            "tool": "run_command"
+          }
+        ]
+      },
+      "target_exists": true
+    },
+    {
+      "case": "ps_remove_item_approved",
+      "observed": {
+        "approvals": [
+          {
+            "always_persists": true,
+            "reason_code": "irreversible.filesystem_delete",
+            "summary": "`Remove-Item` deletes real data: C:\\Users\\code\\AppData\\Local\\Temp\\.tmpYhdzWk\\repo\\victim-del.txt",
+            "tool": "run_command"
+          }
+        ],
+        "decisions": [
+          "approve_once"
+        ],
+        "failure": null,
+        "policy_kind": "effect-auto",
+        "terminal": true,
+        "tool_results": [
+          {
+            "ok": true,
+            "preview": "exit: 0\n",
+            "tool": "run_command"
+          }
+        ]
+      },
+      "target_exists": false
+    },
+    {
+      "case": "shell_command_powershell_delete",
+      "observed": {
+        "approvals": [
+          {
+            "always_persists": true,
+            "reason_code": "irreversible.filesystem_delete",
+            "summary": "`Remove-Item` deletes real data: C:\\Users\\code\\AppData\\Local\\Temp\\.tmpYhdzWk\\repo\\victim-shell.txt",
+            "tool": "shell_command"
+          }
+        ],
+        "decisions": [
+          "deny"
+        ],
+        "failure": null,
+        "policy_kind": "effect-auto",
+        "terminal": true,
+        "tool_results": [
+          {
+            "ok": false,
+            "preview": "action not permitted: denied by user",
+            "tool": "shell_command"
+          }
+        ]
+      },
+      "target_exists": true
+    },
+    {
+      "case": "python_indirect_delete",
+      "deleted": true,
+      "observed": {
+        "approvals": [],
+        "decisions": [],
+        "failure": null,
+        "policy_kind": "effect-auto",
+        "terminal": true,
+        "tool_results": [
+          {
+            "ok": true,
+            "preview": "exit: 0\n",
+            "tool": "run_command"
+          }
+        ]
+      },
+      "ran": true
+    }
+  ],
+  "gate": "W3",
+  "host": {
+    "arch": "x86_64",
+    "os": "windows"
+  },
+  "powershell": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+}

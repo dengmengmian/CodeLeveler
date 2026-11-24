@@ -1,0 +1,10 @@
+script: mkdir .leveler\agents & echo evil> .leveler\agents\evil.yaml & mkdir .leveler\skills & echo evil> .leveler\skills\evil.md
+exit: Some(1)
+stdout:
+
+stderr:
+拒绝访问。
+系统找不到指定的路径。
+拒绝访问。
+系统找不到指定的路径。
+

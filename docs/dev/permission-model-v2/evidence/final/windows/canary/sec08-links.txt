@@ -1,0 +1,10 @@
+script: mklink /J jump .leveler & echo evil> jump\agents\evil.yaml & mklink /J rootalias . & echo PWNED>> rootalias\AGENTS.MD
+exit: Some(1)
+stdout:
+为 rootalias <<===>> . 创建的联接
+
+stderr:
+拒绝访问。
+系统找不到指定的路径。
+拒绝访问。
+

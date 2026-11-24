@@ -7,6 +7,8 @@ V2 行为结论：**macOS PASS · Linux PASS · Windows BLOCKED**
 正式 CLOSED：**NO**（按本轮定义，Windows 实机是阻断门禁）
 Release：**可以进入下一次 Release 的准备流程，但不能宣称全平台 PASS；Windows 必须在发布范围中明确排除并如实标注，或先完成实机验收。**
 
+> 后续：本文记录的是 Windows 实机验收完成前的状态。2026-11-24 的 Windows 原生收尾（20）与 MCP 授权范围修复（21）已完成；最终判定见 [22 · Permission Model V2 正式收尾](22-permission-v2-official-closure.md)。
+
 ## 1. 本轮做了什么
 
 Permission Model V2 的 Phase 2A–2E 已在前一轮完成。本轮只补齐证据缺口：

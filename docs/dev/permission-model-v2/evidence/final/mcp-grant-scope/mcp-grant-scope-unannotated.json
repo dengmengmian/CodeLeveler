@@ -1,0 +1,9 @@
+{
+  "approvals": 0,
+  "case": "unannotated_delete",
+  "delete_tool_calls": 1,
+  "failure": null,
+  "gate": "M1",
+  "resource_a_deleted": true,
+  "terminal": true
+}

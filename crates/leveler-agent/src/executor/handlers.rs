@@ -407,6 +407,7 @@ impl Executor {
                 // request asks for; a second generic bullet would repeat it.
                 write_scope_expanded: false,
                 reason_code: Some("request.permissions".to_string()),
+                exact_call_only: false,
             };
             // Through the host's one ask path (PR 5): the reviewer, the human, and
             // the human-vs-headless distinction mean the same here as for a tool

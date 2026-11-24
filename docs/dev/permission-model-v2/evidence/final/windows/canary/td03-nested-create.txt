@@ -1,0 +1,6 @@
+script: mkdir src\new & echo NESTED-FORGED> src\new\AGENTS.md
+exit: Some(0)
+stdout:
+
+stderr:
+

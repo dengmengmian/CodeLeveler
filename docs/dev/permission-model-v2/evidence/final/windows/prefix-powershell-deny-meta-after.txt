@@ -1,0 +1,7 @@
+exit=3
+ended=2026-11-24T13:59:24Z
+victim_exists=false
+approval_prompts=0
+approval_events=0
+requests=4
+session="session_id":"ce03fbb2-774c-42fe-9887-348229b08b80"

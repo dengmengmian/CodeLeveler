@@ -326,6 +326,33 @@ pub fn file_identity_supported() -> bool {
 mod tests {
     use super::*;
 
+    /// Create a junction through a small batch file.
+    ///
+    /// The direct `cmd /c mklink /J <link> <target>` argv form is rejected on
+    /// this host with "Access is denied" even though the same mklink line in a
+    /// batch file succeeds; the test cares about the junction, not cmd's
+    /// argument reconstruction.
+    #[cfg(windows)]
+    fn create_junction(link: &std::path::Path, target: &std::path::Path) -> std::process::Output {
+        let parent = link.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let script = parent.join(format!(
+            "mklink-{}.cmd",
+            link.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| std::process::id().to_string())
+        ));
+        std::fs::write(&script, "@echo off\r\nmklink /J \"%~1\" \"%~2\"\r\n").unwrap();
+        let output = std::process::Command::new("cmd")
+            .arg("/c")
+            .arg(&script)
+            .arg(link)
+            .arg(target)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_file(&script);
+        output
+    }
+
     #[cfg(windows)]
     #[test]
     fn a_fresh_state_directory_is_created_owner_only_and_validates() {
@@ -363,13 +390,8 @@ mod tests {
         let target = temp.path().join("real");
         let link = temp.path().join("link");
         std::fs::create_dir_all(&target).unwrap();
-        let status = std::process::Command::new("cmd")
-            .args(["/c", "mklink", "/J"])
-            .arg(&link)
-            .arg(&target)
-            .status()
-            .unwrap();
-        assert!(status.success(), "mklink /J must succeed");
+        let status = create_junction(&link, &target);
+        assert!(status.status.success(), "mklink /J must succeed");
         let error = secure_private_state_dir(&link).expect_err("junction must be refused");
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
     }
@@ -383,13 +405,8 @@ mod tests {
         let target = temp.path().join("elsewhere");
         std::fs::create_dir_all(&target).unwrap();
         let link = state.join("ready.json");
-        let status = std::process::Command::new("cmd")
-            .args(["/c", "mklink", "/J"])
-            .arg(&link)
-            .arg(&target)
-            .status()
-            .unwrap();
-        assert!(status.success(), "mklink /J must succeed");
+        let status = create_junction(&link, &target);
+        assert!(status.status.success(), "mklink /J must succeed");
         let error = verify_private_state_file(&link).expect_err("reparse point must be refused");
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
     }
@@ -529,12 +546,17 @@ mod tests {
         use std::path::Path;
 
         fn junction(link: &Path, target: &Path) {
+            let parent = link.parent().unwrap_or_else(|| Path::new("."));
+            let script = parent.join("mklink-identity.cmd");
+            std::fs::write(&script, "@echo off\r\nmklink /J \"%~1\" \"%~2\"\r\n").unwrap();
             let output = std::process::Command::new("cmd")
-                .args(["/C", "mklink", "/J"])
+                .arg("/C")
+                .arg(&script)
                 .arg(link)
                 .arg(target)
                 .output()
                 .unwrap();
+            let _ = std::fs::remove_file(&script);
             assert!(
                 output.status.success(),
                 "mklink /J failed: {}",

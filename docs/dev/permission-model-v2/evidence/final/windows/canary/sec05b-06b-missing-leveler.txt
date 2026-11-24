@@ -1,0 +1,6 @@
+script: mkdir .leveler & mkdir .leveler\agents & echo evil> .leveler\agents\evil.yaml & mkdir .leveler\skills
+exit: Some(0)
+stdout:
+
+stderr:
+

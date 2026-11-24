@@ -1,0 +1,63 @@
+captured=2026-11-24T14:36:16Z
+--- cmd ver ---
+
+Microsoft Windows [版本 10.0.26300.9711]
+--- whoami ---
+
+用户信息
+----------------
+
+用户名               SID                                           
+==================== ==============================================
+desktop-6egc57e\code S-1-5-21-3985448448-3491830538-3645417405-1001
+
+
+组信息
+-----------------
+
+组名                                   类型   SID          属性                          
+====================================== ====== ============ ==============================
+Everyone                               已知组 S-1-1-0      必需的组, 启用于默认, 启用的组
+NT AUTHORITY\本地帐户和管理员组成员    已知组 S-1-5-114    只用于拒绝的组                
+BUILTIN\Administrators                 别名   S-1-5-32-544 只用于拒绝的组                
+BUILTIN\Users                          别名   S-1-5-32-545 必需的组, 启用于默认, 启用的组
+NT AUTHORITY\INTERACTIVE               已知组 S-1-5-4      必需的组, 启用于默认, 启用的组
+CONSOLE LOGON                          已知组 S-1-2-1      必需的组, 启用于默认, 启用的组
+NT AUTHORITY\Authenticated Users       已知组 S-1-5-11     必需的组, 启用于默认, 启用的组
+NT AUTHORITY\This Organization         已知组 S-1-5-15     必需的组, 启用于默认, 启用的组
+NT AUTHORITY\本地帐户                  已知组 S-1-5-113    必需的组, 启用于默认, 启用的组
+LOCAL                                  已知组 S-1-2-0      必需的组, 启用于默认, 启用的组
+NT AUTHORITY\NTLM Authentication       已知组 S-1-5-64-10  必需的组, 启用于默认, 启用的组
+Mandatory Label\Medium Mandatory Level 标签   S-1-16-8192                                
+
+
+特权信息
+----------------------
+
+特权名                        描述                 状态  
+============================= ==================== ======
+SeShutdownPrivilege           关闭系统             已禁用
+SeChangeNotifyPrivilege       绕过遍历检查         已启用
+SeUndockPrivilege             从扩展坞上取下计算机 已禁用
+SeIncreaseWorkingSetPrivilege 增加进程工作集       已禁用
+SeTimeZonePrivilege           更改时区             已禁用
+--- powershell ---
+5.1.26100.9711
+--- git ---
+git version 2.56.0.windows.4
+--- rustc ---
+rustc 1.90.0 (1159e78c4 2025-09-14)
+--- cargo ---
+cargo 1.90.0 (840b83a10 2025-07-30)
+--- head ---
+9c569b3d6cd27b27bb776284a4d7f480b73d09dc
+--- systeminfo excerpt ---
+
+
+Caption        : Microsoft Windows 11 家庭版 单语言版
+Version        : 10.0.26300
+BuildNumber    : 26300
+OSArchitecture : 64 位
+
+
+

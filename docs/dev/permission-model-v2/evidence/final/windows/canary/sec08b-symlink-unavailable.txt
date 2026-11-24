@@ -1,0 +1,1 @@
+symlink creation by this account failed: 客户端没有所需的特权。 (os error 1314)

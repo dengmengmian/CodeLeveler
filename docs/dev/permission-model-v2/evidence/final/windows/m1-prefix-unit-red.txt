@@ -1,0 +1,23 @@
+Captured during the Windows Final Closure session on 2026-11-24.
+Command:
+  cargo test -p leveler-agent --lib a_destructive_mcp -- --nocapture
+State: source HEAD 9c569b3d + the MCP fix not yet applied.
+
+running 2 tests
+
+thread 'executor::host::authorize_tests::a_destructive_mcp_always_approval_persists_no_tool_rule' panicked at crates\leveler-agent\src\executor\host.rs:3516:9:
+assertion failed: !first.request.always_persists()
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'executor::host::authorize_tests::a_destructive_mcp_turn_approval_covers_only_the_exact_arguments' panicked at crates\leveler-agent\src\executor\host.rs:3491:9:
+assertion `left == right` failed: approving Resource A must not authorize Resource B
+  left: 1
+ right: 2
+test executor::host::authorize_tests::a_destructive_mcp_always_approval_persists_no_tool_rule ... FAILED
+test executor::host::authorize_tests::a_destructive_mcp_turn_approval_covers_only_the_exact_arguments ... FAILED
+
+failures:
+    executor::host::authorize_tests::a_destructive_mcp_always_approval_persists_no_tool_rule
+    executor::host::authorize_tests::a_destructive_mcp_turn_approval_covers_only_the_exact_arguments
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 612 filtered out; finished in 0.01s

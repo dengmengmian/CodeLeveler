@@ -1,0 +1,6 @@
+
+⚠ approval needed run_command wants to run a WorkspaceWrite action:
+    `Remove-Item` deletes real data: C:\qlab\permission-v2-final\evidence\windows\postfix\postfix-deny\repo\victim.txt
+    powershell -NoProfile -Command 'Remove-Item -LiteralPath '\''C:\qlab\permission-v2-final\evidence\windows\postfix\postfix-deny\repo\victim.txt'\'' -Force'
+    path: C:\qlab\permission-v2-final\evidence\windows\postfix\postfix-deny\repo\victim.txt
+  Approve? [y]es once / this [t]urn / [w]lways for this project / [N]o (default): 

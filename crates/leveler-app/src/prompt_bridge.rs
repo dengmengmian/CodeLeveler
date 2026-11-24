@@ -760,6 +760,7 @@ mod tests {
             paths: Vec::new(),
             write_scope_expanded: false,
             reason_code: None,
+            exact_call_only: false,
         }
     }
 

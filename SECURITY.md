@@ -297,6 +297,11 @@ resource boundary the call was admitted under.
   arguments. The server is already a trust boundary chosen by configuration,
   and the grant is in-memory on the turn: it neither persists nor covers a
   different MCP tool. Every other tool keeps the exact-call meaning.
+- The exception is a tool whose typed MCP annotation declares
+  `destructiveHint: true`. Its approval binds to the exact argument vector the
+  person saw: a repeat of that call is covered for the turn, a different target
+  asks again, and no durable "always" rule is offered or persisted. A tool
+  name alone never generalizes an irreversible MCP authorization.
 - A delegated child's unclaimed or out-of-scope mutation and a delegated MCP
   call are refusals returned to the model, not questions for the user. The
   child claims its own scope with `claim_write_scope` or reports what the

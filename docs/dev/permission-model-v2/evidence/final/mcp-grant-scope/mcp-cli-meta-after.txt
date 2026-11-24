@@ -1,0 +1,7 @@
+exit=3
+ended=2026-11-24T14:17:35Z
+resource_a_exists=false
+resource_b_exists=true
+note=ordinary-mcp
+approval_lines=0
+protocol_delete_calls=2

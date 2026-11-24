@@ -1,0 +1,8 @@
+case=B
+binary=/c/CodeLeveler/target/debug/leveler.exe
+binary_sha256=0fe9531d663794ffc59364c3a2bb6827b2a6885cdba4959eacc7383dfc5e013b
+version=1.0.29 (9c569b3d6cd2-dirty) UNTRUSTED: built from a modified working tree
+head=9c569b3d6cd27b27bb776284a4d7f480b73d09dc
+workspace=C:/qlab/permission-v2-final/real/ws-b
+prompt_sha256=ae535f78dd6dfde5f438f63c66ceaab9d52d1ec6cddeead22bcca5970aa571b6
+started=2026-11-24T16:11:17Z

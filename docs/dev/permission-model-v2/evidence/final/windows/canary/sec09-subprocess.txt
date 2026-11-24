@@ -1,0 +1,15 @@
+script: cmd /C "echo PWNED>> AGENTS.md" & powershell -NoProfile -Command "Add-Content -Path AGENTS.md -Value PWNED"
+exit: Some(1)
+stdout:
+
+stderr:
+拒绝访问。
+Add-Content : 对路径“C:\Users\code\AppData\Local\Temp\leveler-sec-canary-7488\workspace\AGENTS.md”的访问被拒绝。
+所在位置 行:1 字符: 1
++ Add-Content -Path AGENTS.md -Value PWNED
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : PermissionDenied: (C:\Users\code\A...space\AGENTS.md:String) [Add-Content], Unauthorized 
+   AccessException
+    + FullyQualifiedErrorId : GetContentWriterUnauthorizedAccessError,Microsoft.PowerShell.Commands.AddContentCommand
+ 
+

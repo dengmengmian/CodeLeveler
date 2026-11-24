@@ -1,0 +1,6 @@
+script: echo fine> src\new_file.txt & mkdir src\new_dir & echo fine> src\new_dir\inside.txt & echo edited>> src\business.rs
+exit: Some(0)
+stdout:
+
+stderr:
+
