@@ -4047,22 +4047,35 @@ impl InProcessRuntimeClient {
                 // has exited, its output is drained, and `store.finish` has
                 // already made `CancelUserShell` a no-op. This matches the
                 // failure paths above, which release before they notify.
+                // The terminal event is persisted with the ownership token,
+                // but it is published only after the durable owner is released.
+                // A client enables its composer on `UserShellExited` and may
+                // submit immediately; publishing first leaves a window where
+                // the command is visibly finished and the session still
+                // answers "already has an active turn". The append still uses
+                // the token so a stale runtime cannot extend the log.
                 active.finish(&admission);
-                let _ = log
-                    .append(
-                        None,
-                        leveler_engine::EngineEvent::UserShellFinished {
-                            execution_id: id.clone(),
-                            exit_code,
-                            duration_ms,
-                            status: status.to_string(),
-                            output_tail,
-                            output_truncated,
-                            full_output,
-                        },
-                        &mut forward,
-                    )
-                    .await;
+                let mut terminal_event = None;
+                {
+                    let mut persist_only = |event: leveler_engine::EngineEvent| {
+                        terminal_event = Some(event);
+                    };
+                    let _ = log
+                        .append(
+                            None,
+                            leveler_engine::EngineEvent::UserShellFinished {
+                                execution_id: id.clone(),
+                                exit_code,
+                                duration_ms,
+                                status: status.to_string(),
+                                output_tail,
+                                output_truncated,
+                                full_output,
+                            },
+                            &mut persist_only,
+                        )
+                        .await;
+                }
                 // The shell has exited and its terminal fact is written: the
                 // session is nobody's until the next execution acquires it. A
                 // crash before this line leaves the task to a dead boot, which
@@ -4080,6 +4093,9 @@ impl InProcessRuntimeClient {
                         session = session_id.as_str(),
                         "user shell could not release the session"
                     );
+                }
+                if let Some(event) = terminal_event {
+                    bridge.forward(event);
                 }
             });
         });
