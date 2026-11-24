@@ -30,6 +30,12 @@ const ALLOWED: &[(&str, usize, &str)] = &[
          how much history to read, before the turn's ownership token exists, and \
          never appends",
     ),
+    (
+        "leveler-app/src/session_history.rs",
+        1,
+        "history projection: reads conversation cuts and discarded turns to bound \
+         the replay; never appends",
+    ),
 ];
 
 const SCANNED: &[&str] = &["src", "../leveler-app/src"];
