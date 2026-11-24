@@ -1503,6 +1503,9 @@ mod snapshot_tests {
             ],
         );
         run(dir.path(), &["fetch", "-q", "origin"]);
+        // `fetch` does not write the remote's symbolic HEAD; `clone` does.
+        // Without this the fixture's `origin/HEAD` is ambiguous on every git.
+        run(dir.path(), &["remote", "set-head", "origin", "-a"]);
         run(dir.path(), &["reset", "-q", "--hard", "origin/HEAD"]);
 
         std::fs::write(upstream.path().join("a.txt"), "two\n").unwrap();
