@@ -195,6 +195,7 @@ pub async fn cmd_schedule(
                     "session_policy": definition.session_policy.as_str(),
                     "overlap": definition.overlap.as_str(),
                     "mode": definition.mode.as_str(),
+                    "permission_contract": definition.permission_contract.as_str(),
                     "model": definition.model.as_ref().map(|model| model.to_string()),
                     "timeout_secs": definition.timeout.as_secs(),
                     "misfire": definition.misfire.as_str(),
@@ -221,6 +222,7 @@ pub async fn cmd_schedule(
                     }
                 );
                 println!("  permission: {}", definition.mode.as_str());
+                println!("  contract:   {}", definition.permission_contract.as_str());
                 println!(
                     "  model:      {}",
                     definition
@@ -1079,6 +1081,7 @@ fn grant_json(definition: &leveler_schedule::ScheduleDefinition) -> serde_json::
             "definition_id": grant.definition_id,
             "workspace": grant.workspace,
             "permission_mode": grant.permission_mode,
+            "permission_contract": grant.permission_contract.as_str(),
             "actions": grant.actions.iter().map(|kind| kind.as_str()).collect::<Vec<_>>(),
             "external_side_effects": grant.external_side_effects,
             "granted_at": grant.granted_at,

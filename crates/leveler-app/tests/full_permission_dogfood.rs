@@ -341,7 +341,9 @@ fn operations(workroot: &std::path::Path, home: &std::path::Path) -> Vec<Op> {
             arguments: serde_json::json!({
                 "path": outside.join("created.txt").display().to_string(), "content": "x"
             }),
-            auto_asks: true,
+            // V2 Auto has no workspace write fence: a foreign ordinary write
+            // is part of ordinary development, not a question.
+            auto_asks: false,
         },
         Op {
             id: "write_home",
@@ -349,7 +351,7 @@ fn operations(workroot: &std::path::Path, home: &std::path::Path) -> Vec<Op> {
             arguments: serde_json::json!({
                 "path": home_file.display().to_string(), "content": "x"
             }),
-            auto_asks: true,
+            auto_asks: false,
         },
         Op {
             id: "read_credential_path",
@@ -357,8 +359,10 @@ fn operations(workroot: &std::path::Path, home: &std::path::Path) -> Vec<Op> {
             arguments: serde_json::json!({"path": credential.display().to_string()}),
             auto_asks: true,
         },
-        // Git — including pushes and history rewrites — is ordinary development
-        // under Auto. The Full case still runs it and must produce no approval.
+        // Git push is ordinary development under Auto. History loss is the
+        // V2 Auto's structured irreversible effect, so it is part of the
+        // Auto→Full supersede path. The Full case still runs both and must
+        // produce no approval.
         Op {
             id: "git_push",
             tool: "run_command",
@@ -369,7 +373,7 @@ fn operations(workroot: &std::path::Path, home: &std::path::Path) -> Vec<Op> {
             id: "git_reset_hard",
             tool: "run_command",
             arguments: serde_json::json!({"program": "git", "args": ["reset", "--hard"]}),
-            auto_asks: false,
+            auto_asks: true,
         },
         // The boundary Auto DOES hold: privilege escalation.
         Op {
@@ -408,7 +412,9 @@ fn operations(workroot: &std::path::Path, home: &std::path::Path) -> Vec<Op> {
             id: "request_permissions",
             tool: "request_permissions",
             arguments: serde_json::json!({"action": "dogfood probe", "network": true}),
-            auto_asks: true,
+            // V2 Auto already holds the file and network axes this tool can
+            // request; asking would be a prompt for access the call has.
+            auto_asks: false,
         },
         Op {
             id: "mcp_invocation",
@@ -613,6 +619,12 @@ async fn run_case(path: Path, op: &Op, workroot: &std::path::Path) -> (Case, Vec
 
     let root = workroot.join(format!("case-{}", sanitize(&case_id)));
     std::fs::create_dir_all(&root).unwrap();
+    // The fixture files are shared by every path; an earlier Full case may have
+    // consumed the deletion target, and a missing target is deliberately free
+    // under Auto. Restore the same starting state for every case.
+    let outside = workroot.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("victim.txt"), "x").unwrap();
     write_config(&root, &server.base_url());
     init_git(&root);
 

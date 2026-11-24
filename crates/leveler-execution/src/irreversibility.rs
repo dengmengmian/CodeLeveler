@@ -39,6 +39,10 @@ pub enum IrreversibleKind {
     GitHistory,
     McpDestructive,
     HostShutdown,
+    /// The outer command asks the OS for authority the runtime cannot grant.
+    /// It is a boundary reason, not a data-loss effect: the inner command is
+    /// still analyzed separately and keeps its more specific fact.
+    PrivilegeEscalation,
 }
 
 impl IrreversibleKind {
@@ -52,6 +56,7 @@ impl IrreversibleKind {
             Self::GitHistory => "irreversible.git_history",
             Self::McpDestructive => "irreversible.mcp_destructive",
             Self::HostShutdown => "irreversible.host_shutdown",
+            Self::PrivilegeEscalation => "boundary.privilege_escalation",
         }
     }
 }
@@ -492,24 +497,52 @@ fn powershell_target(value: &str, literals: &mut Vec<String>, dynamic: &mut bool
 /// Analyze one executed argv, peeling a transparent wrapper (`sudo`, `env`,
 /// `nohup`, …) when present. A wrapper is not the effect; what it runs is.
 fn analyze_words(words: &[String], input: &EffectInput<'_>) -> Option<IrreversibleFact> {
+    let privilege = words
+        .first()
+        .filter(|program| is_privilege_program(program))
+        .map(|program| privilege_fact(program));
     if let Some(inner) = transparent_wrapper_argv(words) {
         if let Some(fact) = analyze_words(&inner, input) {
             return Some(fact);
         }
         // The inner program may itself be a shell wrapper or a Git command,
         // which the argv classifier alone does not decode.
-        if let Some((inner_program, inner_args)) = inner.split_first() {
-            return analyze_command(
+        if let Some((inner_program, inner_args)) = inner.split_first()
+            && let Some(fact) = analyze_command(
                 &CommandView {
                     program: inner_program,
                     args: inner_args,
                 },
                 input,
-            );
+            )
+        {
+            return Some(fact);
         }
-        return None;
+        // The wrapper asks the OS for privilege even when the inner command
+        // has no destructive effect (`sudo -n true`); the more specific inner
+        // fact above wins when there is one.
+        return privilege;
     }
     analyze_argv(words, input)
+}
+
+fn is_privilege_program(program: &str) -> bool {
+    let lower = basename(program).to_ascii_lowercase();
+    matches!(
+        lower.strip_suffix(".exe").unwrap_or(&lower),
+        "sudo" | "su" | "doas"
+    )
+}
+
+fn privilege_fact(program: &str) -> IrreversibleFact {
+    IrreversibleFact {
+        kind: IrreversibleKind::PrivilegeEscalation,
+        summary: format!(
+            "`{}` requests OS privilege the runtime cannot grant",
+            basename(program)
+        ),
+        paths: Vec::new(),
+    }
 }
 
 /// The command a transparent wrapper runs, or `None` when `words` is not such
@@ -780,6 +813,9 @@ fn analyze_argv(words: &[String], input: &EffectInput<'_>) -> Option<Irreversibl
     }
     if matches!(stem, "powershell" | "pwsh") {
         return analyze_powershell(args, input);
+    }
+    if is_privilege_program(program) {
+        return Some(privilege_fact(program));
     }
 
     if matches!(stem, "shutdown" | "reboot" | "halt" | "poweroff")
@@ -1518,9 +1554,14 @@ mod tests {
     }
 
     #[test]
-    fn sudo_is_not_an_irreversible_effect() {
+    fn sudo_is_a_privilege_boundary_not_a_data_loss_effect() {
         let f = fixture();
-        assert!(analyze_shell(&f, "sudo -n true").is_none());
+        for script in ["sudo -n true", "sudo", "su -c true", "doas true"] {
+            let fact = analyze_shell(&f, script)
+                .unwrap_or_else(|| panic!("{script} requests OS privilege"));
+            assert_eq!(fact.kind, IrreversibleKind::PrivilegeEscalation, "{script}");
+            assert_eq!(fact.code(), "boundary.privilege_escalation", "{script}");
+        }
     }
 
     #[test]
@@ -1540,9 +1581,14 @@ mod tests {
                 .unwrap_or_else(|| panic!("{script} must name the deletion"));
             assert_eq!(fact.kind, IrreversibleKind::FileDelete, "{script}");
         }
-        // The same wrappers around ordinary work stay ordinary.
-        for script in ["sudo -n true", "env FOO=1 true", "nohup true"] {
+        // The same wrappers around ordinary work stay ordinary; the privilege
+        // request itself is the one boundary they keep.
+        for script in ["env FOO=1 true", "nohup true"] {
             assert!(analyze_shell(&f, script).is_none(), "{script}");
         }
+        assert_eq!(
+            analyze_shell(&f, "sudo -n true").map(|fact| fact.kind),
+            Some(IrreversibleKind::PrivilegeEscalation)
+        );
     }
 }
