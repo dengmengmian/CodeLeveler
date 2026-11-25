@@ -2675,7 +2675,12 @@ class Supervisor:
         except ActionRetry as error:
             action["attempts"] = int(action.get("attempts", 0)) + 1
             action["detail"] = {"retry": str(error)}
-            if action["attempts"] >= 40:
+            # A killed runtime leaves its run open until the run's own timeout
+            # expires, then one dispatch pass settles it. A 300s definition
+            # timeout (or the 120s fault definition) plus observation needs
+            # more than the old 120s retry window; 80 attempts at the 3s loop
+            # covers the timeout and the next pass without changing a check.
+            if action["attempts"] >= 80:
                 action["status"] = "failed"
                 message = str(error)
                 record_runner_error(self.state, name, message)
