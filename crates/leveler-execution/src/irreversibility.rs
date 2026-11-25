@@ -1178,7 +1178,12 @@ fn literal_target(raw: &str, input: &EffectInput<'_>) -> Option<PathBuf> {
         }
         input.environment.temp_dir().join(rest)
     } else {
-        if raw.contains(['$', '`', '*', '?', '[', '{', '~']) || (raw.contains('%') && cfg!(windows))
+        // A leading `~` is shell home expansion and cannot be resolved before
+        // running. An interior `~` is a literal path character: Windows 8.3
+        // short names (RUNNER~1) appear in real absolute paths.
+        if raw.starts_with('~')
+            || raw.contains(['$', '`', '*', '?', '[', '{'])
+            || (raw.contains('%') && cfg!(windows))
         {
             return None;
         }
@@ -1340,6 +1345,23 @@ mod tests {
         assert_eq!(outside.kind, IrreversibleKind::FileDelete);
         let missing = f._tmp.path().join("never-created");
         assert!(analyze_shell(&f, &format!("rm -rf {}", missing.display())).is_none());
+    }
+
+    #[test]
+    fn an_interior_tilde_is_a_literal_path_character() {
+        let f = fixture();
+        std::fs::create_dir_all(f.root.join("RUNNER~1")).unwrap();
+        std::fs::write(f.root.join("RUNNER~1/real.txt"), "x").unwrap();
+        // Windows short names (RUNNER~1) carry `~` inside a path. Only a
+        // leading `~` is home expansion; an interior one is a literal byte.
+        let real = analyze_shell(&f, "rm -rf RUNNER~1/real.txt").expect("real data");
+        assert_eq!(real.kind, IrreversibleKind::FileDelete);
+        assert!(real.paths.iter().any(|path| path.ends_with("real.txt")));
+        assert!(analyze_shell(&f, "rm -rf RUNNER~1/missing.txt").is_none());
+        assert!(
+            analyze_shell(&f, "rm -rf ~/real.txt").is_some(),
+            "a leading tilde is still an unresolvable home path"
+        );
     }
 
     #[test]
