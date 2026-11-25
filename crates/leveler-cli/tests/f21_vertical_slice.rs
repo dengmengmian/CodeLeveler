@@ -945,17 +945,27 @@ fn cancelling_a_goal_reaps_its_supervised_background_task() {
                 alive(supervisor),
                 "the supervisor owns the task lifecycle, not this runtime"
             );
-            let list = env.background(&["list", "--json"]);
-            let tasks: Vec<serde_json::Value> = serde_json::from_str(&list).unwrap();
-            let task = tasks
-                .iter()
-                .find(|task| task["task_id"].as_str() == Some(&task_id))
-                .unwrap_or_else(|| panic!("no host record for {task_id}: {list}"));
-            assert_ne!(
-                task["status"].as_str(),
-                Some("running"),
-                "the stopped task must not remain running: {task}"
-            );
+            // The child is reaped by the supervisor, but its durable host
+            // record is settled asynchronously. Read it until it leaves
+            // `running`; a single immediate read races the supervisor on a
+            // slower host (observed on Linux CI) and is not the contract.
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                let list = env.background(&["list", "--json"]);
+                let tasks: Vec<serde_json::Value> = serde_json::from_str(&list).unwrap();
+                let task = tasks
+                    .iter()
+                    .find(|task| task["task_id"].as_str() == Some(&task_id))
+                    .unwrap_or_else(|| panic!("no host record for {task_id}: {list}"));
+                if task["status"].as_str() != Some("running") {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the stopped task must not remain running: {task}"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
             let _ = runtime.kill();
             let _ = runtime.wait();
             stop_isolated_host(&host_state);
