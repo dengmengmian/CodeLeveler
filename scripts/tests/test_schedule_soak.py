@@ -107,6 +107,76 @@ class S4Tests(unittest.TestCase):
         self.assertEqual(args[args.index("--session-policy") + 1], "fresh")
 
 
+class RunOrderTests(unittest.TestCase):
+    def test_run_ids_follow_the_store_order(self):
+        rows = [
+            {"id": "a", "started_at": "2026-11-25T00:00:00.100Z"},
+            {"id": "b", "started_at": "2026-11-25T00:00:00.200Z"},
+            {"id": "c", "started_at": "2026-11-25T00:00:00.200Z"},
+            {"id": "d", "started_at": None},
+        ]
+        self.assertEqual(soak.ordered_run_ids(rows), ["c", "b", "a", "d"])
+
+    def test_a_cli_page_that_misses_an_old_row_does_not_cover_history(self):
+        cli = [{"id": "a", "started_at": "2026-11-25T00:00:00.200Z"}]
+        db = [
+            {"id": "a", "started_at": "2026-11-25T00:00:00.200Z"},
+            {"id": "old", "started_at": "2026-11-25T00:00:00.100Z"},
+        ]
+        self.assertFalse(soak.covers_history(cli, db))
+
+    def test_a_newer_row_inserted_after_the_cli_query_is_not_a_disagreement(self):
+        cli = [
+            {"id": "a", "started_at": "2026-11-25T00:00:00.200Z"},
+            {"id": "b", "started_at": "2026-11-25T00:00:00.100Z"},
+        ]
+        db = [
+            {"id": "new", "started_at": "2026-11-25T00:00:00.300Z"},
+            {"id": "a", "started_at": "2026-11-25T00:00:00.200Z"},
+            {"id": "b", "started_at": "2026-11-25T00:00:00.100Z"},
+        ]
+        self.assertTrue(soak.covers_history(cli, db))
+
+
+class AgentMarkerTests(unittest.TestCase):
+    def marker(self, tail, lines=1, exists=True):
+        return {"exists": exists, "tail": tail, "lines": lines, "value_ok": True}
+
+    def test_a_fresh_goal_requires_its_own_token(self):
+        self.assertTrue(
+            soak.agent_marker_ok(
+                "agent_fresh", self.marker("VALUE=421\nSOAK=agent-fresh"), ["succeeded"]
+            )
+        )
+        self.assertFalse(
+            soak.agent_marker_ok(
+                "agent_fresh", self.marker("VALUE=421\nSOAK=agent-short"), ["succeeded"]
+            )
+        )
+
+    def test_a_continue_goal_needs_one_appended_line_per_succeeded_run(self):
+        both = ["succeeded", "succeeded"]
+        self.assertTrue(
+            soak.agent_marker_ok(
+                "agent_continue",
+                self.marker("VALUE=421 RUN=a\nVALUE=421 RUN=b", lines=2),
+                both,
+            )
+        )
+        self.assertFalse(
+            soak.agent_marker_ok(
+                "agent_continue",
+                self.marker("VALUE=421 RUN=a", lines=1),
+                both,
+            )
+        )
+
+    def test_a_missing_artifact_is_never_a_pass(self):
+        self.assertFalse(
+            soak.agent_marker_ok("agent_short", self.marker("", exists=False), ["succeeded"])
+        )
+
+
 class EffectAccountingTests(unittest.TestCase):
     def test_a_spec_key_resolves_to_the_created_definition_id(self):
         defs = {"queue": {"id": "def-1", "name": "soak-overlap-queue", "spec": {}}}
@@ -373,6 +443,8 @@ class ResourceTests(unittest.TestCase):
             summary = soak.resource_summary([sample])
             self.assertEqual(summary["cpu_pct"]["count"], 1)
             self.assertEqual(summary["db_bytes_growth"], 0.0)
+            self.assertEqual(sample["occupancy"]["runs"], 0)
+            self.assertEqual(sample["runtime_health"], {})
         finally:
             shutil.rmtree(root, ignore_errors=True)
 
@@ -412,6 +484,66 @@ class ResourceTests(unittest.TestCase):
             self.assertEqual(sample["rss_kb"], 300)
         finally:
             shutil.rmtree(root, ignore_errors=True)
+
+    def test_rss_growth_is_attributed_to_the_process_that_grew(self):
+        samples = [
+            {
+                "ts": "2026-11-25T00:00:00Z",
+                "rss_kb": 1500,
+                "phys_footprint_bytes": 1_000_000,
+                "process_rss": [
+                    {"pid": 11, "kind": "dispatcher", "rss_kb": 1000, "phys_footprint_bytes": 600_000},
+                    {"pid": 22, "kind": "runtime", "rss_kb": 500, "phys_footprint_bytes": 400_000},
+                ],
+            },
+            {
+                "ts": "2026-11-25T00:01:00Z",
+                "rss_kb": 2000,
+                "phys_footprint_bytes": 1_500_000,
+                "process_rss": [
+                    {"pid": 11, "kind": "dispatcher", "rss_kb": 1500, "phys_footprint_bytes": 1_100_000},
+                    {"pid": 22, "kind": "runtime", "rss_kb": 500, "phys_footprint_bytes": 400_000},
+                ],
+            },
+        ]
+        summary = soak.resource_summary(samples)
+        self.assertEqual(summary["rss_kb_growth"], 500.0)
+        self.assertEqual(summary["phys_footprint_bytes_growth"], 500_000.0)
+        self.assertEqual(summary["largest_process_growth"]["pid"], 11)
+        self.assertEqual(summary["largest_process_growth"]["kind"], "dispatcher")
+        self.assertEqual(summary["largest_process_growth"]["growth_kb"], 500.0)
+        self.assertEqual(summary["largest_process_growth"]["phys_growth_bytes"], 500_000.0)
+        self.assertEqual(summary["processes_started"], [])
+        self.assertEqual(summary["processes_ended"], [])
+        self.assertEqual(summary["new_process_rss_kb"], 0.0)
+        self.assertEqual(summary["ended_process_rss_kb"], 0.0)
+
+    def test_a_new_process_is_not_reported_as_one_process_leaking(self):
+        samples = [
+            {
+                "ts": "2026-11-25T00:00:00Z",
+                "rss_kb": 1500,
+                "process_rss": [
+                    {"pid": 11, "kind": "dispatcher", "rss_kb": 1000},
+                    {"pid": 22, "kind": "runtime", "rss_kb": 500},
+                ],
+            },
+            {
+                "ts": "2026-11-25T00:01:00Z",
+                "rss_kb": 2400,
+                "process_rss": [
+                    {"pid": 11, "kind": "dispatcher", "rss_kb": 1000},
+                    {"pid": 22, "kind": "runtime", "rss_kb": 500},
+                    {"pid": 33, "kind": "runtime", "rss_kb": 900},
+                ],
+            },
+        ]
+        summary = soak.resource_summary(samples)
+        self.assertEqual(summary["rss_kb_growth"], 900.0)
+        self.assertIsNone(summary["largest_process_growth"])
+        self.assertEqual(summary["processes_started"], [33])
+        self.assertEqual(summary["processes_ended"], [])
+        self.assertEqual(summary["new_process_rss_kb"], 900.0)
 
 
 class WorkspaceIsolationTests(unittest.TestCase):

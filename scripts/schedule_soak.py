@@ -1599,6 +1599,45 @@ def _table_rows(connection: sqlite3.Connection, table: str) -> List[Dict[str, An
     return [dict(row) for row in cursor.fetchall()]
 
 
+def _run_key(row: Dict[str, Any]) -> Tuple[str, str]:
+    return (str(row.get("started_at") or ""), str(row.get("id") or ""))
+
+
+def ordered_run_ids(rows: Sequence[Dict[str, Any]]) -> List[str]:
+    """Run ids in the store's own order: `started_at DESC, id DESC`.
+
+    The comparison is against the CLI's page, so the order has to be the same
+    one SQLite uses: string comparison, NULL `started_at` last in DESC, and the
+    id as the tie-break. The runner must not invent a different order and call
+    an identical set a disagreement.
+    """
+    ordered = sorted(rows, key=_run_key, reverse=True)
+    return [str(row.get("id")) for row in ordered]
+
+
+def covers_history(
+    cli_rows: Sequence[Dict[str, Any]], db_rows: Sequence[Dict[str, Any]]
+) -> bool:
+    """The CLI returned every run that existed when it queried the store.
+
+    The DB snapshot is taken after the CLI query, so the live store may have
+    inserted newer rows after the newest row the CLI saw. Those are normal
+    execution races, not a truncated history. Everything at or below the CLI's
+    newest key must be present, in store order; a default-page truncation or a
+    missing older row breaks the comparison and fails.
+    """
+    cli_ids = [str(row.get("id")) for row in cli_rows]
+    if not cli_rows:
+        return not db_rows
+    newest = _run_key(cli_rows[0])
+    expected = [
+        str(row.get("id"))
+        for row in sorted(db_rows, key=_run_key, reverse=True)
+        if _run_key(row) <= newest
+    ]
+    return expected == cli_ids
+
+
 def read_schedule(home: Path) -> Dict[str, Any]:
     path = schedule_database(home)
     empty = {"database": str(path), "exists": path.is_file(), "definitions": [], "occurrences": [], "runs": [], "wakeups": []}
@@ -1831,6 +1870,28 @@ def marker_counts(lane: Dict[str, Any], specs: Sequence[DefSpec]) -> Dict[str, A
     return result
 
 
+def agent_marker_ok(key: str, marker: Dict[str, Any], states: Sequence[Any]) -> bool:
+    """The agent's business artifact matches what its goal asked for.
+
+    A succeeded run is not the artifact. The fresh/short goals name a literal
+    token; the continue goal appends one line per run, so its line count must
+    keep up with the succeeded runs and the appended line must name RUN=.
+    """
+    if not marker.get("exists"):
+        return False
+    tail = str(marker.get("tail") or "")
+    if key in ("agent_short", "agent_fresh"):
+        return "SOAK=%s" % key.replace("agent_", "agent-") in tail
+    if key == "agent_continue":
+        succeeded = sum(1 for state in states if state == "succeeded")
+        return (
+            succeeded >= 1
+            and "RUN=" in tail
+            and int(marker.get("lines") or 0) >= succeeded
+        )
+    return True
+
+
 def load_seen_runs(paths: RunPaths) -> set:
     seen = set()
     if not paths.runs.is_file():
@@ -1917,11 +1978,140 @@ def _latency_ms(start: Optional[str], end: Optional[str]) -> Optional[int]:
     return int(round(seconds * 1000)) if seconds is not None else None
 
 
+def database_occupancy(lanes: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """Run/occurrence/session counts the scheduler store itself owns.
+
+    Active turns are runtime state, not store state; `runtime_health_sample`
+    records them. These counts make a resource sample interpretable: a RSS
+    rise while runs are flat is not explained by work volume.
+    """
+    totals = {"runs": 0, "occurrences": 0, "sessions": 0, "lanes": {}}
+    for name, lane in lanes.items():
+        path = schedule_database(Path(lane["home"]))
+        row = {"runs": 0, "occurrences": 0, "sessions": 0}
+        if path.is_file():
+            with contextlib.suppress(sqlite3.Error):
+                with contextlib.closing(_sqlite_ro(path)) as connection:
+                    row["runs"] = int(
+                        connection.execute("SELECT COUNT(*) FROM schedule_runs").fetchone()[0]
+                    )
+                    row["occurrences"] = int(
+                        connection.execute("SELECT COUNT(*) FROM schedule_occurrences").fetchone()[0]
+                    )
+                    row["sessions"] = int(
+                        connection.execute(
+                            "SELECT COUNT(DISTINCT session_id) FROM schedule_runs "
+                            "WHERE session_id IS NOT NULL"
+                        ).fetchone()[0]
+                    )
+        totals["lanes"][name] = row
+        for key in ("runs", "occurrences", "sessions"):
+            totals[key] += row[key]
+    return totals
+
+
+def runtime_health_sample(lanes: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """The runtime's own active-turn and background-work facts, per lane.
+
+    `runtime status` is a read-only IPC call; an absent runtime answers
+    `presence: absent` without being started. A lane that cannot answer is
+    recorded as an observation error, never as a healthy zero.
+    """
+    health: Dict[str, Any] = {}
+    for name, lane in lanes.items():
+        binary = Path(lane.get("binary") or "")
+        if not binary.is_file():
+            health[name] = {"error": "lane binary is missing"}
+            continue
+        command = [
+            str(binary),
+            "runtime",
+            "status",
+            "--json",
+            "--repo",
+            str(lane["repo"]),
+            "--config-dir",
+            str(lane["home"]),
+        ]
+        result = run_command(
+            command,
+            env=cli_environment(Path(lane["home"]), int(lane.get("idle_secs", 120))),
+            cwd=Path(lane["repo"]),
+            timeout=8,
+        )
+        if result.returncode != 0:
+            health[name] = {
+                "error": "runtime status failed: %s" % (result.stderr or result.stdout or "").strip()[:300]
+            }
+            continue
+        try:
+            payload = json.loads(result.stdout)
+        except ValueError:
+            health[name] = {"error": "runtime status returned non-JSON output"}
+            continue
+        health[name] = {
+            key: payload.get(key)
+            for key in (
+                "presence",
+                "pid",
+                "runtime_id",
+                "version",
+                "active_turns",
+                "active_background_tasks",
+                "lifecycle",
+                "idle_eviction",
+            )
+        }
+    return health
+
+
+def _process_start_time(pid: int) -> Optional[str]:
+    """The OS-reported process start time, when `ps` can name it."""
+    result = run_command(["ps", "-p", str(pid), "-o", "lstart="], timeout=5)
+    value = (result.stdout or "").strip()
+    return value if result.returncode == 0 and value else None
+
+
+def _physical_footprint(pid: int, scratch_dir: Path) -> Optional[int]:
+    """The process's physical footprint in bytes, or None when unobservable.
+
+    `ps` RSS counts resident pages, including clean file-backed pages shared
+    with other processes. macOS `footprint` reports the dirty/private
+    footprint, so a sum of these values is not inflated by shared pages. It is
+    attribution evidence only; the frozen gate remains RSS.
+    """
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=str(scratch_dir), prefix="fp-%d-" % pid, suffix=".json", delete=False
+        ) as handle:
+            scratch = Path(handle.name)
+    except OSError:
+        return None
+    try:
+        result = run_command(["footprint", "-j", str(scratch), str(pid)], timeout=10)
+        if result.returncode != 0:
+            return None
+        payload = json.loads(scratch.read_text(encoding="utf-8"))
+        processes = payload.get("processes") or []
+        if not processes:
+            return None
+        value = processes[0].get("footprint")
+        return int(value) if isinstance(value, (int, float)) else None
+    except (OSError, ValueError, TypeError):
+        return None
+    finally:
+        with contextlib.suppress(OSError):
+            scratch.unlink()
+
+
 def sample_processes(paths: RunPaths, lanes: Dict[str, Dict[str, Any]], recorder: Recorder) -> Dict[str, Any]:
     rows = matching_processes(paths.live_root)  # type: ignore[arg-type]
     runtime_count = 0
     dispatcher_count = 0
     process_rss: List[Dict[str, Any]] = []
+    footprint_dir = Path(paths.evidence) / "footprint"
+    with contextlib.suppress(OSError):
+        footprint_dir.mkdir(parents=True, exist_ok=True)
     for row in rows:
         command = row["command"]
         if " schedule " in command and " serve" in command:
@@ -1935,8 +2125,21 @@ def sample_processes(paths: RunPaths, lanes: Dict[str, Dict[str, Any]], recorder
         # Per-process RSS makes a growth failure attributable to the resident
         # dispatcher or to a specific runtime instead of only to the sum. The
         # sum alone cannot say which process leaked.
-        process_rss.append({"pid": row["pid"], "rss_kb": row["rss_kb"], "kind": kind})
+        process_rss.append(
+            {
+                "pid": row["pid"],
+                "rss_kb": row["rss_kb"],
+                "kind": kind,
+                "started_at": _process_start_time(row["pid"]),
+                "phys_footprint_bytes": _physical_footprint(row["pid"], footprint_dir),
+            }
+        )
     rss_kb = sum(row["rss_kb"] for row in rows)
+    footprint_total = sum(
+        int(row["phys_footprint_bytes"])
+        for row in process_rss
+        if row.get("phys_footprint_bytes") is not None
+    )
     cpu = sum(row["cpu"] for row in rows)
     db_bytes = 0
     for lane in lanes.values():
@@ -1959,9 +2162,12 @@ def sample_processes(paths: RunPaths, lanes: Dict[str, Dict[str, Any]], recorder
         "dispatcher_processes": dispatcher_count,
         "rss_kb": rss_kb,
         "process_rss": process_rss,
+        "phys_footprint_bytes": footprint_total if process_rss else None,
         "cpu_pct": round(cpu, 3),
         "db_bytes": db_bytes,
         "live_root_bytes": root_bytes,
+        "occupancy": database_occupancy(lanes),
+        "runtime_health": runtime_health_sample(lanes),
     }
     append_jsonl(paths.samples, sample)
     return sample
@@ -3031,19 +3237,54 @@ class Supervisor:
             lane,
             ["schedule", "runs", "--definition", target["id"], "--limit", "100000"],
         )
+        all_runs = lane_json(lane, ["schedule", "runs", "--limit", "100000"])
         snapshot = read_schedule(Path(lane["home"]))
-        db_runs = len([run for run in snapshot["runs"] if run.get("definition_id") == target["id"]])
+        db_runs = [run for run in snapshot["runs"] if run.get("definition_id") == target["id"]]
+
+        cli_ids = [str(row.get("id")) for row in runs]
+        db_ids = ordered_run_ids(db_runs)
+        all_cli_ids = [str(row.get("id")) for row in all_runs]
+        all_db_ids = ordered_run_ids(snapshot["runs"])
+        lane_checks: Dict[str, Any] = {}
+        for lane_name, lane in self.lanes.items():
+            lane_snapshot = (
+                snapshot if lane_name == "os" else read_schedule(Path(lane["home"]))
+            )
+            lane_runs = (
+                all_runs
+                if lane_name == "os"
+                else lane_json(lane, ["schedule", "runs", "--limit", "100000"])
+            )
+            lane_checks[lane_name] = {
+                "cli_runs": len(lane_runs),
+                "db_runs": len(lane_snapshot["runs"]),
+                "consistent": covers_history(lane_runs, lane_snapshot["runs"]),
+                "db_newer_rows": max(0, len(lane_snapshot["runs"]) - len(lane_runs)),
+            }
+        all_lanes_consistent = all(row["consistent"] for row in lane_checks.values())
         payload = {
             "definition": target["id"],
             "next_occurrence": shown.get("next_occurrence"),
             "revision": shown.get("revision"),
             "cli_runs": len(runs),
-            "db_runs": db_runs,
-            "consistent": len(runs) == db_runs,
+            "db_runs": len(db_runs),
+            "consistent": covers_history(runs, db_runs),
+            "ids_match": covers_history(runs, db_runs),
+            "db_newer_rows": max(0, len(db_ids) - len(cli_ids)),
+            "all_cli_runs": len(all_runs),
+            "all_db_runs": len(snapshot["runs"]),
+            "all_consistent": covers_history(all_runs, snapshot["runs"]),
+            "all_db_newer_rows": max(0, len(all_db_ids) - len(all_cli_ids)),
+            "lanes": lane_checks,
+            "all_lanes_consistent": all_lanes_consistent,
             "tui": "NOT_VERIFIED",
             "desktop": "NOT_VERIFIED",
             "agent_tools": "NOT_VERIFIED",
-            "passed": len(runs) == db_runs,
+            "passed": (
+                covers_history(runs, db_runs)
+                and covers_history(all_runs, snapshot["runs"])
+                and all_lanes_consistent
+            ),
         }
         self.mark("S8_" + name, payload["passed"], payload)
         return payload
@@ -3131,7 +3372,7 @@ class Supervisor:
             if not spec or not spec.marker or "succeeded" not in row["states"]:
                 continue
             marker = markers.get(row["key"]) or {}
-            if not marker.get("exists"):
+            if not agent_marker_ok(row["key"], marker, row["states"]):
                 marker_ok = False
             elif marker.get("value_ok") is False:
                 marker_ok = False
@@ -3269,6 +3510,8 @@ def aggregate_run(
         "mode": plan["mode"],
         "commit": plan["commit"],
         "binary": plan["binary"],
+        "runner": plan.get("runner"),
+        "source_tree": (plan.get("preflight") or {}).get("source"),
         "model": plan.get("model"),
         "start_at": plan["start_at"],
         "deadline_at": plan["deadline_at"],
@@ -3513,10 +3756,91 @@ def read_jsonl(path: Path) -> List[Dict[str, Any]]:
 
 def resource_summary(samples: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     rss = [float(row.get("rss_kb") or 0) for row in samples if row.get("rss_kb")]
+    phys = [
+        float(row.get("phys_footprint_bytes"))
+        for row in samples
+        if row.get("phys_footprint_bytes") is not None
+    ]
     cpu = [float(row.get("cpu_pct") or 0) for row in samples if row.get("cpu_pct") is not None]
     db_bytes = [float(row.get("db_bytes") or 0) for row in samples if row.get("db_bytes") is not None]
     live_bytes = [float(row.get("live_root_bytes") or 0) for row in samples if row.get("live_root_bytes") is not None]
     processes = [int(row.get("processes") or 0) for row in samples]
+
+    # The frozen threshold is on the summed RSS. The sum alone cannot tell a
+    # single leaking process from a set of healthy ones, nor from a process
+    # count that merely changed, so attribute every PID's own growth. This is
+    # evidence for the failure, not a second pass/fail rule: the gate above
+    # stays exactly as frozen.
+    first_index: Dict[int, int] = {}
+    last_index: Dict[int, int] = {}
+    first_ts: Dict[int, Any] = {}
+    last_ts: Dict[int, Any] = {}
+    first_rss: Dict[int, float] = {}
+    last_rss: Dict[int, float] = {}
+    min_rss: Dict[int, float] = {}
+    max_rss: Dict[int, float] = {}
+    phys_first: Dict[int, float] = {}
+    phys_last: Dict[int, float] = {}
+    phys_min: Dict[int, float] = {}
+    phys_max: Dict[int, float] = {}
+    os_started: Dict[int, Any] = {}
+    kinds: Dict[int, Any] = {}
+    seen_count: Dict[int, int] = {}
+    for index, sample in enumerate(samples):
+        for row in sample.get("process_rss") or []:
+            pid = row.get("pid")
+            if pid is None:
+                continue
+            pid = int(pid)
+            value = float(row.get("rss_kb") or 0)
+            first_index.setdefault(pid, index)
+            first_ts.setdefault(pid, sample.get("ts"))
+            last_index[pid] = index
+            last_ts[pid] = sample.get("ts")
+            first_rss.setdefault(pid, value)
+            last_rss[pid] = value
+            min_rss[pid] = min(min_rss.get(pid, value), value)
+            max_rss[pid] = max(max_rss.get(pid, value), value)
+            physical = row.get("phys_footprint_bytes")
+            if physical is not None:
+                physical = float(physical)
+                phys_first.setdefault(pid, physical)
+                phys_last[pid] = physical
+                phys_min[pid] = min(phys_min.get(pid, physical), physical)
+                phys_max[pid] = max(phys_max.get(pid, physical), physical)
+            os_started.setdefault(pid, row.get("started_at"))
+            kinds.setdefault(pid, row.get("kind"))
+            seen_count[pid] = seen_count.get(pid, 0) + 1
+    per_process = [
+        {
+            "pid": pid,
+            "kind": kinds.get(pid),
+            "samples": seen_count[pid],
+            "os_started_at": os_started.get(pid),
+            "first_seen_at": first_ts[pid],
+            "last_seen_at": last_ts[pid],
+            "first_seen_index": first_index[pid],
+            "last_seen_index": last_index[pid],
+            "first_rss_kb": first_rss[pid],
+            "last_rss_kb": last_rss[pid],
+            "min_rss_kb": min_rss[pid],
+            "max_rss_kb": max_rss[pid],
+            "growth_kb": max_rss[pid] - min_rss[pid],
+            "phys_first_bytes": phys_first.get(pid),
+            "phys_last_bytes": phys_last.get(pid),
+            "phys_min_bytes": phys_min.get(pid),
+            "phys_max_bytes": phys_max.get(pid),
+            "phys_growth_bytes": (
+                phys_max[pid] - phys_min[pid] if pid in phys_max and pid in phys_min else None
+            ),
+            "alive_at_end": last_index[pid] == len(samples) - 1,
+        }
+        for pid in first_index
+    ]
+    per_process.sort(key=lambda row: (-row["growth_kb"], str(row["kind"] or ""), row["pid"]))
+    started = sorted(pid for pid in first_index if first_index[pid] > 0)
+    ended = sorted(pid for pid in last_index if last_index[pid] < len(samples) - 1)
+    largest = next((row for row in per_process if row["growth_kb"] > 0), None)
 
     def growth(values: List[float]) -> float:
         if len(values) < 2:
@@ -3527,11 +3851,22 @@ def resource_summary(samples: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "sample_count": len(samples),
         "rss_kb": latency_stats(rss),
         "rss_kb_growth": growth(rss),
+        "phys_footprint_bytes": latency_stats(phys),
+        "phys_footprint_bytes_growth": growth(phys),
+        "phys_footprint_available": bool(phys),
+        "phys_footprint_missing_samples": max(0, len(samples) - len(phys)),
         "cpu_pct": latency_stats(cpu),
         "db_bytes_growth": growth(db_bytes),
         "live_root_bytes_growth": growth(live_bytes),
         "process_count_max": max(processes) if processes else 0,
         "process_count_last": processes[-1] if processes else 0,
+        "process_count_first": processes[0] if processes else 0,
+        "processes": per_process,
+        "processes_started": started,
+        "processes_ended": ended,
+        "new_process_rss_kb": sum(first_rss[pid] for pid in started),
+        "ended_process_rss_kb": sum(last_rss[pid] for pid in ended),
+        "largest_process_growth": largest,
     }
 
 
@@ -3840,6 +4175,11 @@ def cleanup_run(
     recorder: Recorder,
 ) -> Dict[str, Any]:
     baseline_labels = set(plan.get("baseline_labels") or [])
+    # A baseline label can disappear before this run's cleanup starts (another
+    # lab or the user's own maintenance). That is not this run's residue; only
+    # a label that was present at cleanup start and is gone after it can be
+    # attributed to this cleanup.
+    labels_before_cleanup = set(launchd_labels())
     own_labels = {lane.get("label") or label_for(Path(lane["home"])) for lane in lanes.values()}
     disabled: Dict[str, Any] = {}
     for lane in lanes.values():
@@ -3890,7 +4230,8 @@ def cleanup_run(
     leftover_labels = sorted(labels_now & own_labels)
     leftover_plists = [str(plist_for(label)) for label in own_labels if plist_for(label).is_file()]
     unexpected_labels = sorted(labels_now - baseline_labels - own_labels)
-    missing_user_labels = sorted(baseline_labels - labels_now)
+    missing_user_labels = sorted(labels_before_cleanup - labels_now)
+    missing_baseline_before_cleanup = sorted(baseline_labels - labels_before_cleanup)
     archives = {name: archive_lane_data(paths, lane) for name, lane in lanes.items()}
     credentials_removed: List[str] = []
     for lane in lanes.values():
@@ -3905,6 +4246,7 @@ def cleanup_run(
         "plists": leftover_plists,
         "unexpected_user_labels": unexpected_labels,
         "missing_user_labels": missing_user_labels,
+        "missing_baseline_before_cleanup": missing_baseline_before_cleanup,
         "credentials_removed": credentials_removed,
         "disabled": disabled,
         "archives": archives,
@@ -3946,6 +4288,11 @@ def render_report(report: Dict[str, Any]) -> str:
     lines.append("| binary | `%s` |" % binary.get("path"))
     lines.append("| binary sha256 | `%s` |" % binary.get("sha256"))
     lines.append("| binary version | `%s` |" % binary.get("version"))
+    runner = report.get("runner") or {}
+    lines.append("| runner | `%s` |" % runner.get("path"))
+    lines.append("| runner sha256 | `%s` |" % runner.get("sha256"))
+    source = report.get("source_tree") or {}
+    lines.append("| source tree | `%s` (HEAD %s, clean %s) |" % (source.get("path"), source.get("head"), source.get("clean")))
     lines.append("| model | `%s` |" % report.get("model"))
     lines.append("")
     lines.append("## Matrix")
@@ -4014,10 +4361,46 @@ def render_report(report: Dict[str, Any]) -> str:
     lines.append("| --- | --- |")
     lines.append("| samples | %s |" % resources.get("sample_count"))
     lines.append("| RSS max KB | %s |" % (resources.get("rss_kb") or {}).get("max"))
+    lines.append("| RSS sum growth KB (frozen gate) | %s |" % resources.get("rss_kb_growth"))
+    lines.append("| physical footprint max bytes | %s |" % (resources.get("phys_footprint_bytes") or {}).get("max"))
+    lines.append("| physical footprint sum growth bytes | %s |" % resources.get("phys_footprint_bytes_growth"))
+    lines.append("| physical footprint samples available | %s (missing %s) |" % (resources.get("phys_footprint_available"), resources.get("phys_footprint_missing_samples")))
     lines.append("| CPU P95 %% | %s |" % (resources.get("cpu_pct") or {}).get("p95"))
     lines.append("| process max | %s |" % resources.get("process_count_max"))
+    lines.append("| processes started / ended | %s / %s |" % (len(resources.get("processes_started") or []), len(resources.get("processes_ended") or [])))
+    lines.append("| new / ended process RSS KB | %s / %s |" % (resources.get("new_process_rss_kb"), resources.get("ended_process_rss_kb")))
     lines.append("| DB growth bytes | %s |" % resources.get("db_bytes_growth"))
     lines.append("| live root growth bytes | %s |" % resources.get("live_root_bytes_growth"))
+    lines.append("")
+    per_process = resources.get("processes") or []
+    if per_process:
+        lines.append("Per-process RSS attribution (summed RSS includes shared pages, so a sum is not private memory):")
+        lines.append("")
+        lines.append("| PID | kind | first -> last KB | min -> max KB | growth KB | phys growth bytes | samples | alive at end |")
+        lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
+        for row in per_process[:10]:
+            lines.append(
+                "| %s | %s | %s -> %s | %s -> %s | %s | %s | %s | %s |"
+                % (
+                    row.get("pid"),
+                    row.get("kind"),
+                    row.get("first_rss_kb"),
+                    row.get("last_rss_kb"),
+                    row.get("min_rss_kb"),
+                    row.get("max_rss_kb"),
+                    row.get("growth_kb"),
+                    row.get("phys_growth_bytes"),
+                    row.get("samples"),
+                    row.get("alive_at_end"),
+                )
+            )
+        largest = resources.get("largest_process_growth")
+        if largest:
+            lines.append("")
+            lines.append(
+                "Largest single-process growth: pid %s (%s) %s KB; compare with the frozen sum growth %s KB."
+                % (largest.get("pid"), largest.get("kind"), largest.get("growth_kb"), resources.get("rss_kb_growth"))
+            )
     lines.append("")
     usage = report.get("usage") or {}
     lines.append("## Usage")
@@ -4441,6 +4824,13 @@ def create_run(
     live_root = choose_live_root()
     start_at = dt.datetime.now(dt.timezone.utc)
     plan = make_plan(mode, identity, commit, start_at, duration_secs, model, budget, live_root)
+    runner_path = Path(__file__).resolve()
+    plan["runner"] = {
+        "path": str(runner_path),
+        "sha256": sha256_file(runner_path),
+        "version": VERSION,
+        "python": sys.version.split()[0],
+    }
     plan["baseline_labels"] = report["launchd_labels"]
     plan["host"] = report["host"]
     plan["preflight"] = {
