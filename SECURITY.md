@@ -341,6 +341,18 @@ resource boundary the call was admitted under.
   express a loopback-only boundary deny all network rather than widening to the
   Internet.
 
+## Credential custody
+
+A credential the user hands to CodeLeveler is captured only by an explicit
+decision (the TUI review or `/secret`). The model receives an opaque
+`[secret:sec_…]` reference, never the value. The host writes it only to a
+dotenv file the user's own message named, within the workspace, through the
+ordinary atomic editor; an out-of-scope target or field is refused in every
+permission mode, including Full. The value stays out of the provider request
+and the ordinary session stores. The authorized `.env` is plaintext on disk by
+design. The complete contract, channel matrix and honest limits are in
+[docs/SECRET-BROKER.md](docs/SECRET-BROKER.md).
+
 ## Known trade-offs (by design)
 
 These are deliberate boundaries, documented so they are not mistaken for

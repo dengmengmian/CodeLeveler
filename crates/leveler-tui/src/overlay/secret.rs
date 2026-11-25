@@ -46,8 +46,21 @@ pub struct SecretReviewOverlay {
 impl SecretReviewOverlay {
     /// Open the review for `draft`.
     pub fn new(draft: String, findings: Vec<SecretFinding>) -> Self {
-        let use_targets = leveler_core::dotenv_targets_in(&draft);
-        let use_fields = leveler_core::dotenv_fields_in(&draft);
+        // The secret values themselves are not instructions. Blank their
+        // spans before extracting the use scope, exactly as the runtime does
+        // by replacing them with placeholders; a value that happens to
+        // contain `.env` or `NAME=` must not appear as a target or field.
+        let mut scope_text = draft.clone();
+        for finding in findings.iter().rev() {
+            if finding.start < finding.end && finding.end <= scope_text.len() {
+                scope_text.replace_range(
+                    finding.start..finding.end,
+                    &" ".repeat(finding.end - finding.start),
+                );
+            }
+        }
+        let use_targets = leveler_core::dotenv_targets_in(&scope_text);
+        let use_fields = leveler_core::dotenv_fields_in(&scope_text);
         Self {
             draft,
             findings,
@@ -412,6 +425,19 @@ mod tests {
         assert!(rendered.contains("Write target: .env"), "{rendered}");
         assert!(rendered.contains("Field: DEMO_API_KEY"), "{rendered}");
         assert!(!rendered.contains("abc123def"), "{rendered}");
+    }
+
+    #[test]
+    fn a_secret_value_cannot_declare_the_use_scope() {
+        // The value itself happens to contain a path-shaped token. It is not
+        // an instruction: the runtime replaces the value with a placeholder
+        // before deriving the scope, and the review must show the same scope.
+        let draft = "DEEPSEEK_API_KEY=sk-abc123def.env.production".to_string();
+        let findings = leveler_core::detect_secrets(&draft);
+        assert!(!findings.is_empty());
+        let ov = SecretReviewOverlay::new(draft, findings);
+        assert!(ov.use_targets.is_empty(), "{:?}", ov.use_targets);
+        assert_eq!(ov.use_fields, vec!["DEEPSEEK_API_KEY".to_string()]);
     }
 
     #[test]

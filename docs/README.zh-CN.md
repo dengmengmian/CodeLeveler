@@ -23,6 +23,7 @@
 
 ## 契约与项目资料
 
+- [凭据接管契约](SECRET-BROKER.md)
 - [权限、隐私与安全报告](../SECURITY.md)
 - [发布说明](RELEASE.zh-CN.md) · [完整版本历史](../CHANGELOG.zh-CN.md) · [发布下载](https://github.com/dengmengmian/CodeLeveler/releases)
 - [贡献指南](../CONTRIBUTING.zh-CN.md) · [开发代理规则](../AGENTS.md)
