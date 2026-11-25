@@ -14,6 +14,7 @@ use leveler_model::{ModelRef, ThinkingLevel};
 
 use super::definition_trust::DefinitionTrustDecision;
 use super::media::AttachmentRef;
+use super::secret::{SecretCapture, SecretValue};
 use super::snapshot::MessageId;
 use super::{ApprovalDecision, PermissionProfile};
 
@@ -119,6 +120,61 @@ pub enum ClientCommand {
         content: String,
         #[serde(default)]
         attachments: Vec<AttachmentRef>,
+    },
+    /// Submit a user message that hands one or more credentials to the
+    /// runtime instead of to the model.
+    ///
+    /// Each [`SecretCapture::placeholder`] must appear exactly once in
+    /// `content`. The runtime replaces it with an opaque
+    /// `[secret:sec_…]` token, stores the value in its vault, and only then
+    /// admits the message. This is one command on purpose: capture and
+    /// admission succeed or fail together, so a client can never believe a
+    /// value was protected while the plaintext was sent.
+    ///
+    /// Clients that predate this variant keep using `SubmitMessage`; the
+    /// runtime still refuses a high-confidence credential arriving that way
+    /// unless `plaintext_secret_ack` is set on this variant.
+    SubmitUserInput {
+        session_id: SessionId,
+        content: String,
+        #[serde(default)]
+        attachments: Vec<AttachmentRef>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        secret_captures: Vec<SecretCapture>,
+        /// The person explicitly chose to send a detected credential as
+        /// ordinary visible text. It travels as plaintext, is visible to the
+        /// model and may be stored by the provider. Default false.
+        #[serde(default)]
+        plaintext_secret_ack: bool,
+    },
+    /// [`ClientCommand::SteerCurrentTurn`] with captured credentials.
+    SteerUserInput {
+        session_id: SessionId,
+        content: String,
+        #[serde(default)]
+        secret_captures: Vec<SecretCapture>,
+        /// See [`ClientCommand::SubmitUserInput`].
+        #[serde(default)]
+        plaintext_secret_ack: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<MessageId>,
+    },
+    /// Revoke a capture the person no longer wants the runtime to hold. The
+    /// reference stops resolving immediately; the transcript's dead token is
+    /// harmless.
+    RevokeSecret {
+        session_id: SessionId,
+        secret_ref: String,
+    },
+    /// Hand one credential to the runtime vault and answer with its reference,
+    /// without submitting a message. Used by the explicit "secure paste"
+    /// entry, where the person still wants to type the instruction.
+    CaptureSecret {
+        session_id: SessionId,
+        request_id: CommandId,
+        value: SecretValue,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key_hint: Option<String>,
     },
     /// Steer the turn that is already running: the text is injected at the top
     /// of the next round instead of waiting for the turn to end. This is the
@@ -798,7 +854,11 @@ impl ClientCommand {
             ClientCommand::RequestPromptSuggestion { session_id }
             | ClientCommand::RequestAwaySummary { session_id }
             | ClientCommand::SubmitMessage { session_id, .. }
+            | ClientCommand::SubmitUserInput { session_id, .. }
             | ClientCommand::SteerCurrentTurn { session_id, .. }
+            | ClientCommand::SteerUserInput { session_id, .. }
+            | ClientCommand::CaptureSecret { session_id, .. }
+            | ClientCommand::RevokeSecret { session_id, .. }
             | ClientCommand::ManageSteer { session_id, .. }
             | ClientCommand::RunGoal { session_id, .. }
             | ClientCommand::ResumeTask { session_id, .. }

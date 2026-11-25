@@ -631,18 +631,29 @@ pub async fn run(
     // Persist (or clear) the composer draft for next launch (spec §24).
     if let Some(path) = state.draft_path() {
         let draft = state.composer.canonical_text();
-        if draft.trim().is_empty() {
+        // A draft the detector calls a high-confidence credential is not
+        // persisted. Losing an unsubmitted draft is recoverable; writing a
+        // plaintext credential to `~/.leveler` is not.
+        let unsafe_draft = leveler_core::detect_secrets(&draft)
+            .iter()
+            .any(|finding| finding.level == leveler_core::SecretLevel::HighConfidence);
+        if draft.trim().is_empty() || unsafe_draft {
             let _ = std::fs::remove_file(path);
         } else if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
             let _ = std::fs::write(path, draft);
         }
     }
-    // Persist the input history (last HISTORY_CAP entries) for ↑ recall.
+    // Persist the input history (last HISTORY_CAP entries) for ↑ recall. The
+    // same rule applies: a high-confidence value is masked, so recall cannot
+    // replay a credential from disk.
     if let Some(path) = state.history_path() {
         let history = state.composer.history();
-        let tail = &history[history.len().saturating_sub(HISTORY_CAP)..];
-        if let (Ok(json), Some(parent)) = (serde_json::to_string(tail), path.parent()) {
+        let tail: Vec<String> = history[history.len().saturating_sub(HISTORY_CAP)..]
+            .iter()
+            .map(|entry| mask_high_confidence(entry))
+            .collect();
+        if let (Ok(json), Some(parent)) = (serde_json::to_string(&tail), path.parent()) {
             let _ = std::fs::create_dir_all(parent);
             let _ = std::fs::write(path, json);
         }
@@ -1773,6 +1784,23 @@ fn spawn_termination_forwarder(tx: mpsc::UnboundedSender<()>) {
     let _ = tx;
 }
 
+/// Replace every high-confidence value in a history entry with its mask. The
+/// entry stays recognizable without becoming a credential store.
+fn mask_high_confidence(text: &str) -> String {
+    let findings = leveler_core::detect_secrets(text);
+    let mut out = text.to_string();
+    for finding in findings.iter().rev() {
+        if finding.level != leveler_core::SecretLevel::HighConfidence {
+            continue;
+        }
+        out.replace_range(
+            finding.start..finding.end,
+            &leveler_core::masked_secret(finding.value(text)),
+        );
+    }
+    out
+}
+
 async fn maybe_coalesce_text_input(
     first: Action,
     state: &AppState,
@@ -2558,5 +2586,22 @@ mod tests {
             s.notification.as_ref().map(|n| n.message.as_str()),
             Some("boom")
         );
+    }
+}
+
+#[cfg(test)]
+mod secret_persistence_tests {
+    use super::mask_high_confidence;
+
+    #[test]
+    fn history_entries_never_persist_a_high_confidence_value() {
+        let raw = "DEEPSEEK_API_KEY=sk-CANARY-SECRET-DO-NOT-EXPOSE-001";
+        let masked = mask_high_confidence(raw);
+        assert!(!masked.contains("sk-CANARY"), "{masked}");
+        assert!(masked.contains("DEEPSEEK_API_KEY"), "{masked}");
+        assert!(masked.contains("••••"), "{masked}");
+        // Ordinary text is byte-identical.
+        let ordinary = "let password = config.password;";
+        assert_eq!(mask_high_confidence(ordinary), ordinary);
     }
 }

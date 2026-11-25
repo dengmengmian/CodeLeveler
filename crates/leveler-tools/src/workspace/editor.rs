@@ -124,6 +124,37 @@ impl WorkspaceEditor {
         replacement: &str,
         allow_redacted_literal: bool,
     ) -> Result<Commit, ToolError> {
+        Self::replace_impl(
+            context,
+            resolved,
+            expected,
+            replacement,
+            allow_redacted_literal,
+            false,
+        )
+        .await
+    }
+
+    /// As [`Self::replace`], for a destination the host's secret broker owns.
+    /// The credential-file name denylist does not apply; every other write
+    /// protection (scope, symlink identity, trust stores) still does.
+    pub(crate) async fn replace_secret(
+        context: &ToolContext,
+        resolved: &std::path::Path,
+        expected: &str,
+        replacement: &str,
+    ) -> Result<Commit, ToolError> {
+        Self::replace_impl(context, resolved, expected, replacement, false, true).await
+    }
+
+    async fn replace_impl(
+        context: &ToolContext,
+        resolved: &std::path::Path,
+        expected: &str,
+        replacement: &str,
+        allow_redacted_literal: bool,
+        secret: bool,
+    ) -> Result<Commit, ToolError> {
         if let Err(message) =
             crate::workspace::ensure_materializable(replacement, allow_redacted_literal)
         {
@@ -141,7 +172,12 @@ impl WorkspaceEditor {
         .map_err(|e| ToolError::Io(format!("join file-lock task: {e}")))?
         .map_err(|e| ToolError::Io(format!("lock {}: {e}", lock_path.display())))?;
 
-        if let Err(e) = workspace.revalidate_write_path(resolved, &context.write_scope()) {
+        let revalidated = if secret {
+            workspace.revalidate_secret_write_path(resolved, &context.write_scope())
+        } else {
+            workspace.revalidate_write_path(resolved, &context.write_scope())
+        };
+        if let Err(e) = revalidated {
             drop(lock);
             return Ok(Commit::Rejected(e.to_string()));
         }
@@ -313,6 +349,35 @@ impl WorkspaceEditor {
         permissions: Option<std::fs::Permissions>,
         allow_redacted_literal: bool,
     ) -> Result<Commit, ToolError> {
+        Self::create_impl(
+            context,
+            resolved,
+            content,
+            permissions,
+            allow_redacted_literal,
+            false,
+        )
+        .await
+    }
+
+    /// As [`Self::create`], for a destination the host's secret broker owns.
+    pub(crate) async fn create_secret(
+        context: &ToolContext,
+        resolved: &std::path::Path,
+        content: &str,
+        permissions: Option<std::fs::Permissions>,
+    ) -> Result<Commit, ToolError> {
+        Self::create_impl(context, resolved, content, permissions, false, true).await
+    }
+
+    async fn create_impl(
+        context: &ToolContext,
+        resolved: &std::path::Path,
+        content: &str,
+        permissions: Option<std::fs::Permissions>,
+        allow_redacted_literal: bool,
+        secret: bool,
+    ) -> Result<Commit, ToolError> {
         if let Err(message) =
             crate::workspace::ensure_materializable(content, allow_redacted_literal)
         {
@@ -336,7 +401,12 @@ impl WorkspaceEditor {
         .map_err(|e| ToolError::Io(format!("join file-lock task: {e}")))?
         .map_err(|e| ToolError::Io(format!("lock {}: {e}", lock_path.display())))?;
 
-        if let Err(e) = workspace.revalidate_write_path(resolved, &context.write_scope()) {
+        let revalidated = if secret {
+            workspace.revalidate_secret_write_path(resolved, &context.write_scope())
+        } else {
+            workspace.revalidate_write_path(resolved, &context.write_scope())
+        };
+        if let Err(e) = revalidated {
             drop(lock);
             return Ok(Commit::Rejected(e.to_string()));
         }

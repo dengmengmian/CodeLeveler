@@ -2498,6 +2498,7 @@ impl InProcessRuntimeClient {
         // The session's cached prompt index and activity outlive the turn that
         // produced them; a deleted session must not keep either in memory.
         self.app.memory().forget_session(session_id.as_str());
+        self.app.secret_vault().revoke_session(session_id.as_str());
     }
 
     /// Drop session streams nobody is watching once the cache is over its
@@ -4302,6 +4303,88 @@ impl InProcessRuntimeClient {
     /// notification. Every path that starts a main turn goes through here so
     /// the sequence cannot drift between commands. This client notification is
     /// not a persistence witness; daemon ACKs wait on the turn record instead.
+    /// Take custody of every value a client captured and replace its
+    /// placeholder with the opaque reference. Refuses a message that still
+    /// carries an unacknowledged high-confidence credential.
+    fn prepare_secrets(
+        &self,
+        session_id: &SessionId,
+        content: &str,
+        captures: &[leveler_client_protocol::secret::SecretCapture],
+        plaintext_ack: bool,
+    ) -> Result<String, ClientError> {
+        crate::secret_input::prepare_secret_input(
+            self.app.secret_vault().as_ref(),
+            session_id,
+            content,
+            captures,
+            plaintext_ack,
+        )
+    }
+
+    /// Revoke one capture by reference. The vault is the authority; a forged
+    /// or foreign reference is simply "not found".
+    async fn handle_revoke_secret(
+        &self,
+        session_id: SessionId,
+        secret_ref: String,
+    ) -> Result<(), ClientError> {
+        let revoked =
+            leveler_execution::secret_vault::SecretRef::parse(&secret_ref).is_ok_and(|reference| {
+                self.app
+                    .secret_vault()
+                    .revoke(session_id.as_str(), &reference)
+            });
+        let _ = self
+            .events_for(&session_id)
+            .send(RuntimeEvent::Notification {
+                level: if revoked {
+                    leveler_client_protocol::NotificationLevel::Info
+                } else {
+                    leveler_client_protocol::NotificationLevel::Warning
+                },
+                message: if revoked {
+                    "已撤销该凭据；后续使用会被拒绝".to_string()
+                } else {
+                    "没有可撤销的凭据（可能已过期或不属于本会话）".to_string()
+                },
+            });
+        Ok(())
+    }
+
+    /// Hand one captured value to the runtime vault without submitting a
+    /// message. The answer is an event, never a return value: a transport ACK
+    /// only says the command arrived.
+    async fn handle_capture_secret(
+        &self,
+        session_id: SessionId,
+        request_id: CommandId,
+        value: leveler_client_protocol::secret::SecretValue,
+        key_hint: Option<String>,
+    ) -> Result<(), ClientError> {
+        let vault = self.app.secret_vault();
+        let event = match vault.capture(
+            session_id.as_str(),
+            value.expose().to_string(),
+            key_hint.clone(),
+        ) {
+            Ok(reference) => RuntimeEvent::SecretCaptured {
+                session_id: session_id.clone(),
+                request_id,
+                secret_ref: reference.as_str().to_string(),
+                masked: leveler_core::masked_secret(value.expose()),
+                key_hint,
+            },
+            Err(error) => RuntimeEvent::SecretCaptureFailed {
+                session_id: session_id.clone(),
+                request_id,
+                error: error.to_string(),
+            },
+        };
+        let _ = self.events_for(&session_id).send(event);
+        Ok(())
+    }
+
     async fn stage_turn(
         &self,
         session_id: &SessionId,
@@ -5544,7 +5627,15 @@ impl InProcessRuntimeClient {
         session_id: SessionId,
         content: String,
         require_new_turn: bool,
+        secret_captures: Vec<leveler_client_protocol::secret::SecretCapture>,
+        plaintext_secret_ack: bool,
     ) -> Result<(), ClientError> {
+        let content = self.prepare_secrets(
+            &session_id,
+            &content,
+            &secret_captures,
+            plaintext_secret_ack,
+        )?;
         // A client that sends the explicit command while a turn already runs
         // must get the same upgrade as a text steer. Refusing with "session is
         // busy" would make Goal entry depend on which command shape a client
@@ -5560,7 +5651,9 @@ impl InProcessRuntimeClient {
                         .into(),
                 ));
             }
-            return self.steer_into_goal(session_id, content).await;
+            return self
+                .steer_into_goal(session_id, content, Vec::new(), plaintext_secret_ack)
+                .await;
         }
         let config = self.runtime_config(&session_id).await?;
         // A Goal turn is an agent turn. Refuse before the declaration is
@@ -5600,7 +5693,11 @@ impl InProcessRuntimeClient {
         &self,
         session_id: SessionId,
         task: String,
+        secret_captures: Vec<leveler_client_protocol::secret::SecretCapture>,
+        plaintext_secret_ack: bool,
     ) -> Result<(), ClientError> {
+        let task =
+            self.prepare_secrets(&session_id, &task, &secret_captures, plaintext_secret_ack)?;
         // The durable form and the in-memory copy must be byte-identical:
         // the executor consumes the durable declaration by compare-and-swap
         // on this text.
@@ -5681,6 +5778,8 @@ impl InProcessRuntimeClient {
         attachments: Vec<AttachmentRef>,
         _origin: Option<&CommandId>,
         seed_input_id: Option<String>,
+        secret_captures: Vec<leveler_client_protocol::secret::SecretCapture>,
+        plaintext_secret_ack: bool,
     ) -> Result<(), ClientError> {
         // A promoted append is already the user's instruction for this turn.
         // Re-parsing it as `/goal` or a continuation would turn the text they
@@ -5697,9 +5796,19 @@ impl InProcessRuntimeClient {
             use leveler_client_protocol::GoalCommand;
             return match command {
                 GoalCommand::Run(task) if self.active.is_running(&session_id) => {
-                    self.steer_into_goal(session_id, task).await
+                    self.steer_into_goal(session_id, task, secret_captures, plaintext_secret_ack)
+                        .await
                 }
-                GoalCommand::Run(task) => self.run_goal_turn(session_id, task, false).await,
+                GoalCommand::Run(task) => {
+                    self.run_goal_turn(
+                        session_id,
+                        task,
+                        false,
+                        secret_captures,
+                        plaintext_secret_ack,
+                    )
+                    .await
+                }
                 GoalCommand::Clear => self.clear_goal_axis(session_id).await,
                 GoalCommand::Status => self.goal_status(session_id).await,
                 GoalCommand::Usage => Err(ClientError::Runtime(
@@ -5707,6 +5816,12 @@ impl InProcessRuntimeClient {
                 )),
             };
         }
+        let content = self.prepare_secrets(
+            &session_id,
+            &content,
+            &secret_captures,
+            plaintext_secret_ack,
+        )?;
         let config = self.runtime_config(&session_id).await?;
         // Every route below runs a model. A session that exists only for
         // deterministic host commands says so here, before it stages a turn.
@@ -5783,6 +5898,7 @@ impl InProcessRuntimeClient {
         content: String,
         origin: Option<&CommandId>,
     ) -> Result<(), ClientError> {
+        let content = self.prepare_secrets(&session_id, &content, &[], false)?;
         // Continuation intent is not enough: the runtime must also own a
         // resumable task. An explicitly cancelled task must never be silently
         // reopened, so it is told apart from the ordinary "nothing to resume".
@@ -5800,7 +5916,15 @@ impl InProcessRuntimeClient {
             ContinuationState::NotResumable => {
                 // Nothing to resume: the same text is a normal message.
                 return self
-                    .handle_submit_message(session_id, content, Vec::new(), origin, None)
+                    .handle_submit_message(
+                        session_id,
+                        content,
+                        Vec::new(),
+                        origin,
+                        None,
+                        Vec::new(),
+                        false,
+                    )
                     .await;
             }
         }
@@ -7308,8 +7432,16 @@ impl InProcessRuntimeClient {
                 // continues an existing goal is the model's reading, declared
                 // through the structured intent tool, not a client-side phrase
                 // match.
-                self.handle_submit_message(session_id, content, attachments, Some(origin), None)
-                    .await
+                self.handle_submit_message(
+                    session_id,
+                    content,
+                    attachments,
+                    Some(origin),
+                    None,
+                    Vec::new(),
+                    false,
+                )
+                .await
             }
             ClientCommand::ResumeTask {
                 session_id,
@@ -7330,6 +7462,231 @@ impl InProcessRuntimeClient {
             }
 
             command => self.send(command).await,
+        }
+    }
+
+    /// Steer the running turn, taking custody of any captured credentials
+    /// before any journal row exists.
+    async fn handle_steer(
+        &self,
+        session_id: SessionId,
+        content: String,
+        message_id: Option<MessageId>,
+        secret_captures: Vec<leveler_client_protocol::secret::SecretCapture>,
+        plaintext_secret_ack: bool,
+    ) -> Result<(), ClientError> {
+        let content = self.prepare_secrets(
+            &session_id,
+            &content,
+            &secret_captures,
+            plaintext_secret_ack,
+        )?;
+        // `/goal` is control input with its own durable declaration;
+        // it is not a plain append and never enters the input journal.
+        if let Some(command) = leveler_client_protocol::parse_goal_command(&content) {
+            use leveler_client_protocol::GoalCommand;
+            if self.active.is_running(&session_id) {
+                return match command {
+                    GoalCommand::Run(task) => {
+                        self.steer_into_goal(session_id, task, Vec::new(), plaintext_secret_ack)
+                            .await
+                    }
+                    GoalCommand::Clear => self.clear_goal_axis(session_id).await,
+                    GoalCommand::Status => self.goal_status(session_id).await,
+                    GoalCommand::Usage => Err(ClientError::Runtime(
+                        "用法: /goal <任务>（/goal clear 返回 Chat，/goal status 查看模式）".into(),
+                    )),
+                };
+            }
+            return Box::pin(self.handle_submit_message(
+                session_id,
+                content,
+                Vec::new(),
+                None,
+                None,
+                Vec::new(),
+                plaintext_secret_ack,
+            ))
+            .await;
+        }
+        let content = content.trim().to_string();
+        if content.is_empty() || content.len() > 256 * 1024 {
+            return Err(ClientError::Runtime(
+                "steer input must contain between 1 byte and 256 KiB".into(),
+            ));
+        }
+        let id = message_id
+            .map(|id| id.as_str().to_string())
+            .unwrap_or_else(leveler_core::new_uuid_string);
+        let publisher = self.events_for(&session_id);
+        let (admission, mut terminal_events) = self
+            .active
+            .observe_steering(&session_id, || publisher.subscribe())
+            .map_or((None, None), |(gate, events)| (Some(gate), Some(events)));
+        // A steer is appended as plain text and never rebuilds the
+        // turn's skill injection. Decide that refusal before taking
+        // the admission lock: it reads the skill registry, and holding
+        // the lock across that read would change when the executor can
+        // collect pending input at a round boundary.
+        let mid_turn_skill_refusal = admission
+            .as_ref()
+            .and_then(|_| self.app.mid_turn_skill_refusal(&content));
+        let admission_guard = if let Some(gate) = &admission {
+            let guard = gate.admission_closed.lock().await;
+            if *guard {
+                // Admission already closed. No journal row has been
+                // written for this text. A confirmed normal terminal
+                // lets it start fresh, while a failure or cancellation
+                // leaves it with the caller.
+                drop(guard);
+                let mut terminal_events = terminal_events
+                    .take()
+                    .expect("the active admission has its own terminal subscription");
+                let completed = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                    while let Ok(event) = terminal_events.recv().await {
+                        match event {
+                            RuntimeEvent::TurnAnswered
+                            | RuntimeEvent::TurnCompleted
+                            | RuntimeEvent::TurnCompletedPartiallyUnverified { .. }
+                            | RuntimeEvent::TurnCompletedWithWarnings { .. } => {
+                                return true;
+                            }
+                            RuntimeEvent::TurnCancelled
+                            | RuntimeEvent::TaskCancelled
+                            | RuntimeEvent::TurnFailed { .. }
+                            | RuntimeEvent::TurnTruncated { .. }
+                            | RuntimeEvent::TurnIncomplete { .. }
+                            | RuntimeEvent::TurnBlocked { .. }
+                            | RuntimeEvent::TurnPaused { .. } => return false,
+                            _ => {}
+                        }
+                    }
+                    false
+                })
+                .await
+                .unwrap_or(false);
+                if !completed {
+                    return Err(ClientError::SteerConflict(
+                        leveler_client_protocol::SteerConflict::Unavailable,
+                    ));
+                }
+                None
+            } else if self
+                .active
+                .steering(&session_id)
+                .is_some_and(|live| Arc::ptr_eq(gate, &live))
+            {
+                Some(guard)
+            } else {
+                return Err(ClientError::SteerConflict(
+                    leveler_client_protocol::SteerConflict::Unavailable,
+                ));
+            }
+        } else {
+            None
+        };
+        // Durable before the ACK. A retry with the same id finds the
+        // same row instead of creating a second instruction.
+        let window = admission
+            .as_ref()
+            .filter(|_| admission_guard.is_some())
+            .map(|active| {
+                active.window.lock().unwrap().clone().ok_or_else(|| {
+                    ClientError::Runtime("当前任务尚未进入可追加指令的执行窗口".into())
+                })
+            })
+            .transpose()?;
+        // A steer is appended as plain text and never rebuilds the
+        // turn's skill injection. Refuse a `/name` or `$name` skill
+        // request here, before any journal row exists, so no client
+        // can turn it into a normal instruction by accident.
+        // Refuse only once this text is confirmed to append to a
+        // running turn: when admission closed, the fallthrough below
+        // starts a fresh turn, which loads skills normally.
+        if admission_guard.is_some()
+            && let Some(reason) = mid_turn_skill_refusal
+        {
+            return Err(ClientError::Runtime(reason));
+        }
+        let row = self
+            .admit_input(&session_id, &id, &content, window.as_ref())
+            .await?;
+        let text = row.content.clone();
+        match row.state {
+            SessionInputState::Consumed => {
+                self.emit_input_admitted(&session_id, &id, &text);
+                self.emit_input_settled(&session_id, &id, UiInputState::Delivered, "", row.ordinal);
+                return Ok(());
+            }
+            SessionInputState::Cancelled => {
+                self.emit_input_admitted(&session_id, &id, &text);
+                self.emit_input_settled(
+                    &session_id,
+                    &id,
+                    UiInputState::Cancelled,
+                    &row.reason,
+                    None,
+                );
+                return Ok(());
+            }
+            SessionInputState::Pending => {}
+        }
+        // Announce the durable row before making it available to an
+        // executor. Another subscribed client has no optimistic row;
+        // it must see admission before a fast round settles the input.
+        self.emit_input_admitted(&session_id, &id, &text);
+        if let (Some(active), Some(_guard)) = (&admission, admission_guard) {
+            // Keep the reservation until the durable admission is visible to the drive.
+            // A retry of the submission that STARTED this turn is
+            // already its opening message; queueing it again would
+            // deliver the same row twice.
+            if self.active.seed_input_id(&session_id).as_deref() != Some(id.as_str()) {
+                active
+                    .input_signal
+                    .store(true, std::sync::atomic::Ordering::Release);
+                self.signal_pending_input(&session_id);
+            }
+            return Ok(());
+        }
+        // The turn ended between the client deciding to steer and this
+        // arriving — a real race, because the client's "busy" view lags
+        // the runtime by one event. The row is already durable, so the
+        // text becomes the next turn's opening message instead of a
+        // second, differently-identified submission.
+        match Box::pin(self.handle_submit_message(
+            session_id.clone(),
+            text.clone(),
+            Vec::new(),
+            None,
+            Some(id.clone()),
+            Vec::new(),
+            plaintext_secret_ack,
+        ))
+        .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // No turn was ever durably admitted for it. Settle the
+                // row so a later turn cannot run what the client was
+                // told failed; the client still holds the text.
+                if let Ok(Some(settled)) = self
+                    .cancel_input(
+                        &session_id,
+                        &id,
+                        "the turn could not start, so the input was not admitted",
+                    )
+                    .await
+                {
+                    self.emit_input_settled(
+                        &session_id,
+                        &settled.id,
+                        UiInputState::Cancelled,
+                        &settled.reason,
+                        None,
+                    );
+                }
+                Err(error)
+            }
         }
     }
 }
@@ -7645,9 +8002,48 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             } => {
                 // Same rule as `send_with_origin`: no client-side continuation
                 // classification. Attachments stay on the content path.
-                self.handle_submit_message(session_id, content, attachments, None, None)
+                self.handle_submit_message(
+                    session_id,
+                    content,
+                    attachments,
+                    None,
+                    None,
+                    Vec::new(),
+                    false,
+                )
+                .await
+            }
+            ClientCommand::SubmitUserInput {
+                session_id,
+                content,
+                attachments,
+                secret_captures,
+                plaintext_secret_ack,
+            } => {
+                self.handle_submit_message(
+                    session_id,
+                    content,
+                    attachments,
+                    None,
+                    None,
+                    secret_captures,
+                    plaintext_secret_ack,
+                )
+                .await
+            }
+            ClientCommand::CaptureSecret {
+                session_id,
+                request_id,
+                value,
+                key_hint,
+            } => {
+                self.handle_capture_secret(session_id, request_id, value, key_hint)
                     .await
             }
+            ClientCommand::RevokeSecret {
+                session_id,
+                secret_ref,
+            } => self.handle_revoke_secret(session_id, secret_ref).await,
             ClientCommand::ResumeTask {
                 session_id,
                 content,
@@ -7657,7 +8053,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 content,
                 require_new_turn,
             } => {
-                self.run_goal_turn(session_id, content, require_new_turn)
+                self.run_goal_turn(session_id, content, require_new_turn, Vec::new(), false)
                     .await
             }
             ClientCommand::AddAttachment {
@@ -7788,6 +8184,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 } else {
                     content
                 };
+                let goal = self.prepare_secrets(&session_id, &goal, &[], false)?;
                 // Fail before the declaration is written: a confirmed plan
                 // needs an execution model.
                 let config = self.runtime_config(&session_id).await?;
@@ -7805,216 +8202,25 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 content,
                 message_id,
             } => {
-                // `/goal` is control input with its own durable declaration;
-                // it is not a plain append and never enters the input journal.
-                if let Some(command) = leveler_client_protocol::parse_goal_command(&content) {
-                    use leveler_client_protocol::GoalCommand;
-                    if self.active.is_running(&session_id) {
-                        return match command {
-                            GoalCommand::Run(task) => self.steer_into_goal(session_id, task).await,
-                            GoalCommand::Clear => self.clear_goal_axis(session_id).await,
-                            GoalCommand::Status => self.goal_status(session_id).await,
-                            GoalCommand::Usage => Err(ClientError::Runtime(
-                                "用法: /goal <任务>（/goal clear 返回 Chat，/goal status 查看模式）"
-                                    .into(),
-                            )),
-                        };
-                    }
-                    return Box::pin(self.handle_submit_message(
-                        session_id,
-                        content,
-                        Vec::new(),
-                        None,
-                        None,
-                    ))
-                    .await;
-                }
-                let content = content.trim().to_string();
-                if content.is_empty() || content.len() > 256 * 1024 {
-                    return Err(ClientError::Runtime(
-                        "steer input must contain between 1 byte and 256 KiB".into(),
-                    ));
-                }
-                let id = message_id
-                    .map(|id| id.as_str().to_string())
-                    .unwrap_or_else(leveler_core::new_uuid_string);
-                let publisher = self.events_for(&session_id);
-                let (admission, mut terminal_events) = self
-                    .active
-                    .observe_steering(&session_id, || publisher.subscribe())
-                    .map_or((None, None), |(gate, events)| (Some(gate), Some(events)));
-                // A steer is appended as plain text and never rebuilds the
-                // turn's skill injection. Decide that refusal before taking
-                // the admission lock: it reads the skill registry, and holding
-                // the lock across that read would change when the executor can
-                // collect pending input at a round boundary.
-                let mid_turn_skill_refusal = admission
-                    .as_ref()
-                    .and_then(|_| self.app.mid_turn_skill_refusal(&content));
-                let admission_guard = if let Some(gate) = &admission {
-                    let guard = gate.admission_closed.lock().await;
-                    if *guard {
-                        // Admission already closed. No journal row has been
-                        // written for this text. A confirmed normal terminal
-                        // lets it start fresh, while a failure or cancellation
-                        // leaves it with the caller.
-                        drop(guard);
-                        let mut terminal_events = terminal_events
-                            .take()
-                            .expect("the active admission has its own terminal subscription");
-                        let completed =
-                            tokio::time::timeout(std::time::Duration::from_secs(30), async {
-                                while let Ok(event) = terminal_events.recv().await {
-                                    match event {
-                                        RuntimeEvent::TurnAnswered
-                                        | RuntimeEvent::TurnCompleted
-                                        | RuntimeEvent::TurnCompletedPartiallyUnverified {
-                                            ..
-                                        }
-                                        | RuntimeEvent::TurnCompletedWithWarnings { .. } => {
-                                            return true;
-                                        }
-                                        RuntimeEvent::TurnCancelled
-                                        | RuntimeEvent::TaskCancelled
-                                        | RuntimeEvent::TurnFailed { .. }
-                                        | RuntimeEvent::TurnTruncated { .. }
-                                        | RuntimeEvent::TurnIncomplete { .. }
-                                        | RuntimeEvent::TurnBlocked { .. }
-                                        | RuntimeEvent::TurnPaused { .. } => return false,
-                                        _ => {}
-                                    }
-                                }
-                                false
-                            })
-                            .await
-                            .unwrap_or(false);
-                        if !completed {
-                            return Err(ClientError::SteerConflict(
-                                leveler_client_protocol::SteerConflict::Unavailable,
-                            ));
-                        }
-                        None
-                    } else if self
-                        .active
-                        .steering(&session_id)
-                        .is_some_and(|live| Arc::ptr_eq(gate, &live))
-                    {
-                        Some(guard)
-                    } else {
-                        return Err(ClientError::SteerConflict(
-                            leveler_client_protocol::SteerConflict::Unavailable,
-                        ));
-                    }
-                } else {
-                    None
-                };
-                // Durable before the ACK. A retry with the same id finds the
-                // same row instead of creating a second instruction.
-                let window = admission
-                    .as_ref()
-                    .filter(|_| admission_guard.is_some())
-                    .map(|active| {
-                        active.window.lock().unwrap().clone().ok_or_else(|| {
-                            ClientError::Runtime("当前任务尚未进入可追加指令的执行窗口".into())
-                        })
-                    })
-                    .transpose()?;
-                // A steer is appended as plain text and never rebuilds the
-                // turn's skill injection. Refuse a `/name` or `$name` skill
-                // request here, before any journal row exists, so no client
-                // can turn it into a normal instruction by accident.
-                // Refuse only once this text is confirmed to append to a
-                // running turn: when admission closed, the fallthrough below
-                // starts a fresh turn, which loads skills normally.
-                if admission_guard.is_some()
-                    && let Some(reason) = mid_turn_skill_refusal
-                {
-                    return Err(ClientError::Runtime(reason));
-                }
-                let row = self
-                    .admit_input(&session_id, &id, &content, window.as_ref())
-                    .await?;
-                let text = row.content.clone();
-                match row.state {
-                    SessionInputState::Consumed => {
-                        self.emit_input_admitted(&session_id, &id, &text);
-                        self.emit_input_settled(
-                            &session_id,
-                            &id,
-                            UiInputState::Delivered,
-                            "",
-                            row.ordinal,
-                        );
-                        return Ok(());
-                    }
-                    SessionInputState::Cancelled => {
-                        self.emit_input_admitted(&session_id, &id, &text);
-                        self.emit_input_settled(
-                            &session_id,
-                            &id,
-                            UiInputState::Cancelled,
-                            &row.reason,
-                            None,
-                        );
-                        return Ok(());
-                    }
-                    SessionInputState::Pending => {}
-                }
-                // Announce the durable row before making it available to an
-                // executor. Another subscribed client has no optimistic row;
-                // it must see admission before a fast round settles the input.
-                self.emit_input_admitted(&session_id, &id, &text);
-                if let (Some(active), Some(_guard)) = (&admission, admission_guard) {
-                    // Keep the reservation until the durable admission is visible to the drive.
-                    // A retry of the submission that STARTED this turn is
-                    // already its opening message; queueing it again would
-                    // deliver the same row twice.
-                    if self.active.seed_input_id(&session_id).as_deref() != Some(id.as_str()) {
-                        active
-                            .input_signal
-                            .store(true, std::sync::atomic::Ordering::Release);
-                        self.signal_pending_input(&session_id);
-                    }
-                    return Ok(());
-                }
-                // The turn ended between the client deciding to steer and this
-                // arriving — a real race, because the client's "busy" view lags
-                // the runtime by one event. The row is already durable, so the
-                // text becomes the next turn's opening message instead of a
-                // second, differently-identified submission.
-                match Box::pin(self.handle_submit_message(
-                    session_id.clone(),
-                    text.clone(),
-                    Vec::new(),
-                    None,
-                    Some(id.clone()),
-                ))
+                self.handle_steer(session_id, content, message_id, Vec::new(), false)
+                    .await
+            }
+
+            ClientCommand::SteerUserInput {
+                session_id,
+                content,
+                secret_captures,
+                plaintext_secret_ack,
+                message_id,
+            } => {
+                self.handle_steer(
+                    session_id,
+                    content,
+                    message_id,
+                    secret_captures,
+                    plaintext_secret_ack,
+                )
                 .await
-                {
-                    Ok(()) => Ok(()),
-                    Err(error) => {
-                        // No turn was ever durably admitted for it. Settle the
-                        // row so a later turn cannot run what the client was
-                        // told failed; the client still holds the text.
-                        if let Ok(Some(settled)) = self
-                            .cancel_input(
-                                &session_id,
-                                &id,
-                                "the turn could not start, so the input was not admitted",
-                            )
-                            .await
-                        {
-                            self.emit_input_settled(
-                                &session_id,
-                                &settled.id,
-                                UiInputState::Cancelled,
-                                &settled.reason,
-                                None,
-                            );
-                        }
-                        Err(error)
-                    }
-                }
             }
 
             ClientCommand::ManageSteer { session_id, action } => {

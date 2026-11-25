@@ -65,6 +65,19 @@ Without `timeout_seconds`, a foreground command still running after 15 seconds m
 
 Tool summaries show elapsed time from dispatch to completion where reliable timing is available. Reconnecting restores the recorded timing. Approval dialogs start on **Allow once**. Press Esc to deny.
 
+## Credential custody
+
+When you paste an API key, token or password into chat, CodeLeveler identifies it locally and keeps the plaintext away from the model by default:
+
+- A high-confidence or uncertain value opens a review: **Capture securely and continue** (the default), **Send as plain text**, or **Back to editing**. Esc never sends, and the draft is preserved.
+- For unknown formats or a missed detection, use `/secret`. It opens a masked field; pasted text is never echoed. After capture, the `[secret:sec_…]` reference is inserted into the composer so you can say where it should go.
+- The value goes only into this session's runtime vault. The model receives the reference and calls `secret_apply` so the host can write it to `.env` (or `.env.*`) in the workspace; the model never receives the plaintext from the vault or a tool result (see the next point for the written `.env`).
+- Choosing “Send as plain text” is an explicit risk decision: the model request and the provider will see it.
+- The vault is process-local. After a restart or resume, old references stop resolving and the credential must be provided again. `/secret revoke <sec_…>` immediately revokes one reference in this session.
+- The written `.env` is a real plaintext file. Whether another process can read or send it depends on the current permission mode and sandbox; Full mode offers no isolation guarantee.
+- Clients without a custody lane (for example plain `leveler run` arguments) are refused when they carry a high-confidence credential, instead of sending it silently.
+- Provider API keys are still configured with `leveler login` or `api_key_env`; that mechanism is independent of this feature.
+
 ## Sessions and background work
 
 Use `leveler resume` to continue a session. On macOS and Linux, `leveler serve` also keeps work running in the background. A local background service is not supported on Windows.

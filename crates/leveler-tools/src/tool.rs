@@ -112,6 +112,10 @@ pub struct ExecutionResources {
     /// model round of one turn sends the same bytes and the provider's prefix
     /// cache stays valid across rounds.
     pub memory_index: Option<Arc<str>>,
+    /// Host custody of credentials the user captured in this runtime. `None`
+    /// when no runtime owns a vault (eval, standalone tool tests), in which
+    /// case the broker tools refuse rather than inventing a store.
+    pub secret_vault: Option<Arc<leveler_execution::secret_vault::SecretVault>>,
 }
 
 /// Compare two filesystem names after resolving an existing file or its
@@ -511,6 +515,7 @@ impl ToolContext {
                 command_gate: Arc::new(tokio::sync::Mutex::new(())),
                 memory: None,
                 memory_index: None,
+                secret_vault: None,
             },
             policy: ToolPolicy {
                 permission_profile: SharedPermissionProfile::new(mode),
@@ -860,6 +865,16 @@ impl ToolContext {
     /// Bind this context to a session identity (browser page/ref isolation).
     pub fn with_session_scope(mut self, scope: impl Into<Arc<str>>) -> Self {
         self.session_scope = Some(scope.into());
+        self
+    }
+
+    /// Attach the runtime's credential custody. Broker tools resolve values
+    /// through this handle; without it they refuse.
+    pub fn with_secret_vault(
+        mut self,
+        vault: Arc<leveler_execution::secret_vault::SecretVault>,
+    ) -> Self {
+        self.execution.secret_vault = Some(vault);
         self
     }
 

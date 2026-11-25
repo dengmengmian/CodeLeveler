@@ -183,6 +183,7 @@ infer = "0.16"
 sha2 = "0.10"
 libc = "0.2"
 base64 = "0.22"
+zeroize = "1.8"
 fs2 = "0.4"
 rustix = { version = "1.1", features = ["fs"] }
 cap-std = "4.0.2"

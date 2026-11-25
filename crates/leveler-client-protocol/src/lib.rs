@@ -64,6 +64,8 @@ mod retirement;
 pub mod review;
 /// Structured scheduled-automation management shared by every client.
 pub mod schedule;
+/// Captured-credential wire types shared by every client.
+pub mod secret;
 /// The runtime's effective settings projection shared by every client.
 pub mod settings;
 mod skills;

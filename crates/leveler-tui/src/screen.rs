@@ -431,6 +431,16 @@ pub const SLASH_DEFS: &[SlashDef] = &[
         SlashVisibility::Searchable,
         BusyPolicy::Always,
     ),
+    // The explicit secure-paste entry. It works while a turn runs: capture
+    // only fills the vault and the composer, and the message is sent later by
+    // the ordinary submit path.
+    slash(
+        "/secret",
+        &[],
+        SlashCategory::Input,
+        SlashVisibility::Searchable,
+        BusyPolicy::Always,
+    ),
     // System
     slash(
         "/theme",
@@ -730,6 +740,7 @@ fn slash_copy(name: &str, t: &UiText, brief: bool) -> &'static str {
         "/rename" => s.rename,
         "/memory" => s.memory,
         "/remember" => s.remember,
+        "/secret" => s.secret,
         "/dream" => s.dream,
         "/flush" => s.flush,
         "/resume-claude" => s.resume_claude,
@@ -1307,6 +1318,7 @@ mod surface_tests {
                 "/resume-claude",
                 "/resume-codex",
                 "/attach",
+                "/secret",
                 "/theme",
                 "/help",
                 "/exit",

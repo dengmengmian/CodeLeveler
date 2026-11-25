@@ -1013,7 +1013,12 @@ async fn progressive_initial_surface_inventory() {
     // 20 (was 19): a Goal turn also offers `declare_scope`, the only writer of
     // the structured requirement set the completion gate enforces. Without it
     // the model can read the set but never record what the user asked for.
-    assert_eq!(initial.tools.len(), 20, "pinned initial surface grew");
+    // 22 (was 20): the Secret Broker pair (`secret_apply` / `secret_inspect`)
+    // is part of the FIRST surface. A credential can be pasted into the first
+    // message of a session; hiding the only safe way to use it behind a
+    // capability the model has not enabled yet would leave the model holding
+    // a reference it cannot act on.
+    assert_eq!(initial.tools.len(), 22, "pinned initial surface grew");
     // 7000 (was 6800): the Goal completion contract now carries the
     // mechanical `verification` evidence field the runtime checks. That is
     // ~100 tokens on a surface already pinned; the alternative — a completion
@@ -1073,10 +1078,17 @@ async fn progressive_initial_surface_inventory() {
     // Every addition answers an observed failure or a real contract, and the
     // new ceiling leaves 46 tokens of headroom — below a field-sized
     // addition, so its regression value stands.
+    //
+    // 9400 (was 8850): the Secret Broker pair adds 434 measured tokens
+    // (9238 total). `secret_apply` is the only way a model can use a
+    // credential it must never see, and `secret_inspect` is how it verifies
+    // the write without reading the value. This is a new security capability,
+    // not restated prose; 162 tokens of headroom keeps a field-sized addition
+    // visible as a decision.
     let tools_report = report("progressive_initial", &initial);
     eprintln!("{tools_report}");
     assert!(
-        schema_tokens <= 8850,
+        schema_tokens <= 9400,
         "initial schema grew beyond its fixed budget: {schema_tokens}\n{tools_report}"
     );
     assert!(initial.tools.len() < full.tools.len());

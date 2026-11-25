@@ -10,11 +10,12 @@ use crate::action::Effect;
 use crate::overlay::Overlay;
 use crate::overlay::approval::{ApprovalOutcome, ApprovalOverlay};
 use crate::overlay::clarification::{ClarificationOutcome, ClarificationOverlay};
+use crate::overlay::secret::SecurePasteOutcome;
 use crate::overlay::selection::{SelectionModel, SelectionOption, SelectionOutcome};
 use crate::state::{AppState, Notification, PendingInteraction};
 use crate::theme::{Theme, ThemeId};
 
-use super::submit::send_message;
+use super::submit::{send_message, submit_secret_review};
 
 /// Route a key to the active overlay, returning any resulting command. Ctrl+C
 /// is treated as Esc so it closes the overlay safely .
@@ -421,6 +422,30 @@ pub(super) fn handle_overlay_key(state: &mut AppState, key: KeyEvent) -> Vec<Eff
                     Vec::new()
                 }
             },
+        },
+        Overlay::SecretReview(mut review) => match review.on_key(effective) {
+            None => {
+                state.overlay = Some(Overlay::SecretReview(review));
+                Vec::new()
+            }
+            Some(choice) => submit_secret_review(state, *review, choice),
+        },
+        Overlay::SecurePaste(mut paste) => match paste.on_key(effective) {
+            SecurePasteOutcome::None => {
+                state.overlay = Some(Overlay::SecurePaste(paste));
+                Vec::new()
+            }
+            SecurePasteOutcome::Cancel => Vec::new(),
+            SecurePasteOutcome::Submit(value) => {
+                let request_id = CommandId::generate();
+                state.pending_secret_paste = Some(request_id.clone());
+                vec![Effect::Send(ClientCommand::CaptureSecret {
+                    session_id: state.session_id.clone(),
+                    request_id,
+                    value: leveler_client_protocol::secret::SecretValue::new(value),
+                    key_hint: None,
+                })]
+            }
         },
         Overlay::UnsupportedMedia(mut sel) => match sel.on_key(effective) {
             SelectionOutcome::None => {

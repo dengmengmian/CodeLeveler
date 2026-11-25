@@ -391,6 +391,47 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 None => state.transcript.push_user_if_new(shown),
             }
         }
+        RuntimeEvent::SecretCaptured {
+            session_id,
+            request_id,
+            secret_ref,
+            masked,
+            ..
+        } => {
+            // Only the capture this client asked for may write into its
+            // composer. The reference itself is safe to show; the value is
+            // already in the runtime vault.
+            if session_id == state.session_id
+                && state.pending_secret_paste.as_ref() == Some(&request_id)
+            {
+                state.pending_secret_paste = None;
+                let token = leveler_core::secret_reference_token(&secret_ref);
+                if state.composer.is_empty() {
+                    state.composer.insert_str(&token);
+                } else {
+                    state.composer.insert_str(&format!(" {token} "));
+                }
+                state.notification = Some(crate::state::Notification {
+                    level: leveler_client_protocol::NotificationLevel::Info,
+                    message: state.t().secret.captured.replace("{}", &masked),
+                });
+            }
+        }
+        RuntimeEvent::SecretCaptureFailed {
+            session_id,
+            request_id,
+            error,
+        } => {
+            if session_id == state.session_id
+                && state.pending_secret_paste.as_ref() == Some(&request_id)
+            {
+                state.pending_secret_paste = None;
+                state.notification = Some(crate::state::Notification {
+                    level: leveler_client_protocol::NotificationLevel::Warning,
+                    message: state.t().secret.capture_failed.replace("{}", &error),
+                });
+            }
+        }
         RuntimeEvent::InputAdmitted { message } => {
             // Admission and consumption can be emitted by different runtime
             // threads. A late admission cannot undo a terminal journal fact;

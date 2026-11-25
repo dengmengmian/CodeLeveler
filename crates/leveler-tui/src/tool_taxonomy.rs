@@ -155,6 +155,22 @@ pub static BUILTIN_TAXONOMY: &[ToolTaxonomyEntry] = &[
         visibility: ActivityVisibility::Important,
     },
     ToolTaxonomyEntry {
+        name: "secret_apply",
+        kind: ToolKind::Write,
+        presentation_en: "Configure secret",
+        presentation_zh: "写入凭据",
+        read_only_default: false,
+        visibility: ActivityVisibility::Normal,
+    },
+    ToolTaxonomyEntry {
+        name: "secret_inspect",
+        kind: ToolKind::Read,
+        presentation_en: "Check secret",
+        presentation_zh: "检查凭据",
+        read_only_default: true,
+        visibility: ActivityVisibility::Normal,
+    },
+    ToolTaxonomyEntry {
         name: "write_file",
         kind: ToolKind::Edit,
         presentation_en: "Write file",

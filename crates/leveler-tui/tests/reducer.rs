@@ -17999,3 +17999,256 @@ fn an_unknown_slash_name_stays_a_typo_and_never_starts_a_turn() {
         notification_text(&s)
     );
 }
+
+// ── Secret Broker: detection review and secure paste ────────────────────────
+
+const BROKER_CANARY: &str = "sk-CANARY-SECRET-DO-NOT-EXPOSE-001";
+
+fn secret_review_command(effects: &[Effect]) -> &ClientCommand {
+    match effects {
+        [
+            Effect::Submit {
+                command: command @ ClientCommand::SubmitUserInput { .. },
+                ..
+            },
+        ] => command,
+        other => panic!("expected one SubmitUserInput, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_detected_credential_opens_review_instead_of_sending() {
+    let mut s = state();
+    typed(
+        &mut s,
+        &format!("帮我配置 DEEPSEEK_API_KEY={BROKER_CANARY}"),
+    );
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        effects.is_empty(),
+        "nothing may leave before the decision: {effects:?}"
+    );
+    assert!(matches!(
+        s.overlay,
+        Some(leveler_tui::overlay::Overlay::SecretReview(_))
+    ));
+    assert!(
+        s.composer.text().contains(BROKER_CANARY),
+        "returning to editing must not lose the draft"
+    );
+}
+
+#[test]
+fn capture_replaces_the_value_and_sends_one_capture() {
+    let mut s = state();
+    typed(
+        &mut s,
+        &format!("帮我配置 DEEPSEEK_API_KEY={BROKER_CANARY}"),
+    );
+    reduce(&mut s, key(KeyCode::Enter));
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    let ClientCommand::SubmitUserInput {
+        content,
+        secret_captures,
+        plaintext_secret_ack,
+        ..
+    } = secret_review_command(&effects)
+    else {
+        unreachable!()
+    };
+    assert!(!content.contains(BROKER_CANARY), "{content}");
+    assert!(content.contains("{{secret-capture:"), "{content}");
+    assert_eq!(secret_captures.len(), 1);
+    assert_eq!(secret_captures[0].value.expose(), BROKER_CANARY);
+    assert!(!plaintext_secret_ack);
+    assert!(s.composer.is_empty());
+    assert!(s.overlay.is_none());
+    let history = s.composer.history().join("\n");
+    assert!(!history.contains(BROKER_CANARY), "history leaked the value");
+}
+
+#[test]
+fn the_plaintext_choice_is_explicit_and_sends_the_raw_text() {
+    let mut s = state();
+    typed(&mut s, &format!("DEEPSEEK_API_KEY={BROKER_CANARY}"));
+    reduce(&mut s, key(KeyCode::Enter));
+    reduce(&mut s, key(KeyCode::Down));
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    let ClientCommand::SubmitUserInput {
+        content,
+        secret_captures,
+        plaintext_secret_ack,
+        ..
+    } = secret_review_command(&effects)
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        content.as_str(),
+        format!("DEEPSEEK_API_KEY={BROKER_CANARY}")
+    );
+    assert!(secret_captures.is_empty());
+    assert!(plaintext_secret_ack);
+}
+
+#[test]
+fn escape_returns_to_the_untouched_draft() {
+    let mut s = state();
+    typed(&mut s, &format!("DEEPSEEK_API_KEY={BROKER_CANARY}"));
+    reduce(&mut s, key(KeyCode::Enter));
+    let effects = reduce(&mut s, key(KeyCode::Esc));
+    assert!(effects.is_empty());
+    assert!(s.overlay.is_none());
+    assert_eq!(
+        s.composer.text(),
+        format!("DEEPSEEK_API_KEY={BROKER_CANARY}")
+    );
+}
+
+#[test]
+fn ordinary_code_is_not_interrupted_by_the_review() {
+    let mut s = state();
+    typed(&mut s, "let password = config.password;");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert_eq!(
+        submitted(&effects).0,
+        ClientCommand::SubmitMessage {
+            session_id: SessionId::new("s1"),
+            content: "let password = config.password;".to_string(),
+            attachments: Vec::new(),
+        }
+    );
+}
+
+#[test]
+fn secret_slash_opens_a_masked_field_and_capture_fills_the_composer() {
+    let mut s = state();
+    typed(&mut s, "/secret");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(effects.is_empty(), "{effects:?}");
+    assert!(matches!(
+        s.overlay,
+        Some(leveler_tui::overlay::Overlay::SecurePaste(_))
+    ));
+
+    typed(&mut s, BROKER_CANARY);
+    // The field renders a mask, never the value.
+    let content = leveler_tui::overlay::content(
+        s.overlay.as_ref().unwrap(),
+        &leveler_tui::Theme::no_color(),
+        80,
+        leveler_tui::Locale::Zh,
+    );
+    let rendered: String = content
+        .lines
+        .iter()
+        .flat_map(|line| line.spans.iter().map(|span| span.content.clone()))
+        .collect();
+    assert!(!rendered.contains(BROKER_CANARY), "{rendered}");
+
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    let request_id = match effects.as_slice() {
+        [
+            Effect::Send(ClientCommand::CaptureSecret {
+                request_id, value, ..
+            }),
+        ] => {
+            assert_eq!(value.expose(), BROKER_CANARY);
+            request_id.clone()
+        }
+        other => panic!("expected CaptureSecret, got {other:?}"),
+    };
+    assert_eq!(s.pending_secret_paste.as_ref(), Some(&request_id));
+
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SecretCaptured {
+            session_id: SessionId::new("s1"),
+            request_id: request_id.clone(),
+            secret_ref: "sec_0123456789abcdef0123456789abcdef".into(),
+            masked: "•••••• (33 chars)".into(),
+            key_hint: None,
+        }),
+    );
+    assert_eq!(
+        s.composer.text(),
+        "[secret:sec_0123456789abcdef0123456789abcdef]"
+    );
+    assert!(s.pending_secret_paste.is_none());
+}
+
+#[test]
+fn a_local_slash_command_that_cannot_take_custody_is_refused() {
+    let mut s = state();
+    typed(&mut s, &format!("/remember my key is {BROKER_CANARY}"));
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(effects.is_empty(), "{effects:?}");
+    assert!(s.overlay.is_none(), "no custody lane exists for /remember");
+    assert!(
+        notification_text(&s).contains("/secret"),
+        "{}",
+        notification_text(&s)
+    );
+}
+
+#[test]
+fn a_captured_steer_uses_the_steer_command_not_a_new_turn() {
+    let mut s = busy_state();
+    typed(
+        &mut s,
+        &format!("顺便配置 DEEPSEEK_API_KEY={BROKER_CANARY}"),
+    );
+    reduce(&mut s, key(KeyCode::Enter));
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    match effects.as_slice() {
+        [
+            Effect::Submit {
+                command:
+                    ClientCommand::SteerUserInput {
+                        content,
+                        secret_captures,
+                        plaintext_secret_ack,
+                        message_id: Some(_),
+                        ..
+                    },
+                ..
+            },
+        ] => {
+            assert!(!content.contains(BROKER_CANARY), "{content}");
+            assert_eq!(secret_captures.len(), 1);
+            assert!(!plaintext_secret_ack);
+        }
+        other => panic!("expected one captured steer, got {other:?}"),
+    }
+    assert!(s.composer.is_empty());
+}
+
+#[test]
+fn secret_revoke_sends_the_reference_and_nothing_else() {
+    let mut s = state();
+    typed(
+        &mut s,
+        "/secret revoke [secret:sec_0123456789abcdef0123456789abcdef]",
+    );
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    match effects.as_slice() {
+        [Effect::Send(ClientCommand::RevokeSecret { secret_ref, .. })] => {
+            assert_eq!(secret_ref, "sec_0123456789abcdef0123456789abcdef")
+        }
+        other => panic!("expected RevokeSecret, got {other:?}"),
+    }
+    assert!(s.overlay.is_none());
+}
+
+#[test]
+fn secret_revoke_without_a_reference_is_a_usage_notice() {
+    let mut s = state();
+    typed(&mut s, "/secret revoke");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(effects.is_empty(), "{effects:?}");
+    assert!(
+        notification_text(&s).contains("revoke"),
+        "{}",
+        notification_text(&s)
+    );
+}
