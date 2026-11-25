@@ -3557,6 +3557,9 @@ def aggregate_run(
         lane_occurrence_states: Dict[str, int] = {}
         lane_effects = marker_counts(lane, specs_by_lane.get(lane_name, []))
         succeeded_by_definition: Dict[str, int] = {}
+        occurrences_by_id = {
+            occurrence.get("id"): occurrence for occurrence in snapshot["occurrences"]
+        }
         for run in snapshot["runs"]:
             _bump(lane_states, run.get("state"))
             _bump(total_states, run.get("state"))
@@ -3600,8 +3603,11 @@ def aggregate_run(
                 )
             if run.get("started_at"):
                 started = parse_iso(run["started_at"])
-                if run.get("scheduled_for"):
-                    claim_latencies.append((started - parse_iso(run["scheduled_for"])).total_seconds())
+                # `scheduled_for` belongs to the occurrence, not the run row.
+                occurrence = occurrences_by_id.get(run.get("occurrence_id")) or {}
+                scheduled_for = run.get("scheduled_for") or occurrence.get("scheduled_for")
+                if scheduled_for:
+                    claim_latencies.append((started - parse_iso(scheduled_for)).total_seconds())
                 if run.get("finished_at"):
                     completion_latencies.append((parse_iso(run["finished_at"]) - started).total_seconds())
                 if run.get("handed_off_at"):
