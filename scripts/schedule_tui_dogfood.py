@@ -135,7 +135,7 @@ def main() -> int:
         report.check("boot", "the real TUI paints a frame", pty.wait_for("CodeLeveler", 60))
         pty.write("/schedules")
         submit(pty)
-        report.check("page", "/schedules opens the scheduled-task page", wait(pty, "定时任务"))
+        report.check("page", "/schedules opens the scheduled-task page", wait(pty, "日程"))
         report.check("page", "the CLI-seeded definition is projected", wait(pty, "TUI seeded shell"))
         report.check("wakeup", "OS wakeup is honestly off by default", wait(pty, "后台唤醒未启用"))
         report.dump("list", pty)
@@ -148,7 +148,7 @@ def main() -> int:
         pty.key("w")
         report.check("wakeup", "enabling OS wakeup asks first", wait(pty, "启用系统唤醒？"))
         pty.key("\x1b")
-        report.check("wakeup", "Esc cancels without registering", wait(pty, "定时任务", 5))
+        report.check("wakeup", "Esc cancels without registering", wait(pty, "日程", 5))
         report.dump("wakeup-confirm-cancelled", pty)
 
         pty.key("g")
@@ -204,12 +204,13 @@ def main() -> int:
         submit(pty)  # ActionKind (Shell)
         submit(pty)  # -> ActionText
         type_text(pty, "printf created > created.txt")
-        submit(pty)  # -> TriggerKind (Daily)
-        submit(pty)  # -> TriggerText
+        submit(pty)  # ActionText -> Model
+        submit(pty)  # Model (empty for a shell action) -> TriggerKind
+        submit(pty)  # TriggerKind (Daily) -> TriggerText
         type_text(pty, "09:30 Asia/Shanghai")
-        submit(pty)  # -> Mode
-        submit(pty)  # -> Grant
-        submit(pty)  # submit
+        submit(pty)  # TriggerText -> Mode
+        submit(pty)  # Mode -> Grant
+        submit(pty)  # Grant -> submit
         created = wait(pty, "已创建 ·", 30)
         report.check("create", "the form saves through the runtime", created, pty.screen.text()[-600:])
         report.check("create", "the created definition opens with next run", wait(pty, "TUI created shell"))
@@ -228,7 +229,9 @@ def main() -> int:
         pty.key("e")
         report.check("edit", "e opens the editor with the current rule", wait(pty, "编辑定时任务"))
         type_text(pty, " v2")
-        for _ in range(7):
+        # EDIT_FIELDS: Name, Workspace, ActionKind, ActionText, Model,
+        # TriggerKind, TriggerText, Mode. Enter on the last field saves.
+        for _ in range(8):
             submit(pty)
         report.check("edit", "the edit saves through the runtime", wait(pty, "已保存 ·", 30))
         report.check("edit", "the detail shows the new name", wait(pty, "TUI created shell v2", 10))
@@ -252,7 +255,7 @@ def main() -> int:
         # still projected.
         report.check("layout", "60x20 keeps the page and the definition row", wait(pty, "每隔 1 小时", 10))
         pty.resize(120, 44)
-        report.check("layout", "restoring the size keeps the page", wait(pty, "定时任务", 10))
+        report.check("layout", "restoring the size keeps the page", wait(pty, "日程", 10))
 
         # The seeded definition is still the runtime's, not a page-owned copy.
         survivor = [d for d in cli(env, ["schedule", "list", "--repo", repo, "--json"]) if d["name"] == "TUI seeded shell"]

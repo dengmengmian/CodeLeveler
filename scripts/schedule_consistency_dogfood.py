@@ -117,7 +117,7 @@ def to_chat(pty: Pty):
 def open_list(pty: Pty):
     assert to_chat(pty), "could not return to chat before opening the page"
     enter_page(pty)
-    assert wait_text(pty, "定时任务", 20), "the schedules page did not open"
+    assert wait_text(pty, "日程", 20), "the schedules page did not open"
 
 
 def open_detail(pty: Pty):

@@ -280,7 +280,7 @@ def main() -> int:
         settle_turn(pty)
         pty.write("/schedules")
         pty.key("\r")
-        report.check("grant", "the schedules page opens", pty.wait_for("定时任务", 20))
+        report.check("grant", "the schedules page opens", pty.wait_for("日程", 20))
         report.check("grant", "the model-created definition is projected", pty.wait_for(NAME, 20))
         pty.key("\r")
         report.check("grant", "the detail opens", pty.wait_for("运行历史", 20))
@@ -367,7 +367,7 @@ def main() -> int:
         # The TUI itself must say the grant is gone, not just the store.
         pty.write("/schedules")
         pty.key("\r")
-        report.check("df52", "the schedules page reopens", pty.wait_for("定时任务", 20))
+        report.check("df52", "the schedules page reopens", pty.wait_for("日程", 20))
         report.check("df52", "the edited rule is visible", pty.wait_for("10:15", 20))
         pty.key("\r")
         report.check(
