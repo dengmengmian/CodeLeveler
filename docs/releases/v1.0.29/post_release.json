@@ -1,0 +1,207 @@
+{
+ "verified_at": "2026-11-25T08:42:56Z",
+ "channel": "GitHub Releases",
+ "artifacts": [
+  {
+   "name": "leveler-v1.0.29-aarch64-apple-darwin.tar.gz",
+   "platform": "macOS arm64",
+   "checksum": "sha256:0d1d60e60aac55909b58bbdf2906fe98c9e7e9e110b3fc495ad170711da41d7f",
+   "checksum_verified": true,
+   "download_url": "https://github.com/dengmengmian/CodeLeveler/releases/download/v1.0.29/leveler-v1.0.29-aarch64-apple-darwin.tar.gz"
+  },
+  {
+   "name": "leveler-v1.0.29-aarch64-apple-darwin.tar.xz",
+   "platform": "macOS arm64",
+   "checksum": "sha256:506668dd288a833c7e5924bf792d3792b94f8ed55afd5aac13cf075f5e912fcd",
+   "checksum_verified": true,
+   "download_url": "https://github.com/dengmengmian/CodeLeveler/releases/download/v1.0.29/leveler-v1.0.29-aarch64-apple-darwin.tar.xz"
+  },
+  {
+   "name": "leveler-v1.0.29-x86_64-apple-darwin.tar.gz",
+   "platform": "macOS x86_64",
+   "checksum": "sha256:2a8122a42a397728a0ad3e9f24482825f339c1df38e4ff1d84d626cb7b526a57",
+   "checksum_verified": true,
+   "download_url": "https://github.com/dengmengmian/CodeLeveler/releases/download/v1.0.29/leveler-v1.0.29-x86_64-apple-darwin.tar.gz"
+  },
+  {
+   "name": "leveler-v1.0.29-x86_64-apple-darwin.tar.xz",
+   "platform": "macOS x86_64",
+   "checksum": "sha256:4b1e79893a5be8ecf4a6cd16b1a691b15b15b3234f16601cbe51c0fcca6b776f",
+   "checksum_verified": true,
+   "download_url": "https://github.com/dengmengmian/CodeLeveler/releases/download/v1.0.29/leveler-v1.0.29-x86_64-apple-darwin.tar.xz"
+  },
+  {
+   "name": "leveler-v1.0.29-x86_64-pc-windows-msvc.zip",
+   "platform": "Windows x86_64",
+   "checksum": "sha256:515ee99f82cb234e6bc67df029e87fa9560a3387728a55792ca4f610a9af8898",
+   "checksum_verified": true,
+   "download_url": "https://github.com/dengmengmian/CodeLeveler/releases/download/v1.0.29/leveler-v1.0.29-x86_64-pc-windows-msvc.zip"
+  },
+  {
+   "name": "leveler-v1.0.29-x86_64-unknown-linux-gnu.tar.gz",
+   "platform": "Linux x86_64",
+   "checksum": "sha256:fd22d3b3f8c8bc96c71b3923296813c4870088282970b5cc95ae57f5adc73386",
+   "checksum_verified": true,
+   "download_url": "https://github.com/dengmengmian/CodeLeveler/releases/download/v1.0.29/leveler-v1.0.29-x86_64-unknown-linux-gnu.tar.gz"
+  },
+  {
+   "name": "leveler-v1.0.29-x86_64-unknown-linux-gnu.tar.xz",
+   "platform": "Linux x86_64",
+   "checksum": "sha256:0a6b4af82e8158a7746c891aae7e8474364403354f9b209e542504d564dc0c82",
+   "checksum_verified": true,
+   "download_url": "https://github.com/dengmengmian/CodeLeveler/releases/download/v1.0.29/leveler-v1.0.29-x86_64-unknown-linux-gnu.tar.xz"
+  }
+ ],
+ "fresh_install": {
+  "status": "PASS",
+  "detail": "downloaded every published payload and verified all seven .sha256 sidecars; installed the aarch64-apple-darwin payload into a fresh prefix and ran it; real PTY TUI (first paint 1349 ms, /help, one real provider prompt), a real run_command turn, Goal/Plan turns, a background task, the request-approval boundary, session surfaces and both error paths; 34/34 checks PASS",
+  "version_output": "1.0.29 (f972f9f613db)",
+  "tui_start": true,
+  "provider_call": true,
+  "tool_execution": true
+ },
+ "upgrade": {
+  "status": "PASS",
+  "from": "v1.0.28",
+  "detail": "installed the published v1.0.28 binary, created a config and ran one real turn, replaced it with the published v1.0.29 binary, then re-read the session and ran another real turn; config and session survived",
+  "config_preserved": true,
+  "sessions_readable": true
+ },
+ "platform_matrix": [
+  {
+   "platform": "macOS arm64",
+   "host": "Apple M4 Max, macOS 26.6.2, arm64",
+   "status": "PASS",
+   "package_sha256": "506668dd288a833c7e5924bf792d3792b94f8ed55afd5aac13cf075f5e912fcd",
+   "binary_sha256": "24d31595478ef65a9ed24aa78650c2eabc1d77e1be5894224dcdd4809d19dbed",
+   "detail": "published payload, fresh isolated HOME on a short lab path, 34/34 checks: install, version, CLI surfaces, PTY TUI, real provider turns, tool, sessions, Goal/Plan, background, permission boundary, error paths, upgrade from v1.0.28",
+   "evidence": "../../dev/v1.0.29-post-release/evidence/macos-arm64/result.json"
+  },
+  {
+   "platform": "macOS x86_64",
+   "host": "no Intel host attached",
+   "status": "BLOCKED_ENVIRONMENT",
+   "package_sha256": "4b1e79893a5be8ecf4a6cd16b1a691b15b15b3234f16601cbe51c0fcca6b776f",
+   "binary_sha256": "258f3849896e779135e5f3c45df9ebdf8c523483312aa5209fde767e9f7c1c7f",
+   "detail": "published payload hash verified and the binary extracted; Rosetta execution is not accepted as native Intel evidence; run accept_macos.py on a real Intel host",
+   "evidence": "docs/dev/v1.0.29-post-release/scripts/accept_macos.py"
+  },
+  {
+   "platform": "Linux x86_64",
+   "host": "no x86_64 Linux host",
+   "status": "BLOCKED_ENVIRONMENT",
+   "package_sha256": "0a6b4af82e8158a7746c891aae7e8474364403354f9b209e542504d564dc0c82",
+   "binary_sha256": "790f8a0788e042da3915818f267da16c27da6d2415373eb5736751598c4522ce",
+   "detail": "published payload hash verified and the binary extracted; the release workflow installed and smoke-tested this archive on Ubuntu and CI's Linux test jobs passed, but no interactive runtime acceptance ran on a Linux host",
+   "evidence": "docs/dev/v1.0.29-post-release/scripts/accept_linux.sh"
+  },
+  {
+   "platform": "Windows x86_64",
+   "host": "no Windows host attached",
+   "status": "BLOCKED_ENVIRONMENT",
+   "package_sha256": "515ee99f82cb234e6bc67df029e87fa9560a3387728a55792ca4f610a9af8898",
+   "binary_sha256": "df0bd84063a7ab3601a201ab87a92a69767185b578107084e0c160f025c8c1ac",
+   "detail": "published zip hash verified; leveler.exe and leveler-confine.exe extracted (confine SHA-256 39abb97efc054e3272cf98280a2cb0d4f8d12e43f1d903170867e5da624f98ad); release workflow installed/smoke-tested the zip on windows-latest and CI's Task Scheduler acceptance passed; no GUI runtime acceptance on a Windows host",
+   "evidence": "docs/dev/v1.0.29-post-release/scripts/accept_windows.ps1"
+  }
+ ],
+ "performance": {
+  "method": "same host, published binaries, interleaved A/B, fresh HOME per TUI sample; A = v1.0.28, B = v1.0.29; 20 startup samples, 3 real turns, 5 TUI runs",
+  "rows": [
+   {
+    "metric": "leveler --version, process start-to-exit p50",
+    "previous": "7.60 ms",
+    "current": "7.44 ms",
+    "delta": "-2.1%",
+    "verdict": "MEASURED"
+   },
+   {
+    "metric": "TUI first frame on a real PTY p50",
+    "previous": "107 ms",
+    "current": "109 ms",
+    "delta": "+1.9%",
+    "verdict": "MEASURED"
+   },
+   {
+    "metric": "TUI /help round trip p50",
+    "previous": "760 ms",
+    "current": "760 ms",
+    "delta": "0.0%",
+    "verdict": "MEASURED"
+   },
+   {
+    "metric": "one real reply turn, wall p50",
+    "previous": "2.07 s",
+    "current": "1.62 s",
+    "delta": "-21.7%",
+    "verdict": "INCONCLUSIVE",
+    "note": "3 samples per arm; provider latency dominates"
+   },
+   {
+    "metric": "peak process-tree RSS p50",
+    "previous": "33.6 MB",
+    "current": "33.3 MB",
+    "delta": "-0.9%",
+    "verdict": "MEASURED"
+   }
+  ]
+ },
+ "performance_ab": {
+  "classification": "NOT_RUN",
+  "method": "the full six-arm L3 A/B experiment was not run for v1.0.29",
+  "summary": "The release gate qualified 23 live L3 cases plus RC on the candidate, and the published-binary supplement measured startup -2.1%, TUI first paint +1.9%, RSS -0.9% and a noisy turn-wall delta (-21.7% at n=3). No full per-case A/B exists, so no parity or regression claim beyond the supplement."
+ },
+ "fixes": [
+  {
+   "id": "windows-interior-tilde",
+   "severity": "medium",
+   "root_cause": "literal_target treated any `~` in a path as unresolvable. Windows 8.3 short names (C:\\Users\\RUNNER~1\\AppData\\Local\\Temp) put `~` inside every absolute path on GitHub's Windows runner, so three irreversibility tests saw dynamic targets and the Windows CI job failed.",
+   "fix": "Only a leading `~` is home expansion; an interior `~` is a literal path character. Regression test added.",
+   "commit": "f972f9f6",
+   "tests": "crates/leveler-execution/src/irreversibility.rs::an_interior_tilde_is_a_literal_path_character (red before the fix); Windows CI test job green on the released commit",
+   "affects_published": "no - fixed before the v1.0.29 tag"
+  }
+ ],
+ "known_issues": [
+  "Release packages are not Apple-notarized or Microsoft-signed.",
+  "FullAccess is a documented user-authority boundary, not an OS guarantee.",
+  "On Windows, a confined shell can create a previously missing AGENTS.md or .leveler tree; the file is never admitted without approval, and existing protected objects keep their OS fences.",
+  "macOS local transport uses a Unix-domain socket. A project or HOME path longer than the platform SUN_LEN limit fails with a clear `path must be shorter than SUN_LEN` error instead of starting the TUI; the published binary passed acceptance from a short lab path.",
+  "There is no Linux ARM archive; the desktop client is built from source and is not part of this archive."
+ ],
+ "not_verified": [
+  "Windows x86_64 GUI runtime: the published zip was not executed on a Windows host (CI install/smoke and Task Scheduler acceptance passed).",
+  "Linux x86_64 runtime: the published tarball was not executed interactively on a Linux host (CI install/smoke passed).",
+  "macOS x86_64 runtime: the published tarball was not executed on an Intel host.",
+  "Full six-arm L3 A/B performance experiment: only the published-binary supplement ran.",
+  "24-hour soak: no soak was run for v1.0.29.",
+  "upgrade migration step: the session was read by the new build, but no separate migration action was observed."
+ ],
+ "residual_risks": [
+  {
+   "risk": "Windows, Linux and Intel macOS runtime unverified",
+   "severity": "high",
+   "evidence": "no host attached; payload hashes and CI build/smoke only",
+   "impact": "platform-specific install, sandbox, scheduler and TUI behaviour is unknown",
+   "next_action": "run the provided acceptance scripts on real hosts"
+  },
+  {
+   "risk": "Full L3 A/B not run",
+   "severity": "medium",
+   "evidence": "supplement only: startup -2.1%, TUI +1.9%, RSS -0.9%, turn wall n=3",
+   "impact": "cannot separate a code effect from provider drift at task level",
+   "next_action": "run the six-arm published-binary experiment"
+  },
+  {
+   "risk": "24-hour soak not run",
+   "severity": "medium",
+   "evidence": "no v1.0.29 soak",
+   "impact": "long-run leaks and rare stalls are not characterized for this build",
+   "next_action": "run soak.py against the published binary"
+  }
+ ],
+ "soak": {
+  "status": "NOT_RUN",
+  "note": "no 24-hour soak was run for v1.0.29; this is not a PASS"
+ }
+}

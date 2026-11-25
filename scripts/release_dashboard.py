@@ -802,7 +802,7 @@ p{margin:6px 0}
 a{color:var(--accent)}
 .sub{color:var(--muted)}
 .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px 18px}
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px;margin-top:12px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(190px,100%),1fr));gap:10px;margin-top:12px}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
 .card .k{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
 .card .v{margin:6px 0 2px;font-size:16px;font-weight:600}
@@ -815,12 +815,13 @@ th,td{padding:8px 12px;text-align:left;border-bottom:1px solid var(--line);verti
 th{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);font-weight:600;background:var(--panel);position:sticky;top:0}
 tbody tr:last-child td{border-bottom:none}
 td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
-code,.mono{font-family:var(--mono);font-size:12.5px}
+code,.mono{font-family:var(--mono);font-size:12.5px;overflow-wrap:anywhere}
 ul{margin:6px 0;padding-left:20px}
 li{margin:3px 0}
 .meta{display:flex;flex-wrap:wrap;gap:8px 22px;margin-top:10px;font-size:13px;color:var(--muted)}
 .meta b{color:var(--ink);font-weight:600}
 .note{font-size:13px;color:var(--muted)}
+@media (max-width:520px){main{padding:20px 14px 48px}.cards{grid-template-columns:1fr}}
 footer{margin-top:40px;font-size:12.5px;color:var(--muted)}
 """
 
