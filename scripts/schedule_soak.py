@@ -330,7 +330,11 @@ def unregister_lane_fallback(
 # How long an overlap probe may wait for a real terminal run. An empty run
 # list is not terminal and must not pass. When the window ends with nothing
 # to judge, the check is UNKNOWN.
-OVERLAP_OBSERVE_SECS = 180
+# A natural run's terminal reaches the store on the next dispatch pass, so a
+# 60 s grid can need up to two passes after the shell exits. 240 s keeps the
+# observation inside the same policy contract without turning a scheduling
+# phase offset into UNKNOWN.
+OVERLAP_OBSERVE_SECS = 240
 # Fault-lane unknown is an injected kill. Cancelled is how quiesce stops a
 # live run. Neither is a product shell failure. A snapshot miss that the
 # product settled as unknown on any other lane is.
