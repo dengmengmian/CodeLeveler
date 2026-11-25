@@ -181,6 +181,141 @@ pub fn parse_secret_reference_token(token: &str) -> Option<&str> {
     .then_some(inner)
 }
 
+/// Validate and normalize a workspace-relative dotenv target.
+///
+/// The broker writes dotenv files only. This is the one shape check shared by
+/// the host broker and the capture-time use scope: a relative path whose file
+/// name is `.env` or `.env.<suffix>`. Absolute paths, parent traversal, drive
+/// letters and non-dotenv names are not targets.
+pub fn normalize_dotenv_target(target: &str) -> Option<String> {
+    let trimmed = target.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 1024
+        || trimmed.contains(['\0', '\n', '\r'])
+        || trimmed.starts_with('/')
+        || trimmed.starts_with('\\')
+        || trimmed.contains(':')
+    {
+        return None;
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for part in trimmed.split(['/', '\\']) {
+        match part {
+            "" | "." => continue,
+            ".." => return None,
+            other => parts.push(other),
+        }
+    }
+    let file = *parts.last()?;
+    if file != ".env" && !file.starts_with(".env.") {
+        return None;
+    }
+    Some(parts.join("/"))
+}
+
+/// Bytes that may belong to one path-shaped token. Only ASCII: any non-ASCII
+/// character is prose adjacent to the path, not part of it.
+fn is_target_path_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-' | b'/' | b'\\')
+}
+
+/// Every dotenv target the user's own text names.
+///
+/// This is the authorization source for a captured credential's write target:
+/// a message that says "configure this in `.env`" lets the broker write that
+/// reference to `.env`, and nowhere else. It deliberately does not parse
+/// natural language — it extracts path-shaped tokens whose file name is a
+/// dotenv file. A message that names no target authorizes none.
+pub fn dotenv_targets_in(text: &str) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let bytes = text.as_bytes();
+    let mut targets = std::collections::BTreeSet::new();
+    let mut cursor = 0usize;
+    while let Some(relative) = text[cursor..].find(".env") {
+        let hit = cursor + relative;
+        let mut start = hit;
+        while start > 0 && is_target_path_byte(bytes[start - 1]) {
+            start -= 1;
+        }
+        let mut end = hit + 4;
+        while end < bytes.len() && is_target_path_byte(bytes[end]) {
+            end += 1;
+        }
+        if let Some(target) = normalize_dotenv_target(&text[start..end]) {
+            targets.insert(target);
+        }
+        if targets.len() >= 16 {
+            break;
+        }
+        cursor = end.max(hit + 1);
+    }
+    targets.into_iter().collect()
+}
+
+/// Whether `name` can be a dotenv key.
+fn is_dotenv_field_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 128 {
+        return false;
+    }
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Every dotenv field the user's own text assigns (`NAME=`).
+///
+/// Only explicit assignment syntax counts. A label in prose ("password: …")
+/// is not reliably the environment variable name the user wants, so it is not
+/// turned into a field authorization.
+pub fn dotenv_fields_in(text: &str) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let bytes = text.as_bytes();
+    let mut fields = std::collections::BTreeSet::new();
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte != b'=' {
+            continue;
+        }
+        // `==`, `=>`, `=<` and `=~` are comparisons or arrows, not assignments.
+        if matches!(
+            bytes.get(index + 1),
+            Some(b'=') | Some(b'>') | Some(b'<') | Some(b'~')
+        ) {
+            continue;
+        }
+        let mut end = index;
+        while end > 0 && matches!(bytes[end - 1], b' ' | b'\t') {
+            end -= 1;
+        }
+        let mut start = end;
+        while start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_') {
+            start -= 1;
+        }
+        if start == end {
+            continue;
+        }
+        // A `=` directly before the name means this is another assignment's
+        // value (`A=B=C`), not a field of its own.
+        if start > 0 && matches!(bytes[start - 1], b'=' | b'>' | b'<' | b'!') {
+            continue;
+        }
+        let name = &text[start..end];
+        if is_dotenv_field_name(name) {
+            fields.insert(name.to_string());
+            if fields.len() >= 16 {
+                break;
+            }
+        }
+    }
+    fields.into_iter().collect()
+}
+
 /// Detect credential candidates in text a person typed.
 ///
 /// Deterministic and local: no network, no model, no entropy-only guessing.
@@ -2259,5 +2394,91 @@ mod tests {
         let out = sanitize(dotted);
         assert!(!out.contains("abcdef0123456789"), "{out}");
         assert!(out.contains("Bearer"), "{out}");
+    }
+
+    #[test]
+    fn only_workspace_dotenv_files_are_targets() {
+        for (input, expected) in [
+            (".env", Some(".env")),
+            (".env.local", Some(".env.local")),
+            (".env.production", Some(".env.production")),
+            ("./.env", Some(".env")),
+            ("apps/web/.env", Some("apps/web/.env")),
+            (r"apps\web\.env", Some("apps/web/.env")),
+            ("apps//web/.env", Some("apps/web/.env")),
+            ("配置 目录/.env", Some("配置 目录/.env")),
+        ] {
+            assert_eq!(
+                normalize_dotenv_target(input).as_deref(),
+                expected,
+                "{input}"
+            );
+        }
+        for input in [
+            "",
+            ".envrc",
+            "config.toml",
+            "../.env",
+            "/etc/.env",
+            r"C:\project\.env",
+            "a/../../.env",
+            "dotenv",
+        ] {
+            assert_eq!(normalize_dotenv_target(input), None, "{input}");
+        }
+    }
+
+    #[test]
+    fn the_users_own_text_names_the_targets_a_capture_may_write() {
+        for (text, expected) in [
+            ("请把凭据配置到 .env：", vec![".env"]),
+            ("写到 apps/web/.env.local 里", vec!["apps/web/.env.local"]),
+            (
+                "用 `./.env` 和 .env.production",
+                vec![".env.production", ".env"],
+            ),
+            ("配置到.env中", vec![".env"]),
+            ("see (.env), then continue", vec![".env"]),
+        ] {
+            let mut got = dotenv_targets_in(text);
+            got.sort();
+            let mut expected: Vec<String> = expected.into_iter().map(String::from).collect();
+            expected.sort();
+            assert_eq!(got, expected, "{text}");
+        }
+        for text in [
+            "把 key 配置进去",
+            "README.env is documentation",
+            "my.env is not a dotenv name",
+            "https://example.com/.env",
+            "/etc/.env",
+        ] {
+            assert!(dotenv_targets_in(text).is_empty(), "{text}");
+        }
+    }
+
+    #[test]
+    fn only_explicit_assignments_name_a_field() {
+        for (text, expected) in [
+            ("DEMO_API_KEY=CANARY", vec!["DEMO_API_KEY"]),
+            ("export DB_PASSWORD = x", vec!["DB_PASSWORD"]),
+            ("api_key=\"abc\"", vec!["api_key"]),
+        ] {
+            let mut got = dotenv_fields_in(text);
+            got.sort();
+            let mut expected: Vec<String> = expected.into_iter().map(String::from).collect();
+            expected.sort();
+            assert_eq!(got, expected, "{text}");
+        }
+        for text in [
+            "密码是 password: hunter2",
+            "值在字段 DEMO_API_KEY 里",
+            "if (a == b) {}",
+            "a >= b",
+            "FOO=>bar",
+            "1BAD=value",
+        ] {
+            assert!(dotenv_fields_in(text).is_empty(), "{text}");
+        }
     }
 }

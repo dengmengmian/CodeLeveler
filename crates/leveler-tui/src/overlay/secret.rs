@@ -34,15 +34,25 @@ pub struct SecretReviewOverlay {
     pub draft: String,
     /// Non-overlapping findings, sorted by position.
     pub findings: Vec<SecretFinding>,
+    /// The dotenv targets this message names. The runtime recomputes them
+    /// from the same bytes; showing them makes the confirmation describe the
+    /// authority it actually grants.
+    pub use_targets: Vec<String>,
+    /// Explicit field assignments in the same message.
+    pub use_fields: Vec<String>,
     choice: usize,
 }
 
 impl SecretReviewOverlay {
     /// Open the review for `draft`.
     pub fn new(draft: String, findings: Vec<SecretFinding>) -> Self {
+        let use_targets = leveler_core::dotenv_targets_in(&draft);
+        let use_fields = leveler_core::dotenv_fields_in(&draft);
         Self {
             draft,
             findings,
+            use_targets,
+            use_fields,
             choice: 0,
         }
     }
@@ -206,6 +216,28 @@ pub(super) fn review_content(
         ]));
     }
     lines.push(Line::from(""));
+    if ov.use_targets.is_empty() {
+        lines.push(Line::from(Span::styled(
+            t.secret.review_scope_none,
+            Style::default().fg(theme.status.warning),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            t.secret
+                .review_scope_targets
+                .replace("{}", &ov.use_targets.join(", ")),
+            Style::default().fg(theme.text.secondary),
+        )));
+    }
+    if !ov.use_fields.is_empty() {
+        lines.push(Line::from(Span::styled(
+            t.secret
+                .review_scope_fields
+                .replace("{}", &ov.use_fields.join(", ")),
+            Style::default().fg(theme.text.secondary),
+        )));
+    }
+    lines.push(Line::from(""));
     let options = [
         (t.secret.review_capture, SecretReviewChoice::Capture),
         (t.secret.review_plaintext, SecretReviewChoice::Plaintext),
@@ -362,6 +394,36 @@ mod tests {
             .collect();
         assert!(!rendered.contains("abc123def"), "{rendered}");
         assert!(rendered.contains("API_KEY"), "{rendered}");
+    }
+
+    #[test]
+    fn the_review_shows_the_target_and_field_the_message_authorizes() {
+        let draft = "把 DEMO_API_KEY=abc123def 写到 .env".to_string();
+        let findings = leveler_core::detect_secrets(&draft);
+        let ov = SecretReviewOverlay::new(draft, findings);
+        assert_eq!(ov.use_targets, vec![".env".to_string()]);
+        assert_eq!(ov.use_fields, vec!["DEMO_API_KEY".to_string()]);
+        let content = review_content(&ov, &Theme::default(), 80, Locale::En);
+        let rendered: String = content
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.clone()))
+            .collect();
+        assert!(rendered.contains("Write target: .env"), "{rendered}");
+        assert!(rendered.contains("Field: DEMO_API_KEY"), "{rendered}");
+        assert!(!rendered.contains("abc123def"), "{rendered}");
+    }
+
+    #[test]
+    fn a_review_without_a_declared_target_says_the_location_is_unbound() {
+        let ov = review();
+        let content = review_content(&ov, &Theme::default(), 80, Locale::En);
+        let rendered: String = content
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.clone()))
+            .collect();
+        assert!(rendered.contains("names no .env target"), "{rendered}");
     }
 
     #[test]

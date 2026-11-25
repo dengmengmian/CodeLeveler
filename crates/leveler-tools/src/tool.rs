@@ -1270,6 +1270,18 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// Whether an approval for one call of this tool must bind to that exact
+    /// argument vector: no "always" rule, no reuse for another target.
+    ///
+    /// Tools whose arguments name a specific resource whose authority cannot
+    /// be expressed in the durable rule language declare this. Today that is
+    /// the credential broker: approving `secret_apply` for one captured
+    /// reference and one target must not become a standing authorization for
+    /// every later credential use.
+    fn exact_call_consent(&self) -> bool {
+        false
+    }
+
     /// Whether re-running this call after a crash, with the same arguments, is
     /// guaranteed to have no external effect beyond what the first (possibly
     /// completed) attempt already had.

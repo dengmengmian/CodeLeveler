@@ -43,6 +43,10 @@ pub enum WorkspaceError {
     OutsideWorkspace(String),
     #[error("path `{0}` is denied (sensitive file)")]
     Denied(String),
+    /// The secret broker writes dotenv files only. This is not a general
+    /// credential-file write authority.
+    #[error("path `{0}` is not a dotenv target; the secret broker writes only .env files")]
+    NotSecretTarget(String),
     /// An agent definition, which only the agent store writes.
     #[error(
         "path `{0}` is an agent definition; tools do not edit it. Change agents \
@@ -539,31 +543,41 @@ impl Workspace {
     /// Resolve the destination of a host-brokered credential write.
     ///
     /// Like [`Self::resolve_for_write`], except the credential-file name
-    /// denylist does not apply: writing `.env` is the broker's purpose. The
-    /// caller must have authorized the specific target first; this method
-    /// only says where the bytes may land.
+    /// denylist does not apply for **dotenv files only**: writing `.env` is
+    /// the broker's purpose. A key file, a credential store or any other
+    /// sensitive name stays denied even on this path. Every other protection
+    /// (workspace bound, symlink identity, trust stores, `.git`/`.ssh`/`.aws`,
+    /// agent and skill definitions) still applies.
     pub fn resolve_for_secret_write(
         &self,
         input: impl AsRef<Path>,
         scope: &WriteScope,
     ) -> Result<PathBuf, WorkspaceError> {
+        let input = input.as_ref();
+        if !is_dotenv_target_path(input) {
+            return Err(WorkspaceError::NotSecretTarget(input.display().to_string()));
+        }
         self.resolve_for_mutation(
-            input.as_ref(),
+            input,
             scope,
             leveler_core::Capability::FilesystemWrite,
             PathAccess::SecretWrite,
         )
     }
 
-    /// Resolve a dotenv file for the broker's own verification read. The
-    /// credential-file name denylist does not apply; the trust-store,
-    /// `.git`/`.ssh`/`.aws` and workspace-bound checks do.
+    /// Resolve a dotenv file for the broker's own verification read. Only a
+    /// dotenv name qualifies; the trust-store, `.git`/`.ssh`/`.aws`,
+    /// agent/skill and workspace-bound checks all still apply.
     pub fn resolve_for_secret_read(
         &self,
         input: impl AsRef<Path>,
     ) -> Result<PathBuf, WorkspaceError> {
+        let input = input.as_ref();
+        if !is_dotenv_target_path(input) {
+            return Err(WorkspaceError::NotSecretTarget(input.display().to_string()));
+        }
         let bound = self.root.as_path();
-        self.resolve_bounded(input.as_ref(), Some(bound), PathAccess::SecretRead)
+        self.resolve_bounded(input, Some(bound), PathAccess::SecretRead)
     }
 
     /// Resolve a deletion under its independent capability.
@@ -825,6 +839,15 @@ impl Workspace {
                 original.display().to_string(),
             ));
         }
+        // The broker's dotenv exception does not make agent/skill definition
+        // trees readable either: a `.env` inside them is still control-plane
+        // material, not a project configuration file.
+        if matches!(access, PathAccess::SecretRead)
+            && (self.is_in_project_agents_dir(normalized)
+                || self.is_in_project_skills_dir(normalized))
+        {
+            return Err(denied(original));
+        }
 
         for comp in normalized.components() {
             if let Component::Normal(os) = comp {
@@ -883,8 +906,15 @@ impl Workspace {
     }
 }
 
-/// File names that commonly hold credentials, denied at the workspace layer
-/// (`read_file`, `apply_patch`, …) and best-effort refused by the shell guard
+/// Whether the path's file name is a dotenv file. This is the complete set of
+/// names the secret broker's narrow authority covers.
+fn is_dotenv_target_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == ".env" || name.starts_with(".env."))
+}
+
+/// File names that commonly hold credentials, denied at the workspace layer/// (`read_file`, `apply_patch`, …) and best-effort refused by the shell guard
 /// so both layers enforce one rule set: `.env*`, key/cert material by
 /// extension, SSH private keys by conventional name, and well-known credential
 /// stores. Public halves (`id_rsa.pub`) stay allowed.
@@ -1872,7 +1902,7 @@ mod read_confinement_tests {
             root: workspace.root().to_path_buf(),
         };
 
-        for allowed in [".env", ".env.local", "apps/web/.env", "key.pem"] {
+        for allowed in [".env", ".env.local", "apps/web/.env"] {
             assert!(
                 workspace.resolve_for_secret_write(allowed, &scope).is_ok(),
                 "broker must be able to write {allowed}: {:?}",
@@ -1892,7 +1922,15 @@ mod read_confinement_tests {
             );
         }
 
-        for denied in [".ssh/config", ".git/config"] {
+        for denied in [
+            ".ssh/config",
+            ".git/config",
+            ".aws/credentials",
+            "key.pem",
+            "credentials.json",
+            ".leveler/agents/reviewer/.env",
+            ".leveler/skills/deploy/.env",
+        ] {
             assert!(
                 workspace.resolve_for_secret_write(denied, &scope).is_err(),
                 "broker must not write {denied}"

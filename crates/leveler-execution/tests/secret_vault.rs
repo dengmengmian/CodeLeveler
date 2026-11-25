@@ -188,3 +188,87 @@ fn a_restarted_process_cannot_resolve_the_old_process_s_references() {
     ));
     assert_eq!(restarted.available_count("s"), 0);
 }
+
+#[test]
+fn a_capture_starts_with_no_authorized_use() {
+    let vault = vault();
+    let reference = vault
+        .capture("s", "hunter2-abc123".to_string(), None)
+        .unwrap();
+    let scope = vault.use_scope("s", &reference).unwrap();
+    assert!(scope.targets.is_empty());
+    assert!(scope.fields.is_empty());
+}
+
+#[test]
+fn the_users_named_targets_and_fields_bound_a_capture() {
+    let vault = vault();
+    let reference = vault
+        .capture("s", "hunter2-abc123".to_string(), None)
+        .unwrap();
+    assert!(vault.authorize_use(
+        "s",
+        &reference,
+        &[".env".to_string()],
+        &["DEMO_API_KEY".to_string()]
+    ));
+    let scope = vault.use_scope("s", &reference).unwrap();
+    assert_eq!(scope.targets, vec![".env".to_string()]);
+    assert_eq!(scope.fields, vec!["DEMO_API_KEY".to_string()]);
+
+    // A later message may extend the same capture's declared use; it never
+    // replaces what the user already authorized.
+    assert!(vault.authorize_use(
+        "s",
+        &reference,
+        &[".env.local".to_string()],
+        &["OTHER_TOKEN".to_string()]
+    ));
+    let scope = vault.use_scope("s", &reference).unwrap();
+    assert_eq!(
+        scope.targets,
+        vec![".env".to_string(), ".env.local".to_string()]
+    );
+    assert_eq!(
+        scope.fields,
+        vec!["DEMO_API_KEY".to_string(), "OTHER_TOKEN".to_string()]
+    );
+}
+
+#[test]
+fn a_foreign_unknown_revoked_or_expired_capture_cannot_gain_a_use_scope() {
+    let vault = SecretVault::with_ttl(Duration::from_millis(30));
+    let reference = vault
+        .capture("s", "hunter2-abc123".to_string(), None)
+        .unwrap();
+    assert!(!vault.authorize_use(
+        "other",
+        &reference,
+        &[".env".to_string()],
+        &["KEY".to_string()]
+    ));
+    assert!(matches!(
+        vault.use_scope("other", &reference),
+        Err(VaultError::Unavailable)
+    ));
+
+    let guessed = SecretRef::parse("sec_00000000000000000000000000000000").unwrap();
+    assert!(!vault.authorize_use("s", &guessed, &[".env".to_string()], &["KEY".to_string()]));
+
+    vault.revoke("s", &reference);
+    assert!(!vault.authorize_use("s", &reference, &[".env".to_string()], &["KEY".to_string()]));
+    assert!(matches!(
+        vault.use_scope("s", &reference),
+        Err(VaultError::Revoked)
+    ));
+
+    let expiring = vault
+        .capture("s", "second-secret-42".to_string(), None)
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(60));
+    assert!(!vault.authorize_use("s", &expiring, &[".env".to_string()], &["KEY".to_string()]));
+    assert!(matches!(
+        vault.use_scope("s", &expiring),
+        Err(VaultError::Expired)
+    ));
+}

@@ -38,7 +38,7 @@ mod review_live;
 pub mod runtime_boot;
 mod runtime_identity;
 mod schedule_tools;
-mod secret_input;
+pub mod secret_input;
 mod session;
 pub mod session_history;
 pub mod session_projection;

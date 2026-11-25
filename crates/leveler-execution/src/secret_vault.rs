@@ -122,6 +122,21 @@ impl std::fmt::Display for SecretRef {
     }
 }
 
+/// The uses the user's own messages named for one captured value.
+///
+/// This is authorization data, not a detection result: an empty target set
+/// means the person never named a dotenv file for this capture, so the host
+/// cannot confine the write to one the model chose. A non-empty set is a hard
+/// bound — the broker may write the value only to those targets and fields.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SecretUseScope {
+    /// Workspace-relative dotenv targets, normalized by
+    /// `leveler_core::normalize_dotenv_target`.
+    pub targets: Vec<String>,
+    /// Dotenv field names explicitly assigned in the user's text.
+    pub fields: Vec<String>,
+}
+
 /// Lifecycle of one capture, as the host reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretState {
@@ -145,6 +160,10 @@ struct Entry {
     /// Targets an authorized operation has written it to. Names only; never
     /// the value.
     targets: Vec<String>,
+    /// Targets and fields the user's own messages named for this capture.
+    /// Empty until a message names one; never inferred from the model.
+    scope_targets: std::collections::BTreeSet<String>,
+    scope_fields: std::collections::BTreeSet<String>,
 }
 
 /// Process-local captures. One instance per runtime host, shared by every
@@ -215,6 +234,8 @@ impl SecretVault {
                 created: Instant::now(),
                 state: SecretState::Available,
                 targets: Vec::new(),
+                scope_targets: std::collections::BTreeSet::new(),
+                scope_fields: std::collections::BTreeSet::new(),
             },
         );
         Ok(reference)
@@ -247,6 +268,80 @@ impl SecretVault {
             return Err(VaultError::Expired);
         }
         Ok(operation(entry.value.as_str()))
+    }
+
+    /// Record the targets and fields the user's own message named for this
+    /// capture. Returns whether the reference was live and belonged to
+    /// `session`.
+    ///
+    /// The caller supplies values already normalized by the text layer. Empty
+    /// and oversized values are ignored rather than stored; a live capture
+    /// with nothing to add still answers `true`, because authorization itself
+    /// did not fail. Revoked and expired captures cannot gain new uses.
+    pub fn authorize_use(
+        &self,
+        session: &str,
+        reference: &SecretRef,
+        targets: &[String],
+        fields: &[String],
+    ) -> bool {
+        let mut entries = self.lock();
+        let Some(entry) = entries.get_mut(reference) else {
+            return false;
+        };
+        if entry.session != session {
+            return false;
+        }
+        if matches!(entry.state, SecretState::Revoked | SecretState::Expired) {
+            return false;
+        }
+        if self.is_expired(entry) {
+            entry.state = SecretState::Expired;
+            entry.value.clear();
+            return false;
+        }
+        for target in targets {
+            if !target.is_empty() && target.len() <= 1024 && entry.scope_targets.len() < 32 {
+                entry.scope_targets.insert(target.clone());
+            }
+        }
+        for field in fields {
+            if !field.is_empty() && field.len() <= 128 && entry.scope_fields.len() < 32 {
+                entry.scope_fields.insert(field.clone());
+            }
+        }
+        true
+    }
+
+    /// The use scope accumulated for one capture. The same availability
+    /// answers as [`Self::with_value`] apply: unknown and foreign references
+    /// are indistinguishable.
+    pub fn use_scope(
+        &self,
+        session: &str,
+        reference: &SecretRef,
+    ) -> Result<SecretUseScope, VaultError> {
+        let mut entries = self.lock();
+        let Some(entry) = entries.get_mut(reference) else {
+            return Err(VaultError::Unavailable);
+        };
+        if entry.session != session {
+            return Err(VaultError::Unavailable);
+        }
+        match entry.state {
+            SecretState::Revoked => return Err(VaultError::Revoked),
+            SecretState::Expired => return Err(VaultError::Expired),
+            SecretState::Available | SecretState::Used => {}
+        }
+        if self.is_expired(entry) {
+            entry.state = SecretState::Expired;
+            entry.value.clear();
+            return Err(VaultError::Expired);
+        }
+        Ok(SecretUseScope {
+            targets: entry.scope_targets.iter().cloned().collect(),
+            fields: entry.scope_fields.iter().cloned().collect(),
+        })
     }
 
     /// Current lifecycle state. Cross-session access reports the same

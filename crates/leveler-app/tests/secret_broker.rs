@@ -299,6 +299,95 @@ fn a_captured_credential_reaches_neither_the_provider_nor_the_database() {
 }
 
 #[test]
+fn a_plaintext_acknowledgement_is_one_command_and_confers_no_custody() {
+    leveler_test_support::bounded_test(
+        "a_plaintext_acknowledgement_is_one_command_and_confers_no_custody",
+        Duration::from_secs(60),
+        || async {
+            let f = fixture(vec![text_response("acknowledged")]).await;
+            let mut rx = f.client.subscribe();
+            f.client
+                .send(ClientCommand::SubmitUserInput {
+                    session_id: f.session.clone(),
+                    content: format!("DEEPSEEK_API_KEY={CANARY}"),
+                    attachments: Vec::new(),
+                    secret_captures: Vec::new(),
+                    plaintext_secret_ack: true,
+                })
+                .await
+                .expect("the person's explicit plaintext choice is admitted");
+            f.wait_for_turn_end(&mut rx).await;
+
+            // What the person chose is a real disclosure: the provider sees it.
+            // Local persistence is a separate boundary, and the ordinary
+            // model-visible sanitizer still keeps the value out of the session
+            // store. Plaintext means "the provider may see it", not "the disk
+            // now holds it".
+            let bodies = f.server.request_bodies().await;
+            assert!(
+                bodies.iter().any(|body| body.contains(CANARY)),
+                "plaintext was not sent even though the person chose it"
+            );
+            assert_eq!(
+                f.app.secret_vault().available_count(f.session.as_str()),
+                0,
+                "plaintext acknowledgement must not create custody"
+            );
+            assert_canary_absent_from_disk(f._tmp.path());
+
+            // The acknowledgement belongs to THAT command. A later command
+            // carrying the same value is refused before any provider request.
+            let error = f
+                .client
+                .send(ClientCommand::SubmitMessage {
+                    session_id: f.session.clone(),
+                    content: format!("再发一次 DEEPSEEK_API_KEY={CANARY}"),
+                    attachments: Vec::new(),
+                })
+                .await
+                .expect_err("a plaintext acknowledgement is not reusable");
+            assert!(!error.to_string().contains(CANARY), "{error}");
+            assert_eq!(
+                f.server.request_bodies().await.len(),
+                bodies.len(),
+                "the refused command started no turn"
+            );
+        },
+    );
+}
+
+#[test]
+fn an_unreviewed_ambiguous_value_is_refused_on_a_legacy_command() {
+    leveler_test_support::bounded_test(
+        "an_unreviewed_ambiguous_value_is_refused_on_a_legacy_command",
+        Duration::from_secs(60),
+        || async {
+            let f = fixture(vec![text_response("should not run")]).await;
+            let mut _rx = f.client.subscribe();
+            let error = f
+                .client
+                .send(ClientCommand::SubmitMessage {
+                    session_id: f.session.clone(),
+                    content: "API_KEY=abc123def".to_string(),
+                    attachments: Vec::new(),
+                })
+                .await
+                .expect_err("a client with no review surface cannot silently send it");
+            assert!(!error.to_string().contains("abc123def"), "{error}");
+            assert!(
+                f.server.request_bodies().await.is_empty(),
+                "the refused command started no provider request"
+            );
+            assert_eq!(
+                f.app.secret_vault().available_count(f.session.as_str()),
+                0,
+                "nothing was captured"
+            );
+        },
+    );
+}
+
+#[test]
 fn an_unacknowledged_credential_is_refused_before_any_turn_or_write() {
     leveler_test_support::bounded_test(
         "an_unacknowledged_credential_is_refused_before_any_turn_or_write",

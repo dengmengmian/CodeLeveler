@@ -67,10 +67,23 @@ def last_role(body: str) -> str:
 def transform(body: str, frames: list[str]) -> list[str]:
     """Answer like a model that read the reference from its own prompt."""
     if last_role(body) == "tool":
+        if "authorized only for" in body:
+            return base.text_turn("目标超出授权，已停止。")
         return base.text_turn("已完成配置。")
     reference = secret_in(body)
     if reference is None:
         return base.text_turn("消息中没有可用的凭据引用。")
+    if "超出授权测试" in body:
+        # The user did not name .env.production. The host must refuse even
+        # though this run uses Full access and no approval is involved.
+        arguments = json.dumps(
+            {
+                "secret_ref": reference,
+                "field": "DEEPSEEK_API_KEY",
+                "target": ".env.production",
+            }
+        )
+        return base.tool_turn("secret_apply", arguments)
     field = "OTHER_TOKEN" if "OTHER_TOKEN" in body else "DEEPSEEK_API_KEY"
     arguments = json.dumps(
         {
@@ -183,7 +196,7 @@ def main() -> int:
             captured and "[secret:sec_" in pty.screen.text(),
             pty.screen.text()[-600:],
         )
-        pty.write(" 请把它配置为 OTHER_TOKEN")
+        pty.write(" 请把它配置到 .env，字段为 OTHER_TOKEN")
         time.sleep(0.3)
         pty.key("\r")
         done_b = pty.wait_for("已完成配置", 60)
@@ -196,6 +209,20 @@ def main() -> int:
             written,
         )
         report.dump("B-done", pty)
+
+        # ── Scenario C: a target the user never named ──────────────────────
+        pty.write("超出授权测试：请再次写入")
+        time.sleep(0.3)
+        pty.key("\r")
+        refused = pty.wait_for("目标超出授权，已停止", 60)
+        production = os.path.join(env.repo, ".env.production")
+        report.check(
+            "scope",
+            "an undeclared target is refused even in Full access",
+            refused and not os.path.exists(production),
+            pty.screen.text()[-800:],
+        )
+        report.dump("C-refused", pty)
 
         # ── Leak boundaries ───────────────────────────────────────────────
         requests = "\n".join(mock.requests)

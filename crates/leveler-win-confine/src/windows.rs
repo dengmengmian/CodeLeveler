@@ -858,6 +858,36 @@ pub(crate) fn verify_private_state_file(path: &Path) -> io::Result<()> {
     validate_private_security(path)
 }
 
+/// Apply the owner-only DACL to one existing regular file and verify it.
+///
+/// `SetNamedSecurityInfoW` is path-based, so callers must already have
+/// established that the path is not a reparse point and is the object they
+/// mean to protect. The validation below repeats that check on the current
+/// metadata; the caller's own write path remains the authority for identity.
+pub(crate) fn secure_private_file(path: &Path) -> io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is a reparse point", path.display()),
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    if is_reparse_point(file_attributes(path)?) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is a reparse point", path.display()),
+        ));
+    }
+    apply_private_dacl(path)?;
+    validate_private_security(path)
+}
+
 /// Open `pid` and read its creation time. `ERROR_INVALID_PARAMETER` means no
 /// process with that id exists; any other failure is not proof of absence.
 pub(crate) fn process_creation_time(pid: u32) -> io::Result<u64> {

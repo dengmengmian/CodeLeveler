@@ -54,7 +54,13 @@ pub(crate) async fn cmd_run(
     sandbox: bool,
     collaboration: leveler_lifecycle::CollaborationMode,
     max_model_steps: Option<u32>,
+    allow_plaintext_secrets: bool,
 ) -> anyhow::Result<std::process::ExitCode> {
+    // No review surface exists on this path. Refuse a detected credential
+    // before a session or a provider request exists; the explicit opt-in is
+    // the only way to send one as visible text.
+    leveler_app::secret_input::admit_uninteractive_input(&task, allow_plaintext_secrets)
+        .map_err(anyhow::Error::msg)?;
     let mut app = Application::assemble(layout)?
         .with_collaboration(collaboration)
         .with_model_step_ceiling(max_model_steps);
@@ -153,7 +159,10 @@ pub(crate) async fn cmd_run_parallel(
     max_model_steps: Option<u32>,
     output: OutputFormat,
     ship: leveler_app::ShipOptions,
+    allow_plaintext_secrets: bool,
 ) -> anyhow::Result<std::process::ExitCode> {
+    leveler_app::secret_input::admit_uninteractive_input(&task, allow_plaintext_secrets)
+        .map_err(anyhow::Error::msg)?;
     if ship.any() || ship.branch.is_some() || ship.pr_base.is_some() {
         anyhow::bail!(
             "parallel shipping is unsupported; integrate candidates first, then push the reviewed result explicitly"
@@ -1707,7 +1716,12 @@ pub(crate) async fn cmd_run_resume(
     auto_approve: bool,
     confirm_recovery: bool,
     output: OutputFormat,
+    allow_plaintext_secrets: bool,
 ) -> anyhow::Result<std::process::ExitCode> {
+    if let Some(instruction) = &instruction {
+        leveler_app::secret_input::admit_uninteractive_input(instruction, allow_plaintext_secrets)
+            .map_err(anyhow::Error::msg)?;
+    }
     // Resume reloads collaboration and active capabilities from durable state.
     let mut app = Application::assemble(layout)?;
     // The same eval-only seams a fresh `run` reads must apply to the resumed

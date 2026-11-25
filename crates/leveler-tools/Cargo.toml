@@ -58,6 +58,7 @@ rustix = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 cap-std = { workspace = true }
 cap-tempfile = { workspace = true }
+leveler-win-confine = { workspace = true }
 
 [dev-dependencies]
 leveler-definition-trust = { workspace = true, features = ["test-support"] }

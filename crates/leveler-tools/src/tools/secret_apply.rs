@@ -89,12 +89,60 @@ impl Tool for SecretApplyTool {
         true
     }
 
+    fn exact_call_consent(&self) -> bool {
+        // One approval authorizes one captured value for one target and field.
+        // It can never become a tool-wide rule: the authority lives in the
+        // vault entry, not in a permission rule.
+        true
+    }
+
     fn approval_reason(&self, input: &serde_json::Value, context: &ToolContext) -> Option<String> {
+        // Full never asks. Every other mode asks only when the user's own
+        // message did not already name this exact use: an over-scope request
+        // is refused by the tool, not put to the person as a question the
+        // tool would then reject anyway.
+        if context.policy.unrestricted_execution() {
+            return None;
+        }
         let target = input
             .get("target")
             .and_then(|value| value.as_str())
             .unwrap_or(".env");
-        crate::workspace::path_approval_reason(context, target, true)
+        let target = leveler_core::normalize_dotenv_target(target)?;
+        let field = input.get("field")?.as_str()?;
+        if !is_env_field(field) {
+            return None;
+        }
+        let reference = SecretRef::parse(input.get("secret_ref")?.as_str()?).ok()?;
+        let session = context.session_scope.as_deref()?;
+        let vault = context.execution.secret_vault.as_ref()?;
+        let scope = vault.use_scope(session, &reference).ok()?;
+        if scope_refusal(&scope, &target, field).is_some() {
+            return None;
+        }
+        // No prompt only when the person's own message named BOTH dimensions.
+        // A target without a field (or a field without a target) leaves the
+        // other half to the model, which is exactly the sensitive credential
+        // use Auto asks about.
+        let missing = match (scope.targets.is_empty(), scope.fields.is_empty()) {
+            (false, false) => return None,
+            (true, true) => "目标与字段都未在用户消息中声明",
+            (true, false) => "目标未在用户消息中声明",
+            (false, true) => "字段未在用户消息中声明",
+        };
+        // Do not prompt for a write the execution layer would refuse.
+        if context.write_path_denied(&target).is_some() {
+            return None;
+        }
+        context
+            .execution_workspace()
+            .ok()?
+            .resolve_for_secret_write(&target, &context.write_scope())
+            .ok()?;
+        Some(format!(
+            "使用已接管凭据（{}）写入 {target} 的 {field}。{missing}，请确认。",
+            short_reference(&reference)
+        ))
     }
 
     async fn execute(
@@ -140,6 +188,16 @@ impl Tool for SecretApplyTool {
                 ));
             }
         };
+        // The person's own messages are the use authorization. A message that
+        // named `.env` and `DEMO_API_KEY` permits exactly that; it does not
+        // permit the model to choose another target or field afterwards.
+        let scope = match vault.use_scope(session, &reference) {
+            Ok(scope) => scope,
+            Err(error) => return Ok(ToolOutput::error(error.to_string())),
+        };
+        if let Some(reason) = scope_refusal(&scope, &target, &input.field) {
+            return Ok(ToolOutput::error(reason));
+        }
 
         if let Some(denied) = context.write_path_denied(&target) {
             return Ok(ToolOutput::error(denied));
@@ -250,12 +308,19 @@ impl Tool for SecretApplyTool {
         }
 
         vault.mark_used(session, &reference, &target);
-        Ok(ToolOutput::ok(format!(
+        // The value is already in the file; an existing world-readable file
+        // must still be tightened. The commit path tightens before returning,
+        // but an idempotent retry never reaches it.
+        let tightened = tighten_to_private(&resolved).await;
+        let mut message = format!(
             "{} already contains the same value for {}; nothing changed. \
              secret_ref={}",
             target, input.field, input.secret_ref
-        ))
-        .with_metadata(serde_json::json!({
+        );
+        if !tightened {
+            message.push_str("\n\nNote: the file's permissions could not be tightened to 0600.");
+        }
+        Ok(ToolOutput::ok(message).with_metadata(serde_json::json!({
             "modified_files": [],
             "secret_ref": input.secret_ref,
             "field": input.field,
@@ -381,24 +446,45 @@ fn is_env_field(field: &str) -> bool {
 /// (`apps/web/.env`) is allowed; an absolute path, a parent traversal or a
 /// different file family is not.
 fn validate_env_target(target: &str) -> Result<String, String> {
-    let target = target.trim();
-    if target.is_empty() {
-        return Err("target must not be empty".into());
+    leveler_core::normalize_dotenv_target(target).ok_or_else(|| {
+        "only .env files are supported, relative to the workspace (for example .env or .env.local)"
+            .to_string()
+    })
+}
+
+/// Why the model's requested use is outside what the person's own message
+/// authorized. An empty scope is not a refusal: the person may still approve
+/// the use at admission, or the capture may have arrived through `/secret`
+/// without a target.
+fn scope_refusal(
+    scope: &leveler_execution::secret_vault::SecretUseScope,
+    target: &str,
+    field: &str,
+) -> Option<String> {
+    if !scope.targets.is_empty() && !scope.targets.iter().any(|allowed| allowed == target) {
+        return Some(format!(
+            "this captured secret is authorized only for {}; the user's message did not \
+             name {target}. Tell the user which target is needed and let them state it \
+             explicitly; do not use another target.",
+            scope.targets.join(", ")
+        ));
     }
-    if target.len() > 1024 {
-        return Err("target is too long".into());
+    if !scope.fields.is_empty() && !scope.fields.iter().any(|allowed| allowed == field) {
+        return Some(format!(
+            "this captured secret is authorized only for field {}; the user's message did \
+             not name {field}. Tell the user which field is needed and let them state it \
+             explicitly; do not use another field.",
+            scope.fields.join(", ")
+        ));
     }
-    if target.starts_with('/') || target.starts_with('\\') || target.contains(':') {
-        return Err("target must be relative to the workspace".into());
-    }
-    if target.split(['/', '\\']).any(|part| part == "..") {
-        return Err("target must not leave the workspace".into());
-    }
-    let file = target.rsplit(['/', '\\']).next().unwrap_or(target);
-    if file != ".env" && !file.starts_with(".env.") {
-        return Err("only .env files are supported (for example .env or .env.local)".into());
-    }
-    Ok(target.to_string())
+    None
+}
+
+/// A reference suffix safe to show in an approval prompt: the model already
+/// has the full reference, and the suffix is enough to tell two prompts apart.
+fn short_reference(reference: &SecretRef) -> String {
+    let text = reference.as_str();
+    format!("sec_…{}", &text[text.len().saturating_sub(6)..])
 }
 
 /// Set `field` in `content`, preserving every other line and the file's line
@@ -525,8 +611,21 @@ async fn tighten_to_private(path: &std::path::Path) -> bool {
 }
 
 #[cfg(not(unix))]
-async fn tighten_to_private(_path: &std::path::Path) -> bool {
-    true
+async fn tighten_to_private(path: &std::path::Path) -> bool {
+    #[cfg(windows)]
+    {
+        // Windows has no mode bits. The equivalent of 0600 is an owner-only,
+        // inheritance-protected DACL: only the current user, SYSTEM and the
+        // Administrators group. Applying it after the atomic replace leaves a
+        // short window that the sandbox/permission mode already covers; a
+        // file the host created earlier is tightened here too.
+        leveler_win_confine::secure_private_file(path).is_ok()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        true
+    }
 }
 
 /// Warn when a dotenv is inside a Git repository and not ignored by the local
@@ -638,6 +737,50 @@ mod tests {
             std::fs::read_to_string(dir.join(".env")).unwrap(),
             "# keep me\r\nDEEPSEEK_API_KEY=sk-2f8a1c9e4b7d6a5f3e2c1b0a\r\nOTHER=visible\r\nexport EXPORTED=sk-2f8a1c9e4b7d6a5f3e2c1b0a\r\n"
         );
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_existing_dotenv_is_still_tightened() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let (context, dir, _vault, reference) = broker_ctx(&[]);
+            let path = dir.join(".env");
+            std::fs::write(&path, "API_KEY=sk-2f8a1c9e4b7d6a5f3e2c1b0a\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let output = apply(&context, &reference, "API_KEY", ".env").await;
+            assert!(!output.is_error, "{}", output.content);
+            assert_eq!(output.metadata["changed"], false);
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "an idempotent retry must still tighten the credential file"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn the_dotenv_gets_an_owner_only_acl() {
+        let (context, dir, _vault, reference) = broker_ctx(&[]);
+        let output = apply(&context, &reference, "DEMO_API_KEY", ".env").await;
+        assert!(!output.is_error, "{}", output.content);
+        leveler_win_confine::verify_private_state_file(&dir.join(".env"))
+            .expect("the credential file must carry the owner-only DACL");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn an_unchanged_existing_dotenv_is_still_protected() {
+        let (context, dir, _vault, reference) = broker_ctx(&[]);
+        let path = dir.join(".env");
+        std::fs::write(&path, "API_KEY=sk-2f8a1c9e4b7d6a5f3e2c1b0a\n").unwrap();
+        let output = apply(&context, &reference, "API_KEY", ".env").await;
+        assert!(!output.is_error, "{}", output.content);
+        assert_eq!(output.metadata["changed"], false);
+        leveler_win_confine::verify_private_state_file(&path)
+            .expect("an idempotent retry must still protect the credential file");
     }
 
     #[tokio::test]
@@ -794,5 +937,175 @@ mod tests {
             Some(reference.as_str())
         );
         assert!(leveler_core::parse_secret_reference_token("[secret:not-a-ref]").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_child_execution_shares_the_capture_scope_but_not_extra_authority() {
+        let (context, dir, vault, reference) = broker_ctx(&[]);
+        assert!(vault.authorize_use(
+            "s",
+            &reference,
+            &[".env".to_string()],
+            &["DEMO_API_KEY".to_string()]
+        ));
+        let child = context
+            .clone()
+            .with_writer_scope("child-writer")
+            .with_tool_call_scope("child-call-2");
+        let inside = apply(&child, &reference, "DEMO_API_KEY", ".env").await;
+        assert!(!inside.is_error, "{}", inside.content);
+        let outside = apply(&child, &reference, "DEMO_API_KEY", ".env.production").await;
+        assert!(
+            outside.is_error,
+            "a delegated writer must not widen the capture's use"
+        );
+        assert!(!dir.join(".env.production").exists());
+    }
+
+    #[tokio::test]
+    async fn an_apply_outside_the_users_declared_target_is_refused_in_every_mode() {
+        for mode in [
+            PermissionProfile::Assisted,
+            PermissionProfile::FullAccess,
+            PermissionProfile::RequestApproval,
+        ] {
+            let (context, dir) = super::super::test_ctx(mode, &[]);
+            let vault = Arc::new(SecretVault::new());
+            let reference = vault
+                .capture("s", "sk-2f8a1c9e4b7d6a5f3e2c1b0a".into(), None)
+                .unwrap();
+            assert!(vault.authorize_use(
+                "s",
+                &reference,
+                &[".env".to_string()],
+                &["DEMO_API_KEY".to_string()]
+            ));
+            let context = context.with_session_scope("s").with_secret_vault(vault);
+
+            let authorized = apply(&context, &reference, "DEMO_API_KEY", ".env").await;
+            assert!(!authorized.is_error, "{mode:?}: {}", authorized.content);
+
+            let other_target = apply(&context, &reference, "DEMO_API_KEY", ".env.production").await;
+            assert!(
+                other_target.is_error,
+                "{mode:?}: a new target must be refused"
+            );
+            assert!(
+                !dir.join(".env.production").exists(),
+                "{mode:?}: a refused target writes nothing"
+            );
+
+            let other_field = apply(&context, &reference, "ATTACKER_TOKEN", ".env").await;
+            assert!(
+                other_field.is_error,
+                "{mode:?}: a new field must be refused"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.join(".env")).unwrap(),
+                "DEMO_API_KEY=sk-2f8a1c9e4b7d6a5f3e2c1b0a\n",
+                "{mode:?}: the authorized write is the only one that landed"
+            );
+            assert!(!other_field.content.contains("sk-2f8a1c9e"));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_apply_inside_the_declared_scope_needs_no_further_approval() {
+        let (context, dir, vault, reference) = broker_ctx(&[]);
+        assert!(vault.authorize_use(
+            "s",
+            &reference,
+            &[".env".to_string()],
+            &["DEMO_API_KEY".to_string()]
+        ));
+        let input = serde_json::json!({
+            "secret_ref": reference.as_str(),
+            "field": "DEMO_API_KEY",
+            "target": ".env",
+        });
+        assert_eq!(
+            SecretApplyTool.approval_reason(&input, &context),
+            None,
+            "the user's own message already authorized this exact use"
+        );
+        let output = SecretApplyTool
+            .execute(input, context.clone(), CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(!output.is_error, "{}", output.content);
+        assert!(dir.join(".env").exists());
+    }
+
+    #[tokio::test]
+    async fn a_partially_declared_use_asks_for_the_missing_dimension() {
+        let (context, _dir, vault, reference) = broker_ctx(&[]);
+        assert!(vault.authorize_use("s", &reference, &[".env".to_string()], &[]));
+        let input = serde_json::json!({
+            "secret_ref": reference.as_str(),
+            "field": "DEMO_API_KEY",
+            "target": ".env",
+        });
+        let reason = SecretApplyTool
+            .approval_reason(&input, &context)
+            .expect("a target without a field is not a full use authorization");
+        assert!(reason.contains("字段未在用户消息中声明"), "{reason}");
+
+        let (context, _dir, vault, reference) = broker_ctx(&[]);
+        assert!(vault.authorize_use("s", &reference, &[], &["DEMO_API_KEY".to_string()]));
+        let input = serde_json::json!({
+            "secret_ref": reference.as_str(),
+            "field": "DEMO_API_KEY",
+            "target": ".env",
+        });
+        let reason = SecretApplyTool
+            .approval_reason(&input, &context)
+            .expect("a field without a target is not a full use authorization");
+        assert!(reason.contains("目标未在用户消息中声明"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn an_unscoped_reference_asks_and_an_out_of_scope_one_does_not() {
+        let (context, _dir, vault, reference) = broker_ctx(&[]);
+        let input = serde_json::json!({
+            "secret_ref": reference.as_str(),
+            "field": "DEMO_API_KEY",
+            "target": ".env",
+        });
+        let reason = SecretApplyTool
+            .approval_reason(&input, &context)
+            .expect("an unbound credential use is a decision for the person");
+        assert!(reason.contains(".env"), "{reason}");
+        assert!(reason.contains("DEMO_API_KEY"), "{reason}");
+        assert!(!reason.contains("sk-2f8a1c9e"), "{reason}");
+        assert!(
+            SecretApplyTool.exact_call_consent(),
+            "one approval must not become a standing credential-use rule"
+        );
+
+        assert!(vault.authorize_use(
+            "s",
+            &reference,
+            &[".env".to_string()],
+            &["DEMO_API_KEY".to_string()]
+        ));
+        let other = serde_json::json!({
+            "secret_ref": reference.as_str(),
+            "field": "DEMO_API_KEY",
+            "target": ".env.production",
+        });
+        assert_eq!(
+            SecretApplyTool.approval_reason(&other, &context),
+            None,
+            "an over-scope use is refused by the broker, not put to the person as a question"
+        );
+
+        let full = context.clone().with_permission_profile(
+            leveler_execution::SharedPermissionProfile::new(PermissionProfile::FullAccess),
+        );
+        assert_eq!(
+            SecretApplyTool.approval_reason(&input, &full),
+            None,
+            "Full mode never asks"
+        );
     }
 }
