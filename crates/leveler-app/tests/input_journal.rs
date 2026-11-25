@@ -185,6 +185,26 @@ async fn settle_event(
     }
 }
 
+/// Wait until the runtime has journaled this append. The cancellation below
+/// must target a pending append; sending it first lets the runtime's
+/// documented "the turn ended before the steer arrived" fallback deliver the
+/// text as the next turn, which is correct behavior but not this scenario.
+async fn wait_for_admission(
+    rx: &mut tokio::sync::broadcast::Receiver<RuntimeEvent>,
+    seek: &MessageId,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(left, rx.recv()).await {
+            Ok(Ok(RuntimeEvent::InputAdmitted { message })) if &message.id == seek => return,
+            Ok(Ok(_)) => continue,
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            other => panic!("no admission for {seek:?}: {other:?}"),
+        }
+    }
+}
+
 async fn snapshot(
     client: &InProcessRuntimeClient,
     rx: &mut tokio::sync::broadcast::Receiver<RuntimeEvent>,
@@ -937,6 +957,7 @@ async fn a_cancelled_append_is_settled_and_never_resurrects() {
         .await
         .unwrap();
     let id = MessageId::new("append-cancelled");
+    let mut admission = client.subscribe();
     client
         .send(ClientCommand::SteerCurrentTurn {
             session_id: session.clone(),
@@ -945,6 +966,7 @@ async fn a_cancelled_append_is_settled_and_never_resurrects() {
         })
         .await
         .unwrap();
+    wait_for_admission(&mut admission, &id).await;
     client
         .send(ClientCommand::CancelCurrentTurn {
             session_id: session.clone(),
