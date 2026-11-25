@@ -4181,6 +4181,7 @@ def cleanup_run(
     # attributed to this cleanup.
     labels_before_cleanup = set(launchd_labels())
     own_labels = {lane.get("label") or label_for(Path(lane["home"])) for lane in lanes.values()}
+    user_labels_before_cleanup = labels_before_cleanup - own_labels
     disabled: Dict[str, Any] = {}
     for lane in lanes.values():
         status = registration_status(lane)
@@ -4230,7 +4231,7 @@ def cleanup_run(
     leftover_labels = sorted(labels_now & own_labels)
     leftover_plists = [str(plist_for(label)) for label in own_labels if plist_for(label).is_file()]
     unexpected_labels = sorted(labels_now - baseline_labels - own_labels)
-    missing_user_labels = sorted(labels_before_cleanup - labels_now)
+    missing_user_labels = sorted(user_labels_before_cleanup - labels_now)
     missing_baseline_before_cleanup = sorted(baseline_labels - labels_before_cleanup)
     archives = {name: archive_lane_data(paths, lane) for name, lane in lanes.items()}
     credentials_removed: List[str] = []
