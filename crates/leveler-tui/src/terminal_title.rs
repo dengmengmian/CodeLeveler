@@ -99,7 +99,8 @@ fn terminal_status(end: TurnEndStatus) -> TerminalTaskStatus {
         | TurnEndStatus::Blocked
         | TurnEndStatus::AnsweredUnregistered
         | TurnEndStatus::Failed
-        | TurnEndStatus::Cancelled => TerminalTaskStatus::Failed,
+        | TurnEndStatus::Cancelled
+        | TurnEndStatus::Interrupted => TerminalTaskStatus::Failed,
     }
 }
 

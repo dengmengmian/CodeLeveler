@@ -1696,6 +1696,7 @@ pub fn turn_status_label(status: TurnEndStatus, t: &UiText) -> String {
         TurnEndStatus::NoFinalAnswer => format!("⚠ {}", t.turn_no_final_answer),
         TurnEndStatus::Failed => format!("✗ {}", t.final_failed),
         TurnEndStatus::Cancelled => format!("⊘ {}", t.final_cancelled),
+        TurnEndStatus::Interrupted => format!("⊘ {}", t.final_interrupted),
     }
 }
 

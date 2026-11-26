@@ -270,6 +270,10 @@ pub enum TurnEndStatus {
     NoFinalAnswer,
     Failed,
     Cancelled,
+    /// The owning runtime or process stopped before a normal terminal. Not a
+    /// user cancellation: the durable outcome is `interrupted`, and a resumed
+    /// session must show that difference instead of relabelling the kill.
+    Interrupted,
 }
 
 /// Persistent boundary between one finished turn and the next user input.

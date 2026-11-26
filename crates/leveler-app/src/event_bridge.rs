@@ -469,7 +469,7 @@ fn task_finished_event(
         return turn_end_event(stop, reason);
     }
     match outcome {
-        leveler_lifecycle::TaskOutcome::Interrupted => RuntimeEvent::TurnCancelled,
+        leveler_lifecycle::TaskOutcome::Interrupted => RuntimeEvent::TurnInterrupted,
         // Explicit task cancellation is terminal, not a resumable pause.
         leveler_lifecycle::TaskOutcome::Cancelled => RuntimeEvent::TaskCancelled,
         leveler_lifecycle::TaskOutcome::Failed => RuntimeEvent::TurnFailed {
@@ -2797,6 +2797,22 @@ mod bridge_tests {
             bound_goal: None,
             verification: None,
         }
+    }
+
+    #[test]
+    fn a_process_interruption_is_not_replayed_as_a_user_cancel() {
+        assert_eq!(
+            task_finished_event(
+                leveler_lifecycle::TaskOutcome::Interrupted,
+                None,
+                None,
+                None,
+                Vec::new(),
+                None,
+                false,
+            ),
+            RuntimeEvent::TurnInterrupted
+        );
     }
 
     #[test]

@@ -777,6 +777,10 @@ pub enum RuntimeEvent {
     },
     /// The current turn was cancelled (resumable).
     TurnCancelled,
+    /// The turn ended because its owning runtime or process stopped before a
+    /// normal terminal. The durable `turn_finished` outcome is `interrupted`,
+    /// not a user cancellation; a client must show that difference.
+    TurnInterrupted,
     /// The logical task was explicitly cancelled by the user. Terminal: unlike
     /// [`Self::TurnCancelled`] a continuation must not reopen it.
     TaskCancelled,
@@ -2049,6 +2053,7 @@ mod tests {
     #[test]
     fn turn_cancelled_roundtrips() {
         roundtrip(RuntimeEvent::TurnCancelled, "turn_cancelled");
+        roundtrip(RuntimeEvent::TurnInterrupted, "turn_interrupted");
         roundtrip(
             RuntimeEvent::BackgroundTaskStarted {
                 task_id: "bg-1".into(),

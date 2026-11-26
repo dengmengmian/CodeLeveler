@@ -1694,6 +1694,8 @@ pub struct UiText {
     pub theme_hc_label: &'static str,
     pub theme_hc_desc: &'static str,
     pub cancelled_continue: &'static str,
+    /// Runtime/process interruption, which the user did not ask for.
+    pub interrupted_continue: &'static str,
     /// Suffix on an interrupted/failed turn that a continuation can re-enter.
     pub resumable_hint: &'static str,
     /// The logical task was explicitly cancelled: terminal, not continuable.
@@ -1772,6 +1774,7 @@ pub struct UiText {
     pub final_verification_failed: &'static str,
     pub final_failed: &'static str,
     pub final_cancelled: &'static str,
+    pub final_interrupted: &'static str,
     /// Title of the single terminal-failure block.
     pub failure_title: &'static str,
     /// Label before the always-visible safe technical failure detail.
@@ -3881,6 +3884,7 @@ static ZH: UiText = UiText {
     theme_hc_label: "High Contrast",
     theme_hc_desc: "高对比深色，状态与边框更强",
     cancelled_continue: "已取消，可继续输入",
+    interrupted_continue: "任务在运行时中断；可继续输入恢复",
     resumable_hint: "进度已保留 · 发送「继续」可恢复",
     task_cancelled: "任务已取消，无法继续",
     history_omitted_turns: "更早的 {} 个回合未显示",
@@ -3935,6 +3939,7 @@ static ZH: UiText = UiText {
     final_verification_failed: "验证未通过",
     final_failed: "失败",
     final_cancelled: "已取消",
+    final_interrupted: "已中断",
     failure_title: "请求失败",
     failure_detail_label: "技术详情",
     failure_provider_label: "服务商",
@@ -5829,6 +5834,7 @@ static EN: UiText = UiText {
     theme_hc_label: "High Contrast",
     theme_hc_desc: "high-contrast dark palette",
     cancelled_continue: "cancelled — you can keep typing",
+    interrupted_continue: "the runtime interrupted this turn; you can keep typing to resume",
     resumable_hint: "progress preserved · send \"continue\" to resume",
     task_cancelled: "task cancelled — it cannot be continued",
     history_omitted_turns: "{} earlier turns not shown",
@@ -5883,6 +5889,7 @@ static EN: UiText = UiText {
     final_verification_failed: "Verification failed",
     final_failed: "Failed",
     final_cancelled: "Cancelled",
+    final_interrupted: "Interrupted",
     failure_title: "Request failed",
     failure_detail_label: "Technical detail",
     failure_provider_label: "Provider",

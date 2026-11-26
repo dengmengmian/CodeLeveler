@@ -1075,34 +1075,12 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.turn_diff_files = None;
         }
         RuntimeEvent::TurnCancelled => {
-            note_turn_settled(state);
-            state.status = RuntimeStatus::Idle;
-            state.finalization_stage = None;
-            clear_activity(state);
-            state.goal_mode_active = false;
-            state.transcript.finalize_in_flight();
-            let live_reviews = state.transcript.live_review_ids();
-            state
-                .team
-                .mark_unreported_at_turn_end(state.elapsed_secs, &live_reviews);
-            state.cancel_armed = false;
-            state.cancel_repeat_armed = false;
-            state.turn_cancel_requested = false;
-            state.resumable_task = true;
-            // An interrupted turn keeps its goal: the clock freezes and the
-            // indicator waits for `继续` instead of disappearing.
-            if let Some(goal) = state.active_goal.as_mut() {
-                goal.pause(std::time::Instant::now());
-            }
-            let summary = turn_end_summary(state, TurnEndStatus::Cancelled);
-            archive_active_plan(state);
-            state.turn_diff_files = None;
-            push_turn_receipt(state, TurnEndStatus::Cancelled, summary, None);
-            seal_analysis_segment(state);
-            state.notification = Some(Notification {
-                level: NotificationLevel::Warning,
-                message: state.t().cancelled_continue.to_string(),
-            });
+            let message = state.t().cancelled_continue;
+            apply_resumable_turn_stop(state, TurnEndStatus::Cancelled, message);
+        }
+        RuntimeEvent::TurnInterrupted => {
+            let message = state.t().interrupted_continue;
+            apply_resumable_turn_stop(state, TurnEndStatus::Interrupted, message);
         }
         RuntimeEvent::TaskCancelled => {
             // The user cancelled the LOGICAL task. It is terminal: the resume
@@ -2118,9 +2096,10 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
         } else {
             match status {
                 TurnEndStatus::Answered => goal.complete(now),
-                TurnEndStatus::Truncated | TurnEndStatus::Incomplete | TurnEndStatus::Cancelled => {
-                    goal.pause(now)
-                }
+                TurnEndStatus::Truncated
+                | TurnEndStatus::Incomplete
+                | TurnEndStatus::Cancelled
+                | TurnEndStatus::Interrupted => goal.pause(now),
                 // The goal is still owed; the blocked window stops the clock
                 // but does not fail the goal.
                 TurnEndStatus::Blocked => goal.pause(now),
@@ -3628,6 +3607,41 @@ fn apply_session_with(
     }
 
     // Welcome card removed: Header owns project context; Input owns model/mode.
+}
+
+/// A turn that stopped without a user cancellation but can be resumed.
+///
+/// Both a user cancel and a runtime interruption keep the goal and offer
+/// `继续`; only the wording and the receipt status differ.
+fn apply_resumable_turn_stop(state: &mut AppState, status: TurnEndStatus, message: &'static str) {
+    note_turn_settled(state);
+    state.status = RuntimeStatus::Idle;
+    state.finalization_stage = None;
+    clear_activity(state);
+    state.goal_mode_active = false;
+    state.transcript.finalize_in_flight();
+    let live_reviews = state.transcript.live_review_ids();
+    state
+        .team
+        .mark_unreported_at_turn_end(state.elapsed_secs, &live_reviews);
+    state.cancel_armed = false;
+    state.cancel_repeat_armed = false;
+    state.turn_cancel_requested = false;
+    state.resumable_task = true;
+    // A stopped turn keeps its goal: the clock freezes and the indicator waits
+    // for `继续` instead of disappearing.
+    if let Some(goal) = state.active_goal.as_mut() {
+        goal.pause(std::time::Instant::now());
+    }
+    let summary = turn_end_summary(state, status);
+    archive_active_plan(state);
+    state.turn_diff_files = None;
+    push_turn_receipt(state, status, summary, None);
+    seal_analysis_segment(state);
+    state.notification = Some(Notification {
+        level: NotificationLevel::Warning,
+        message: message.to_string(),
+    });
 }
 
 pub(super) fn mode_label(mode: PermissionProfile) -> &'static str {
