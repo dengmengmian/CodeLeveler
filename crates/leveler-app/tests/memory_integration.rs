@@ -1641,8 +1641,8 @@ async fn an_interrupted_turn_settles_its_capture_range_without_inventing_memory(
         .unwrap();
     let terminal = wait_for_turn_end(&mut rx).await;
     assert!(
-        matches!(terminal, RuntimeEvent::TurnInterrupted),
-        "the interrupted turn settles as interrupted: {terminal:?}"
+        matches!(terminal, RuntimeEvent::TurnCancelled),
+        "the user-cancelled turn settles as cancelled: {terminal:?}"
     );
 
     let activity = harness
