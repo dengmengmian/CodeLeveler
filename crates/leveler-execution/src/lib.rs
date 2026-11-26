@@ -59,7 +59,7 @@ pub use approval::{
     is_host_escape_program, is_remote_publish_command, is_shell_c_flag, is_shell_wrapper_program,
     shell_c_script,
 };
-pub use artifact::{ArtifactRef, ArtifactStore};
+pub use artifact::{ArtifactPage, ArtifactReadError, ArtifactRef, ArtifactStore};
 pub use background::{
     AdoptError, AdoptedTaskSpec, BackgroundCleanupTicket, BackgroundSettlement,
     BackgroundTaskEvent, BackgroundTaskLifetime, BackgroundTaskObservation, BackgroundTaskOrigin,

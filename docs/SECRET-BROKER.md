@@ -20,23 +20,59 @@ contract. The detailed design, threat model and acceptance record live in
   expired or post-restart reference reports the same `Unavailable` answer.
 - **Use is bound to what the user declared.** A reference is minted with an
   empty use scope. Every admitted message that mentions the reference adds the
-  dotenv targets it names (`.env`, `.env.<suffix>`, including a nested path)
-  and the fields it explicitly assigns (`NAME=`). `secret_apply` may write
-  only to those targets and fields. A request outside a non-empty scope is
-  refused in every permission mode, including Full. A dimension the message
-  never named is left to the model; in Auto and Restricted the first use of
-  such a reference asks the person, and that approval is bound to the exact
-  call (no standing rule, no reuse for another target or field).
+  dotenv targets and fields **structurally attributable to that reference**:
+  the names in its own clause, or — when the message mentions exactly one
+  reference — the names elsewhere in that message. Multi-reference messages
+  never take a Cartesian product: a target or field shared by several
+  references, or a positive mention in no reference's clause, marks those
+  references ambiguous and grants nothing. An ambiguous, unattributed
+  dimension must be confirmed as an exact `(reference, target, field)` use;
+  it is never guessed, in any permission mode. A dimension the message never
+  mentioned at all is a different case: the model may choose it; Auto and
+  Restricted ask on the first such use, and Full allows the model's choice.
+  `secret_apply` may write only inside the positively declared dimensions. A
+  request outside a non-empty scope is refused in every permission mode,
+  including Full.
+- **Prohibitions and refusals are hard.** A clause that reads as a
+  prohibition (for example "不要修改 .env.production") denies those targets
+  or fields for the references it applies to. An exact use the person refused
+  in the approval surface stays refused. A later bare mention in an ordinary
+  message does not lift either decision; a new capture is the way back, and a
+  fresh approval can lift only an exact-call refusal, never an explicit target
+  prohibition. Denials are enforced in every mode, including Full.
+- **One approval binds one exact use.** When a dimension is missing under
+  Auto/Restricted, or a mention is ambiguous in any mode, the first
+  `secret_apply` for that reference asks through the ordinary consent
+  surface. The approval is stored as
+  `(reference, target, field)`: it authorizes that call, not another target,
+  another field, another reference, or a tool-wide rule. A second identical
+  call is the same authorized operation and does not ask again. The approval
+  is process-local, like the vault; a restart forgets it along with the value.
 - **The target family is dotenv files only.** The one path-authority exception
   is a workspace-relative `.env` / `.env.*`; `.git`, `.ssh`, `.aws`, the
   definition trust stores, agent and skill definition trees and the workspace
   bound still apply. The write is the ordinary atomic editor: lock, exact-byte
   compare-and-swap, symlink/junction identity revalidation, descriptor-relative
   replace or the Windows capability path.
-- **File permissions are private.** A new file is `0600` on Unix. On Windows,
-  the host applies and verifies an owner-only, inheritance-protected DACL
-  (current user, SYSTEM, Administrators). An existing file is tightened even
-  when the value is unchanged.
+- **File permissions are private from creation.** A new file is `0600` on
+  Unix, and a replacement keeps that mode on the staged file rather than
+  copying a broad destination mode; the rename publishes it at `0600`. On
+  Windows the broker stages the new bytes in a sibling file created with an
+  owner-only, inheritance-protected security descriptor (`CreateFileW` +
+  `SECURITY_ATTRIBUTES`), then renames the staged file into place with
+  `MoveFileExW`, which keeps the staged file's DACL. A destination that
+  already exists is tightened before the rename; it is never passed to
+  `ReplaceFileW`, which keeps the replaced file's (possibly broad) DACL. The
+  committed file is verified again. An existing file is tightened even when
+  the value is unchanged.
+- **Drafts and history do not store an undecided candidate.** The composer
+  keeps the raw text in memory while the person edits. A draft containing any
+  detected candidate — high-confidence or ambiguous — is not written to disk;
+  an old unsafe draft is removed when the client opens (the Desktop rescans
+  its persisted drafts at startup and rewrites only the clean ones). History
+  entries are masked for every detected candidate before they are written, and
+  an old history file is sanitized and rewritten on open. Ordinary code,
+  templates and environment references are left byte-identical.
 - **The plaintext acknowledgement is a per-command decision.** It is carried
   by that one `SubmitUserInput` / `SteerUserInput`, never stored as custody,
   never combined with captures, and never reused for a later command. It
@@ -53,6 +89,7 @@ contract. The detailed design, threat model and acceptance record live in
 | Resume | the replayed text goes through the same admission | yes when captured before | explicit choice |
 | Older clients (`SubmitMessage`, `SteerCurrentTurn`, …) | no review surface | no | no; any finding is refused |
 | Direct client / IPC | same runtime admission | yes when it sends the new command | per-command ack |
+| Desktop chat / safe paste | host scan review before send | yes | explicit choice in the review |
 | `leveler run` (headless) | no review surface | no | only `--allow-plaintext-secrets` |
 
 A client cannot set `plaintext_secret_ack` on behalf of a tool or a model: the
@@ -67,16 +104,29 @@ process isolation between same-user processes.
   every unknown format. `/secret` is the guaranteed lane for anything the
   detector cannot name.
 - Detection is local and bounded; it does not claim a real-world recall rate.
+  A false positive removes a draft or masks a history line; it does not send
+  or rewrite the message.
+- Use scope is structural, not semantic. A bare `.env` mention in an admitted
+  message with exactly one reference is treated as an authorization; the
+  broker does not understand "background" or "for example". In messages with
+  several references such a mention grants nothing, and an explicit
+  prohibition is honored in every mode. State the target and field you mean,
+  and use a prohibition when you mean one.
 - The written `.env` is plaintext on disk. Anything that can read that file
   after the write can leak it. Full mode provides no filesystem or network
   isolation; under Auto/Restricted the existing sandbox and permission mode
-  decide who can read it and where a process may send it.
+  decide who can read it and where a process may send it. Windows protection
+  is the file's DACL, not encryption: backups, volume shadow copies, memory
+  copies and administrators remain outside it.
 - Memory copies are zeroized on drop, but the allocator, the OS (swap, core
   dumps) and child processes are outside this boundary.
 - `secret_inspect` verifies presence and non-emptiness, never the value and
   never a live provider connection.
-- The vault is process-local. A restart loses every value; the transcript
-  keeps dead references and the user must provide the credential again.
+- The vault is process-local. A restart loses every value and every exact
+  approval recorded in the consent surface; the transcript keeps dead
+  references and the user must provide the credential again. A revoked or
+  expired reference never resolves, and the user cannot revive it by merely
+  mentioning it.
 - A multi-line value (an unencrypted PEM block) can be captured but the 1.0
   dotenv writer refuses it rather than writing an invalid quoted value.
 

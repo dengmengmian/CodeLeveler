@@ -725,6 +725,55 @@ async fn pausing_hides_the_generated_slot_but_keeps_run_now_claimable() {
     assert!(claims[0].occurrence.run_now);
 }
 
+/// The in-process surfaces need the exact slot they just queued; a message
+/// string is not an identity. This is what lets the TUI, Desktop and agent
+/// tool start a dispatcher scoped to that slot instead of a generic pass.
+#[tokio::test]
+async fn run_now_occurrence_returns_the_exact_queued_slot() {
+    let fixture = fixture().await;
+    let view = create(
+        &fixture.manager,
+        draft("scoped run-now", &fixture.workspace, daily("09:00")),
+    )
+    .await;
+
+    let (response, occurrence) = fixture
+        .manager
+        .run_now_occurrence(&view.id)
+        .await
+        .expect("the run-now slot is queued");
+
+    let ScheduleResponse::Changed {
+        schedule: Some(schedule),
+        message,
+    } = response
+    else {
+        panic!("unexpected run-now response");
+    };
+    assert_eq!(schedule.id, view.id);
+    assert!(
+        message.contains(occurrence.as_str()),
+        "the response names the slot it queued: {message}"
+    );
+
+    let queued = fixture
+        .manager
+        .store()
+        .occurrences(&leveler_schedule::ScheduleId::from(view.id), 10)
+        .await
+        .unwrap();
+    let queued = queued
+        .into_iter()
+        .find(|row| row.id == occurrence)
+        .expect("the returned identity names a persisted occurrence");
+    assert!(queued.run_now);
+    assert_eq!(
+        queued.state,
+        leveler_schedule::OccurrenceState::Pending,
+        "the manager queues the slot; it never executes it"
+    );
+}
+
 #[tokio::test]
 async fn list_filters_read_the_same_projection_as_show() {
     let fixture = fixture().await;

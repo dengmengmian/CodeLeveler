@@ -69,7 +69,7 @@ try {
     badge: item.querySelector('.badge-unconnected')?.textContent ?? null,
   })));
   await page.keyboard.press('Escape');
-  assert.deepEqual(commandBadges.filter(item => item.badge).map(item => item.id).sort(), ['export', 'plan']);
+  assert.deepEqual(commandBadges.filter(item => item.badge).map(item => item.id).sort(), ['export']);
   for (const id of ['compact', 'permission', 'model']) {
     assert.equal(commandBadges.find(item => item.id === id)?.badge, null, `${id} must not claim 未接入`);
   }
@@ -121,10 +121,18 @@ try {
   assert.ok(await page.locator('.menu .menu-item').count() >= 8);
   await page.keyboard.press('Escape');
   await page.locator('#settings-nav-list button').filter({ hasText: '模型' }).click();
-  const useModel = page.locator('.provider-row button').filter({ hasText: '使用' }).first();
-  await useModel.click();
+  // R2a split the surfaces: the settings page owns providers and the default
+  // model, while the ACTIVE session's model is the composer picker. Assert the
+  // real settings rows, then switch the session through its real control.
+  await page.waitForFunction(() => document.querySelectorAll('.provider-row.provider-model-row').length >= 2);
+  evidence.settings_model_rows = await page.locator('.provider-row.provider-model-row').count();
+  await closeSettings();
+  await page.locator('#model-picker').click();
+  await page.waitForSelector('.menu .menu-item');
+  await page.getByRole('menuitemradio', { name: /^n\b/ }).first().click();
   await page.waitForFunction(async id => (await window.desktop.snapshot(id)).model.model === 'n', sessionId);
   evidence.model_switch = (await page.evaluate(id => window.desktop.snapshot(id), sessionId)).model;
+  await openSettings();
   await page.locator('#settings-nav-list button').filter({ hasText: 'Agent 与技能' }).click();
   await page.waitForFunction(() => document.querySelector('#settings-content')?.innerText.includes('code-architect'));
   await page.getByRole('button', { name: '查看配置' }).first().click();

@@ -54,6 +54,9 @@ struct AgentRuntime {
     delivered: Mutex<Vec<CommandEnvelope>>,
     policies: Mutex<Vec<(SessionId, ApprovalPolicy)>>,
     states: Mutex<HashMap<SessionId, RuntimeState>>,
+    /// A terminal the runtime publishes as soon as it admits a turn. Used to
+    /// pin a follower that observes the runtime's own terminal record.
+    terminal_on_delivery: Mutex<Option<UiTaskTerminal>>,
     events: broadcast::Sender<RuntimeEvent>,
 }
 
@@ -67,8 +70,19 @@ impl AgentRuntime {
             delivered: Mutex::new(Vec::new()),
             policies: Mutex::new(Vec::new()),
             states: Mutex::new(HashMap::new()),
+            terminal_on_delivery: Mutex::new(None),
             events,
         }
+    }
+
+    fn set_terminal_on_delivery(&self, sequence: i64, outcome: &str) {
+        *self.terminal_on_delivery.lock().unwrap() = Some(UiTaskTerminal {
+            sequence,
+            outcome: outcome.into(),
+            stop: None,
+            reason: None,
+            warnings: Vec::new(),
+        });
     }
 
     fn snapshot_for(&self, session: &SessionId, state: &RuntimeState) -> UiSessionSnapshot {
@@ -195,6 +209,7 @@ impl InteractiveRuntimeClient for AgentRuntime {
             require_new_turn, ..
         } = &envelope.command
         {
+            let terminal = self.terminal_on_delivery.lock().unwrap().clone();
             let mut states = self.states.lock().unwrap();
             let state = states.entry(envelope.session_id.clone()).or_default();
             let busy = matches!(
@@ -213,6 +228,10 @@ impl InteractiveRuntimeClient for AgentRuntime {
                 state.turn_ordinal += 1;
                 state.task_status = Some(UiTaskStatus::Running);
                 state.task_terminal = None;
+                if let Some(terminal) = terminal {
+                    state.task_terminal = Some(terminal);
+                    state.task_status = None;
+                }
             }
         }
         self.delivered.lock().unwrap().push(envelope);
@@ -455,6 +474,53 @@ async fn only_run(fixture: &Fixture) -> leveler_schedule::ScheduleRun {
         .unwrap();
     assert_eq!(runs.len(), 1, "expected exactly one run: {runs:?}");
     runs[0].clone()
+}
+
+/// The explicit run-now path for an agent schedule observes the runtime's own
+/// terminal record. Without the follower the run would stay `running` until a
+/// later dispatch pass, which does not exist when background scheduling is
+/// off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_now_agent_follow_observes_the_runtime_terminal() {
+    let runtime = Arc::new(AgentRuntime::new(SessionId::new("sess-agent-runnow")));
+    runtime.set_terminal_on_delivery(1, "completed");
+    let fixture = fixture(
+        &runtime,
+        agent_action(),
+        SessionPolicy::Continue,
+        OverlapPolicy::SkipIfRunning,
+        PermissionProfile::Assisted,
+        grant(),
+    )
+    .await;
+    let definition = fixture
+        .store
+        .definition(&fixture.definition_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let occurrence = fixture.store.create_run_now(&definition).await.unwrap();
+
+    let state = dispatcher(&runtime, fixture.store.clone())
+        .with_follow(true)
+        .dispatch_occurrence(&occurrence.id)
+        .await
+        .unwrap();
+
+    assert_eq!(state, Some(RunState::Succeeded));
+    let run = fixture
+        .store
+        .run_for_occurrence(&occurrence.id)
+        .await
+        .unwrap()
+        .expect("the run-now slot produced a run");
+    assert_eq!(run.state, RunState::Succeeded);
+    assert!(run.finished_at.is_some());
+    assert_eq!(
+        runtime.goals().len(),
+        1,
+        "following must observe the handed-off goal, not submit it again"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

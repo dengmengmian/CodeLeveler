@@ -99,7 +99,7 @@ test('history prompts include user intent but exclude runtime notices on the sam
 
 test('plan statuses use the actual Runtime states and retain unknown semantics',async()=>{
  const {planStepLabel}=await import('../src/presentation.mjs');
- assert.deepEqual(['pending','running','done','failed','skipped'].map(planStepLabel),['待执行','进行中','已完成','失败','已跳过']);
+ assert.deepEqual(['pending','running','done','failed','skipped','abandoned'].map(planStepLabel),['待执行','进行中','已完成','失败','已跳过','已弃用']);
  assert.equal(planStepLabel('future_state'),'未知状态：future_state');
 });
 test('Workbench only offers views backed by plan steps, diff evidence or actual read failure',async()=>{
@@ -263,6 +263,8 @@ test('the task dock reports per-status counts in the reference order', async () 
   assert.equal(planProgressLabel([{ status: 'running' }]), '1 进行中');
   assert.equal(planProgressLabel([{ status: 'done' }, { status: 'failed' }, { status: 'skipped' }]),
     '1 已完成 · 1 失败 · 1 已跳过');
+  // An abandoned step is replacement history, never delivered work.
+  assert.equal(planProgressLabel([{ status: 'done' }, { status: 'abandoned' }]), '1 已完成 · 1 已弃用');
   assert.equal(planProgressLabel([]), '');
 });
 
@@ -290,4 +292,84 @@ test('a multi-step tool run collapses to one category sentence, not a count', as
   assert.equal(merged.label, '执行了命令并已读取文件');
   assert.equal(executionStatusLabel(merged), '', 'a settled run carries no trailing success sentence');
   assert.equal(executionStatusLabel({ ...merged, failed: 1 }), '1 项失败');
+});
+
+test('a stopped automatic goal continuation is a policy stop, never a completion', async () => {
+  const { goalContinuationStopLabel } = await import('../src/presentation.mjs');
+  const label = goalContinuationStopLabel(2);
+  assert.match(label, /自动续跑已停止/);
+  assert.match(label, /连续 2 个窗口没有执行工作/);
+  assert.match(label, /目标仍未完成/);
+  assert.doesNotMatch(label, /已完成|失败|成功/);
+  assert.match(goalContinuationStopLabel(undefined), /连续 0 个窗口/);
+});
+
+test('only a preview that proves it is partial earns the full-output action', async () => {
+  const { outputMayBeTruncated, canViewFullOutput, sanitizeOutputText, toolOutputUnavailableLabel, toolOutputReferenceLabel } = await import('../src/presentation.mjs');
+  assert.equal(outputMayBeTruncated({ preview: 'exit 0\nall tests passed' }), false);
+  assert.equal(outputMayBeTruncated({ preview: 'long body…' }), true);
+  assert.equal(outputMayBeTruncated({ preview: 'prefix…\n[stdout full output: /state/artifacts/a.txt]' }), true);
+  assert.equal(outputMayBeTruncated({ preview: '[tool output saved: /state/artifacts/a.txt | sha256:aa | 9 bytes. …]' }), true);
+  assert.equal(outputMayBeTruncated({ preview: 'a\n… [1000 bytes (~400 tokens) elided to fit the context] …\nb' }), true);
+  assert.equal(canViewFullOutput({ status: 'success' }), true);
+  assert.equal(canViewFullOutput({ status: 'failed' }), true);
+  assert.equal(canViewFullOutput({ status: 'running' }), false);
+  assert.equal(canViewFullOutput({ status: 'cancelled' }), false);
+  assert.equal(canViewFullOutput({ status: 'unknown' }), false);
+  // Control sequences are stripped; real text and line breaks survive.
+  const raw = '\u001b[31mRED\u001b[0m\r\n中文\tTAB\u0000end';
+  assert.equal(sanitizeOutputText(raw), 'RED\n中文\tTAB end');
+  assert.match(toolOutputUnavailableLabel('not_saved'), /没有保存/);
+  assert.match(toolOutputUnavailableLabel('artifact_missing'), /已不存在/);
+  assert.match(toolOutputUnavailableLabel('read_failed'), /重试/);
+  assert.match(toolOutputReferenceLabel({ label: 'stdout', size_bytes: 2048, available: true }), /stdout · 2\.0 KB/);
+  assert.match(toolOutputReferenceLabel({ label: 'stdout', available: false }), /已不可用/);
+});
+
+test('the turn delivery view is built only from real tool and terminal facts', async () => {
+  const { turnDelivery } = await import('../src/presentation.mjs');
+  const state = {
+    messages: [
+      { id: 'm1', role: 'user', text: 'old', seq: 0 },
+      { id: 'm2', role: 'assistant', text: 'ok', seq: 1 },
+      { id: 'm3', role: 'user', text: 'new', seq: 10 },
+    ],
+    tools: [
+      { id: 'old', name: 'run_command', status: 'success', exit_code: 0, seq: 2 },
+      { id: 'edit', name: 'apply_patch', status: 'success', seq: 11, appliedDiff: '--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n' },
+      { id: 'cmd', name: 'run_command', status: 'failed', exit_code: 1, seq: 12, arguments: '{"command":"cargo test"}' },
+      { id: 'read', name: 'read_file', status: 'success', seq: 13 },
+    ],
+    turnTerminals: [{ status: 'completed_partially_unverified', detail: 'x', requirements: ['req A'], seq: 14 }],
+  };
+  const delivery = turnDelivery(state);
+  assert.equal(delivery.terminal.status, 'completed_partially_unverified');
+  assert.equal(delivery.changed.length, 1, 'only this turn\'s confirmed edit counts');
+  assert.equal(delivery.changed[0].path, 'a.txt');
+  assert.equal(delivery.changed[0].added, 1);
+  assert.equal(delivery.changed[0].removed, 1);
+  assert.deepEqual(delivery.commands.map(command => [command.id, command.exit_code, command.status]), [['cmd', 1, 'failed']]);
+  assert.deepEqual(delivery.requirements, ['req A']);
+  assert.equal(delivery.toolCalls, 3);
+  // A turn that has not ended carries no invented completion.
+  const open = turnDelivery({ messages: [{ id: 'u', role: 'user', text: 'x', seq: 1 }], tools: [], turnTerminals: [] });
+  assert.equal(open.terminal, null);
+  assert.deepEqual(open.changed, []);
+});
+
+test('the product collaboration axis names, encodes and confirms only Runtime values', async () => {
+  const { collaborationLabel, validCollaboration, collaborationCommand, collaborationConfirmed } = await import('../src/presentation.mjs');
+  assert.deepEqual(['chat', 'plan', 'goal'].map(collaborationLabel), ['对话', '计划', '目标']);
+  assert.equal(collaborationLabel(undefined), '对话');
+  for (const good of ['chat', 'plan', 'goal']) assert.equal(validCollaboration(good), true);
+  for (const bad of ['Chat', 'auto', '', null, undefined, 'orchestrate']) assert.equal(validCollaboration(bad), false);
+  assert.deepEqual(collaborationCommand('s1', 'goal'), { type: 'set_product_axes', session_id: 's1', work_profile: 'single', collaboration: 'goal' });
+  assert.throws(() => collaborationCommand('', 'goal'));
+  assert.throws(() => collaborationCommand('s1', 'auto'));
+  // Confirmation is the Runtime snapshot's value, never the requested one.
+  assert.equal(collaborationConfirmed({ session: { id: 's1', collaboration: 'plan' } }, 's1', 'plan'), true);
+  assert.equal(collaborationConfirmed({ session: { id: 's1', collaboration: 'chat' } }, 's1', 'plan'), false);
+  assert.equal(collaborationConfirmed({ session: { id: 's2', collaboration: 'plan' } }, 's1', 'plan'), false);
+  // An older runtime omits the field; an interactive session is chat.
+  assert.equal(collaborationConfirmed({ session: { id: 's1' } }, 's1', 'chat'), true);
 });

@@ -119,7 +119,7 @@ pub(crate) fn request_user_input_tool_definition() -> ToolDefinition {
 /// not end when the model goes quiet — it ends only when the model calls this to
 /// mark the objective `complete` (done and truthfully reported) or `blocked`
 /// (truly stuck).
-pub(crate) const UPDATE_GOAL_TOOL: &str = "update_goal";
+pub const UPDATE_GOAL_TOOL: &str = "update_goal";
 
 /// Resolve the current objective. Verification is evidence, not a universal
 /// completion gate: the description asks for a truthful claim about the

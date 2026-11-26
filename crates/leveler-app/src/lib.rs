@@ -35,6 +35,7 @@ mod parallel;
 mod plaintext_disclosure;
 mod prompt_assist;
 mod prompt_bridge;
+pub mod provider_config;
 mod review_live;
 pub mod runtime_boot;
 mod runtime_identity;
@@ -43,10 +44,11 @@ pub mod secret_input;
 mod session;
 pub mod session_history;
 pub mod session_projection;
-mod settings_service;
+pub mod settings_service;
 mod side_question;
 pub mod skills;
 mod startup_recovery;
+mod tool_output;
 pub mod usage;
 mod user_shell;
 mod vcs;
@@ -347,6 +349,22 @@ mod runtime_config_fingerprint_tests {
 /// (global `~/.leveler/config.toml` underneath the repository bundle) or about
 /// validation.
 pub fn load_config(layout: &Layout) -> Result<LoadedConfig, AppError> {
+    let global_config =
+        global_config::GlobalConfig::load().map_err(|e| AppError::GlobalConfig(e.to_string()))?;
+    load_config_with_global(layout, global_config)
+}
+
+/// Assemble a generation from an already-parsed global config.
+///
+/// The configuration editor validates a *candidate* global file by running it
+/// through this exact assembly (and the registry build) before replacing the
+/// on-disk file, so a save can never install a generation the next runtime
+/// would refuse to start with. Keeping one assembly for both paths is what
+/// makes that guarantee true.
+pub(crate) fn load_config_with_global(
+    layout: &Layout,
+    global_config: global_config::GlobalConfig,
+) -> Result<LoadedConfig, AppError> {
     let mut providers = Vec::new();
     for path in yaml_files(&layout.providers_dir()) {
         providers.push(load_provider_config(&path)?);
@@ -358,8 +376,6 @@ pub fn load_config(layout: &Layout) -> Result<LoadedConfig, AppError> {
     // Merge the global config (`~/.leveler/config.toml`) underneath the repo
     // bundle: the repo wins on any id collision, but global entries fill in
     // so `leveler` works without a per-repo `configs/` directory.
-    let global_config =
-        global_config::GlobalConfig::load().map_err(|e| AppError::GlobalConfig(e.to_string()))?;
     for model in &mut models {
         if model.profile.thinking.is_none() {
             model.profile.thinking = Some(global_config.thinking_level_for(&model.profile.id));

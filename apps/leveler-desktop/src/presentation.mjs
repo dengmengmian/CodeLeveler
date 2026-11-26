@@ -35,6 +35,28 @@ export function relativeActivity(time,now=Date.now()){
 }
 /** @param {string|undefined} mode @returns {string} */
 export function permissionLabel(mode){const labels=/** @type {Record<string,string>} */ ({full_access:'完全权限',assisted:'工作区内修改',request_approval:'需批准'});return labels[mode??'']??'权限由 Runtime 决定';}
+// ── Product collaboration axis ───────────────────────────────────────────
+// `chat | plan | goal` is a durable session fact owned by the Runtime. These
+// helpers only name it and build the one typed command that changes it.
+const COLLABORATION_LABELS=/** @type {Record<string,string>} */ ({chat:'对话',plan:'计划',goal:'目标'});
+/** @param {string|null|undefined} mode @returns {string} */
+export function collaborationLabel(mode){return COLLABORATION_LABELS[mode??'']??'对话';}
+/** @param {string} mode */
+export function validCollaboration(mode){return Object.hasOwn(COLLABORATION_LABELS,mode);}
+/** The one command that asks the Runtime to change the session's axis. The
+ *  deprecated `work_profile` field is required by the wire type and carries no
+ *  product meaning. @param {string} sessionId @param {string} mode */
+export function collaborationCommand(sessionId,mode){if(!sessionId||!validCollaboration(mode))throw new Error('无效的执行模式');return {type:'set_product_axes',session_id:sessionId,work_profile:'single',collaboration:mode};}
+/** Whether the Runtime's own snapshot confirmed the requested axis. The
+ *  renderer must never treat the local choice as success.
+ *  @param {{session?:{id?:string,collaboration?:string|undefined}}|null} state
+ *  @param {string} sessionId @param {string} mode */
+export function collaborationConfirmed(state,sessionId,mode){return state?.session?.id===sessionId&&(state.session.collaboration??'chat')===mode;}
+/** The runtime stopped opening empty Goal windows. This is not completion,
+ *  failure or budget exhaustion: the goal still owes its work. The count is
+ *  the runtime's own structured fact. @param {number} windows */
+export function goalContinuationStopLabel(windows){const n=Number.isFinite(windows)&&windows>0?windows:0;return `自动续跑已停止 · 连续 ${n} 个窗口没有执行工作 · 目标仍未完成，可发送消息继续`;}
+
 /** @param {{primary_workspace?:string|null}[]} tasks @param {string} [query] */
 export function recentWorkspaces(tasks,query=''){
  const paths=[...new Set(tasks.map(task=>task.primary_workspace).filter(/** @returns {path is string} */ path=>typeof path==='string'&&!!path))];return paths.map(path=>({path,name:workspaceLabel(path)})).filter(workspace=>workspace.name.toLowerCase().includes(query.trim().toLowerCase()));
@@ -79,7 +101,7 @@ export function historyQuestions(messages){return messages.filter(message=>messa
 export function contractRoundStatus(round){const statuses=round.tools.map(tool=>contractToolStatus(tool.status));if(statuses.includes('running'))return 'running';if(round.tools.length>0&&statuses.every(status=>status==='ok'))return 'ok';if(statuses.includes('failed'))return 'failed';if(statuses.includes('cancelled'))return 'cancelled';return 'unknown';}
 
 /** @param {string} status */
-export function planStepLabel(status){const labels=/** @type {Record<string,string>} */({pending:'待执行',running:'进行中',done:'已完成',failed:'失败',skipped:'已跳过'});return labels[status]??`未知状态：${status}`;}
+export function planStepLabel(status){const labels=/** @type {Record<string,string>} */({pending:'待执行',running:'进行中',done:'已完成',failed:'失败',skipped:'已跳过',abandoned:'已弃用'});return labels[status]??`未知状态：${status}`;}
 /**
  * The task dock's one-line progress summary: per-status counts in the
  * reference order, zero segments dropped, separated by wide spaces.
@@ -87,15 +109,19 @@ export function planStepLabel(status){const labels=/** @type {Record<string,stri
  */
 export function planProgressLabel(steps){
  const count=(/** @type {string} */ status)=>steps.filter(step=>step.status===status).length;
- const done=count('done'),running=count('running'),pending=count('pending'),failed=count('failed'),skipped=count('skipped');
+ const done=count('done'),running=count('running'),pending=count('pending'),failed=count('failed'),skipped=count('skipped'),abandoned=count('abandoned');
  return [
   done?`${done} 已完成`:'',
   running?`${running} 进行中`:'',
   pending?`${pending} 待处理`:'',
   failed?`${failed} 失败`:'',
   skipped?`${skipped} 已跳过`:'',
+  abandoned?`${abandoned} 已弃用`:'',
  ].filter(Boolean).join(' · ');
 }
+/** Delivered/open steps, excluding history the model abandoned.
+ *  @param {{status?:string}[]} steps */
+export function planActiveSteps(steps){return steps.filter(step=>step.status!=='abandoned');}
 /** @param {{plan?:{steps:unknown[]}|null,diff?:unknown,diffError?:string|null,hasWorkspace?:boolean}} state */
 export function availableWorkbenchViews(state){return ['overview',...(state.plan?.steps.length?['plan']:[]),...(state.hasWorkspace!==false&&(state.diff||state.diffError)?['changes']:[])];}
 
@@ -169,6 +195,55 @@ export const commandOutputBody = shared.commandOutputBody;
 export const failureReason = shared.failureLine;
 export const displayPreview = shared.displayPreview;
 export const isCommandTool = shared.isCommandTool;
+
+// ── Full tool output ─────────────────────────────────────────────────────
+// The tool card shows the runtime's bounded preview. The full recorded result
+// lives in the session transcript; only ask for it when the preview itself
+// proves it is not the whole story. A short complete result gets no button.
+/** @param {{preview?:string|null}} tool */
+export function outputMayBeTruncated(tool){
+ const preview=String(displayPreview(/** @type {any} */ (tool))??'');
+ if(!preview)return false;
+ if(preview.endsWith('…'))return true;
+ if(preview.includes('[tool output saved:'))return true;
+ if(/\[(?:stdout|stderr) full output: [^\]\n]+\]/.test(preview))return true;
+ return preview.includes('elided to fit the context');
+}
+/** A terminal-state tool can have a recorded result; a running one cannot yet.
+ *  @param {{status?:string}} tool */
+export function canViewFullOutput(tool){
+ return !['running','run'].includes(String(tool?.status??''))
+  && !['cancelled','unknown'].includes(contractToolStatus(tool?.status??''));
+}
+/** Strip terminal control sequences for display and copy. The bytes stay the
+ *  runtime's; this is a presentation projection, not a rewrite of the record.
+ *  @param {string} text */
+export function sanitizeOutputText(text){
+ return String(text??'')
+  .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g,'')
+  .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g,'')
+  .replace(/\r\n/g,'\n')
+  .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g,' ');
+}
+/** The typed reason a recorded result cannot be served.
+ *  @param {string|null|undefined} reason */
+export function toolOutputUnavailableLabel(reason){
+ switch(reason){
+  case 'not_saved':return 'Runtime 没有保存这次调用的完整结果（可能仍在运行、历史已被压缩，或来自不保存工具结果的旧版本）。';
+  case 'artifact_missing':return '这次调用引用的完整输出文件已不存在（可能被存储配额清理）；模型当时看到的预览仍然保留。';
+  case 'unknown_part':return '请求的输出片段不存在。';
+  case 'read_failed':return '读取已保存的输出失败，请重试。';
+  default:return '完整输出当前不可用。';
+ }
+}
+/** The complete-artifact chip label for one reference.
+ *  @param {{label?:string,size_bytes?:number,available?:boolean}} reference */
+export function toolOutputReferenceLabel(reference){
+ const label=reference?.label??'完整输出';
+ const size=Number(reference?.size_bytes??0);
+ const sizeText=size>0?(size>=1024*1024?` · ${(size/1024/1024).toFixed(1)} MB`:` · ${(size/1024).toFixed(1)} KB`):'';
+ return reference?.available===false?`${label} · 已不可用`:`${label}${sizeText}`;
+}
 
 /** Conversation presentation rules, from the same shared module. */
 export const groupExploration = shared.groupExploration;
@@ -323,6 +398,8 @@ export function turnTerminalFromEvent(type,messages,tools){
  if(type==='turn_completed_with_warnings')return 'completed_with_warnings';
  if(type==='turn_truncated')return 'truncated';
  if(type==='turn_incomplete')return 'incomplete';
+ if(type==='turn_paused')return 'paused';
+ if(type==='turn_blocked')return 'blocked';
  if(type==='turn_failed')return 'failed';
  if(type==='turn_cancelled'||type==='task_cancelled')return 'cancelled';
  if(type==='turn_interrupted')return 'interrupted';
@@ -429,6 +506,8 @@ const RECEIPT_LABELS = {
   truncated: ['⚠', '已完成，但有警告'],
   incomplete: ['⚠', '未完成'],
   no_final_answer: ['⚠', '执行已结束，但未提交最终回答'],
+  paused: ['◐', '已暂停'],
+  blocked: ['⚠', '目标受阻'],
   failed: ['✗', '失败'],
   cancelled: ['⊘', '已取消'],
   interrupted: ['⊘', '已中断'],
@@ -438,6 +517,7 @@ const RECEIPT_TONES = {
   answered: 'success', completed: 'success',
   completed_with_warnings: 'warning', truncated: 'warning',
   incomplete: 'warning', no_final_answer: 'warning',
+  paused: 'muted', blocked: 'warning',
   failed: 'error', cancelled: 'muted', interrupted: 'muted',
 };
 
@@ -456,6 +536,58 @@ export function receiptStats(terminal) {
     (terminal.rounds ?? 0) > 0 ? `${terminal.rounds} 轮` : '',
     (terminal.toolCalls ?? 0) > 0 ? `${terminal.toolCalls} 次工具调用` : '',
   ].filter(Boolean);
+}
+
+/** The tool rows that belong to the newest turn.
+ *
+ * A turn starts at the newest user line in the conversation. Tool rows carry
+ * the runtime's own arrival order (`seq`); a row without one cannot be placed
+ * and is kept rather than silently dropped from the delivery view.
+ * @param {ProjectionMessage[]} messages @param {ExecutionToolRow[]} tools */
+export function latestTurnToolIds(messages, tools) {
+  let start = null;
+  for (let index = (messages?.length ?? 0) - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (messageKind(message) !== 'user') continue;
+    start = typeof message.seq === 'number' ? message.seq : index;
+    break;
+  }
+  return (tools ?? [])
+    .filter(tool => start === null || typeof tool.seq !== 'number' || tool.seq >= start)
+    .map(tool => tool.id);
+}
+
+/**
+ * The newest turn's real delivery facts, from Runtime data only:
+ * - the turn terminal (or null when it has not ended),
+ * - files a tool confirmed it changed (`applied_diff`),
+ * - commands that actually ran and their exit codes,
+ * - the requirements the Runtime itself reported as unverified.
+ *
+ * It deliberately carries no success judgement: a status label comes from the
+ * terminal, and an exit code is an exit code, not a verification verdict.
+ * @param {{messages?:ProjectionMessage[],tools?:ExecutionToolRow[],turnTerminals?:Array<{status?:string,detail?:string|null,requirements?:string[]}>}} state
+ */
+export function turnDelivery(state) {
+  const messages = state?.messages ?? [];
+  const tools = state?.tools ?? [];
+  const ids = latestTurnToolIds(messages, tools);
+  const wanted = new Set(ids);
+  const scoped = tools.filter(tool => wanted.has(tool.id));
+  const terminal = (state?.turnTerminals ?? []).at(-1) ?? null;
+  return {
+    terminal,
+    changed: confirmedChangeFiles(ids, tools),
+    confirmedToolIds: scoped.filter(tool => confirmedDiffOf(/** @type {any} */ (tool))).map(tool => tool.id),
+    commands: scoped.filter(tool => isCommandTool(tool.name)).map(tool => ({
+      id: tool.id,
+      label: toolTarget(/** @type {any} */ (tool)) || tool.name || '命令',
+      status: contractToolStatus(tool.status),
+      exit_code: Number.isInteger(tool.exit_code) ? tool.exit_code : null,
+    })),
+    requirements: Array.isArray(terminal?.requirements) ? terminal.requirements : [],
+    toolCalls: scoped.length,
+  };
 }
 
 /** @param {ExecutionToolRow[]} tools @param {string} id */

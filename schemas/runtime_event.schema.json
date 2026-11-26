@@ -911,6 +911,28 @@
       }
     },
     {
+      "description": "The runtime stopped continuing a Goal automatically because consecutive yielded work windows executed no work at all.\n\nThis is a policy stop, not a task outcome: the goal still owes its work, the last window's own terminal (`turn_yielded`) is the durable record of that window, and the user can continue the goal with a message. Clients must not paint this as completion, failure, or budget exhaustion.",
+      "type": "object",
+      "required": [
+        "consecutive_windows_without_work",
+        "type"
+      ],
+      "properties": {
+        "consecutive_windows_without_work": {
+          "description": "Consecutive windows, ending with the last one, that executed no tool other than `update_goal`.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "goal_continuation_stopped"
+          ]
+        }
+      }
+    },
+    {
       "description": "Project behavior constraints loaded for this turn. Sources are workspace-relative paths; instruction contents never enter UI chrome.",
       "type": "object",
       "required": [
@@ -3335,6 +3357,33 @@
           "type": "string",
           "enum": [
             "session_history_loaded"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Result of [`crate::ClientCommand::QueryToolOutput`]: one page of a tool call's full recorded result, or the typed reason it cannot be served.",
+      "type": "object",
+      "required": [
+        "output",
+        "query_id",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "output": {
+          "$ref": "#/definitions/UiToolOutput"
+        },
+        "query_id": {
+          "$ref": "#/definitions/CommandId"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "tool_output_loaded"
           ]
         }
       }
@@ -5962,6 +6011,28 @@
           }
         },
         {
+          "description": "The runtime stopped continuing a Goal automatically because consecutive yielded work windows executed no work at all.\n\nThis is a policy stop, not a task outcome: the goal still owes its work, the last window's own terminal (`turn_yielded`) is the durable record of that window, and the user can continue the goal with a message. Clients must not paint this as completion, failure, or budget exhaustion.",
+          "type": "object",
+          "required": [
+            "consecutive_windows_without_work",
+            "type"
+          ],
+          "properties": {
+            "consecutive_windows_without_work": {
+              "description": "Consecutive windows, ending with the last one, that executed no tool other than `update_goal`.",
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "goal_continuation_stopped"
+              ]
+            }
+          }
+        },
+        {
           "description": "Project behavior constraints loaded for this turn. Sources are workspace-relative paths; instruction contents never enter UI chrome.",
           "type": "object",
           "required": [
@@ -8386,6 +8457,33 @@
               "type": "string",
               "enum": [
                 "session_history_loaded"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Result of [`crate::ClientCommand::QueryToolOutput`]: one page of a tool call's full recorded result, or the typed reason it cannot be served.",
+          "type": "object",
+          "required": [
+            "output",
+            "query_id",
+            "session_id",
+            "type"
+          ],
+          "properties": {
+            "output": {
+              "$ref": "#/definitions/UiToolOutput"
+            },
+            "query_id": {
+              "$ref": "#/definitions/CommandId"
+            },
+            "session_id": {
+              "$ref": "#/definitions/SessionId"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "tool_output_loaded"
               ]
             }
           }
@@ -14126,6 +14224,207 @@
           "minimum": 0.0
         }
       }
+    },
+    "UiToolOutput": {
+      "description": "One page of a tool call's recorded output.",
+      "type": "object",
+      "required": [
+        "call_id",
+        "full_output_lost",
+        "has_more",
+        "label",
+        "model_result_reduced",
+        "next_offset",
+        "offset",
+        "part",
+        "state",
+        "text",
+        "total_bytes"
+      ],
+      "properties": {
+        "call_id": {
+          "description": "The tool call this page belongs to (echo of the request).",
+          "type": "string"
+        },
+        "full_output_lost": {
+          "description": "The result was reduced with no saved copy: the original bytes are gone and no operation can recover them.",
+          "type": "boolean"
+        },
+        "has_more": {
+          "type": "boolean"
+        },
+        "label": {
+          "description": "Human-readable name of the part (`模型所见结果`, `stdout`, ...).",
+          "type": "string"
+        },
+        "model_result_reduced": {
+          "description": "The model-visible result was reduced: its preview is not the whole result. The complete text, when it exists, is among `references`.",
+          "type": "boolean"
+        },
+        "next_offset": {
+          "description": "Offset of the next page; equals `total_bytes` at the end.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "offset": {
+          "description": "Byte offset of this page in the whole part.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "part": {
+          "description": "Which recorded part this page belongs to.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/UiToolOutputPart"
+            }
+          ]
+        },
+        "references": {
+          "description": "Complete artifacts the recorded result references, in stable order.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiToolOutputReference"
+          }
+        },
+        "state": {
+          "$ref": "#/definitions/UiToolOutputState"
+        },
+        "text": {
+          "description": "This page's text. Empty when unavailable.",
+          "type": "string"
+        },
+        "total_bytes": {
+          "description": "Length of the whole part in bytes.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "unavailable": {
+          "description": "Why the output is unavailable. Present only with [`UiToolOutputState::Unavailable`].",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiToolOutputUnavailable"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "UiToolOutputPart": {
+      "description": "Which recorded part a page belongs to.",
+      "oneOf": [
+        {
+          "description": "The exact result text the model received.",
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "result"
+              ]
+            }
+          }
+        },
+        {
+          "description": "The complete text saved at `index` in `references`.",
+          "type": "object",
+          "required": [
+            "index",
+            "kind"
+          ],
+          "properties": {
+            "index": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "artifact"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "UiToolOutputReference": {
+      "description": "One complete artifact a recorded result references.",
+      "type": "object",
+      "required": [
+        "available",
+        "index",
+        "label",
+        "size_bytes"
+      ],
+      "properties": {
+        "available": {
+          "description": "False when the file is missing (swept or deleted); the client shows the reference as unavailable instead of hiding that it existed.",
+          "type": "boolean"
+        },
+        "index": {
+          "description": "Stable index a client passes back to page this artifact.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "label": {
+          "type": "string"
+        },
+        "size_bytes": {
+          "description": "Size of the saved file when it exists.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "UiToolOutputState": {
+      "type": "string",
+      "enum": [
+        "available",
+        "unavailable"
+      ]
+    },
+    "UiToolOutputUnavailable": {
+      "description": "Why a recorded output could not be served. Each variant names a real state of the durable record, never an inference about what the tool \"should\" have produced.",
+      "oneOf": [
+        {
+          "description": "No stored result exists for this call: it is still running, the transcript that held it was compacted away, or it was produced by a runtime that did not persist tool results.",
+          "type": "string",
+          "enum": [
+            "not_saved"
+          ]
+        },
+        {
+          "description": "The recorded result names an artifact whose file is gone (quota sweep or manual deletion). The recorded preview remains what the model saw.",
+          "type": "string",
+          "enum": [
+            "artifact_missing"
+          ]
+        },
+        {
+          "description": "The request named a reference index the recorded result does not have.",
+          "type": "string",
+          "enum": [
+            "unknown_part"
+          ]
+        },
+        {
+          "description": "The stored artifact could not be read for an environmental reason.",
+          "type": "string",
+          "enum": [
+            "read_failed"
+          ]
+        }
+      ]
     },
     "UiToolTiming": {
       "description": "One tool's timing on a shared, turn-local runtime timeline. Live sources and replay sources use the same persisted monotonic execution facts. Wall-clock timestamps never stand in for missing execution boundaries. Absence means unknown, never an assumed zero. The start coordinate lets clients measure overlapping calls as a span instead of adding durations.",

@@ -743,6 +743,37 @@ pub enum ClientCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         query_id: Option<CommandId>,
     },
+    /// Read one page of a tool call's full recorded result.
+    ///
+    /// The transcript stores the exact text the model received; when that text
+    /// was bounded, the runtime saved the complete output to its
+    /// content-addressed artifact store and the result names the saved file.
+    /// `index` selects one of those complete artifacts (as listed in the
+    /// answer's `references`); `None` pages the model-visible result itself.
+    ///
+    /// The request never carries a path: the runtime resolves references from
+    /// the stored result of THIS session's call and serves only files inside
+    /// its own artifact store. Answered by
+    /// [`crate::RuntimeEvent::ToolOutputLoaded`].
+    ///
+    /// Reserved for trusted local clients: the text is raw tool output, which
+    /// may name workspace paths and command lines.
+    QueryToolOutput {
+        session_id: SessionId,
+        query_id: CommandId,
+        /// The tool call whose recorded result is read.
+        call_id: String,
+        /// Which complete artifact to page; `None` is the model-visible result.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        index: Option<u32>,
+        /// Byte offset into the selected part.
+        #[serde(default)]
+        offset: u64,
+        /// Page size. The runtime clamps it to
+        /// [`crate::TOOL_OUTPUT_PAGE_MAX_BYTES`].
+        #[serde(default = "default_tool_output_page_bytes")]
+        max_bytes: u32,
+    },
     /// List the agent definitions the session's project resolves.
     /// Answered by [`crate::RuntimeEvent::AgentsLoaded`].
     ListAgents {
@@ -901,6 +932,7 @@ impl ClientCommand {
             | ClientCommand::QueryChildContribution { session_id, .. }
             | ClientCommand::ListUnfinishedGoals { session_id, .. }
             | ClientCommand::QuerySessionHistory { session_id, .. }
+            | ClientCommand::QueryToolOutput { session_id, .. }
             | ClientCommand::ListAgents { session_id, .. }
             | ClientCommand::GetAgent { session_id, .. }
             | ClientCommand::CreateAgent { session_id, .. }
@@ -967,6 +999,10 @@ impl ClientCommand {
             | ClientCommand::Quit => None,
         }
     }
+}
+
+fn default_tool_output_page_bytes() -> u32 {
+    crate::TOOL_OUTPUT_PAGE_DEFAULT_BYTES
 }
 
 #[cfg(test)]

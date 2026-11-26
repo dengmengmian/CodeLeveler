@@ -370,6 +370,23 @@ mod tests {
         assert_eq!(status, UiTaskStatus::Completed);
         assert_eq!(terminal.unwrap().stop, None);
     }
+    /// Rows written before the verification gate was removed stored the old
+    /// verdict as the terminal outcome (`verified` / `completed_unverified`).
+    /// They must project instead of failing the whole source as unreadable.
+    #[test]
+    fn legacy_terminal_outcome_payloads_still_project() {
+        for legacy in ["verified", "completed_unverified"] {
+            let mut facts = facts();
+            finish(&mut facts, StopReason::Completed);
+            facts.terminal.as_mut().unwrap().payload =
+                format!(r#"{{"type":"task_finished","payload":{{"outcome":"{legacy}"}}}}"#);
+            let (status, terminal) =
+                project_task(&facts, &Probe(BootLiveness::Unknown), false, false)
+                    .unwrap_or_else(|error| panic!("{legacy} must project: {error}"));
+            assert_eq!(status, UiTaskStatus::Completed, "legacy outcome {legacy}");
+            assert!(terminal.is_some(), "legacy outcome {legacy}");
+        }
+    }
     #[test]
     fn canonical_terminal_outlives_postcommit_turn_lease() {
         let mut facts = facts();

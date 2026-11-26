@@ -24,12 +24,7 @@ pub(crate) fn snapshot(app: &Application) -> UiSettingsSnapshot {
         .providers
         .iter()
         .map(|provider| {
-            let api_key_configured = provider
-                .api_key
-                .as_deref()
-                .is_some_and(|key| !key.trim().is_empty())
-                || (!provider.api_key_env.is_empty()
-                    && std::env::var_os(&provider.api_key_env).is_some());
+            let api_key_configured = crate::provider_config::api_key_present(provider);
             let model_count = loaded
                 .models
                 .iter()
@@ -101,7 +96,7 @@ pub(crate) fn snapshot(app: &Application) -> UiSettingsSnapshot {
 /// The provider's endpoint is useful context; the userinfo of a URL is a
 /// credential and a query string commonly carries a token. Neither belongs in
 /// a client answer.
-fn display_safe_url(raw: &str) -> String {
+pub(crate) fn display_safe_url(raw: &str) -> String {
     let raw = raw.trim();
     let Some(scheme_end) = raw.find("://") else {
         return raw.to_string();

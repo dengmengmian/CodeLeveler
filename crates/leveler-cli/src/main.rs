@@ -14,6 +14,7 @@ mod common;
 mod completions_cmd;
 mod crash;
 mod desktop_bridge;
+mod desktop_provider;
 mod eval_cmd;
 mod eval_commitment;
 mod eval_signals;

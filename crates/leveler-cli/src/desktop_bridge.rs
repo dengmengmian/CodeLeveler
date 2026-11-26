@@ -91,10 +91,81 @@ fn validate_command(session: &SessionId, command: &ClientCommand) -> anyhow::Res
         ClientCommand::ManageSchedule {
             query_id, request, ..
         } if valid_desktop_command_id(query_id) && valid_desktop_schedule_request(request) => {}
+        ClientCommand::QueryToolOutput {
+            query_id,
+            call_id,
+            index,
+            offset,
+            max_bytes,
+            ..
+        } if valid_desktop_command_id(query_id)
+            && valid_desktop_tool_call_id(call_id)
+            && index.is_none_or(|index| index <= 1024)
+            && *offset <= 1024 * 1024 * 1024
+            && (1..=leveler_client_protocol::TOOL_OUTPUT_PAGE_MAX_BYTES).contains(max_bytes) => {}
         ClientCommand::ResumeTask { content, .. }
             if !content.is_empty() && content.chars().count() <= 100_000 => {}
         ClientCommand::CancelBackgroundTask { task_id, .. }
             if !task_id.trim().is_empty() && task_id.len() <= 256 => {}
+        // A trust answer must name the session that owns the waiter and a
+        // bounded request identity. The runtime still refuses a request it no
+        // longer holds; the bridge refuses an unroutable answer earlier.
+        ClientCommand::DefinitionTrustDecision {
+            request_id,
+            session_id: Some(_),
+            ..
+        } if !request_id.as_str().trim().is_empty() && request_id.as_str().len() <= 256 => {}
+        // Credentials travel through the one admission transform every client
+        // uses. The bridge checks shape and bounds; the runtime owns custody,
+        // placeholder replacement and the plaintext acknowledgement.
+        ClientCommand::SubmitUserInput {
+            content,
+            attachments,
+            secret_captures,
+            plaintext_secret_ack,
+            ..
+        } if content.chars().count() <= 100_000
+            && attachments.len() <= 16
+            && attachments.iter().all(valid_desktop_image)
+            && valid_desktop_secret_captures(content, secret_captures, *plaintext_secret_ack)
+            && (!content.is_empty() || !attachments.is_empty()) => {}
+        ClientCommand::SteerUserInput {
+            content,
+            secret_captures,
+            plaintext_secret_ack,
+            message_id,
+            ..
+        } if !content.is_empty()
+            && content.chars().count() <= 100_000
+            && valid_desktop_secret_captures(content, secret_captures, *plaintext_secret_ack)
+            && message_id
+                .as_ref()
+                .is_none_or(|id| !id.as_str().trim().is_empty() && id.as_str().len() <= 256) => {}
+        ClientCommand::CaptureSecret {
+            request_id,
+            value,
+            key_hint,
+            ..
+        } if !request_id.as_str().trim().is_empty()
+            && request_id.as_str().len() <= 256
+            && !value.is_empty()
+            && value.len() <= MAX_DESKTOP_SECRET_BYTES
+            && key_hint.as_ref().is_none_or(|hint| {
+                !hint.is_empty() && hint.len() <= MAX_DESKTOP_SECRET_HINT_BYTES
+            }) => {}
+        ClientCommand::RevokeSecret { secret_ref, .. } if valid_desktop_secret_ref(secret_ref) => {}
+        // The product collaboration axis is the same typed command the
+        // terminal sends. `work_profile` is the deprecated wire field every
+        // current client fills with `single`; it carries no product meaning and
+        // the runtime ignores it. The axis itself is the runtime's to validate
+        // again — the bridge only refuses values that are not representable.
+        ClientCommand::SetProductAxes {
+            work_profile,
+            collaboration,
+            ..
+        } if !work_profile.is_empty()
+            && work_profile.len() <= 64
+            && matches!(collaboration.as_str(), "chat" | "plan" | "goal") => {}
         ClientCommand::SteerCurrentTurn { .. }
         | ClientCommand::CancelCurrentTurn { .. }
         | ClientCommand::CancelTask { .. }
@@ -118,6 +189,17 @@ fn validate_command(session: &SessionId, command: &ClientCommand) -> anyhow::Res
 
 fn valid_desktop_query_id(id: &Option<leveler_core::CommandId>) -> bool {
     id.as_ref().is_some_and(valid_desktop_command_id)
+}
+
+/// A tool-call identity is a provider/host token, not free prose: the query
+/// only ever looks it up, but bounding it keeps an answer from being built
+/// around a meaningless key.
+fn valid_desktop_tool_call_id(call_id: &str) -> bool {
+    !call_id.trim().is_empty()
+        && call_id.len() <= 256
+        && call_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
 }
 
 fn valid_desktop_command_id(id: &leveler_core::CommandId) -> bool {
@@ -285,6 +367,115 @@ fn valid_desktop_image(attachment: &leveler_client_protocol::AttachmentRef) -> b
             .is_some_and(|height| (1..=2048).contains(&height))
 }
 
+/// One message may hand at most this many credentials. A message with more is
+/// a data dump, not a request (mirrors the runtime's admission bound).
+const MAX_DESKTOP_CAPTURES: usize = 16;
+const MAX_DESKTOP_PLACEHOLDER_BYTES: usize = 256;
+const MAX_DESKTOP_SECRET_BYTES: usize = 64 * 1024;
+const MAX_DESKTOP_SECRET_HINT_BYTES: usize = 128;
+
+/// A capture is well-formed only when every placeholder occupies exactly one
+/// span of the message and no two captures share one. The runtime revalidates;
+/// this boundary refuses malformed shapes before they can reach the vault.
+fn valid_desktop_secret_captures(
+    content: &str,
+    captures: &[leveler_client_protocol::secret::SecretCapture],
+    plaintext_ack: bool,
+) -> bool {
+    // Capture and plaintext are different decisions for the same bytes; the
+    // runtime refuses the combination, so the adapter does too.
+    if plaintext_ack && !captures.is_empty() {
+        return false;
+    }
+    if captures.len() > MAX_DESKTOP_CAPTURES {
+        return false;
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for capture in captures {
+        if capture.placeholder.is_empty()
+            || capture.placeholder.len() > MAX_DESKTOP_PLACEHOLDER_BYTES
+            || capture.value.is_empty()
+            || capture.value.len() > MAX_DESKTOP_SECRET_BYTES
+            || capture
+                .key_hint
+                .as_ref()
+                .is_some_and(|hint| hint.is_empty() || hint.len() > MAX_DESKTOP_SECRET_HINT_BYTES)
+            || !seen.insert(capture.placeholder.as_str())
+            || content.matches(capture.placeholder.as_str()).count() != 1
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// `sec_` plus 128 random bits as lowercase hex — the vault's one reference
+/// spelling. Anything else is not a reference this host may ask to revoke.
+fn valid_desktop_secret_ref(value: &str) -> bool {
+    let Some(hex) = value.strip_prefix("sec_") else {
+        return false;
+    };
+    hex.len() == 32
+        && hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// The configured model refs, read through the same config authority the
+/// runtime uses. No session and no runtime process are created.
+fn model_list_payload(layout: Layout) -> anyhow::Result<Value> {
+    let config = leveler_app::ConfigManager::load(layout)?;
+    let mut models = config.snapshot().registry.model_refs();
+    models.sort_by_key(|model| model.to_string());
+    Ok(json!({ "models": models }))
+}
+
+/// The host-side credential scan the Desktop UI uses for its review. It reuses
+/// the exact detector the TUI and the runtime admission use, and returns only
+/// masks, names and spans — never the value.
+fn secret_scan_payload(content: &str) -> Value {
+    use leveler_core::SecretLevel;
+    let findings = leveler_core::detect_secrets(content);
+    // The value is not an instruction: blank its span before deriving the use
+    // scope, exactly as the runtime does.
+    let mut scope_text = content.to_string();
+    for finding in findings.iter().rev() {
+        if finding.start < finding.end && finding.end <= scope_text.len() {
+            scope_text.replace_range(
+                finding.start..finding.end,
+                &" ".repeat(finding.end - finding.start),
+            );
+        }
+    }
+    let items = findings
+        .iter()
+        .map(|finding| {
+            // Byte offsets are Rust-side; the renderer slices UTF-16. Both are
+            // reported so a client never has to convert one into the other.
+            let start_utf16 = content[..finding.start].encode_utf16().count();
+            let end_utf16 = content[..finding.end].encode_utf16().count();
+            json!({
+                "start": finding.start,
+                "end": finding.end,
+                "start_utf16": start_utf16,
+                "end_utf16": end_utf16,
+                "level": match finding.level {
+                    SecretLevel::HighConfidence => "high_confidence",
+                    SecretLevel::Ambiguous => "ambiguous",
+                },
+                "kind": format!("{:?}", finding.kind),
+                "key": finding.key,
+                "masked": leveler_core::masked_secret(finding.value(content)),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "findings": items,
+        "use_targets": leveler_core::dotenv_targets_in(&scope_text),
+        "use_fields": leveler_core::dotenv_fields_in(&scope_text),
+    })
+}
+
 struct Bridge {
     home: leveler_core::LevelerHome,
     config_dir: Option<PathBuf>,
@@ -442,6 +633,75 @@ impl Bridge {
             // bridge answers before announcing a connection; it touches no
             // runtime, session or durable state.
             "ping" => Ok(json!({"ok": true})),
+            // Read-only credential review for the Desktop composer. It reuses
+            // the runtime's detector and never sends the value back.
+            "secret_scan" => {
+                let content = required_string(&params, "content")?;
+                anyhow::ensure!(
+                    content.chars().count() <= 100_000,
+                    "content exceeds the message limit"
+                );
+                Ok(secret_scan_payload(content))
+            }
+            // A session-less read of the configured models for the composer's
+            // picker. The list is the same registry the snapshot advertises;
+            // selecting one only becomes a fact when a session is created.
+            "models" => {
+                let workspace = workspace_param(&params)?;
+                model_list_payload(self.layout_for(workspace)?)
+            }
+            // Provider management is host-side user configuration, not
+            // runtime state: the same file `leveler login` edits, read and
+            // written through the one shared service. The renderer only ever
+            // receives masked facts; a key it sends is written and forgotten.
+            "providers" => {
+                let layout = self.layout_for(workspace_param(&params)?)?;
+                crate::desktop_provider::view(layout, self.client.as_ref(), self.layout.as_ref())
+                    .await
+            }
+            "provider_save" => {
+                let layout = self.layout_for(workspace_param(&params)?)?;
+                crate::desktop_provider::save(
+                    layout,
+                    self.client.as_ref(),
+                    self.layout.as_ref(),
+                    &params,
+                )
+                .await
+            }
+            "provider_remove" => {
+                let layout = self.layout_for(workspace_param(&params)?)?;
+                crate::desktop_provider::remove(
+                    layout,
+                    self.client.as_ref(),
+                    self.layout.as_ref(),
+                    &params,
+                )
+                .await
+            }
+            // A saved provider or a not-yet-saved draft: first-run must be
+            // able to verify a key before it is written anywhere.
+            "provider_models" => {
+                let layout = self.layout_for(workspace_param(&params)?)?;
+                crate::desktop_provider::models(&layout, &params).await
+            }
+            // A real text + streaming request through the configured route.
+            "provider_test" => {
+                let layout = self.layout_for(workspace_param(&params)?)?;
+                crate::desktop_provider::test(&layout, &params).await
+            }
+            "default_model_set" => {
+                let layout = self.layout_for(workspace_param(&params)?)?;
+                crate::desktop_provider::set_default_model(
+                    layout,
+                    self.client.as_ref(),
+                    self.layout.as_ref(),
+                    &params,
+                )
+                .await
+            }
+            // Explicit apply of the current files to the attached runtime.
+            "runtime_reload" => Ok(crate::desktop_provider::reload(self.client.as_ref()).await),
             "list_tasks" => Ok(serde_json::to_value(
                 leveler_app::global_task_index::query_global_tasks(
                     &self.home,
@@ -742,6 +1002,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tool_output_queries_are_bounded_and_session_scoped() {
+        let session = SessionId::new("desktop-session");
+        let command = |call_id: &str, index: Option<u32>, offset: u64, max_bytes: u32| {
+            ClientCommand::QueryToolOutput {
+                session_id: session.clone(),
+                query_id: leveler_core::CommandId::new("q1"),
+                call_id: call_id.to_string(),
+                index,
+                offset,
+                max_bytes,
+            }
+        };
+        assert!(validate_command(&session, &command("call_abc-1", None, 0, 65_536)).is_ok());
+        assert!(validate_command(&session, &command("call_abc-1", Some(3), 1024, 262_144)).is_ok());
+        for bad in [
+            command("", None, 0, 1024),
+            command("a b", None, 0, 1024),
+            command("../../etc/passwd", None, 0, 1024),
+            command("call", None, 0, 0),
+            command("call", None, 0, 262_145),
+            command("call", Some(1025), 0, 1024),
+            command("call", None, 1024 * 1024 * 1024 + 1, 1024),
+        ] {
+            assert!(validate_command(&session, &bad).is_err(), "{bad:?}");
+        }
+        let mut other_session = command("call", None, 0, 1024);
+        if let ClientCommand::QueryToolOutput { session_id, .. } = &mut other_session {
+            *session_id = SessionId::new("another");
+        }
+        assert!(validate_command(&session, &other_session).is_err());
+    }
+
+    #[test]
     fn desktop_existing_task_commands_validate_scope_and_resume_content() {
         let session = SessionId::new("desktop-session");
         for command in [
@@ -778,6 +1071,172 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn definition_trust_decisions_are_scoped_to_the_selected_session() {
+        let session = SessionId::new("desktop-session");
+        let decision = || leveler_client_protocol::DefinitionTrustDecision::AllowOnce;
+        for (id, expected) in [
+            (session.clone(), true),
+            (SessionId::new("other-session"), false),
+        ] {
+            let command = ClientCommand::DefinitionTrustDecision {
+                request_id: leveler_core::DefinitionTrustRequestId::new("trust-1"),
+                decision: decision(),
+                session_id: Some(id),
+            };
+            assert_eq!(validate_command(&session, &command).is_ok(), expected);
+        }
+        // The runtime refuses a decision that does not name its session; the
+        // bridge refuses it earlier instead of forwarding an unroutable answer.
+        for session_id in [None, Some(SessionId::new(" "))] {
+            let command = ClientCommand::DefinitionTrustDecision {
+                request_id: leveler_core::DefinitionTrustRequestId::new("trust-1"),
+                decision: decision(),
+                session_id,
+            };
+            assert!(validate_command(&session, &command).is_err());
+        }
+        let empty = ClientCommand::DefinitionTrustDecision {
+            request_id: leveler_core::DefinitionTrustRequestId::new(""),
+            decision: decision(),
+            session_id: Some(session.clone()),
+        };
+        assert!(validate_command(&session, &empty).is_err());
+    }
+
+    #[test]
+    fn secret_scan_returns_utf16_spans_and_never_the_value() {
+        let text = "请把 .env 的 API_KEY=sk-abcdefghijklmnop1234 写入";
+        let payload = secret_scan_payload(text);
+        let findings = payload["findings"].as_array().unwrap();
+        assert_eq!(findings.len(), 1, "{payload}");
+        let finding = &findings[0];
+        let value = "sk-abcdefghijklmnop1234";
+        let start = finding["start_utf16"].as_u64().unwrap() as usize;
+        let end = finding["end_utf16"].as_u64().unwrap() as usize;
+        let sliced: String = text
+            .encode_utf16()
+            .skip(start)
+            .take(end - start)
+            .map(|unit| char::from_u32(u32::from(unit)).unwrap())
+            .collect();
+        assert_eq!(sliced, value);
+        assert_eq!(
+            finding["masked"].as_str().unwrap(),
+            leveler_core::masked_secret(value)
+        );
+        assert!(!payload.to_string().contains(value));
+        assert!(
+            !payload["use_targets"].as_array().unwrap().is_empty(),
+            "the scan describes the declared dotenv target: {payload}"
+        );
+    }
+
+    #[test]
+    fn desktop_secret_commands_validate_shape_bounds_and_session() {
+        use leveler_client_protocol::secret::{SecretCapture, SecretValue};
+        let capture = SecretCapture::new("{{s}}", "sk-x");
+        assert!(valid_desktop_secret_captures(
+            "use {{s}}",
+            &[capture.clone()],
+            false
+        ));
+        assert!(!valid_desktop_secret_captures(
+            "no placeholder",
+            &[capture.clone()],
+            false
+        ));
+        assert!(!valid_desktop_secret_captures(
+            "{{s}} and {{s}}",
+            &[capture.clone()],
+            false
+        ));
+        assert!(!valid_desktop_secret_captures(
+            "use {{s}}",
+            &[capture.clone(), capture.clone()],
+            false
+        ));
+        assert!(!valid_desktop_secret_captures(
+            "use {{s}}",
+            &[capture.clone()],
+            true
+        ));
+        assert!(valid_desktop_secret_ref(
+            "sec_00000000000000000000000000000000"
+        ));
+        assert!(!valid_desktop_secret_ref("sec_xyz"));
+
+        let session = SessionId::new("desktop-session");
+        let submit = |id: SessionId| ClientCommand::SubmitUserInput {
+            session_id: id,
+            content: "hello".into(),
+            attachments: vec![],
+            secret_captures: vec![],
+            plaintext_secret_ack: false,
+        };
+        assert!(validate_command(&session, &submit(session.clone())).is_ok());
+        assert!(validate_command(&session, &submit(SessionId::new("other"))).is_err());
+        let capture = ClientCommand::CaptureSecret {
+            session_id: session.clone(),
+            request_id: leveler_core::CommandId::new("r1"),
+            value: SecretValue::new("sk-x"),
+            key_hint: None,
+        };
+        assert!(validate_command(&session, &capture).is_ok());
+        let revoke = ClientCommand::RevokeSecret {
+            session_id: session.clone(),
+            secret_ref: "sec_00000000000000000000000000000000".into(),
+        };
+        assert!(validate_command(&session, &revoke).is_ok());
+        let bad_ref = ClientCommand::RevokeSecret {
+            session_id: session.clone(),
+            secret_ref: "not-a-reference".into(),
+        };
+        assert!(validate_command(&session, &bad_ref).is_err());
+    }
+
+    #[test]
+    fn model_list_reads_configured_models_without_a_session() {
+        let dir =
+            std::env::temp_dir().join(format!("leveler-desktop-models-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config_dir = dir.join("configs");
+        std::fs::create_dir_all(config_dir.join("providers")).unwrap();
+        std::fs::create_dir_all(config_dir.join("models")).unwrap();
+        std::fs::write(
+            config_dir.join("providers/mock.yaml"),
+            "id: mock\nprotocol: openai_chat\nbase_url: http://127.0.0.1:9\n",
+        )
+        .unwrap();
+        std::fs::write(
+            config_dir.join("models/m.yaml"),
+            r#"
+id: m
+provider: mock
+model_id: mock-model
+protocol: openai_chat
+capabilities: { streaming: true, tool_calling: true, parallel_tool_calls: false, structured_output: true, reasoning: false, vision: false }
+limits: { context_window: 131072, reliable_context: 65536, max_output_tokens: 1024, max_tool_schema_bytes: 8192, max_parallel_tool_calls: 1 }
+compatibility: { synthesize_tool_call_ids: true, drop_unsupported_fields: true }
+"#,
+        )
+        .unwrap();
+        let layout = Layout::no_workspace(
+            leveler_core::LevelerHome::from_root(dir.join("home")),
+            Some(config_dir),
+        );
+        let payload = model_list_payload(layout).unwrap();
+        assert!(
+            payload["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|model| model["provider"] == "mock" && model["model"] == "m"),
+            "the configured model must be listed: {payload}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -993,6 +1452,40 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    /// R2b: the Desktop's mode picker writes the SAME typed axis command the
+    /// terminal does, bound to the selected session. Values the runtime cannot
+    /// represent are refused here; anything else stays the runtime's decision.
+    #[test]
+    fn desktop_collaboration_switch_is_the_existing_typed_axis_command() {
+        let session = SessionId::new("mode-session");
+        for collaboration in ["chat", "plan", "goal"] {
+            let command = ClientCommand::SetProductAxes {
+                session_id: session.clone(),
+                work_profile: "single".to_string(),
+                collaboration: collaboration.to_string(),
+            };
+            assert!(validate_command(&session, &command).is_ok());
+            assert!(validate_command(&SessionId::new("other"), &command).is_err());
+        }
+        for collaboration in ["Chat", "Goal", "plan ", "", "auto", "orchestrate"] {
+            let command = ClientCommand::SetProductAxes {
+                session_id: session.clone(),
+                work_profile: "single".to_string(),
+                collaboration: collaboration.to_string(),
+            };
+            assert!(
+                validate_command(&session, &command).is_err(),
+                "`{collaboration}` must not be representable as an axis"
+            );
+        }
+        let long_profile = ClientCommand::SetProductAxes {
+            session_id: session.clone(),
+            work_profile: "x".repeat(65),
+            collaboration: "chat".to_string(),
+        };
+        assert!(validate_command(&session, &long_profile).is_err());
     }
 
     /// DESKTOP-SESSION-1: an ordinary Desktop task is a CONVERSATION.

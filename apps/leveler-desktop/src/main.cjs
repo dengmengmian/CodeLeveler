@@ -129,7 +129,7 @@ async function createWindow(){
   await window.loadURL('leveler-desktop://desktop/index.html');
 }
 app.whenReady().then(async()=>{
-  const assets=new Set(['index.html','terminal.mjs','renderer.mjs','state.mjs','presentation.mjs','markdown.mjs','trajectory.mjs','styles.css','command-policy.gen.mjs','icons.mjs','ui.mjs','schedules.mjs']);
+  const assets=new Set(['index.html','terminal.mjs','renderer.mjs','state.mjs','presentation.mjs','markdown.mjs','trajectory.mjs','styles.css','command-policy.gen.mjs','icons.mjs','ui.mjs','schedules.mjs','secret-review.mjs','provider-settings.mjs']);
   protocol.handle('leveler-desktop',request=>{const url=new URL(request.url);const name=url.pathname.slice(1);if(url.hostname!=='desktop')return new Response('Not found',{status:404});if(name==='packages/conversation-presentation/conversation.mjs')return net.fetch(pathToFileURL(path.join(__dirname,'../../../packages/conversation-presentation/conversation.mjs')).toString());if(name==='node_modules/marked/lib/marked.esm.js')return net.fetch(pathToFileURL(path.join(__dirname,'../node_modules/marked/lib/marked.esm.js')).toString());if(['node_modules/@xterm/xterm/lib/xterm.mjs','node_modules/@xterm/xterm/css/xterm.css','node_modules/@xterm/addon-fit/lib/addon-fit.mjs'].includes(name))return net.fetch(pathToFileURL(path.join(__dirname,'..',name)).toString());if(!assets.has(name))return new Response('Not found',{status:404});return net.fetch(pathToFileURL(path.join(__dirname,name)).toString());});
   session.defaultSession.setPermissionRequestHandler((_contents,_permission,callback)=>callback(false));
   session.defaultSession.setPermissionCheckHandler(()=>false);
@@ -170,17 +170,103 @@ app.whenReady().then(async()=>{
   handle('desktop:discard-upload',value=>{if(!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).length!==2||!Object.hasOwn(value,'sessionId')||!Object.hasOwn(value,'importId'))throw new Error('Invalid upload discard');return attachments.discard(text(value.sessionId,'session'),text(value.importId,'import'));});
   handle('desktop:folder',async()=>{const result=await dialog.showOpenDialog(window,{title:'选择 Workspace 文件夹',properties:['openDirectory']});if(result.canceled)return null;const id=randomUUID();folders.set(id,result.filePaths[0]);return {id,path:result.filePaths[0]};});
   handle('desktop:create',async selection=>{let workspace=null;if(selection!==null){workspace=folders.get(selection);if(!workspace)throw new Error('请重新选择 Workspace 文件夹');}attachments.activate(null);const connection=await bridge.request('connect',{workspace});selectedSource=connection.source_id;const result=await bridge.request('create',{goal:''});addRoot(workspace);trackSnapshot(result.session);rememberTask(result.session);attachmentSession(result.session);return result;});
-  handle('desktop:create-identified',async ({selection,requestId})=>{if(typeof requestId!=='string'||!requestId)throw new Error('identified creation requires request_id');let workspace=null;if(selection!==null){workspace=folders.get(selection);if(!workspace)throw new Error('请重新选择 Workspace 文件夹');}attachments.activate(null);const connection=await bridge.request('connect',{workspace});selectedSource=connection.source_id;const result=await bridge.request('create_identified',{goal:'',request_id:requestId});addRoot(workspace);trackSnapshot(result.session);rememberTask(result.session);attachmentSession(result.session);return result;});
+  handle('desktop:create-identified',async ({selection,requestId,model,collaboration})=>{if(typeof requestId!=='string'||!requestId)throw new Error('identified creation requires request_id');let workspace=null;if(selection!==null){workspace=folders.get(selection);if(!workspace)throw new Error('请重新选择 Workspace 文件夹');}let pinned=null;if(model!==undefined&&model!==null){if(typeof model!=='object'||Array.isArray(model)||Object.keys(model).length!==2||typeof model.provider!=='string'||!model.provider||model.provider.length>256||typeof model.model!=='string'||!model.model||model.model.length>256)throw new Error('Invalid model selection');pinned={provider:model.provider,model:model.model};}let axis=null;if(collaboration!==undefined&&collaboration!==null){if(!['chat','plan','goal'].includes(collaboration))throw new Error('Invalid collaboration selection');axis=collaboration;}attachments.activate(null);const connection=await bridge.request('connect',{workspace});selectedSource=connection.source_id;const result=await bridge.request('create_identified',{goal:'',request_id:requestId,model:pinned,...(axis?{collaboration:axis}:{})});addRoot(workspace);trackSnapshot(result.session);rememberTask(result.session);attachmentSession(result.session);return result;});
   handle('desktop:open',async task=>{if(!task||typeof task!=='object')throw new Error('Invalid task');attachments.activate(null);let result;try{result=await bridge.request('open',{source_id:text(task.source_id,'source'),session_id:text(task.id,'session')});}catch(error){// A missing workspace is an external state the person can restore; the
     // raw OS error names neither the cause nor the next step.
     if(/No such file or directory|os error 2/i.test(String(error?.message??'')))throw new Error('会话的工作区文件夹不存在或无法访问。请恢复该文件夹后重新打开会话。');
     throw error;}selectedSource=result.source_id;trackSnapshot(result.session);rememberTask(result.session);attachmentSession(result.session);return result;});
   handle('desktop:snapshot',async sessionId=>{const snapshot=await bridge.request('snapshot',{session_id:text(sessionId,'session')});trackSnapshot(snapshot);rememberTask(snapshot);attachmentSession(snapshot);return snapshot;});
+  // Session-less, read-only model list for the composer picker. Opening the
+  // picker must never create a session.
+  handle('desktop:models',async selection=>{let workspace=null;if(selection!==null){if(typeof selection!=='string'||!selection)throw new Error('Invalid workspace selection');workspace=folders.get(selection);if(!workspace)throw new Error('请重新选择 Workspace 文件夹');}return bridge.request('models',{workspace});});
+  // Provider management is host-side user configuration. The renderer only
+  // receives masked facts; a key travels once in the request and is never sent
+  // back. The workspace is resolved from state Main already authorized (the
+  // open session's tracked root, or a folder the native picker returned).
+  const providerRequest=(request,keys)=>{
+    if(!request||typeof request!=='object'||Array.isArray(request))throw new Error('Invalid provider request');
+    if(Object.keys(request).length!==keys.length||keys.some(key=>!Object.hasOwn(request,key)))throw new Error('Invalid provider request');
+    return request;
+  };
+  const providerWorkspace=request=>{
+    providerRequest(request,Object.keys(request));
+    if(request.sessionId!==null){
+      if(typeof request.sessionId!=='string'||!request.sessionId)throw new Error('Invalid provider request');
+      return sessionRoots.get(request.sessionId)??null;
+    }
+    if(request.selection===null)return null;
+    if(typeof request.selection!=='string'||!request.selection)throw new Error('Invalid provider request');
+    const workspace=folders.get(request.selection);
+    if(!workspace)throw new Error('请重新选择 Workspace 文件夹');
+    return workspace;
+  };
+  const providerContext=['selection','sessionId'];
+  const providerObject=(value,{models})=>{
+    if(!value||typeof value!=='object'||Array.isArray(value))throw new Error('Invalid provider');
+    const keys=['id','protocol','base_url','api_key_env','api_key',...(models?['models']:[])];
+    if(Object.keys(value).length!==keys.length||keys.some(key=>!Object.hasOwn(value,key)))throw new Error('Invalid provider');
+    for(const key of ['id','protocol'])if(typeof value[key]!=='string'||!value[key]||value[key].length>2048)throw new Error('Invalid provider');
+    // An edit may omit the base URL ("null = keep the stored one"); the bridge
+    // still requires a non-empty endpoint on add.
+    if(value.base_url!==null&&(typeof value.base_url!=='string'||value.base_url.length>2048))throw new Error('Invalid provider');
+    for(const key of ['api_key_env','api_key'])if(value[key]!==null&&(typeof value[key]!=='string'||value[key].length>16*1024))throw new Error('Invalid provider');
+    if(models){
+      if(!Array.isArray(value.models)||value.models.length>8)throw new Error('Invalid provider models');
+      for(const model of value.models){
+        if(!model||typeof model!=='object'||Array.isArray(model)||Object.keys(model).length!==2||!Object.hasOwn(model,'id')||!Object.hasOwn(model,'context_window'))throw new Error('Invalid provider model');
+        if(typeof model.id!=='string'||!model.id||model.id.length>128)throw new Error('Invalid provider model');
+        if(model.context_window!==null&&(!Number.isSafeInteger(model.context_window)||model.context_window<1024||model.context_window>16777216))throw new Error('Invalid context window');
+      }
+    }
+    return {id:value.id,protocol:value.protocol,base_url:value.base_url,api_key_env:value.api_key_env,api_key:value.api_key,...(models?{models:value.models}:{})};
+  };
+  handle('desktop:providers',request=>{providerRequest(request,providerContext);return bridge.request('providers',{workspace:providerWorkspace(request)});});
+  handle('desktop:provider-save',async request=>{
+    providerRequest(request,[...providerContext,'mode','provider']);
+    const workspace=providerWorkspace(request);
+    const mode=request.mode;
+    if(!['add','edit'].includes(mode))throw new Error('Invalid provider mode');
+    const provider=providerObject(request.provider,{models:true});
+    return bridge.request('provider_save',{workspace,mode,provider});
+  });
+  handle('desktop:provider-remove',async request=>{
+    providerRequest(request,[...providerContext,'id']);
+    const workspace=providerWorkspace(request);
+    if(typeof request.id!=='string'||!request.id||request.id.length>64)throw new Error('Invalid provider request');
+    return bridge.request('provider_remove',{workspace,id:request.id});
+  });
+  handle('desktop:provider-models',async request=>{
+    providerRequest(request,[...providerContext,'id','provider']);
+    const workspace=providerWorkspace(request);
+    const provider=request.provider===null?null:providerObject(request.provider,{models:false});
+    if(provider===null&&(typeof request.id!=='string'||!request.id||request.id.length>64))throw new Error('Invalid provider request');
+    if(provider!==null&&request.id!==null)throw new Error('Invalid provider request');
+    return bridge.request('provider_models',{workspace,id:request.id,provider});
+  });
+  handle('desktop:provider-test',async request=>{
+    providerRequest(request,[...providerContext,'id','model']);
+    const workspace=providerWorkspace(request);
+    if(typeof request.id!=='string'||!request.id||request.id.length>64)throw new Error('Invalid provider request');
+    const model=request.model??null;
+    if(model!==null&&(typeof model!=='object'||Array.isArray(model)||Object.keys(model).length!==2||typeof model.provider!=='string'||typeof model.model!=='string'||!model.model||model.model.length>128))throw new Error('Invalid provider model');
+    return bridge.request('provider_test',{workspace,id:request.id,model});
+  });
+  handle('desktop:default-model-set',async request=>{
+    providerRequest(request,[...providerContext,'model']);
+    const workspace=providerWorkspace(request);
+    const model=request.model;
+    if(!model||typeof model!=='object'||Array.isArray(model)||Object.keys(model).length!==2||typeof model.provider!=='string'||!model.provider||model.provider.length>256||typeof model.model!=='string'||!model.model||model.model.length>256)throw new Error('Invalid provider model');
+    return bridge.request('default_model_set',{workspace,model:{provider:model.provider,model:model.model}});
+  });
+  handle('desktop:runtime-reload',()=>bridge.request('runtime_reload',{}));
   handle('desktop:connection-status',()=>bridge.status());
   handle('desktop:reconnect',()=>{bridge.retry();return {ok:true};});
   handle('desktop:open-in-app-apps',async()=>{const apps=installedCatalog();return Promise.all(apps.map(async app=>({...app,icon:await appIcon(app.path)})));});
   handle('desktop:open-in-app',async value=>{if(!value||typeof value!=='object'||Array.isArray(value))throw new Error('Invalid open request');const keys=Object.keys(value);if(keys.some(key=>!['path','appId','action'].includes(key)))throw new Error('Invalid open request');const action=value.action;if(!['open','reveal','default'].includes(action))throw new Error('Invalid open action');const target=resolveTarget(value.path,[...allowedRoots]);if(action==='default'){const error=await shell.openPath(target);if(error)throw new Error(error);return {ok:true};}if(action==='reveal'){if(statSync(target).isDirectory()){const error=await shell.openPath(target);if(error)throw new Error(error);}else shell.showItemInFolder(target);return {ok:true};}const appId=text(value.appId,'application');const catalog=installedCatalog();const selected=catalog.find(candidate=>candidate.id===appId);if(!selected)throw new Error('应用不可用');if(selected.id==='finder'){const error=await shell.openPath(target);if(error)throw new Error(error);return {ok:true};}const child=spawn('/usr/bin/open',['-a',selected.path,target],{detached:true,stdio:'ignore'});child.unref();return {ok:true};});
-  handle('desktop:deliver',envelope=>{validateEnvelope(envelope,(sessionId,ref)=>attachments.authorize(sessionId,ref));if(envelope.command.type==='submit_message'&&envelope.command.attachments?.length&&attachments.selected?.vision!==true)throw new Error('当前模型不支持图片，请切换到视觉模型或移除附件');return bridge.request('deliver',{envelope}).then(()=>({ok:true}),error=>({ok:false,error:{message:error.message,kind:error.kind ?? 'outcome_unknown'}}));});
+  handle('desktop:deliver',envelope=>{validateEnvelope(envelope,(sessionId,ref)=>attachments.authorize(sessionId,ref));if(['submit_message','submit_user_input'].includes(envelope.command.type)&&envelope.command.attachments?.length&&attachments.selected?.vision!==true)throw new Error('当前模型不支持图片，请切换到视觉模型或移除附件');return bridge.request('deliver',{envelope}).then(()=>({ok:true}),error=>({ok:false,error:{message:error.message,kind:error.kind ?? 'outcome_unknown'}}));});
+  // Read-only credential review: the host runs the same detector the runtime
+  // admission uses and returns masks, names and spans — never the value.
+  handle('desktop:secret-scan',content=>{if(typeof content!=='string'||content.length>200000)throw new Error('Invalid secret scan request');return bridge.request('secret_scan',{content});});
   handle('desktop:browser-state',()=>browser.state());
   handle('desktop:browser-command',command=>browser.command(command));
   handle('desktop:browser-surface',surface=>browser.surface(surface));

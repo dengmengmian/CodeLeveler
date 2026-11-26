@@ -462,6 +462,18 @@ pub enum RuntimeEvent {
     /// only outcome a client states. `attempt` is 1-based within the logical
     /// turn's recovery budget.
     GoalRecovery { attempt: u32, max_attempts: u32 },
+    /// The runtime stopped continuing a Goal automatically because consecutive
+    /// yielded work windows executed no work at all.
+    ///
+    /// This is a policy stop, not a task outcome: the goal still owes its work,
+    /// the last window's own terminal (`turn_yielded`) is the durable record of
+    /// that window, and the user can continue the goal with a message. Clients
+    /// must not paint this as completion, failure, or budget exhaustion.
+    GoalContinuationStopped {
+        /// Consecutive windows, ending with the last one, that executed no tool
+        /// other than `update_goal`.
+        consecutive_windows_without_work: u32,
+    },
     /// Project behavior constraints loaded for this turn. Sources are
     /// workspace-relative paths; instruction contents never enter UI chrome.
     ProjectRulesLoaded { sources: Vec<String> },
@@ -1211,6 +1223,13 @@ pub enum RuntimeEvent {
         #[serde(default)]
         omitted_turns: u32,
     },
+    /// Result of [`crate::ClientCommand::QueryToolOutput`]: one page of a tool
+    /// call's full recorded result, or the typed reason it cannot be served.
+    ToolOutputLoaded {
+        query_id: CommandId,
+        session_id: leveler_core::SessionId,
+        output: crate::UiToolOutput,
+    },
 }
 
 /// The current contents and controls of an undelivered input.
@@ -1650,6 +1669,42 @@ mod tests {
                 label: "thinking".to_string(),
             },
             "agent_activity",
+        );
+    }
+
+    #[test]
+    fn goal_continuation_stopped_roundtrips() {
+        roundtrip(
+            RuntimeEvent::GoalContinuationStopped {
+                consecutive_windows_without_work: 2,
+            },
+            "goal_continuation_stopped",
+        );
+    }
+
+    #[test]
+    fn tool_output_loaded_roundtrips() {
+        roundtrip(
+            RuntimeEvent::ToolOutputLoaded {
+                query_id: CommandId::new("q1"),
+                session_id: leveler_core::SessionId::new("s1"),
+                output: crate::UiToolOutput {
+                    call_id: "c1".into(),
+                    state: crate::UiToolOutputState::Available,
+                    unavailable: None,
+                    part: crate::UiToolOutputPart::Result,
+                    label: "模型所见结果".into(),
+                    text: "exit: 0".into(),
+                    total_bytes: 8,
+                    offset: 0,
+                    next_offset: 8,
+                    has_more: false,
+                    model_result_reduced: false,
+                    full_output_lost: false,
+                    references: Vec::new(),
+                },
+            },
+            "tool_output_loaded",
         );
     }
 

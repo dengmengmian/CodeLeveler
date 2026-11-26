@@ -53,7 +53,7 @@ pub use read_file::ReadFileTool;
 pub use read_symbol::ReadSymbolTool;
 pub use rules::ReadProjectRulesTool;
 pub use run_command::RunCommandTool;
-pub use secret_apply::{SecretApplyTool, SecretInspectTool};
+pub use secret_apply::{SecretApplyTool, SecretInspectTool, record_secret_call_decision};
 pub use shell_command::ShellCommandTool;
 pub use skills::{
     DELETE_SKILL_TOOL, DeleteSkillTool, LoadSkillTool, SAVE_SKILL_TOOL, SKILL_AUTHORING_TOOLS,

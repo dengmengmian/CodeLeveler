@@ -951,6 +951,9 @@ pub struct UiText {
     /// Automatic Goal continuation after a transient provider failure:
     /// "正在恢复任务 · 第 {}/{} 次". Not a failure and not a user action.
     pub goal_recovery_activity: &'static str,
+    /// Automatic Goal continuation stopped because consecutive windows did no
+    /// work: "自动续跑已停止 · 连续 {} 个窗口没有执行工作；目标仍未完成".
+    pub goal_continuation_stopped: &'static str,
     /// Footer prefix-cache hit rate of the latest prompt. Not the turn receipt.
     pub footer_cache: &'static str,
     /// This turn's model steps, on the turn receipt only.
@@ -2877,6 +2880,7 @@ static ZH: UiText = UiText {
     reconnecting: "模型服务暂时不可用 · 重试 {attempt}/{max} · {secs}s",
     reconnected: "已恢复",
     goal_recovery_activity: "正在恢复任务 · 第 {}/{} 次",
+    goal_continuation_stopped: "自动续跑已停止 · 连续 {} 个窗口没有执行工作；目标仍未完成",
     footer_cache: "缓存 {}%",
     turn_rounds: "{} 轮",
     turn_tokens: "{} tokens",
@@ -4827,6 +4831,7 @@ static EN: UiText = UiText {
     reconnecting: "Model service unavailable · retry {attempt}/{max} · {secs}s",
     reconnected: "Recovered",
     goal_recovery_activity: "Recovering the task · attempt {}/{}",
+    goal_continuation_stopped: "Automatic continuation stopped: {} consecutive windows did no work; the goal is still owed",
     footer_cache: "cache {}%",
     turn_rounds: "{} rounds",
     turn_tokens: "{} tokens",

@@ -15,13 +15,53 @@ test('desktop rejects cross-session submission but accepts scoped text and live 
  assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'submit_message',session_id:'s1',content:'hi'})));
  assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'approval_decision',request_id:'a1',decision:'approve_once'})));
 });
-test('desktop refuses plaintext credentials it cannot review or authorize',()=>{
- const key='sk-'+'A'.repeat(40);
- for(const type of ['submit_message','steer_current_turn','resume_task'])assert.throws(()=>security.validateEnvelope(envelope({type,session_id:'s1',content:`请使用 ${key} 调用服务`})),/凭据明文授权/);
- assert.throws(()=>security.validateEnvelope(envelope({type:'submit_message',session_id:'s1',content:'AWS AKIA'+'B'.repeat(16)})),/凭据明文授权/);
- assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'submit_message',session_id:'s1',content:'sk- 是常见的 key 前缀，这里只是讨论格式'})));
+test('secret submissions validate captures, acknowledgement and session',()=>{
+ const capture=(over={})=>({placeholder:'{{s}}',value:'sk-test-value',...over});
+ const submit=(over={})=>({type:'submit_user_input',session_id:'s1',content:'use {{s}}',attachments:[],secret_captures:[capture()],plaintext_secret_ack:false,...over});
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope(submit())));
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope(submit({content:'plain sk-test-value',secret_captures:[],plaintext_secret_ack:true}))));
+ for(const bad of [
+   submit({plaintext_secret_ack:true}),
+   submit({content:'no placeholder'}),
+   submit({content:'use {{s}} {{s}}'}),
+   submit({secret_captures:[capture(),capture()]}),
+   submit({secret_captures:[capture({placeholder:''})]}),
+   submit({secret_captures:[capture({value:''})]}),
+   submit({secret_captures:[capture({value:'a'.repeat(65537)})]}),
+   submit({secret_captures:[capture({extra:1})]}),
+   submit({session_id:'s2'}),
+   submit({content:'a'.repeat(100001),secret_captures:[],plaintext_secret_ack:false}),
+   submit({content:'',attachments:[],secret_captures:[],plaintext_secret_ack:false}),
+ ])assert.throws(()=>security.validateEnvelope(envelope(bad)));
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'steer_user_input',session_id:'s1',content:'use {{s}}',secret_captures:[capture()],plaintext_secret_ack:false})));
+ assert.throws(()=>security.validateEnvelope(envelope({type:'steer_user_input',session_id:'s1',content:'',secret_captures:[],plaintext_secret_ack:false})));
+ assert.throws(()=>security.validateEnvelope(envelope({type:'steer_user_input',session_id:'s2',content:'x',secret_captures:[],plaintext_secret_ack:false})));
+ assert.throws(()=>security.validateEnvelope(envelope({type:'steer_user_input',session_id:'s1',content:'x',secret_captures:[],plaintext_secret_ack:false,attachments:[]})));
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'capture_secret',session_id:'s1',request_id:'r1',value:'sk-test-value'})));
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'capture_secret',session_id:'s1',request_id:'r1',value:'sk-test-value',key_hint:'API_KEY'})));
+ for(const bad of [
+   {type:'capture_secret',session_id:'s1',request_id:'r1',value:''},
+   {type:'capture_secret',session_id:'s1',request_id:'r1',value:'a'.repeat(65537)},
+   {type:'capture_secret',session_id:'s1',request_id:'',value:'x'},
+   {type:'capture_secret',session_id:'s2',request_id:'r1',value:'x'},
+   {type:'capture_secret',session_id:'s1',request_id:'r1',value:'x',extra:1},
+ ])assert.throws(()=>security.validateEnvelope(envelope(bad)));
+ const ref=`sec_${'a'.repeat(32)}`;
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'revoke_secret',session_id:'s1',secret_ref:ref})));
+ for(const bad of [
+   {type:'revoke_secret',session_id:'s1',secret_ref:'sec_short'},
+   {type:'revoke_secret',session_id:'s1',secret_ref:`sec_${'A'.repeat(32)}`},
+   {type:'revoke_secret',session_id:'s2',secret_ref:ref},
+   {type:'revoke_secret',session_id:'s1',secret_ref:ref,extra:1},
+ ])assert.throws(()=>security.validateEnvelope(envelope(bad)));
 });
-
+test('definition trust decisions are scoped, enumerated, and exact',()=>{
+ for(const decision of ['allow_once','trust_current_version','deny'])assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'definition_trust_decision',request_id:'d1',decision,session_id:'s1'})));
+ for(const session_id of ['s2','',null,undefined,' '])assert.throws(()=>security.validateEnvelope(envelope({type:'definition_trust_decision',request_id:'d1',decision:'allow_once',session_id})));
+ for(const decision of ['allow','trust','deny_all','ALLOW_ONCE','',null,undefined,{}])assert.throws(()=>security.validateEnvelope(envelope({type:'definition_trust_decision',request_id:'d1',decision,session_id:'s1'})));
+ for(const request_id of ['',null,undefined,'   ','a'.repeat(257)])assert.throws(()=>security.validateEnvelope(envelope({type:'definition_trust_decision',request_id,decision:'deny',session_id:'s1'})));
+ assert.throws(()=>security.validateEnvelope(envelope({type:'definition_trust_decision',request_id:'d1',decision:'deny',session_id:'s1',content:'x'})));
+});
 test('desktop accepts current-session model, title, and archive commands using existing contracts',()=>{
  for(const command of [{type:'select_model',session_id:'s1',model:{provider:'openai',model:'gpt-4o'}},{type:'rename_session',session_id:'s1',name:'新名称'},{type:'archive_session',session_id:'s1'},{type:'unarchive_session',session_id:'s1'}])assert.doesNotThrow(()=>security.validateEnvelope(envelope(command)));
 });
@@ -51,6 +91,30 @@ test('image-only input is supported while unknown submit authority stays rejecte
 test('diff query accepts only selected-session optional bounded query identity',()=>{
  for(const fields of [{},{query_id:'query-1'}])assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'request_diff',session_id:'s1',...fields})));
  for(const fields of [{session_id:'s2'},{session_id:''},{query_id:''},{query_id:' '},{query_id:null},{query_id:42},{query_id:'a'.repeat(257)},{path:'/private'},{include_all:true}])assert.throws(()=>security.validateEnvelope(envelope({type:'request_diff',session_id:'s1',...fields})));
+});
+
+test('tool output queries carry only a call id, a bounded part and a byte window',()=>{
+ const base={type:'query_tool_output',session_id:'s1',query_id:'q1',call_id:'call_abc-123',offset:0,max_bytes:65536};
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope(base)));
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope({...base,index:0,offset:1024,max_bytes:262144})));
+ for(const bad of [
+   {...base,session_id:'s2'},
+   {...base,call_id:''},
+   {...base,call_id:'a'.repeat(257)},
+   {...base,call_id:'../../etc/passwd'},
+   {...base,call_id:'a b'},
+   {...base,offset:-1},
+   {...base,offset:1.5},
+   {...base,offset:1073741825},
+   {...base,max_bytes:0},
+   {...base,max_bytes:262145},
+   {...base,max_bytes:'65536'},
+   {...base,index:-1},
+   {...base,index:1025},
+   {...base,index:1.5},
+   {...base,path:'/etc/passwd'},
+   {...base,query_id:null},
+ ])assert.throws(()=>security.validateEnvelope(envelope(bad)));
 });
 
 test('existing settings reads require exact scoped correlated query fields',()=>{
@@ -108,4 +172,13 @@ test('scheduled automation is session-scoped, bounded and forwarded as a structu
  const valid={type:'manage_schedule',requester_session_id:'s1',query_id:'q1',request:{action:'list',filter:'all'}};
  assert.doesNotThrow(()=>security.validateEnvelope(envelope(valid)));
  for(const fields of [{requester_session_id:'s2'},{requester_session_id:''},{requester_session_id:' '},{query_id:''},{query_id:'a'.repeat(257)},{request:null},{request:[]},{request:'list'},{request:{}},{request:{action:'a'.repeat(33)}},{request:{action:'list',extra:'x'.repeat(200000)}},{path:'/private'},{expected_version:7}])assert.throws(()=>security.validateEnvelope(envelope({...valid,...fields})));
+});
+
+test('desktop mode switching accepts only the three exact current-session axes',()=>{
+ const command=(over={})=>({type:'set_product_axes',session_id:'s1',work_profile:'single',collaboration:'goal',...over});
+ for(const collaboration of ['chat','plan','goal'])assert.doesNotThrow(()=>security.validateEnvelope(envelope(command({collaboration}))));
+ for(const collaboration of ['Chat','Goal','auto','',null,undefined,'orchestrate',{}])assert.throws(()=>security.validateEnvelope(envelope(command({collaboration}))));
+ for(const session_id of ['s2','',null,undefined,' '])assert.throws(()=>security.validateEnvelope(envelope(command({session_id}))));
+ for(const work_profile of ['',null,undefined,'x'.repeat(65)])assert.throws(()=>security.validateEnvelope(envelope(command({work_profile}))));
+ for(const extra of [{mode:'assisted'},{expected_version:1},{permission:'full'}])assert.throws(()=>security.validateEnvelope(envelope({...command(),...extra})));
 });

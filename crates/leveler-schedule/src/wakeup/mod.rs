@@ -21,10 +21,21 @@ use std::time::Duration;
 
 /// How often the OS registration wakes the dispatcher.
 ///
-/// launchd and Task Scheduler are minute-granularity schedulers. A shorter
-/// interval would only spawn more processes; the schedule's own due check is
-/// what decides whether work exists. The default misfire grace absorbs several
-/// missed wakes before a slot is classified as missed.
+/// The minimum schedule grid is one minute, but launchd's `StartInterval`
+/// fires slightly later than the requested period (about one second of timer
+/// overhead per pass). A 60 s registration therefore drifts one second per
+/// minute against a 60 s grid; after a few hours every run is minutes late and
+/// the run-once grace only clears the backlog periodically. 55 s keeps the
+/// wake cadence below the grid and absorbs that overhead. The pass is cheap
+/// and idempotent; its due check, not the wake itself, decides whether work
+/// exists.
+///
+/// Task Scheduler repeats in whole minutes and the registration XML rounds a
+/// sub-minute request up, so Windows keeps the existing one-minute cadence
+/// until a Windows host can verify a shorter repetition.
+#[cfg(not(windows))]
+pub const WAKE_INTERVAL: Duration = Duration::from_secs(55);
+#[cfg(windows)]
 pub const WAKE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// One desired OS registration.

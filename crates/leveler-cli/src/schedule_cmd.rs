@@ -29,9 +29,9 @@ use leveler_runtime_host::{
 use leveler_schedule::{
     DefinitionUpdate, DispatchSummary, Dispatcher, LocalTime, MisfirePolicy, NativeActionClass,
     NativeActionExecutor, NativeExecutionReport, NativeExecutionRequest, NativeRunStatus,
-    NewScheduleDefinition, OverlapPolicy, RuntimeConnector, ScheduleAction, ScheduleDefinition,
-    ScheduleStore, ScheduleTrigger, SessionPolicy, UnattendedRequest, UsageReader, UsageSnapshot,
-    WakeSource, WeekdaySet, parse_cron,
+    NewScheduleDefinition, OccurrenceId, OverlapPolicy, RuntimeConnector, ScheduleAction,
+    ScheduleDefinition, ScheduleStore, ScheduleTrigger, SessionPolicy, UnattendedRequest,
+    UsageReader, UsageSnapshot, WakeSource, WeekdaySet, parse_cron,
     wakeup::{self, WAKE_INTERVAL, WakeupSpec, WakeupStatus},
 };
 
@@ -474,11 +474,13 @@ pub async fn cmd_schedule(
                 anyhow::bail!("schedule {id} not found");
             };
             let occurrence = store.create_run_now(&definition).await?;
-            // Execute this occurrence explicitly. A generic pass could be
-            // consumed by an unrelated overdue slot, leaving the requested run
-            // pending while the command appears to have succeeded.
+            // Execute this occurrence explicitly and observe it to its
+            // terminal fact. A generic pass could be consumed by an unrelated
+            // overdue slot, leaving the requested run pending while the
+            // command appears to have succeeded.
             let state = dispatcher(config_dir, store.clone())
-                .dispatch_run_now(&occurrence.id)
+                .with_follow(true)
+                .dispatch_occurrence(&occurrence.id)
                 .await?;
             let run = store
                 .runs(Some(&id), 20)
@@ -497,8 +499,8 @@ pub async fn cmd_schedule(
                     Some(run) => println!("{}", run_line(run)),
                     None => println!(
                         "created a run-now slot {} but it was not claimable (an earlier run \
-                         still owns this schedule); a dispatcher will pick it up on its next \
-                         wake",
+                         still owns this schedule); no execution was started and the slot stays \
+                         queued",
                         occurrence.id
                     ),
                 }
@@ -560,17 +562,35 @@ pub async fn cmd_schedule(
         ScheduleCommand::Dispatch {
             max,
             source,
-            wait,
+            occurrence,
+            follow,
             json,
         } => {
-            let dispatcher = dispatcher(config_dir, store);
-            let summary = dispatcher
-                .dispatch_due_with_source(max, wake_source(source))
-                .await?;
-            if wait {
-                dispatcher.observe_until_settled().await?;
+            if let Some(occurrence) = occurrence {
+                let occurrence = OccurrenceId::from(occurrence);
+                let dispatcher = dispatcher(config_dir, store).with_follow(follow);
+                let state = dispatcher.dispatch_occurrence(&occurrence).await?;
+                let run = dispatcher.store().run_for_occurrence(&occurrence).await?;
+                if json {
+                    print_json(&serde_json::json!({
+                        "occurrence": occurrence.as_str(),
+                        "state": state,
+                        "run": run,
+                    }))?;
+                } else {
+                    match &run {
+                        Some(run) => println!("{}", run_line(run)),
+                        None => println!(
+                            "run-now slot {occurrence} was not claimed; no run was created"
+                        ),
+                    }
+                }
+            } else {
+                let summary = dispatcher(config_dir, store)
+                    .dispatch_due_with_source(max, wake_source(source))
+                    .await?;
+                print_summary(&summary, json)?;
             }
-            print_summary(&summary, json)?;
         }
         ScheduleCommand::Serve { max, poll_secs } => {
             serve(config_dir, store, max, poll_secs).await?;

@@ -7,8 +7,15 @@ import {
   attachmentErrorPresentation, slashIntent, commandCandidates,
   contractToolStatus, failureReason, displayPreview,
   confirmedDiffOf, diffCounts, messageTime, conversationItems, executionStatusLabel, confirmedChangeFiles,
-  mergeExecutionViews,
+  mergeExecutionViews, collaborationLabel, validCollaboration, collaborationCommand, collaborationConfirmed,
+  planActiveSteps,
 } from './presentation.mjs';
+import {goalContinuationStopLabel} from './presentation.mjs';
+import {
+  outputMayBeTruncated, canViewFullOutput, sanitizeOutputText, toolOutputUnavailableLabel,
+  toolOutputReferenceLabel,
+} from './presentation.mjs';
+import {turnDelivery, receiptMarker} from './presentation.mjs';
 import {
   projectSnapshot, applySessionMetadata, applyEvent, commandEnvelope, terminalEvents,
   approvalDecisions, clarificationAnswer, uploadDraft, applyUploadEvent, reconcileUploadReply,
@@ -27,6 +34,11 @@ import {
   el, iconNode, iconButton, installTooltips, toast, openMenu, closeMenu, openPopover, closePopover, confirmDialog,
   copyText, trapTab,
 } from './ui.mjs';
+import { captureDraft, persistableDrafts, secretReferences } from './secret-review.mjs';
+import {
+  setupGuidance, configurationUsable, providerCredentialText, connectionPresentation,
+  providerFormError, providerContext, runtimeConfigState,
+} from './provider-settings.mjs';
 
 const api = window.desktop;
 const $ = id => document.getElementById(id);
@@ -46,6 +58,7 @@ const LABELS = {
 const TAB_ICON = {
   start: 'compass', files: 'folder', preview: 'file', terminal: 'terminal',
   browser: 'globe', changes: 'diff', plan: 'list', subagent: 'bot',
+  'tool-output': 'terminal',
 };
 const PERMISSION_MODES = [
   ['full_access', '完全权限'],
@@ -95,6 +108,16 @@ const clarificationReplies = new Map();
 let entryPage = null;
 let settingsSection = 'general';
 let fontSettingsOpen = false;
+// Provider configuration is host truth read through the desktop bridge. The
+// renderer never keeps a key: it sends one once and stores only this projection.
+let providerState = { status: 'idle', data: null, error: null, context: null, request: 0 };
+let providerTest = null;
+// Provider buttons have their own busy state. The global `loading` flag is
+// true only while an action runs, but a page rendered during that action keeps
+// the disabled attribute forever (nothing re-renders it afterwards).
+let providerBusy = null;
+let providerSetupSignature = '';
+let providerModelDiscovery = null;
 let agentsRead = null;
 let scheduleBoard = emptyScheduleView();
 const schedulePending = new Map();
@@ -126,25 +149,124 @@ let trajectoryViewport = null;
 let openInAppState = { apps: null, loading: false, error: null, preferred: null };
 
 const drafts = new Map();
+// A draft may be written to local storage only when the host scan reported
+// the exact same text without a credential candidate. The raw composer text
+// stays in memory; losing an unsubmitted draft is recoverable, writing a
+// plaintext credential to disk is not.
+const cleanDrafts = new Map();
+const legacyDrafts = new Map();
 const DRAFTS_KEY = 'codeleveler.drafts.v1';
-// Drafts are user input, not Runtime facts: keep the text per session across a
-// Desktop restart. Attachments are intentionally not persisted.
+let draftScan = { key: null, text: '', status: 'idle', findings: [], useTargets: [], useFields: [], error: null };
+let draftScanTimer = null;
+let draftScanSeq = 0;
+const pendingSecretPaste = new Map();
+const requestedRevokes = new Set();
 function loadDrafts() {
   try {
     const stored = JSON.parse(localStorage.getItem(DRAFTS_KEY) || '{}');
-    for (const [key, value] of Object.entries(stored)) if (typeof value === 'string' && value) drafts.set(key, value.slice(0, 200000));
+    // Old values were written by a version that did not scan. Remove them
+    // from disk immediately; each one is rescanned and only a clean draft is
+    // written back below.
+    localStorage.removeItem(DRAFTS_KEY);
+    for (const [key, value] of Object.entries(stored)) {
+      if (typeof value !== 'string' || !value) continue;
+      const text = value.slice(0, 200000);
+      drafts.set(key, text);
+      legacyDrafts.set(key, text);
+    }
   } catch { /* unreadable storage gives an empty draft set */ }
 }
 function saveDrafts() {
   try {
-    const stored = {};
-    for (const [key, value] of drafts) if (value) stored[key] = value.slice(0, 200000);
-    localStorage.setItem(DRAFTS_KEY, JSON.stringify(stored));
+    localStorage.setItem(DRAFTS_KEY, JSON.stringify(persistableDrafts(drafts, cleanDrafts)));
   } catch { /* a full store must not break typing */ }
 }
-function clearDraft() { drafts.delete(draftKey()); saveDrafts(); }
+function queueDraftScan(key, text) {
+  clearTimeout(draftScanTimer);
+  if (!text || !text.trim()) {
+    draftScan = { key, text: '', status: 'clean', findings: [], useTargets: [], useFields: [], error: null };
+    cleanDrafts.set(key, '');
+    saveDrafts();
+    return;
+  }
+  draftScan = { key, text, status: 'pending', findings: [], useTargets: [], useFields: [], error: null };
+  draftScanTimer = setTimeout(() => { void runDraftScan(key, text); }, 250);
+}
+async function runDraftScan(key, text) {
+  const seq = ++draftScanSeq;
+  let result;
+  try {
+    result = await api.scanSecrets(text);
+  } catch (error) {
+    if (seq === draftScanSeq) {
+      draftScan = { key, text, status: 'error', findings: [], useTargets: [], useFields: [], error: error?.message ?? '凭据扫描失败' };
+      cleanDrafts.delete(key);
+      saveDrafts();
+    }
+    return draftScan;
+  }
+  if (seq !== draftScanSeq) return draftScan;
+  const findings = Array.isArray(result?.findings) ? result.findings : [];
+  draftScan = {
+    key, text,
+    status: findings.length ? 'findings' : 'clean',
+    findings,
+    useTargets: Array.isArray(result?.use_targets) ? result.use_targets : [],
+    useFields: Array.isArray(result?.use_fields) ? result.use_fields : [],
+    error: null,
+  };
+  if (findings.length) cleanDrafts.delete(key); else cleanDrafts.set(key, text);
+  saveDrafts();
+  return draftScan;
+}
+async function scanForSubmit(text) {
+  const key = draftKey();
+  if (draftScan.key === key && draftScan.text === text && ['clean', 'findings', 'error'].includes(draftScan.status)) return draftScan;
+  return runDraftScan(key, text);
+}
+async function migrateLegacyDrafts() {
+  if (!legacyDrafts.size) return;
+  let removed = 0;
+  for (const [key, text] of legacyDrafts) {
+    let scan = null;
+    try { scan = await api.scanSecrets(text); } catch { scan = null; }
+    if (scan && !(scan.findings ?? []).length) {
+      if (drafts.get(key) === text) cleanDrafts.set(key, text);
+    } else if (scan) {
+      // Removing it from the map (not just from storage) follows the TUI
+      // rule: reopening must not revive an unsafe draft.
+      if (drafts.get(key) === text) drafts.delete(key);
+      removed += 1;
+    }
+  }
+  legacyDrafts.clear();
+  saveDrafts();
+  if (removed) toast(`已从本地草稿中移除 ${removed} 条疑似包含凭据的内容`, { tone: 'warning', holdMs: 5000 });
+}
+function clearDraft() { drafts.delete(draftKey()); cleanDrafts.delete(draftKey()); draftScan = { key: null, text: '', status: 'idle', findings: [], useTargets: [], useFields: [], error: null }; saveDrafts(); }
 loadDrafts();
 let queuedMessages = [];
+// Chosen before a session exists. It becomes a session fact only through the
+// create command; opening or browsing the picker never creates one.
+let pendingModel = null;
+// The collaboration axis for the NEXT session, before one exists. The current
+// session's axis is always read from the Runtime snapshot; this is only the
+// pre-session choice. Switching an existing session is never optimistic: the
+// Runtime's own snapshot confirms it.
+let pendingCollaboration = 'chat';
+// One axis switch in flight: {sessionId, target}. Presentation only.
+let collaborationSwitch = null;
+// Per-turn attempts to read the owed-goal projection. The snapshot is the only
+// source of the goal dock; the goal record can land after the submit
+// acknowledgement, so the first tool is the first reliable point to re-read
+// it. A probe that arrives too early is bounded and retried on a later tool of
+// the same turn, never on a timer.
+const goalDockProbes = new Map();
+// Session id -> the runtime's structured "automatic continuation stopped"
+// fact. Transient chrome keyed by the session it belongs to: it must survive a
+// snapshot refresh but never a new user instruction or a real terminal.
+const goalStops = new Map();
+const GOAL_DOCK_PROBE_LIMIT = 3;
 // A submit that the Runtime acknowledged but whose first status event has not
 // reached the page yet is still work that a quit would interrupt.
 let pendingSubmit = false;
@@ -228,7 +350,7 @@ function draftKey() { return current?.session.id ?? 'new-session'; }
 function uploadPending() {
   return attachments().some(item => ['uploading', 'queued', 'unknown'].includes(item.status));
 }
-function stashDraft() { drafts.set(draftKey(), $('message').value); saveDrafts(); }
+function stashDraft() { const key = draftKey(); const value = $('message').value; drafts.set(key, value); saveDrafts(); queueDraftScan(key, value); }
 
 function controls() {
   const uploads = uploadPending();
@@ -239,6 +361,7 @@ function controls() {
   $('send').disabled = frozen || !hasContent;
   $('attachment-add').disabled = frozen;
   $('model-picker').disabled = frozen;
+  $('mode-picker').disabled = frozen;
   $('permission-picker').disabled = frozen;
   $('workspace-picker').disabled = frozen;
   $('new-session').disabled = loading || uploads || offline;
@@ -251,13 +374,16 @@ function controls() {
   }
   for (const button of document.querySelectorAll('.takeover button')) button.disabled = loading || !!uncertain;
   $('conversation-status').textContent = loading ? '连接 Runtime…'
-    : current ? (current.approvals.length || current.clarifications.length
+    : current ? (current.approvals.length || current.clarifications.length || (current.definitionTrust?.length ?? 0)
       ? '等待你处理' : current.activity || LABELS[current.status] || current.status) : '';
 }
 
 // One visible state, sourced from the bridge's real transport lifecycle.
 function applyConnection(frame) {
   connectionState = { ...frame };
+  // Old drafts are rescanned only once the host bridge answers; retry on a
+  // later connection instead of leaving them permanently unpersisted.
+  if (frame.state === 'connected' && legacyDrafts.size) void migrateLegacyDrafts();
   const banner = $('connection-banner');
   if (banner) {
     if (frame.state === 'connected') {
@@ -351,7 +477,8 @@ const SIDEBAR_SESSION_LIMIT = 5;
 const groupLimits = new Map();
 const sessionStatusLabels = {
   running: '运行中', waiting_user: '等待你处理', answered: '已回答', idle: '就绪',
-  completed: '已完成', failed: '失败', cancelled: '已取消', unknown: '状态未知',
+  completed: '已完成', failed: '失败', cancelled: '已取消', interrupted: '已中断',
+  blocked: '受阻', incomplete: '未完成', unknown: '状态未知',
 };
 
 function childIsSettled(child) {
@@ -1617,9 +1744,26 @@ function renderComposerDocks() {
   // A plan is real progress even before its first work message commits; the
   // composer dock must not disappear just because the session still looks home.
   const hasPlan = (current?.plan?.steps ?? []).length > 0;
-  if (!current || (isHome() && !hasPlan)) { host.hidden = true; queuedMessages = queuedMessages.filter(item => item.sessionId === current?.session.id); return; }
+  // An owed goal is runtime state, not transcript: a paused or continued goal
+  // keeps its dock even when the screen would otherwise look idle.
+  const execution = current?.session?.execution_task ?? null;
+  const goalStop = current ? goalStops.get(current.session.id) ?? null : null;
+  if (!current || (isHome() && !hasPlan && !execution && !goalStop)) { host.hidden = true; queuedMessages = queuedMessages.filter(item => item.sessionId === current?.session.id); return; }
   queuedMessages = queuedMessages.filter(item => item.sessionId === current.session.id);
   host.hidden = false;
+  // The runtime stopped opening empty Goal windows. This is a policy stop,
+  // not completion: the goal still owes its work, and the row stays until the
+  // person sends the next instruction (or a real terminal replaces the state).
+  if (goalStop) {
+    const dock = el('div', 'composer-dock goal-dock goal-stop-dock');
+    const head = el('div', 'composer-dock-head');
+    head.append(iconNode('alert', { size: 16 }), el('span', 'todo-title', '目标 · 自动续跑已停止'));
+    dock.append(head);
+    const row = el('div', 'composer-dock-row');
+    row.append(el('span', 'composer-dock-text', goalContinuationStopLabel(goalStop.windows)));
+    dock.append(row);
+    host.append(dock);
+  }
   if (queuedMessages.length) {
     const dock = el('div', 'composer-dock queue-dock');
     const head = el('div', 'composer-dock-head');
@@ -1638,6 +1782,20 @@ function renderComposerDocks() {
       row.append(remove);
       dock.append(row);
     }
+    host.append(dock);
+  }
+  // The owed goal's own projection: objective and whether a window runs or
+  // the goal waits for the person. Both fields come from the Runtime snapshot.
+  if (execution) {
+    const state = execution.user_paused ? '已暂停 · 等待你的指令'
+      : execution.running ? '执行中' : '待继续';
+    const dock = el('div', 'composer-dock goal-dock');
+    const head = el('div', 'composer-dock-head');
+    head.append(iconNode('compass', { size: 16 }), el('span', 'todo-title', `目标 · ${state}`));
+    dock.append(head);
+    const row = el('div', 'composer-dock-row');
+    row.append(el('span', 'composer-dock-text', execution.objective));
+    dock.append(row);
     host.append(dock);
   }
   // Reference task panel: the list stays readable in every plan state, and the
@@ -1706,14 +1864,41 @@ function renderComposerMeta() {
   const permissionText = mode ? permissionLabel(mode) : '工作区内修改';
   permission.dataset.tooltip = `访问模式：${permissionText}（仅影响 Agent，用户终端按系统用户权限运行）`;
   permission.setAttribute('aria-label', `访问模式，当前：${permissionText}`);
-  const model = current?.session.model;
+  // The execution mode is a Runtime fact for an existing session. Before one
+  // exists this is only the pending choice the create request will state.
+  // While a switch is in flight the trigger names the Runtime's value first,
+  // so it never claims the new axis before the snapshot confirms it.
+  const sessionAxis = current ? (current.session.collaboration ?? 'chat') : pendingCollaboration;
+  const switching = !!current && collaborationSwitch?.sessionId === current.session.id
+    && collaborationSwitch.target !== sessionAxis;
+  const modeText = switching
+    ? `${collaborationLabel(sessionAxis)} → ${collaborationLabel(collaborationSwitch.target)}`
+    : collaborationLabel(sessionAxis);
+  const modeTrigger = $('mode-picker');
+  if (modeTrigger) {
+    modeTrigger.replaceChildren(
+      iconNode(collaborationIcon(sessionAxis), { size: 14 }),
+      el('span', 'trigger-label', modeText),
+      iconNode('chevronDown', { size: 12, className: 'trigger-chevron' }),
+    );
+    modeTrigger.dataset.tooltip = current
+      ? `执行模式：${collaborationLabel(sessionAxis)}（由 Runtime 确认${switching ? '，切换中' : ''}；只影响之后的回合）`
+      : `新会话执行模式：${collaborationLabel(pendingCollaboration)}`;
+    modeTrigger.setAttribute('aria-label', current ? `执行模式，当前：${collaborationLabel(sessionAxis)}` : `新会话执行模式，当前：${collaborationLabel(pendingCollaboration)}`);
+  }
+  // Before a session exists the composer shows the configured default until
+  // the person picks another model; it is the same model the next session
+  // will start on, not an invented choice.
+  const model = current ? current.session.model : (pendingModel ?? providerState.data?.resolved_default_model ?? null);
   const modelText = modelLabel(model) || '请选择模型';
   $('model-picker').replaceChildren(
     el('span', 'trigger-label', modelText),
     iconNode('chevronDown', { size: 12, className: 'trigger-chevron' }),
   );
-  $('model-picker').dataset.tooltip = model ? `模型：${modelText} · 提供商：${model.provider}` : '选择模型';
-  $('model-picker').setAttribute('aria-label', `选择模型，当前：${modelText}`);
+  $('model-picker').dataset.tooltip = model
+    ? `模型：${modelText} · 提供商：${model.provider}${current ? '' : '（新会话使用）'}`
+    : '选择模型';
+  $('model-picker').setAttribute('aria-label', current ? `选择模型，当前：${modelText}` : `选择新会话模型，当前：${modelText}`);
   $('send').replaceChildren(iconNode('arrowUp', { size: 16, stroke: 1.8 }));
   // The running button shows a solid stop block, not an outlined icon glyph.
   $('stop').replaceChildren(el('span', 'stop-glyph'));
@@ -1813,6 +1998,7 @@ function refreshContextUsage() {
 
 function render() {
   renderSidebar();
+  renderProviderSetup();
   renderHeader();
   renderComposerMeta();
   renderComposerDocks();
@@ -1919,7 +2105,8 @@ function renderUserExtras(row, message) {
   const replyQuestion = clarificationReplies.get(String(message.text ?? '')) ?? null;
   const files = Array.isArray(message.files) ? message.files : [];
   const references = Array.isArray(message.references) ? message.references : [];
-  const signature = JSON.stringify([files, references, replyQuestion]);
+  const secretTokens = secretReferences(String(message.text ?? ''));
+  const signature = JSON.stringify([files, references, replyQuestion, secretTokens]);
   let extras = row.querySelector('.user-extras');
   if (!extras) {
     extras = el('div', 'user-extras');
@@ -1962,6 +2149,33 @@ function renderUserExtras(row, message) {
       chips.append(el('span', 'message-ref-chip', label));
     }
     extras.append(chips);
+  }
+  if (secretTokens.length) {
+    const row = el('div', 'secret-revoke-row');
+    for (const reference of secretTokens) {
+      const stateKey = `${message.id ?? ''}:${reference}`;
+      const already = requestedRevokes.has(stateKey);
+      const button = el('button', 'secret-revoke', already ? '已请求撤销' : `撤销凭据 ${reference.slice(0, 12)}…`);
+      button.type = 'button';
+      button.disabled = already;
+      button.title = '撤销后该引用立即失效；已写入 .env 的内容不受影响';
+      button.addEventListener('click', () => action(async () => {
+        const ok = await confirmDialog({
+          title: '撤销凭据？',
+          body: '撤销后，该引用立即失效；已写入 .env 的内容不受影响。',
+          confirm: '撤销',
+          danger: true,
+        });
+        if (!ok) return;
+        await deliver({ type: 'revoke_secret', session_id: current.session.id, secret_ref: reference });
+        requestedRevokes.add(stateKey);
+        // The Runtime's own notification reports whether anything was revoked;
+        // this row only records that the request was sent.
+        renderConversation();
+      }));
+      row.append(button);
+    }
+    extras.append(row);
   }
 }
 
@@ -2399,6 +2613,21 @@ function renderToolDetails(row, id) {
   if (output && kind === 'command') {
     detail.append(el('div', 'settings-note', tool.status === 'running' ? '实时输出尾部' : '输出预览，长输出可能被截断'));
   }
+  if (canViewFullOutput(tool) && outputMayBeTruncated(tool)) {
+    // The card's own text is the runtime's bounded preview. Only a preview
+    // that proves it is partial earns the full-output entry; the actual
+    // availability is answered by the Runtime, never assumed here.
+    const bar = el('div', 'tool-output-action');
+    const full = el('button', 'button secondary small', '查看完整结果');
+    full.type = 'button';
+    full.addEventListener('click', event => {
+      event.preventDefault();
+      event.stopPropagation();
+      openToolOutput(tool);
+    });
+    bar.append(full, el('span', 'tool-output-hint', '从 Runtime 的调用记录读取'));
+    detail.append(bar);
+  }
   detail.append(card);
   const raw = el('details', 'tool-raw');
   raw.append(el('summary', undefined, '技术详情'), el('pre', undefined, `工具：${tool.name}\n调用：${tool.id}\n参数：${argsRaw ?? ''}${tool.exit_code !== undefined ? `\n退出码：${tool.exit_code}` : ''}`));
@@ -2676,7 +2905,10 @@ function openConfirmedChanges(toolIds, selected = null) {
 function planCard() {
   const steps = current?.plan?.steps ?? [];
   if (!steps.length) return null;
-  const done = steps.filter(step => step.status === 'done').length;
+  // Abandoned steps are replacement history, never delivered work; the ratio
+  // counts the plan's live steps only (the same rule the terminal uses).
+  const active = planActiveSteps(steps);
+  const done = active.filter(step => step.status === 'done').length;
   const card = el('div', 'plan-card-row');
   card.dataset.key = 'plan-card';
   const main = el('button', 'plan-card-main');
@@ -2685,7 +2917,7 @@ function planCard() {
   icon.append(iconNode('list', { size: 20 }));
   const copy = el('span', 'plan-card-copy');
   const planStateLabel = current?.plan?.state === 'completed' ? '（已完成）' : current?.plan?.state === 'interrupted' ? '（已中断）' : '';
-  copy.append(el('span', 'plan-card-title', `执行计划${planStateLabel}`), el('span', 'plan-card-desc', `${done} / ${steps.length} 步骤已完成`));
+  copy.append(el('span', 'plan-card-title', `执行计划${planStateLabel}`), el('span', 'plan-card-desc', `${done} / ${active.length} 步骤已完成`));
   main.append(icon, copy, el('span', 'plan-card-open', '打开'));
   main.addEventListener('click', () => openRightbarTab('plan'));
   card.append(main);
@@ -2733,19 +2965,88 @@ function presentedFilesCard() {
   return wrap;
 }
 
-function deliveredCard() {
-  const report = current?.session?.completion_report ?? current?.completionReport;
-  if (!report) return null;
-  const card = el('button', 'plan-card-row');
-  card.type = 'button';
-  card.dataset.key = 'delivered-card';
-  const icon = el('span', 'plan-card-icon');
-  icon.append(iconNode('archive', { size: 20 }));
-  const copy = el('span', 'plan-card-copy');
-  copy.append(el('span', 'plan-card-title', '本轮交付'), el('span', 'plan-card-desc', `${report.files_changed ?? 0} 个文件变更 · +${report.added ?? 0} −${report.removed ?? 0}`));
-  card.append(icon, copy, el('span', 'plan-card-open', '查看变更'));
-  card.addEventListener('click', () => openRightbarTab('changes'));
-  return card;
+function turnDeliveryPanel() {
+  if (!current) return null;
+  const delivery = turnDelivery(current);
+  const report = current?.session?.completion_report ?? current?.completionReport ?? null;
+  if (!delivery.terminal && !delivery.changed.length && !delivery.commands.length && !report) return null;
+  const panel = el('div', 'turn-delivery');
+  const head = el('div', 'turn-delivery-head');
+  head.append(el('span', 'turn-delivery-title', '本轮执行'));
+  if (delivery.terminal) {
+    const marker = receiptMarker(delivery.terminal.status);
+    const badge = el('span', 'turn-delivery-status');
+    badge.dataset.tone = marker.tone;
+    badge.textContent = `${marker.glyph} ${marker.label}`;
+    head.append(badge);
+  } else {
+    head.append(el('span', 'turn-delivery-status', '尚未结束'));
+  }
+  panel.append(head);
+  if (delivery.terminal?.detail) panel.append(el('div', 'turn-delivery-detail', delivery.terminal.detail));
+  if (delivery.requirements.length) {
+    const section = el('div', 'turn-delivery-section');
+    section.append(el('div', 'turn-delivery-label', 'Runtime 报告未验证的要求'));
+    const list = el('ul', 'turn-delivery-list');
+    for (const item of delivery.requirements.slice(0, 8)) list.append(el('li', undefined, String(item)));
+    section.append(list);
+    panel.append(section);
+  }
+  if (delivery.changed.length) {
+    const section = el('div', 'turn-delivery-section');
+    section.append(el('div', 'turn-delivery-label', `本轮确认修改 ${delivery.changed.length} 个文件`));
+    for (const file of delivery.changed.slice(0, 8)) {
+      const row = el('button', 'turn-delivery-file');
+      row.type = 'button';
+      row.append(
+        el('span', 'turn-delivery-path', file.path),
+        el('span', 'tool-diffstat add', `+${file.added}`),
+        el('span', 'tool-diffstat del', `−${file.removed}`),
+      );
+      row.addEventListener('click', () => {
+        // Select the file in the confirmed-changes view when the workspace
+        // diff no longer has it (the turn's applied_diff is the evidence), or
+        // in the live workspace diff when that same path is still there.
+        const live = (current?.diff?.files ?? []).some(item => item.path === file.path);
+        const changes = openRightbarTab('changes', live ? {} : { source: 'confirmed', toolIds: delivery.confirmedToolIds, title: '本次修改' });
+        if (!changes) return;
+        changes.selected = file.path;
+        persistRightbar();
+        renderRightbar();
+      });
+      section.append(row);
+    }
+    section.append(el('div', 'turn-delivery-note', '来自工具确认的 applied_diff，是修改发生时的证据。'));
+    panel.append(section);
+  }
+  if (delivery.commands.length) {
+    const section = el('div', 'turn-delivery-section');
+    section.append(el('div', 'turn-delivery-label', `本轮命令 ${delivery.commands.length} 条`));
+    for (const command of delivery.commands.slice(0, 10)) {
+      const row = el('button', 'turn-delivery-command');
+      row.type = 'button';
+      row.title = '查看这次调用记录的完整结果';
+      row.addEventListener('click', () => {
+        const tool = current?.tools.find(item => item.id === command.id);
+        if (tool) openToolOutput(tool);
+      });
+      const exit = command.exit_code !== null ? `退出码 ${command.exit_code}`
+        : command.status === 'running' ? '执行中'
+          : command.status === 'cancelled' ? '已停止'
+            : command.status === 'unknown' ? '结果未知' : '';
+      row.append(el('span', 'turn-delivery-cmd', command.label), el('span', 'turn-delivery-exit', exit));
+      section.append(row);
+    }
+    section.append(el('div', 'turn-delivery-note', '退出码来自真实执行；单条命令通过不代表项目验收通过。'));
+    panel.append(section);
+  }
+  if (report) {
+    // A legacy SessionCompleted report, when some runtime did produce one.
+    // The live delivery facts above are the authority; this line never poses
+    // as a second, conflicting verdict.
+    panel.append(el('div', 'turn-delivery-note', `Runtime 完成报告（旧版事件）：${report.files_changed ?? 0} 个文件变更 · +${report.added ?? 0} −${report.removed ?? 0}`));
+  }
+  return panel;
 }
 
 function renderConversation() {
@@ -2833,7 +3134,6 @@ function renderConversation() {
   if (!running && runClockTimer) { clearInterval(runClockTimer); runClockTimer = null; runStartedAt = null; }
   for (const shell of current.session.user_shells ?? []) nodes.push(userShellNode(shell));
   const plan = planCard(); if (plan) nodes.push(plan);
-  const delivered = deliveredCard(); if (delivered) nodes.push(delivered);
   const presented = presentedFilesCard(); if (presented) nodes.push(presented);
   // The live analysis is the turn's latest activity: it sits above the running
   // line, never above the answer it belongs to.
@@ -3649,6 +3949,12 @@ function renderTrajectory() {
 
 /* ----------------------------------------------------------- interactions */
 
+function shortDigest(value) {
+  const text = String(value ?? '');
+  const body = text.startsWith('sha256:') ? text.slice(7) : text;
+  return body.length > 12 ? `${body.slice(0, 12)}…` : body;
+}
+
 function renderInteractions() {
   const host = $('takeover');
   const cards = [];
@@ -3695,6 +4001,63 @@ function renderInteractions() {
       }));
       actions.append(button);
     }
+    card.append(actions);
+    cards.push(card);
+  }
+  for (const request of current?.definitionTrust ?? []) {
+    const card = el('div', 'interaction-card definition-trust-card');
+    card.dataset.requestId = request.id;
+    card.append(el('h3', undefined, '需要信任一个定义'));
+    card.append(el('p', undefined, '运行时已暂停一个工具调用，直到你决定是否允许下面的定义内容进入执行上下文。'));
+    const meta = el('dl', 'definition-trust-meta');
+    const stateLabels = { unapproved: '未批准', changed: '内容已变更', store_unavailable: '信任存储不可用', other: '其他状态' };
+    for (const [label, value] of [
+      ['定义', request.display],
+      ['类型', request.kind],
+      ['范围', request.scope],
+      ['来源', request.source],
+      ['位置', request.location],
+      ['状态', stateLabels[request.state] ?? request.state],
+    ]) if (value) meta.append(el('dt', undefined, label), el('dd', undefined, String(value)));
+    card.append(meta);
+    const digests = [];
+    if (request.current_digest) digests.push(`当前 ${shortDigest(request.current_digest)}`);
+    if (request.approved_digest) digests.push(`已批准 ${shortDigest(request.approved_digest)}`);
+    if (digests.length) {
+      const line = el('p', 'definition-trust-digest', digests.join(' · '));
+      line.title = `当前 ${request.current_digest ?? ''}${request.approved_digest ? `\n已批准 ${request.approved_digest}` : ''}`;
+      card.append(line);
+    }
+    const content = el('details', 'interaction-details definition-trust-content');
+    content.append(el('summary', undefined, '查看当前内容'), el('pre', undefined, request.current_content ?? ''));
+    card.append(content);
+    if (typeof request.approved_content === 'string') {
+      const approved = el('details', 'interaction-details definition-trust-content');
+      approved.append(el('summary', undefined, '查看已批准的版本'), el('pre', undefined, request.approved_content));
+      card.append(approved);
+    }
+    if (request.content_truncated) card.append(el('p', 'definition-trust-note', '内容预览已被截断；决定只针对运行时的当前完整内容。'));
+    card.append(el('p', 'definition-trust-note', '允许本次使用只影响本会话；信任当前版本会为这份精确内容写入持久批准；拒绝不会写入信任。'));
+    const actions = el('div', 'interaction-actions');
+    const buttons = [];
+    for (const [decision, label, title] of [
+      ['allow_once', '允许本次使用', '仅本次会话使用这份精确内容'],
+      ['trust_current_version', '信任当前版本', '持久批准这份精确内容'],
+      ['deny', '拒绝', '不使用这份定义'],
+    ]) {
+      const button = el('button', `button ${decision === 'deny' ? 'secondary' : 'primary'}`, label);
+      button.type = 'button';
+      button.title = title;
+      button.addEventListener('click', () => action(async () => {
+        // The card is not removed optimistically: it disappears only when the
+        // Runtime resolves the waiter and the next snapshot (or event) says so.
+        for (const item of buttons) item.disabled = true;
+        await deliver({ type: 'definition_trust_decision', request_id: request.id, decision, session_id: current.session.id });
+        await refreshMetadata();
+      }));
+      buttons.push(button);
+    }
+    actions.append(...buttons);
     card.append(actions);
     cards.push(card);
   }
@@ -3760,6 +4123,198 @@ function renderInteractions() {
   controls();
 }
 
+/* ---------------------------------------------------------- secret custody */
+
+const SECRET_LEVEL_LABELS = { high_confidence: '高置信', ambiguous: '疑似' };
+
+function secretFindingLabel(finding) {
+  const key = finding?.key ? String(finding.key) : String(finding?.kind ?? '凭据');
+  return `${SECRET_LEVEL_LABELS[finding?.level] ?? '疑似'} · ${key}`;
+}
+
+async function submitSecretCommand(command, { original, refs = [], steer }) {
+  await deliver(command);
+  const key = draftKey();
+  if ($('message').value.trim() === original) { $('message').value = ''; resizeComposer(); }
+  drafts.delete(key);
+  cleanDrafts.delete(key);
+  draftScan = { key: null, text: '', status: 'idle', findings: [], useTargets: [], useFields: [], error: null };
+  saveDrafts();
+  const sent = new Set(refs.map(ref => ref.id));
+  if (sent.size) {
+    attachmentDrafts.set(key, attachments().filter(item => !sent.has(item.attachment?.id)));
+    renderAttachments();
+  }
+  if (steer) toast('已插话：将在当前回合的下一次模型调用中送达', { tone: 'info', holdMs: 2800 });
+  else pendingSubmit = true;
+  controls();
+  await refreshMetadata();
+}
+
+function openSecretReview({ original, refs = [], scan, complement = false }) {
+  if (document.querySelector('.secret-review-modal')) return;
+  const dialog = el('dialog', 'modal secret-review-modal');
+  const card = el('div', 'secret-review-card');
+  card.setAttribute('aria-label', '凭据审查');
+  const head = el('div', 'secret-review-head');
+  head.append(el('h2', undefined, '检测到疑似凭据'));
+  const close = iconButton('close', '关闭凭据审查', { size: 16, tooltip: '关闭' });
+  head.append(close);
+  const findings = el('div', 'secret-review-findings');
+  for (const finding of scan.findings) {
+    findings.append(el('div', 'secret-review-finding', `${secretFindingLabel(finding)} ${finding.masked ?? ''}`.trim()));
+  }
+  const scope = [];
+  if (scan.useTargets?.length) scope.push(`目标：${scan.useTargets.join(', ')}`);
+  if (scan.useFields?.length) scope.push(`字段：${scan.useFields.join(', ')}`);
+  const copy = el('div', 'secret-review-copy');
+  copy.append(
+    el('p', undefined, '发送前请选择如何处理这段内容。'),
+    findings,
+    el('p', 'secret-review-scope', scope.length ? scope.join(' · ') : '消息没有声明 dotenv 目标或字段。'),
+    el('p', 'secret-review-note', '安全接管：值交给 Runtime 保管，消息里只出现引用，模型与 Provider 不会收到明文。'),
+    el('p', 'secret-review-warning', '明文发送：模型与 Provider 会看到这些字节，并可能被其保存。只有你明确选择时才会这样发送。'),
+  );
+  const error = el('p', 'secret-review-error', '');
+  error.hidden = true;
+  const actions = el('div', 'secret-review-actions');
+  const capture = el('button', 'button primary', '安全接管并发送');
+  const plaintext = el('button', 'button secondary', '明文发送（模型与 Provider 可见）');
+  const back = el('button', 'button secondary', '返回');
+  const buttons = [capture, plaintext, back];
+  for (const button of buttons) button.type = 'button';
+  back.addEventListener('click', () => dialog.close());
+  const send = async plaintextAck => {
+    for (const button of buttons) button.disabled = true;
+    error.hidden = true;
+    try {
+      if (!current) await createTask();
+      const sessionId = current.session.id;
+      const running = ['running', 'waiting_user'].includes(current.status);
+      const steer = running && (complement ? settings.busySend !== 'steer' : settings.busySend === 'steer');
+      // A client-side queued message would later be delivered through a path
+      // that cannot carry captures; blocking is the honest outcome.
+      if (running && !steer) throw new Error('回合仍在运行：排队发送不支持凭据接管；请选择插话发送或等待回合结束');
+      if (steer && refs.length) throw new Error('运行中插话不支持附件；请移除附件或等待回合结束');
+      let content = original;
+      let secret_captures = [];
+      if (!plaintextAck) {
+        const captured = captureDraft(original, scan.findings, () => crypto.randomUUID());
+        content = captured.content;
+        secret_captures = captured.captures;
+      }
+      const command = steer
+        ? { type: 'steer_user_input', session_id: sessionId, content, secret_captures, plaintext_secret_ack: plaintextAck }
+        : { type: 'submit_user_input', session_id: sessionId, content, attachments: refs, secret_captures, plaintext_secret_ack: plaintextAck };
+      await submitSecretCommand(command, { original, refs, steer });
+      dialog.close();
+    } catch (sendError) {
+      error.textContent = sendError?.message ?? '发送失败';
+      error.hidden = false;
+      for (const button of buttons) button.disabled = false;
+    }
+  };
+  capture.addEventListener('click', () => void send(false));
+  plaintext.addEventListener('click', () => void send(true));
+  actions.append(capture, plaintext, back);
+  card.append(head, copy, error, actions);
+  dialog.append(card);
+  close.addEventListener('click', () => dialog.close());
+  dialog.addEventListener('close', () => { dialog.remove(); window.dispatchEvent(new Event('ui-overlay-change')); }, { once: true });
+  document.body.append(dialog);
+  dialog.showModal();
+  window.dispatchEvent(new Event('ui-overlay-change'));
+  capture.focus();
+}
+
+function openSecretPaste() {
+  if (!current) { composerError('请先选择或新建会话，再粘贴凭据'); return; }
+  if (document.querySelector('.secret-paste-modal')) return;
+  const sessionId = current.session.id;
+  const dialog = el('dialog', 'modal secret-paste-modal');
+  const card = el('div', 'secret-paste-card');
+  card.setAttribute('aria-label', '安全粘贴凭据');
+  const head = el('div', 'secret-review-head');
+  head.append(el('h2', undefined, '安全粘贴凭据'));
+  const close = iconButton('close', '关闭安全粘贴', { size: 16, tooltip: '关闭' });
+  head.append(close);
+  const input = el('input', 'secret-paste-input');
+  input.type = 'password';
+  input.autocomplete = 'off';
+  input.spellcheck = false;
+  input.setAttribute('aria-label', '凭据值');
+  input.placeholder = '粘贴凭据';
+  const status = el('p', 'secret-paste-status', '值只会交给 Runtime 保管；消息与日志中只出现引用。');
+  const actions = el('div', 'secret-review-actions');
+  const submit = el('button', 'button primary', '接管并插入');
+  const cancel = el('button', 'button secondary', '取消');
+  submit.type = 'button'; cancel.type = 'button';
+  cancel.addEventListener('click', () => dialog.close());
+  submit.addEventListener('click', () => {
+    const value = input.value;
+    if (!value) { status.textContent = '请输入凭据'; return; }
+    submit.disabled = true;
+    input.disabled = true;
+    const requestId = crypto.randomUUID();
+    pendingSecretPaste.set(requestId, { sessionId, dialog, input, status, submit });
+    // The plaintext leaves the DOM field immediately; the command object is
+    // the only copy in this renderer.
+    input.value = '';
+    status.textContent = '正在接管…';
+    deliver({ type: 'capture_secret', session_id: sessionId, request_id: requestId, value })
+      .catch(error => {
+        pendingSecretPaste.delete(requestId);
+        status.textContent = error?.message ?? '接管失败';
+        submit.disabled = false;
+        input.disabled = false;
+      });
+    setTimeout(() => {
+      const pending = pendingSecretPaste.get(requestId);
+      if (!pending) return;
+      pendingSecretPaste.delete(requestId);
+      // A command receipt is not custody. Without the structured event the
+      // outcome is unknown; do not insert a reference that may not exist.
+      pending.status.textContent = '接管结果未知：未收到 Runtime 确认，未插入引用';
+      pending.submit.disabled = false;
+      pending.input.disabled = false;
+    }, 20000);
+  });
+  actions.append(submit, cancel);
+  card.append(head, input, status, actions);
+  dialog.append(card);
+  close.addEventListener('click', () => dialog.close());
+  dialog.addEventListener('close', () => {
+    // A closed dialog cannot receive its own capture answer; dropping the
+    // pending entry keeps the late event from writing into the composer.
+    for (const [id, pending] of pendingSecretPaste) if (pending.dialog === dialog) pendingSecretPaste.delete(id);
+    dialog.remove();
+    window.dispatchEvent(new Event('ui-overlay-change'));
+  }, { once: true });
+  document.body.append(dialog);
+  dialog.showModal();
+  window.dispatchEvent(new Event('ui-overlay-change'));
+  input.focus();
+}
+
+function applySecretCaptureEvent(event) {
+  const pending = pendingSecretPaste.get(event.request_id);
+  if (!pending || pending.sessionId !== event.session_id) return;
+  pendingSecretPaste.delete(event.request_id);
+  if (event.type === 'secret_captured') {
+    const input = $('message');
+    const token = `[secret:${event.secret_ref}]`;
+    const prefix = input.value && !input.value.endsWith('\n') ? ' ' : '';
+    input.value += prefix + token;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    pending.dialog.close();
+    toast(`已安全接管：${event.masked ?? ''}`, { tone: 'success', holdMs: 3200 });
+    return;
+  }
+  pending.status.textContent = event.error || '接管失败';
+  pending.submit.disabled = false;
+  pending.input.disabled = false;
+}
+
 /* --------------------------------------------------------------- composer */
 
 // The native picker is the only directory browser. An in-app shell with
@@ -3806,17 +4361,18 @@ function selectWorkspace(folder) {
   selection = folder;
   if (folder?.path) chosenWorkspaces.set(workspaceKey(folder.path), folder);
   currentSource = null;
+  void refreshProviders();
   $('message').value = text;
   drafts.set('new-session', text);
+  queueDraftScan('new-session', text);
   composerError('');
   render();
   $('message').focus();
 }
 
 function openModelMenu(anchor) {
-  action(async () => {
-    if (!current) await createTask();
-    const models = current?.session.available_models ?? [];
+  if (current) {
+    const models = current.session.available_models ?? [];
     const items = [];
     if (!models.length) {
       items.push({ heading: '暂无可用模型' });
@@ -3838,7 +4394,42 @@ function openModelMenu(anchor) {
       }
     }
     openMenu({ anchor, items, width: 280, side: 'top', align: 'end' });
-  });
+    return;
+  }
+  // No session: read the configured models from the host. Selecting one is a
+  // pending choice; the session is created only when the person actually
+  // sends (or explicitly starts a new session).
+  void (async () => {
+    let models;
+    try {
+      models = (await api.listModels(selection?.id ?? null))?.models ?? [];
+    } catch (error) {
+      toast(`无法读取模型配置：${error?.message ?? '未知错误'}`, { tone: 'error', holdMs: 4200 });
+      return;
+    }
+    const items = [];
+    if (!models.length) {
+      items.push({ heading: '暂无可用模型' });
+      items.push({ label: '配置 Provider', icon: 'settings', onSelect: () => openProviderEditor({ mode: 'add' }) });
+    } else {
+      items.push({ heading: '模型（新会话使用）' });
+      for (const model of models) {
+        items.push({
+          label: model.model,
+          badge: model.provider,
+          checked: (pendingModel ?? providerState.data?.resolved_default_model)?.provider === model.provider
+            && (pendingModel ?? providerState.data?.resolved_default_model)?.model === model.model,
+          onSelect: () => {
+            pendingModel = { provider: model.provider, model: model.model };
+            renderComposerMeta();
+            controls();
+            toast(`新会话将使用 ${model.model}`, { tone: 'info', holdMs: 1800 });
+          },
+        });
+      }
+    }
+    openMenu({ anchor, items, width: 280, side: 'top', align: 'end' });
+  })();
 }
 
 function openPermissionMenu(anchor) {
@@ -3862,14 +4453,81 @@ function openPermissionMenu(anchor) {
   });
 }
 
+const COLLABORATION_MODES = [['chat', '对话'], ['plan', '计划'], ['goal', '目标']];
+const COLLABORATION_HINTS = {
+  chat: '对话：普通回合，回答即结束',
+  plan: '计划：只读规划，写入需要审批；回答即结束',
+  goal: '目标：由 Runtime 持续执行到完成或阻塞',
+};
+function collaborationIcon(axis) {
+  return axis === 'goal' ? 'compass' : axis === 'plan' ? 'list' : 'chat';
+}
+
+/**
+ * The execution-mode picker. Browsing is inert: it creates no session, starts
+ * no Goal, clears no plan and does not interrupt a running turn. The choice
+ * becomes a fact only through the create request (no session yet) or the
+ * Runtime's snapshot after `set_product_axes`.
+ */
+function openCollaborationMenu(anchor) {
+  const sessionAxis = current ? (current.session.collaboration ?? 'chat') : pendingCollaboration;
+  const items = COLLABORATION_MODES.map(([axis, label]) => ({
+    label,
+    icon: collaborationIcon(axis),
+    checked: axis === sessionAxis,
+    title: COLLABORATION_HINTS[axis],
+    onSelect: () => {
+      if (!current) {
+        pendingCollaboration = axis;
+        renderComposerMeta();
+        controls();
+        toast(`新会话将使用${label}模式`, { tone: 'info', holdMs: 1800 });
+        return;
+      }
+      if (axis === (current.session.collaboration ?? 'chat')) return;
+      applyCollaboration(axis);
+    },
+  }));
+  items.push({ divider: true });
+  items.push({ label: current ? '切换只影响之后的回合' : '创建会话时生效', disabled: true });
+  openMenu({ anchor, items, width: 260, side: 'top', align: 'start' });
+}
+
+/**
+ * Ask the Runtime to change the session's axis and require its snapshot to
+ * confirm. A refusal keeps the Runtime's value on screen; nothing here is
+ * optimistically applied.
+ */
+function applyCollaboration(axis) {
+  action(async () => {
+    if (!current || !validCollaboration(axis)) return;
+    if (uncertain) throw new Error('上一个操作结果未知，请先刷新确认');
+    const id = current.session.id;
+    const from = current.session.collaboration ?? 'chat';
+    if (from === axis) return;
+    collaborationSwitch = { sessionId: id, target: axis };
+    renderComposerMeta();
+    try {
+      await deliver(collaborationCommand(id, axis));
+      await refreshMetadata();
+      if (!collaborationConfirmed(current, id, axis)) throw new Error('Runtime 尚未确认执行模式切换');
+    } finally {
+      if (collaborationSwitch?.sessionId === id) collaborationSwitch = null;
+      renderComposerMeta();
+      controls();
+    }
+  }, { onError: composerError, clearGlobal: false });
+}
+
+
 function commandCatalog() {
   const frozen = loading || !!uncertain || uploadPending();
   const session = !!current;
   const entries = [
     ['add', 'file', '添加图片', true, 'paperclip', null, null],
     ['add', 'reference', '引用工作区文件', hasWorkspace(), 'file', null, '请先打开有工作区的会话'],
+    ['add', 'secret', '安全粘贴凭据', session, 'shield', null, '请先选择或新建会话'],
     ['commands', 'goal', '目标', true, 'compass', null, null],
-    ['commands', 'plan', '计划', false, 'list', '未接入', '桌面尚未接入计划模式切换'],
     ['commands', 'feedback', '反馈', true, 'feedback', null, null],
     ['commands', 'diff', '工作区变更', !!current?.session.repository, 'diff', null, '当前会话没有工作区'],
     ['commands', 'compact', '压缩', session, 'archive', null, null],
@@ -3950,6 +4608,7 @@ async function executeCommand(id) {
   closeComposerPopovers();
   if (id === 'file') { composerError(''); controls(); uploadAttachment(); return; }
   if (id === 'reference') { openRightbarTab('files'); return; }
+  if (id === 'secret') { openSecretPaste(); return; }
   if (id === 'goal') { $('message').value = '/goal '; $('message').focus(); return; }
   $('message').value = '';
   composerError('');
@@ -3983,7 +4642,13 @@ function dismissPage() {
   for (const button of document.querySelectorAll('.panel-row')) button.setAttribute('aria-current', 'false');
 }
 
-function newSession() {
+async function newSession() {
+  await ensureProviderState();
+  if (providerConfigurationBlocksStart()) {
+    composerError(providerSetupMessage());
+    render();
+    return;
+  }
   dismissPage();
   resetScheduleProjection();
   stashDraft();
@@ -4001,16 +4666,26 @@ function newSession() {
   trajectoryRange = null;
   trajectoryViewport = null;
   $('message').value = drafts.get('new-session') ?? '';
+  queueDraftScan('new-session', $('message').value);
   $('conversation').replaceChildren();
   render();
   action(createTask);
 }
 
 async function createTask() {
+  await ensureProviderState();
+  if (providerConfigurationBlocksStart()) throw new Error(providerSetupMessage());
   const draftText = $('message').value;
   const key = selection?.id ?? null;
   if (!pendingCreation || pendingCreation.key !== key) pendingCreation = { key, id: crypto.randomUUID() };
-  const result = await api.createTask(key, pendingCreation.id);
+  const pinned = pendingModel ?? providerState.data?.resolved_default_model ?? null;
+  const axis = validCollaboration(pendingCollaboration) ? pendingCollaboration : 'chat';
+  const result = await api.createTask(key, pendingCreation.id, pinned ?? undefined, axis);
+  pendingCreation = null;
+  if (pendingModel) pendingModel = null;
+  // The created session's axis is what the Runtime wrote; the pending choice
+  // only stated the request.
+  if (validCollaboration(result.session?.collaboration)) pendingCollaboration = result.session.collaboration;
   pendingCreation = null;
   history = [];
   uncertain = null;
@@ -4029,6 +4704,7 @@ async function createTask() {
   $('conversation').replaceChildren();
   loadRightbar(current.session.id);
   render();
+  void refreshProviders({ quiet: true });
   if (draftText) {
     $('message').value = draftText;
     resizeComposer();
@@ -4087,9 +4763,11 @@ async function openTask(task) {
   trajectoryRange = null;
   trajectoryViewport = null;
   $('message').value = drafts.get(current.session.id) ?? '';
+  queueDraftScan(current.session.id, $('message').value);
   $('conversation').replaceChildren();
   loadRightbar(current.session.id);
   render();
+  void refreshProviders({ quiet: true });
   await loadHistory();
   setTimeout(refreshContextUsage, 80);
   $('conversation-scroll').scrollTop = $('conversation-scroll').scrollHeight;
@@ -4532,7 +5210,7 @@ function changesTabTitle() {
 
 const TAB_TITLES = {
   start: '开始', files: '文件', terminal: '终端', browser: '浏览器', changes: '变更',
-  preview: '预览', plan: '计划', subagent: '子智能体',
+  preview: '预览', plan: '计划', subagent: '子智能体', 'tool-output': '完整输出',
 };
 
 function tabTitle(kind, extra = {}) {
@@ -4559,8 +5237,10 @@ function openRightbarTab(kind, extra = {}) {
   // instead of consuming it.
   const reusable = kind === 'preview'
     ? Object.values(rightbarTabs).find(tab => tab.kind === 'preview' && tab.path === extra.path && !rightbarFloats.some(float => float.tabId === tab.id))
-    : ['files', 'changes', 'plan', 'subagent'].includes(kind)
-      ? Object.values(rightbarTabs).find(tab => tab.kind === kind && !rightbarFloats.some(float => float.tabId === tab.id)) : null;
+    : kind === 'tool-output'
+      ? Object.values(rightbarTabs).find(tab => tab.kind === 'tool-output' && tab.callId === extra.callId && !rightbarFloats.some(float => float.tabId === tab.id))
+      : ['files', 'changes', 'plan', 'subagent'].includes(kind)
+        ? Object.values(rightbarTabs).find(tab => tab.kind === kind && !rightbarFloats.some(float => float.tabId === tab.id)) : null;
   const tab = reusable ?? newTabRecord(kind, extra);
   if (kind === 'changes') {
     const previous = { source: tab.source ?? 'workspace', toolIds: JSON.stringify(tab.toolIds ?? []) };
@@ -4627,6 +5307,9 @@ async function closeTab(pane, tabId) {
   closeNativeBrowserTab(closing);
   pane.tabs.splice(index, 1);
   delete rightbarTabs[tabId];
+  // The loaded pages are per-tab memory; closing the tab releases them. An
+  // in-flight answer for the closed tab is ignored by the tab-id check.
+  toolOutputViews.delete(tabId);
   if (pane.activeId === tabId) pane.activeId = pane.tabs[Math.max(0, index - 1)] ?? pane.tabs[0] ?? null;
   if (!pane.tabs.length) {
     if (rightbarPanes.length > 1) {
@@ -5006,6 +5689,7 @@ function renderTabView(tab, pane) {
   if (tab.kind === 'browser') return browserView(tab, pane);
   if (tab.kind === 'changes') return changesView(tab);
   if (tab.kind === 'preview') return previewView(tab);
+  if (tab.kind === 'tool-output') return toolOutputView(tab);
   if (tab.kind === 'plan') return planView();
   if (tab.kind === 'subagent') return subagentView();
   return startView();
@@ -5579,21 +6263,8 @@ function changesView(tab) {
   if (!confirmed && hasWorkspace() && !current.diff && !current.diffError && current.diffQuery?.status !== 'pending') setTimeout(requestDiff, 0);
   const view = el('div');
   view.style.display = 'flex'; view.style.flexDirection = 'column'; view.style.flex = '1'; view.style.minHeight = '0';
-  const report = current?.session?.completion_report ?? current?.completionReport;
-  if (report) {
-    const delivery = el('div', 'review-delivery');
-    const summary = el('div', 'deliverable-summary-card');
-    const icon = el('span', 'delivered-icon');
-    icon.append(iconNode('archive', { size: 20 }));
-    const copy = el('span', 'delivered-copy');
-    copy.append(
-      el('span', 'delivered-name', '本轮交付'),
-      el('span', 'delivered-meta', `${report.files_changed ?? 0} 个文件变更 · +${report.added ?? 0} −${report.removed ?? 0}`),
-    );
-    summary.append(icon, copy);
-    delivery.append(summary, el('div', 'deliverable-note', '交付统计来自 Runtime 的完成报告；下方是当前工作区的 Git 变更。'));
-    view.append(delivery);
-  }
+  const deliveryPanel = turnDeliveryPanel();
+  if (deliveryPanel) view.append(deliveryPanel);
   const files = confirmed ? confirmedChangeFiles(tab.toolIds ?? [], current?.tools ?? []) : current?.diff?.files ?? [];
   if (!tab.selected || !files.some(file => file.path === tab.selected)) tab.selected = files[0]?.path ?? null;
   const selected = files.find(file => file.path === tab.selected);
@@ -5908,6 +6579,244 @@ function previewUnavailable(label, path) {
   return empty;
 }
 
+/* ------------------------------------------------------- full tool output */
+// The card preview is the runtime's bounded projection. The full recorded
+// result is read on demand from the session transcript; complete artifacts are
+// served by the runtime from its own store. The renderer never names a path,
+// and no page is loaded until the person opens or scrolls the viewer.
+const toolOutputRequests = new Map(); // query_id -> {resolve, timer}
+const toolOutputViews = new Map();    // "tabN" -> {active, parts: Map<key, part>}
+const TOOL_OUTPUT_PAGE_BYTES = 64 * 1024;
+const TOOL_OUTPUT_COPY_LIMIT = 8 * 1024 * 1024;
+
+function toolOutputViewFor(tab) {
+  let view = toolOutputViews.get(tab.id);
+  if (!view) {
+    view = { active: 'result', parts: new Map() };
+    toolOutputViews.set(tab.id, view);
+  }
+  return view;
+}
+
+function toolOutputPartFor(view, key) {
+  let part = view.parts.get(key);
+  if (!part) {
+    part = {
+      key, text: '', total: 0, next: 0, hasMore: false, loading: false,
+      started: false, error: null, unavailable: null, references: [], reduced: false,
+      lost: false, label: '', generation: 0,
+    };
+    view.parts.set(key, part);
+  }
+  return part;
+}
+
+function toolOutputIndexFor(key) {
+  return key === 'result' ? null : Number(key.slice('artifact:'.length));
+}
+
+function queryToolOutput(callId, index, offset, maxBytes = TOOL_OUTPUT_PAGE_BYTES) {
+  const sessionId = current?.session?.id;
+  if (!sessionId) return Promise.reject(new Error('没有选中的会话'));
+  const queryId = crypto.randomUUID();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      toolOutputRequests.delete(queryId);
+      reject(new Error('15 秒内没有收到 Runtime 结果'));
+    }, 15000);
+    toolOutputRequests.set(queryId, { resolve, timer });
+    deliver({
+      type: 'query_tool_output',
+      session_id: sessionId,
+      query_id: queryId,
+      call_id: callId,
+      ...(index === null ? {} : { index }),
+      offset,
+      max_bytes: maxBytes,
+    }, undefined).catch(error => {
+      const pending = toolOutputRequests.get(queryId);
+      if (pending) { clearTimeout(pending.timer); toolOutputRequests.delete(queryId); }
+      reject(error);
+    });
+  });
+}
+
+function openToolOutput(tool) {
+  const tab = openRightbarTab('tool-output', {
+    callId: tool.id, toolId: tool.id, title: `完整输出 · ${toolLabel(tool)}`,
+  });
+  if (!tab) return;
+  const view = toolOutputViewFor(tab);
+  if (!view.parts.has('result')) view.active = 'result';
+  void loadToolOutput(tab, view.active === 'result' ? null : toolOutputIndexFor(view.active));
+}
+
+async function loadToolOutput(tab, index, { append = false } = {}) {
+  if (!tab || tab.kind !== 'tool-output') return;
+  const view = toolOutputViewFor(tab);
+  const key = index === null ? 'result' : `artifact:${index}`;
+  const part = toolOutputPartFor(view, key);
+  if (part.loading) return;
+  const generation = ++part.generation;
+  part.loading = true;
+  part.error = null;
+  part.unavailable = null;
+  part.started = true;
+  if (!append) { part.text = ''; part.next = 0; part.hasMore = false; part.total = 0; }
+  if (rightbarOpen) renderRightbar();
+  try {
+    const output = await queryToolOutput(tab.callId, index, append ? part.next : 0);
+    if (part.generation !== generation) return;
+    part.references = output.references ?? part.references;
+    part.reduced = output.model_result_reduced === true;
+    part.lost = output.full_output_lost === true;
+    if (output.state === 'unavailable') {
+      part.unavailable = output.unavailable ?? 'read_failed';
+      part.error = toolOutputUnavailableLabel(part.unavailable);
+      return;
+    }
+    part.label = output.label ?? part.label;
+    part.text = append ? part.text + output.text : output.text;
+    part.total = Number(output.total_bytes ?? 0);
+    part.next = Number(output.next_offset ?? 0);
+    part.hasMore = output.has_more === true;
+  } catch (error) {
+    if (part.generation === generation) part.error = error?.message ?? '读取完整输出失败';
+  } finally {
+    if (part.generation === generation) {
+      part.loading = false;
+      if (rightbarOpen) renderRightbar();
+    }
+  }
+}
+
+async function copyAllToolOutput(tab, index) {
+  const view = toolOutputViewFor(tab);
+  const key = index === null ? 'result' : `artifact:${index}`;
+  const part = toolOutputPartFor(view, key);
+  if (part.total > TOOL_OUTPUT_COPY_LIMIT) {
+    toast('输出超过 8 MB；请分页查看后复制所需部分', { tone: 'warning', holdMs: 4000 });
+    return;
+  }
+  let text = part.text;
+  let offset = part.next;
+  let more = part.hasMore;
+  try {
+    while (more) {
+      const output = await queryToolOutput(tab.callId, index, offset);
+      if (output.state !== 'available') throw new Error(toolOutputUnavailableLabel(output.unavailable));
+      text += output.text;
+      offset = output.next_offset;
+      more = output.has_more === true;
+    }
+  } catch (error) {
+    toast(`无法读取完整输出：${error.message}`, { tone: 'error', holdMs: 5000 });
+    return;
+  }
+  const ok = await copyText(api, sanitizeOutputText(text), { quiet: true, showFailure: true });
+  toast(ok ? '已复制完整输出' : '复制失败', { tone: ok ? 'success' : 'error', holdMs: 1600 });
+}
+
+function toolOutputView(tab) {
+  const tabView = toolOutputViewFor(tab);
+  const key = tabView.active;
+  const index = toolOutputIndexFor(key);
+  const part = toolOutputPartFor(tabView, key);
+  if (!part.started && !part.loading) {
+    // First paint of a reopened tab: ask for page 0, never load the world.
+    setTimeout(() => {
+      if (rightbarTabs[tab.id] === tab) void loadToolOutput(tab, index);
+    }, 0);
+  }
+  const wrap = el('div', 'tool-output-view');
+  const head = el('div', 'tool-output-head');
+  const partPicker = el('button', 'preview-renderer', part.label || (index === null ? '模型所见结果' : '完整输出'));
+  partPicker.type = 'button';
+  partPicker.setAttribute('aria-label', '选择输出片段');
+  const referenceItems = part.references.map(reference => ({
+    key: `artifact:${reference.index}`,
+    label: toolOutputReferenceLabel(reference),
+    checked: key === `artifact:${reference.index}`,
+    onSelect: () => { tabView.active = `artifact:${reference.index}`; renderRightbar(); void loadToolOutput(tab, reference.index); },
+  }));
+  partPicker.addEventListener('click', () => openMenu({
+    anchor: partPicker, width: 320,
+    items: [
+      { key: 'result', label: '模型所见结果', checked: key === 'result', onSelect: () => { tabView.active = 'result'; renderRightbar(); void loadToolOutput(tab, null); } },
+      ...referenceItems,
+    ].map(item => ({ label: item.label, checked: item.checked, onSelect: item.onSelect })),
+  }));
+  const copy = iconButton('copy', '复制已加载内容', { size: 15, tooltip: part.hasMore ? '复制已加载内容（未加载全部）' : '复制完整内容' });
+  copy.disabled = !part.text;
+  copy.addEventListener('click', async () => {
+    const ok = await copyText(api, sanitizeOutputText(part.text), { quiet: true, showFailure: true });
+    toast(ok ? (part.hasMore ? '已复制已加载内容' : '已复制完整内容') : '复制失败', { tone: ok ? 'success' : 'error', holdMs: 1600 });
+  });
+  const copyAll = iconButton('archive', '复制全部', { size: 15, tooltip: '读取并复制全部内容' });
+  copyAll.disabled = !part.hasMore && !part.text;
+  copyAll.addEventListener('click', () => void copyAllToolOutput(tab, index));
+  const reload = iconButton('refresh', '重新读取', { size: 15, tooltip: '重新读取' });
+  reload.disabled = part.loading;
+  reload.addEventListener('click', () => void loadToolOutput(tab, index));
+  head.append(partPicker, copy, copyAll, reload);
+  wrap.append(head);
+
+  if (part.reduced && index === null) {
+    wrap.append(el('div', 'tool-output-banner', '模型所见结果已被截断；完整输出在下方引用中。'));
+  } else if (part.reduced && index !== null) {
+    wrap.append(el('div', 'tool-output-banner', '这是 Runtime 保存的完整输出片段。'));
+  }
+  if (part.lost) {
+    wrap.append(el('div', 'tool-output-banner lost', '原始输出没有保存完整，被省略的部分无法恢复。'));
+  }
+  const body = el('div', 'tool-output-body');
+  if (part.loading && !part.text) body.append(el('div', 'review-status', '正在读取完整输出…'));
+  else if (part.unavailable || (part.error && !part.text)) {
+    const status = el('div', 'review-status error');
+    status.append(el('span', undefined, part.error ?? '完整输出当前不可用。'));
+    const retry = el('button', 'button secondary small', '重试');
+    retry.type = 'button';
+    retry.addEventListener('click', () => void loadToolOutput(tab, index));
+    status.append(retry);
+    body.append(status);
+  } else {
+    const pre = el('pre', 'tool-output-pre');
+    pre.textContent = sanitizeOutputText(part.text) || '（无输出）';
+    body.append(pre);
+    if (part.text && part.hasMore) {
+      const more = el('div', 'tool-output-footer');
+      more.append(el('span', 'tool-output-meta', `已加载 ${Math.ceil(part.text.length / 1024)} KB / 共 ${Math.ceil(part.total / 1024)} KB`));
+      const load = el('button', 'button secondary small', '加载更多');
+      load.type = 'button';
+      load.disabled = part.loading;
+      load.addEventListener('click', () => void loadToolOutput(tab, index, { append: true }));
+      more.append(load);
+      body.append(more);
+    } else if (part.total > 0) {
+      body.append(el('div', 'tool-output-meta', `共 ${Math.ceil(part.total / 1024)} KB`));
+    }
+  }
+  wrap.append(body);
+  if (part.references.length) {
+    const refs = el('div', 'tool-output-references');
+    refs.append(el('span', 'tool-output-refs-title', '完整输出引用'));
+    for (const reference of part.references) {
+      const chip = el('button', 'tool-output-ref');
+      chip.type = 'button';
+      chip.disabled = reference.available === false;
+      chip.append(iconNode('terminal', { size: 13 }), el('span', undefined, toolOutputReferenceLabel(reference)));
+      chip.addEventListener('click', () => {
+        tabView.active = `artifact:${reference.index}`;
+        renderRightbar();
+        void loadToolOutput(tab, reference.index);
+      });
+      refs.append(chip);
+    }
+    wrap.append(refs);
+  }
+  return wrap;
+}
+
 async function referenceWorkspaceFile(path) {
   const sessionId = current?.session.id;
   if (!sessionId || !hasWorkspace()) return;
@@ -6063,7 +6972,7 @@ function planView() {
   for (const step of steps) {
     const row = el('div', 'plan-step-row');
     row.dataset.planStatus = step.status;
-    row.append(el('span', 'step-mark', { pending: '○', running: '●', done: '✓', failed: '✕', skipped: '–' }[step.status] ?? '?'));
+    row.append(el('span', 'step-mark', { pending: '○', running: '●', done: '✓', failed: '✕', skipped: '–', abandoned: '⊘' }[step.status] ?? '?'));
     row.append(el('span', 'step-text', step.description), el('span', 'step-status', planStepLabel(step.status)));
     view.append(row);
   }
@@ -6159,6 +7068,7 @@ function closeNarrowSidebar() {
 
 function openSettings(section = 'general') {
   settingsSection = section;
+  if (section === 'models') void refreshProviders({ quiet: true });
   renderSettings();
   if (!$('settings-dialog').open) $('settings-dialog').showModal();
   $('settings-nav-list').querySelector('[aria-current="page"]')?.focus();
@@ -6216,7 +7126,7 @@ function settingsNav() {
   const nav = $('settings-nav-list');
   nav.replaceChildren();
   for (const [id, label, icon] of [
-    ['general', '通用设置', 'settings'], ['models', '模型', 'layers'],
+    ['general', '通用设置', 'settings'], ['models', '模型与 Provider', 'layers'],
     ['presets', 'Agent 与技能', 'bot'],
   ]) {
     const button = el('button');
@@ -6450,53 +7360,743 @@ function showShortcuts() {
   });
 }
 
-function renderModelSettings(content) {
-  content.append(el('h2', undefined, '模型'));
-  const setup = el('div', 'settings-card');
-  setup.append(
-    el('h3', undefined, '配置模型提供商'),
-    el('p', undefined, '首次配置请在终端运行 leveler login。已有配置可通过上方的“打开配置文件”维护。保存后重新打开会话，查看 Runtime 加载的模型。'),
+/* ------------------------------------------------- providers / onboarding */
+
+function providerContextNow() {
+  return providerContext({ selection: selection?.id ?? null, sessionId: current?.session.id ?? null });
+}
+function providerContextKey(context) {
+  return `${context?.sessionId ?? ''}\u0000${context?.selection ?? ''}`;
+}
+
+/** Read the effective provider configuration from the host.
+ * The renderer stores only this projection: masked facts and model refs. */
+async function refreshProviders({ quiet = false } = {}) {
+  const context = providerContextNow();
+  const request = ++providerState.request;
+  if (!quiet && providerState.status !== 'ready') providerState = { ...providerState, status: 'loading' };
+  let next;
+  try {
+    const data = await api.providers(context);
+    if (request !== providerState.request) return providerState;
+    if (providerContextKey(providerContextNow()) !== providerContextKey(context)) return providerState;
+    next = { status: 'ready', data, error: null, context, request };
+  } catch (error) {
+    if (request !== providerState.request) return providerState;
+    next = {
+      status: 'error',
+      data: providerState.data,
+      error: error?.message ?? '无法读取 Provider 配置',
+      context,
+      request,
+    };
+  }
+  providerState = next;
+  renderProviderSetup();
+  renderComposerMeta();
+  if ($('settings-dialog').open && settingsSection === 'models') renderSettings();
+  controls();
+  return providerState;
+}
+
+/** Whether an action that would start a new session has a configured model. */
+async function ensureProviderState() {
+  // A click can arrive before the first host read answers. Wait for that read
+  // instead of reporting an unconfigured profile that was never checked.
+  if (providerState.status !== 'ready') await refreshProviders({ quiet: true });
+  return providerState;
+}
+
+function providerConfigurationBlocksStart() {
+  return providerState.status !== 'ready' || !configurationUsable(providerState.data);
+}
+
+function providerSetupMessage() {
+  if (providerState.status === 'loading' || providerState.status === 'idle') return '正在读取 Provider 配置，请稍候';
+  if (providerState.status === 'error') return '无法读取 Provider 配置，请在设置中处理';
+  return '尚未配置可用的模型 Provider，请先完成配置';
+}
+
+function renderProviderSetup() {
+  const node = $('provider-setup');
+  if (!node) return;
+  const guidance = setupGuidance(providerState);
+  const show = Boolean(guidance) && document.body.classList.contains('home');
+  node.hidden = !show;
+  if (!show) return;
+  const signature = JSON.stringify([guidance, providerState.status]);
+  if (signature === providerSetupSignature) return;
+  providerSetupSignature = signature;
+  node.replaceChildren();
+  node.dataset.tone = guidance.tone;
+  const copy = el('div', 'provider-setup-copy');
+  copy.append(el('div', 'provider-setup-title', guidance.title), el('div', 'provider-setup-detail', guidance.detail));
+  const actions = el('div', 'provider-setup-actions');
+  const add = (label, id, kind) => {
+    const button = el('button', `button ${kind} small`, label);
+    button.type = 'button';
+    button.addEventListener('click', () => runProviderGuidance(id, guidance));
+    actions.append(button);
+  };
+  if (guidance.action === 'retry') add('重试', 'retry', 'primary');
+  else if (guidance.action === 'open-settings') add('打开模型设置', 'open-settings', 'primary');
+  else if (guidance.action === 'add-model') add('添加模型', 'add-model', 'primary');
+  else add('配置 Provider', 'add-provider', 'primary');
+  if (guidance.secondary === 'open-config') add('打开配置文件', 'open-config', 'ghost');
+  else if (guidance.secondary === 'open-settings') add('模型设置', 'open-settings', 'ghost');
+  else if (guidance.secondary === 'retry') add('重试', 'retry', 'ghost');
+  node.append(copy, actions);
+}
+
+function runProviderGuidance(id, guidance) {
+  if (id === 'retry') { void refreshProviders(); return; }
+  if (id === 'open-config') { action(() => api.openConfig()); return; }
+  if (id === 'open-settings') { openSettings('models'); return; }
+  if (id === 'add-model') {
+    const provider = providerState.data?.providers?.find(candidate => candidate.id === guidance.providerId)
+      ?? providerState.data?.providers?.[0];
+    if (provider) openAddModelDialog(provider);
+    return;
+  }
+  openProviderEditor({ mode: 'add' });
+}
+
+/* --------------------------------------------------- provider settings */
+
+function protocolLabel(protocol) {
+  return ({
+    openai_chat: 'OpenAI Chat',
+    openai_responses: 'OpenAI Responses',
+    anthropic_messages: 'Anthropic Messages',
+    gemini_generate_content: 'Gemini',
+  })[protocol] ?? protocol;
+}
+
+function providerErrorCard(message) {
+  const card = el('div', 'settings-card provider-error-card');
+  card.append(
+    el('h3', undefined, '无法读取 Provider 配置'),
+    el('p', undefined, message || 'Host 未能读取配置文件'),
   );
-  const copyLogin = el('button', 'button secondary small', '复制 leveler login');
-  copyLogin.type = 'button';
-  copyLogin.addEventListener('click', () => void copyText(api, 'leveler login'));
-  setup.append(copyLogin);
-  content.append(setup);
-  const models = current?.session.available_models ?? [];
-  if (!current) content.append(el('div', 'settings-note', '请先打开或新建一个会话，再选择模型。'));
-  else if (!models.length) {
-    const card = el('div', 'settings-card');
-    card.append(el('h3', undefined, '暂无可用模型'), el('p', undefined, '当前会话没有可用模型。完成上方配置后，重新打开会话。'));
-    content.append(card);
-  } else {
-    const grouped = new Map();
+  const row = el('div', 'settings-actions');
+  const retry = el('button', 'button secondary small', '重试');
+  retry.type = 'button';
+  retry.addEventListener('click', () => void refreshProviders());
+  const open = el('button', 'button ghost small', '打开配置文件');
+  open.type = 'button';
+  open.addEventListener('click', () => action(() => api.openConfig()));
+  row.append(retry, open);
+  card.append(row);
+  return card;
+}
+
+function renderModelSettings(content) {
+  content.append(el('h2', undefined, '模型与 Provider'));
+  const head = el('div', 'provider-page-head');
+  const add = el('button', 'button primary small', '添加 Provider');
+  add.type = 'button';
+  add.disabled = providerState.status === 'loading';
+  add.addEventListener('click', () => openProviderEditor({ mode: 'add' }));
+  const refresh = el('button', 'button ghost small', '刷新');
+  refresh.type = 'button';
+  refresh.addEventListener('click', () => void refreshProviders());
+  head.append(add, refresh);
+  content.append(head);
+
+  if (providerState.status === 'error') content.append(providerErrorCard(providerState.error));
+  const data = providerState.data;
+  if (!data) {
+    content.append(el('div', 'settings-note', providerState.status === 'loading' ? '正在读取 Provider 配置…' : '尚未读取 Provider 配置。'));
+    return;
+  }
+  const meta = el('div', 'provider-config-meta');
+  meta.append(el('span', 'provider-config-path', `配置文件：${data.config_path}${data.config_exists ? '' : '（尚未创建）'}`));
+  const runtime = runtimeConfigState(data.runtime);
+  meta.append(el('span', `provider-runtime ${runtime.tone}`, runtime.text));
+  if (runtime.canReload) {
+    const reload = el('button', 'button ghost small', '立即重载');
+    reload.type = 'button';
+    reload.addEventListener('click', () => action(async () => {
+      await api.reloadRuntime();
+      toast('已请求 Runtime 重新加载配置', { tone: 'info', holdMs: 2200 });
+      await refreshProviders({ quiet: true });
+    }));
+    meta.append(reload);
+  }
+  content.append(meta);
+  if (!data.default_model && data.models?.length) {
+    content.append(el('div', 'settings-note', '尚未设置默认模型；新会话将使用 Runtime 的后备模型。可在下方模型的“设为默认”中确认。'));
+  }
+  if (data.issues?.length) content.append(el('div', 'settings-note provider-issues', data.issues.join('；')));
+  if (!data.providers.length) {
+    const empty = el('div', 'settings-card');
+    empty.append(el('h3', undefined, '还没有 Provider'), el('p', undefined, '添加一个 Provider 和模型后即可开始第一个任务。'));
+    content.append(empty);
+    return;
+  }
+  for (const provider of data.providers) content.append(providerCard(provider, data));
+  if (current) {
+    const count = (current.session.available_models ?? []).length;
+    content.append(el('div', 'settings-note', `当前会话可使用 ${count} 个模型（由 Runtime 提供）。切换当前会话的模型请使用输入区的模型选择器。`));
+  }
+}
+
+function providerCard(provider, data) {
+  const card = el('div', 'settings-card provider-card');
+  const head = el('div', 'provider-card-head');
+  head.append(el('span', 'provider-name', provider.id));
+  head.append(el('span', 'provider-tag', protocolLabel(provider.protocol)));
+  head.append(el('span', 'provider-tag', provider.source === 'project' ? '项目配置' : '全局配置'));
+  if ((data.models ?? []).some(model => model.provider === provider.id && model.default)) {
+    head.append(el('span', 'provider-tag accent', '默认来源'));
+  }
+  card.append(head);
+  const credential = el('span', `provider-credential ${provider.api_key_configured ? 'ready' : 'missing'}`, providerCredentialText(provider));
+  const facts = el('div', 'provider-facts');
+  facts.append(el('span', 'provider-fact', `Base URL：${provider.base_url || '未设置'}`));
+  facts.append(credential);
+  facts.append(el('span', 'provider-fact', `模型：${provider.model_count} 个`));
+  card.append(facts);
+
+  const models = (data.models ?? []).filter(model => model.provider === provider.id);
+  if (models.length) {
+    const list = el('div', 'provider-model-list');
     for (const model of models) {
-      if (!grouped.has(model.provider)) grouped.set(model.provider, []);
-      grouped.get(model.provider).push(model);
-    }
-    for (const [provider, list] of grouped) {
-      const card = el('div', 'settings-card');
-      const head = el('div', 'provider-row');
-      head.append(el('span', 'provider-name', provider));
-      card.append(head);
-      for (const model of list) {
-        const row = el('div', 'provider-row');
-        const selected = current.session.model?.provider === model.provider && current.session.model?.model === model.model;
-        row.append(el('span', 'provider-badge', selected ? '当前' : '可选'), el('span', 'provider-name', model.model));
-        const use = el('button', 'button secondary small', selected ? '已选择' : '使用');
-        use.type = 'button'; use.disabled = selected || loading;
-        use.addEventListener('click', () => action(async () => {
-          await deliver({ type: 'select_model', session_id: current.session.id, model });
-          await refreshMetadata();
-          renderSettings();
-        }));
+      const row = el('div', 'provider-row provider-model-row');
+      const name = el('span', 'provider-name', model.model);
+      row.append(name);
+      if (model.thinking) row.append(el('span', 'provider-badge', `思考：${model.thinking}`));
+      if (model.default) row.append(el('span', 'provider-tag accent', '默认'));
+      else {
+        const busy = providerBusy === `default:${model.provider}/${model.model}`;
+        const use = el('button', 'button ghost small', busy ? '设置中…' : '设为默认');
+        use.type = 'button';
+        use.disabled = Boolean(providerBusy);
+        use.addEventListener('click', () => void setDefaultModelFlow(model));
         row.append(use);
-        card.append(row);
       }
-      content.append(card);
+      list.append(row);
     }
+    card.append(list);
   }
 
+  const actions = el('div', 'settings-actions provider-actions');
+  const test = el('button', 'button secondary small', '测试连接');
+  test.type = 'button';
+  test.disabled = providerTest?.status === 'running';
+  test.addEventListener('click', () => void runProviderTest(provider, data));
+  actions.append(test);
+  if (provider.editable) {
+    const addModel = el('button', 'button ghost small', '添加模型');
+    addModel.type = 'button';
+    addModel.addEventListener('click', () => openAddModelDialog(provider));
+    const edit = el('button', 'button ghost small', '编辑');
+    edit.type = 'button';
+    edit.addEventListener('click', () => openProviderEditor({ mode: 'edit', provider }));
+    const remove = el('button', 'button ghost small provider-danger', '移除');
+    remove.type = 'button';
+    remove.addEventListener('click', () => void removeProviderFlow(provider, data));
+    actions.append(addModel, edit, remove);
+  } else {
+    actions.append(el('span', 'provider-note', '由项目配置提供，桌面不能修改'));
+  }
+  card.append(actions);
+
+  if (providerTest?.providerId === provider.id) {
+    const line = el('div', 'provider-test');
+    if (providerTest.status === 'running') {
+      line.dataset.tone = 'running';
+      line.textContent = '正在测试连接…';
+    } else {
+      const view = connectionPresentation(providerTest.result);
+      line.dataset.tone = view.tone;
+      line.textContent = `${view.label}：${view.message}`;
+      if (view.retryable) {
+        const retry = el('button', 'button ghost small', '重试');
+        retry.type = 'button';
+        retry.addEventListener('click', () => void runProviderTest(provider, data));
+        line.append(' ', retry);
+      }
+    }
+    card.append(line);
+  }
+  return card;
+}
+
+async function runProviderTest(provider, data) {
+  if (providerTest?.status === 'running') return;
+  providerTest = { providerId: provider.id, status: 'running' };
+  renderSettings();
+  const models = (data.models ?? []).filter(model => model.provider === provider.id);
+  const chosen = models.find(model => model.default) ?? models[0] ?? null;
+  let result;
+  try {
+    result = await api.testProvider({
+      ...providerContextNow(),
+      id: provider.id,
+      model: chosen ? { provider: provider.id, model: chosen.model } : null,
+    });
+  } catch (error) {
+    result = { status: 'error', message: error?.message ?? '连接测试失败' };
+  }
+  providerTest = { providerId: provider.id, status: 'done', result };
+  if ($('settings-dialog').open && settingsSection === 'models') renderSettings();
+}
+
+async function setDefaultModelFlow(model) {
+  if (providerBusy) return;
+  providerBusy = `default:${model.provider}/${model.model}`;
+  if ($('settings-dialog').open) renderSettings();
+  try {
+    const result = await api.setDefaultModel({
+      ...providerContextNow(),
+      model: { provider: model.provider, model: model.model },
+    });
+    providerState = { status: 'ready', data: result, error: null, context: providerContextNow(), request: providerState.request };
+    toast(`默认模型已设置为 ${model.provider}/${model.model}`, { tone: 'success', holdMs: 2400 });
+    renderProviderSetup();
+    renderComposerMeta();
+  } catch (error) {
+    toast(`默认模型保存失败：${error?.message ?? '未知错误'}`, { tone: 'error', holdMs: 5000 });
+  } finally {
+    providerBusy = null;
+    if ($('settings-dialog').open) renderSettings();
+  }
+}
+
+async function removeProviderFlow(provider, data) {
+  const models = (data.models ?? []).filter(model => model.provider === provider.id);
+  const isDefault = models.some(model => model.default);
+  const lines = [
+    `将从全局配置移除 Provider ${provider.id} 及其 ${models.length} 个模型。`,
+    '使用该 Provider 的已有会话将无法继续，直到重新配置。',
+  ];
+  if (isDefault) lines.push('默认模型会被清空；新会话将使用 Runtime 的后备模型。');
+  const ok = await confirmDialog({
+    title: `移除 Provider ${provider.id}？`,
+    body: lines.join('\n'),
+    confirm: '移除',
+    danger: true,
+  });
+  if (!ok) return;
+  try {
+    const result = await api.removeProvider({ ...providerContextNow(), id: provider.id });
+    providerTest = null;
+    providerState = { status: 'ready', data: result, error: null, context: providerContextNow(), request: providerState.request };
+    const removed = (result.removed_models ?? []).length;
+    toast(`已移除 ${provider.id}${removed ? `（${removed} 个模型）` : ''}${result.default_cleared ? '；默认模型已清空' : ''}`, { tone: 'success', holdMs: 3200 });
+    if ($('settings-dialog').open) renderSettings();
+    renderProviderSetup();
+    renderComposerMeta();
+    controls();
+  } catch (error) {
+    toast(`移除失败：${error?.message ?? '未知错误'}`, { tone: 'error', holdMs: 5200 });
+  }
+}
+
+function editorInput(value, { type = 'text', placeholder = '', disabled = false, maxLength = 2048, list = null } = {}) {
+  const input = el('input', 'provider-editor-input');
+  input.type = type;
+  input.value = value ?? '';
+  input.placeholder = placeholder;
+  input.disabled = disabled;
+  input.maxLength = maxLength;
+  input.autocomplete = 'off';
+  input.spellcheck = false;
+  if (list) input.setAttribute('list', list);
+  return input;
+}
+
+function editorSelect(options, value, { disabled = false } = {}) {
+  const select = el('select', 'provider-editor-input');
+  select.disabled = disabled;
+  for (const [key, label] of options) {
+    const option = el('option', undefined, label);
+    option.value = key;
+    select.append(option);
+  }
+  select.value = value;
+  return select;
+}
+
+function editorField(label, control, hint) {
+  const row = el('label', 'provider-editor-row');
+  row.append(el('span', 'provider-editor-label', label));
+  const body = el('span', 'provider-editor-control');
+  body.append(control);
+  if (hint) body.append(el('small', 'provider-editor-hint', hint));
+  row.append(body);
+  return row;
+}
+
+function providerEditorDialog({ title, body, saveLabel, onSave }) {
+  const dialog = el('dialog', 'modal provider-editor');
+  const card = el('form', 'modal-card provider-editor-card');
+  card.addEventListener('submit', event => event.preventDefault());
+  const head = el('div', 'modal-head');
+  head.append(el('h2', undefined, title));
+  const close = iconButton('close', '关闭', { size: 16, tooltip: '关闭' });
+  head.append(close);
+  const error = el('p', 'provider-editor-error');
+  error.hidden = true;
+  error.setAttribute('role', 'alert');
+  const actions = el('div', 'modal-actions');
+  const cancel = el('button', 'button secondary', '取消');
+  cancel.type = 'button';
+  const save = el('button', 'button primary', saveLabel);
+  save.type = 'button';
+  actions.append(cancel, save);
+  card.append(head, body, error, actions);
+  dialog.append(card);
+  document.body.append(dialog);
+  const closeDialog = () => dialog.close();
+  close.addEventListener('click', closeDialog);
+  cancel.addEventListener('click', closeDialog);
+  dialog.addEventListener('close', () => {
+    dialog.remove();
+    // The settings page may have re-rendered behind the dialog; focus the
+    // still-live control instead of leaving it on a removed node.
+    const target = $('settings-dialog')?.open ? $('settings-close') : $('message');
+    target?.focus();
+  }, { once: true });
+  dialog.addEventListener('cancel', event => { event.preventDefault(); closeDialog(); });
+  save.addEventListener('click', () => onSave({ error, save, close: closeDialog }));
+  dialog.showModal();
+  return { dialog, save, error };
+}
+
+function openProviderEditor({ mode = 'add', provider = null } = {}) {
+  if (mode === 'edit' && !provider) return;
+  const presets = providerState.data?.presets ?? [];
+  const editing = mode === 'edit';
+  const originalBaseUrl = editing ? provider.base_url : '';
+  const body = el('div', 'provider-editor-body');
+  let selectedPreset = null;
+
+  const presetSelect = editing ? null : editorSelect(
+    [['custom', '自定义 Provider'], ...presets.map(preset => [preset.id, `${preset.label}（${preset.id}）`])],
+    'custom',
+  );
+  const idInput = editorInput(editing ? provider.id : '', { placeholder: '例如 bigmodel', maxLength: 64, disabled: editing });
+  const protocolSelect = editorSelect([
+    ['openai_chat', 'OpenAI Chat'],
+    ['openai_responses', 'OpenAI Responses'],
+    ['anthropic_messages', 'Anthropic Messages'],
+    ['gemini_generate_content', 'Gemini Generate Content'],
+  ], editing ? provider.protocol : 'openai_chat');
+  presetSelect?.setAttribute('aria-label', 'Provider 预设');
+  idInput.setAttribute('aria-label', 'Provider ID');
+  protocolSelect.setAttribute('aria-label', '接口协议');
+  const baseInput = editorInput(editing ? provider.base_url : '', { placeholder: 'https://api.example.com/v1', maxLength: 2048 });
+  baseInput.setAttribute('aria-label', 'Base URL');
+  const keyInput = editorInput('', {
+    type: 'password',
+    maxLength: 16 * 1024,
+    placeholder: editing
+      ? (provider.api_key_configured
+        ? (provider.key_source === 'environment' ? '当前使用环境变量（留空保持不变）' : '已保存密钥（留空保持不变）')
+        : '粘贴 API Key（留空保持不变）')
+      : '粘贴 API Key',
+  });
+  keyInput.setAttribute('aria-label', 'API Key');
+  const envInput = editorInput(editing ? (provider.api_key_env ?? '') : '', { placeholder: '可选，例如 BIGMODEL_API_KEY', maxLength: 128 });
+  envInput.setAttribute('aria-label', '环境变量名');
+  const advanced = el('details', 'provider-editor-advanced');
+  advanced.append(el('summary', undefined, '高级'), editorField('环境变量名', envInput, '填写后 Provider 会从该环境变量读取密钥；已保存的密钥优先。留空表示不使用环境变量。'));
+  const consoleLink = el('a', 'provider-editor-console');
+  consoleLink.target = '_blank';
+  consoleLink.rel = 'noreferrer';
+  consoleLink.hidden = true;
+  consoleLink.textContent = '获取 API Key';
+
+  const modelSelect = editorSelect([], null);
+  modelSelect.hidden = true;
+  modelSelect.setAttribute('aria-label', '模型列表');
+  modelSelect.addEventListener('change', () => { if (modelSelect.value) modelInput.value = modelSelect.value; });
+  const modelInput = editorInput('', { placeholder: '模型 ID，例如 glm-5.3', maxLength: 128, list: 'provider-model-options' });
+  modelInput.setAttribute('aria-label', '模型 ID');
+  const modelOptions = el('datalist');
+  modelOptions.id = 'provider-model-options';
+  const contextInput = editorInput('', { type: 'number', placeholder: '例如 131072', maxLength: 12 });
+  contextInput.min = '1024';
+  contextInput.max = '16777216';
+  contextInput.setAttribute('aria-label', '上下文窗口');
+  const discoverButton = el('button', 'button secondary small', '获取模型');
+  discoverButton.type = 'button';
+  const discoverStatus = el('span', 'provider-discover-status');
+  const discoverRow = el('div', 'provider-model-tools');
+  discoverRow.append(discoverButton, discoverStatus);
+  const modelSection = el('div', 'provider-model-section');
+  modelSection.append(
+    el('div', 'provider-editor-section-title', editing ? '已保存的模型不会被改写；这里只添加新模型' : '模型'),
+    editorField('模型 ID', modelInput),
+    modelSelect,
+    discoverRow,
+    modelOptions,
+    editorField('上下文窗口', contextInput, '已知模型使用内置事实；未知模型使用这里的保守值。留空使用加载器默认值。'),
+  );
+
+  if (!editing) {
+    body.append(editorField('Provider 预设', presetSelect, '预设只提供端点、协议和常用模型，不表示你的账号一定能访问某个模型。'));
+    presetSelect.addEventListener('change', () => {
+      selectedPreset = presets.find(preset => preset.id === presetSelect.value) ?? null;
+      if (!selectedPreset) return;
+      idInput.value = selectedPreset.id;
+      protocolSelect.value = selectedPreset.protocol;
+      baseInput.value = selectedPreset.base_url;
+      modelInput.value = selectedPreset.suggested_model;
+      contextInput.value = String(selectedPreset.suggested_context);
+      consoleLink.href = selectedPreset.console_url;
+      consoleLink.hidden = false;
+    });
+    presetSelect.dispatchEvent(new Event('change'));
+  }
+  body.append(
+    editorField('Provider ID', idInput, editing ? 'Provider ID 不能在编辑时改名；需要改名请新增并移除。' : null),
+    editorField('接口协议', protocolSelect),
+    editorField('Base URL', baseInput, editing ? '留空保持已保存的值；显示值已移除凭据与查询参数。' : null),
+    editorField('API Key', keyInput, '密钥只保存到全局配置文件（仅当前用户可读），保存后不再回显；不会进入聊天内容、日志或本地存储。'),
+    consoleLink,
+    advanced,
+  );
+  if (!editing) body.append(modelSection);
+
+  providerEditorDialog({
+    title: editing ? `编辑 Provider ${provider.id}` : '添加 Provider',
+    body,
+    saveLabel: '保存并验证',
+    onSave: async ({ error: errorNode, save: saveButton, close }) => {
+      const draftModels = editing
+        ? []
+        : [{ id: modelInput.value.trim(), context_window: contextInput.value.trim() === '' ? null : Number(contextInput.value) }];
+      if (!editing && !modelInput.value.trim()) {
+        errorNode.textContent = '请选择或填写一个模型 ID';
+        errorNode.hidden = false;
+        return;
+      }
+      const surfaceError = providerFormError({
+        mode,
+        id: idInput.value,
+        protocol: protocolSelect.value,
+        baseUrl: baseInput.value,
+        apiKey: keyInput.value,
+        apiKeyEnv: envInput.value.trim(),
+        models: draftModels,
+      });
+      if (surfaceError) {
+        errorNode.textContent = surfaceError;
+        errorNode.hidden = false;
+        return;
+      }
+      const baseUrl = editing && baseInput.value.trim() === originalBaseUrl ? null : baseInput.value.trim();
+      const request = {
+        id: idInput.value.trim(),
+        protocol: protocolSelect.value,
+        base_url: baseUrl,
+        api_key_env: envInput.value.trim(),
+        api_key: keyInput.value ? keyInput.value : null,
+        models: draftModels,
+      };
+      saveButton.disabled = true;
+      saveButton.textContent = '正在保存并验证…';
+      errorNode.hidden = true;
+      try {
+        const result = await api.saveProvider({ ...providerContextNow(), mode, provider: request });
+        keyInput.value = '';
+        // A prior connection result described the configuration that just
+        // changed; it is no longer evidence for the new one.
+        providerTest = null;
+        providerState = { status: 'ready', data: result, error: null, context: providerContextNow(), request: providerState.request };
+        close();
+        toast(editing ? `Provider ${request.id} 已更新` : `Provider ${request.id} 已添加`, { tone: 'success', holdMs: 2600 });
+        renderProviderSetup();
+        renderComposerMeta();
+        if ($('settings-dialog').open) renderSettings();
+        controls();
+      } catch (saveError) {
+        errorNode.textContent = saveError?.message ?? '保存失败';
+        errorNode.hidden = false;
+        saveButton.disabled = false;
+        saveButton.textContent = '保存并验证';
+      }
+    },
+  });
+
+  discoverButton.addEventListener('click', async () => {
+    const surfaceError = providerFormError({
+      mode: 'add',
+      id: idInput.value || 'draft',
+      protocol: protocolSelect.value,
+      baseUrl: baseInput.value,
+      apiKey: keyInput.value,
+      apiKeyEnv: envInput.value.trim(),
+      models: [{ id: 'probe', context_window: null }],
+    });
+    if (surfaceError) {
+      discoverStatus.textContent = surfaceError;
+      discoverStatus.dataset.tone = 'error';
+      return;
+    }
+    discoverButton.disabled = true;
+    discoverStatus.textContent = '正在连接 Provider 并读取模型…';
+    discoverStatus.dataset.tone = 'running';
+    try {
+      const result = await api.listProviderModels({
+        ...providerContextNow(),
+        id: null,
+        provider: {
+          id: idInput.value.trim() || 'draft',
+          protocol: protocolSelect.value,
+          base_url: baseInput.value.trim(),
+          api_key_env: envInput.value.trim() || null,
+          api_key: keyInput.value ? keyInput.value : null,
+        },
+      });
+      const view = connectionPresentation(result);
+      if (result.status === 'ok') {
+        modelOptions.replaceChildren();
+        modelSelect.replaceChildren();
+        modelSelect.append(el('option', undefined, '选择一个模型'));
+        for (const model of view.models) {
+          const option = el('option', undefined, model);
+          option.value = model;
+          modelOptions.append(option);
+          modelSelect.append(option.cloneNode(true));
+        }
+        modelSelect.hidden = view.models.length === 0;
+        modelSelect.value = '';
+        if (view.models.length && !modelInput.value.trim()) modelInput.value = view.models[0];
+        discoverStatus.textContent = `已读取 ${view.models.length} 个模型${result.truncated ? '（仅显示前 2000 个）' : ''}`;
+        discoverStatus.dataset.tone = 'success';
+      } else {
+        discoverStatus.textContent = `${view.label}：${view.message}`;
+        discoverStatus.dataset.tone = view.tone;
+      }
+    } catch (discoverError) {
+      discoverStatus.textContent = discoverError?.message ?? '读取模型失败';
+      discoverStatus.dataset.tone = 'error';
+    } finally {
+      discoverButton.disabled = false;
+    }
+  });
+
+  if (!editing) {
+    // Fill the first preset so a first run starts from a working endpoint.
+    presetSelect.value = presets[0]?.id ?? 'custom';
+    presetSelect.dispatchEvent(new Event('change'));
+    modelInput.value = presets[0]?.suggested_model ?? modelInput.value;
+  }
+}
+
+function openAddModelDialog(provider) {
+  if (!provider) return;
+  const body = el('div', 'provider-editor-body');
+  const modelSelect = editorSelect([], null);
+  modelSelect.hidden = true;
+  const modelInput = editorInput('', { placeholder: '模型 ID，例如 glm-5.3', maxLength: 128, list: 'add-model-options' });
+  modelInput.setAttribute('aria-label', '模型 ID');
+  modelSelect.setAttribute('aria-label', '模型列表');
+  const modelOptions = el('datalist');
+  modelOptions.id = 'add-model-options';
+  const contextInput = editorInput('', { type: 'number', placeholder: '例如 131072', maxLength: 12 });
+  contextInput.min = '1024';
+  contextInput.max = '16777216';
+  contextInput.setAttribute('aria-label', '上下文窗口');
+  const discoverButton = el('button', 'button secondary small', '获取模型');
+  discoverButton.type = 'button';
+  const discoverStatus = el('span', 'provider-discover-status');
+  const discoverRow = el('div', 'provider-model-tools');
+  discoverRow.append(discoverButton, discoverStatus);
+  modelSelect.addEventListener('change', () => { if (modelSelect.value) modelInput.value = modelSelect.value; });
+  body.append(
+    el('p', 'provider-editor-hint', `为 ${provider.id} 添加模型。已保存的模型不会被改写。`),
+    editorField('模型 ID', modelInput),
+    modelSelect,
+    discoverRow,
+    modelOptions,
+    editorField('上下文窗口', contextInput, '未知模型使用这里的保守值；留空使用加载器默认值。'),
+  );
+  providerEditorDialog({
+    title: `为 ${provider.id} 添加模型`,
+    body,
+    saveLabel: '添加并验证',
+    onSave: async ({ error: errorNode, save: saveButton, close }) => {
+      const id = modelInput.value.trim();
+      const context = contextInput.value.trim() === '' ? null : Number(contextInput.value);
+      const formError = providerFormError({
+        mode: 'add',
+        id: provider.id,
+        protocol: provider.protocol,
+        baseUrl: provider.base_url,
+        apiKey: null,
+        apiKeyEnv: provider.api_key_env ?? '',
+        models: [{ id, context_window: context }],
+      });
+      if (formError) {
+        errorNode.textContent = formError;
+        errorNode.hidden = false;
+        return;
+      }
+      saveButton.disabled = true;
+      saveButton.textContent = '正在添加并验证…';
+      try {
+        const result = await api.saveProvider({
+          ...providerContextNow(),
+          mode: 'edit',
+          provider: {
+            id: provider.id,
+            protocol: provider.protocol,
+            base_url: null,
+            api_key_env: provider.api_key_env ?? '',
+            api_key: null,
+            models: [{ id, context_window: context }],
+          },
+        });
+        providerTest = null;
+        providerState = { status: 'ready', data: result, error: null, context: providerContextNow(), request: providerState.request };
+        close();
+        toast(`模型 ${id} 已添加`, { tone: 'success', holdMs: 2400 });
+        if ($('settings-dialog').open) renderSettings();
+        renderProviderSetup();
+      } catch (saveError) {
+        errorNode.textContent = saveError?.message ?? '添加失败';
+        errorNode.hidden = false;
+        saveButton.disabled = false;
+        saveButton.textContent = '添加并验证';
+      }
+    },
+  });
+  discoverButton.addEventListener('click', async () => {
+    discoverButton.disabled = true;
+    discoverStatus.textContent = '正在读取模型列表…';
+    discoverStatus.dataset.tone = 'running';
+    try {
+      const result = await api.listProviderModels({ ...providerContextNow(), id: provider.id, provider: null });
+      const view = connectionPresentation(result);
+      if (result.status === 'ok') {
+        modelOptions.replaceChildren();
+        modelSelect.replaceChildren();
+        modelSelect.append(el('option', undefined, '选择一个模型'));
+        for (const model of view.models) {
+          const option = el('option', undefined, model);
+          option.value = model;
+          modelOptions.append(option);
+          modelSelect.append(option.cloneNode(true));
+        }
+        modelSelect.hidden = view.models.length === 0;
+        discoverStatus.textContent = `已读取 ${view.models.length} 个模型`;
+        discoverStatus.dataset.tone = 'success';
+      } else {
+        discoverStatus.textContent = `${view.label}：${view.message}；可直接填写模型 ID`;
+        discoverStatus.dataset.tone = view.tone;
+      }
+    } catch (discoverError) {
+      discoverStatus.textContent = discoverError?.message ?? '读取模型失败';
+      discoverStatus.dataset.tone = 'error';
+    } finally {
+      discoverButton.disabled = false;
+    }
+  });
 }
 
 function renderPresetSettings(content) {
@@ -7569,6 +9169,7 @@ api.onEvent(frame => {
     trajectoryRange = null;
     trajectoryViewport = null;
     $('message').value = drafts.get(session.id) ?? $('message').value;
+    queueDraftScan(session.id, $('message').value);
     render();
     applyConnection({ event: 'connection', state: 'connected', resumed: true });
     reloadHistory();
@@ -7589,6 +9190,10 @@ api.onEvent(frame => {
     return;
   }
   if (frame.event === 'handoff') return;
+  if (frame.event === 'runtime' && ['secret_captured', 'secret_capture_failed'].includes(frame.data?.type)) {
+    applySecretCaptureEvent(frame.data);
+    return;
+  }
   if (frame.session_id === current?.session.id && frame.event === 'runtime'
     && ['attachment_added', 'attachment_processing_failed'].includes(frame.data?.type)) {
     const previous = attachments();
@@ -7616,6 +9221,7 @@ api.onEvent(frame => {
     current.plan = replayed.plan ?? current.plan;
     current.approvals = replayed.approvals;
     current.clarifications = replayed.clarifications;
+    current.definitionTrust = replayed.definitionTrust;
     current.settledBackgroundTasks = settledBackgroundTasks;
     const reconciled = reconcileBackgroundJobs({
       active: (frame.data.active_background_tasks ?? []).map(job => activeJobRecord(job, priorBackgroundTasks)),
@@ -7633,6 +9239,17 @@ api.onEvent(frame => {
   }
   if (frame.event !== 'runtime') return;
   const event = frame.data;
+  if (event.type === 'tool_output_loaded') {
+    // A read answer, not conversation state: it resolves the query that asked
+    // for it and never enters the transcript, trajectory or seq watermark.
+    const pending = toolOutputRequests.get(event.query_id);
+    if (pending) {
+      clearTimeout(pending.timer);
+      toolOutputRequests.delete(event.query_id);
+      pending.resolve(event.output);
+    }
+    return;
+  }
   recordLiveTrajectory(event);
   if (typeof event.seq === 'number') lastEventSeq = Math.max(lastEventSeq, event.seq);
   if (event.type === 'session_history_loaded') {
@@ -7642,6 +9259,7 @@ api.onEvent(frame => {
     current = retainInterruptedThoughts(mergeRestoredConversation(replayed, current), current);
     current.plan = replayed.plan ?? current.plan;
     renderConversation();
+    if (rightbarOpen) renderRightbar();
     if (activeView === 'trajectory') renderTrajectory();
     return;
   }
@@ -7668,6 +9286,7 @@ api.onEvent(frame => {
     current = attachExtras(applySessionMetadata(current, event.session), event.session);
     renderHeader();
     renderComposerMeta();
+    renderComposerDocks();
     renderSidebar();
     // The status the runtime settles after a turn arrives here, not on the
     // terminal event. The transcript owns the running row and the plan/diff
@@ -7699,7 +9318,24 @@ api.onEvent(frame => {
     return;
   }
   if (event.type === 'notification') {
-    if (event.level === 'warning' || event.level === 'error') toast(event.message, { tone: event.level, holdMs: 5000 });
+    // The Runtime's notification is the authority for outcomes a command
+    // receipt cannot prove (for example a revoked reference). Show info too;
+    // a warning/error keeps its longer hold.
+    const warning = ['warning', 'error'].includes(event.level);
+    toast(event.message, { tone: warning ? event.level : 'info', holdMs: warning ? 5000 : 2600 });
+    return;
+  }
+  if (event.type === 'config_reloaded') {
+    // Applied by the watcher or an explicit reload: the host read is the
+    // authority, so re-read it instead of patching a local copy. A connection
+    // result measured against the previous configuration is no longer proof.
+    providerTest = null;
+    void refreshProviders({ quiet: true });
+    if (event.outcome === 'failed') {
+      toast(`配置重新加载失败：${event.error ?? '未知错误'}`, { tone: 'error', holdMs: 5200 });
+    } else if (event.outcome === 'applied') {
+      toast(`配置已重新加载 · v${event.version}`, { tone: 'info', holdMs: 2200 });
+    }
     return;
   }
   if (event.type === 'agents_loaded') return;
@@ -7712,6 +9348,37 @@ api.onEvent(frame => {
   if (current.status !== statusBefore || current.activity !== activityBefore) { renderHeader(); renderComposerMeta(); }
   modelRetry = event.type === 'model_retrying' ? { attempt: event.attempt ?? 0, max: event.max_attempts ?? 0 } : null;
   if (terminalEvents.has(event.type)) { pendingSubmit = false; setTimeout(flushQueuedMessage, 0); }
+  if (terminalEvents.has(event.type) && current?.session?.id) goalDockProbes.delete(current.session.id);
+  if (terminalEvents.has(event.type) && current?.session?.id) goalStops.delete(current.session.id);
+  if (event.type === 'user_message_added' && current?.session?.id) goalDockProbes.delete(current.session.id);
+  if (event.type === 'user_message_added' && current?.session?.id) goalStops.delete(current.session.id);
+  if (event.type === 'tool_call_started' && current?.session?.id
+    && (current.session.collaboration ?? 'chat') === 'goal'
+    && !current.session.execution_task
+    && (goalDockProbes.get(current.session.id) ?? 0) < GOAL_DOCK_PROBE_LIMIT) {
+    // The goal record can be committed after the submit acknowledgement. A
+    // probe can therefore miss it; retry on a later tool of the same turn (at
+    // most three times) instead of leaving the dock absent or polling.
+    goalDockProbes.set(current.session.id, (goalDockProbes.get(current.session.id) ?? 0) + 1);
+    void refreshMetadata().then(() => renderComposerDocks()).catch(() => {});
+  }
+  if (event.type === 'goal_continuation_stopped' && current?.session?.id) {
+    // The last window's yielded terminal already closed that window; the
+    // runtime only refused to open another empty one. The goal still owes
+    // work, so this is a warning — never a completion or failure receipt.
+    const windows = event.consecutive_windows_without_work ?? 0;
+    goalStops.set(current.session.id, { windows });
+    toast(goalContinuationStopLabel(windows), { tone: 'warning', holdMs: 6000 });
+    renderComposerDocks();
+    return;
+  }
+  if (event.type === 'turn_yielded') {
+    // A goal window closed with work still owed; the runtime continues the
+    // same logical turn in a fresh window. This is NOT a completion — no
+    // receipt is painted — and the snapshot is re-read so the goal dock shows
+    // the runtime's own projection rather than a window-local guess.
+    action(async () => { await refreshSnapshot(); });
+  }
   if (terminalEvents.has(event.type) && current?.session?.repository) {
     const attemptDiff = (attempt = 0) => {
       if (attempt > 6 || !current?.session?.repository) return;
@@ -7746,9 +9413,10 @@ api.onEvent(frame => {
       && current.tools.some(tool => tool.id === event.id && browserActivity(tool)))) {
     renderRightbar();
   }
-  if (['approval_requested', 'approval_resolved', 'clarification_requested', 'clarification_resolved'].includes(event.type)) renderInteractions();
+  if (['approval_requested', 'approval_resolved', 'clarification_requested', 'clarification_resolved', 'definition_trust_requested', 'definition_trust_resolved'].includes(event.type)) renderInteractions();
   if ($('settings-dialog').open && settingsSection === 'presets') renderSettings();
   if (terminalEvents.has(event.type)) action(async () => { await refreshSnapshot(); await loadHistory(); await refreshTasks(); });
+  if (terminalEvents.has(event.type) && rightbarOpen) renderRightbar();
   if (event.type === 'turn_failed') showError(event.failure?.message || event.error || 'Runtime 执行失败');
 });
 
@@ -7868,6 +9536,8 @@ function boot() {
     $('brand-version').title = '桌面客户端版本；Runtime 版本见设置';
   }).catch(() => {});
   api.connectionStatus?.().then(applyConnection).catch(() => {});
+  void refreshProviders();
+  void migrateLegacyDrafts();
   api.onBrowserState(data => {
     browserData = data;
     for (const tab of Object.values(rightbarTabs)) {
@@ -7915,6 +9585,7 @@ function boot() {
   $('account-menu').addEventListener('click', event => openAccountMenu(event.currentTarget));
   $('workspace-picker').addEventListener('click', event => openWorkspaceMenu(event.currentTarget));
   $('model-picker').addEventListener('click', event => openModelMenu(event.currentTarget));
+  $('mode-picker').addEventListener('click', event => openCollaborationMenu(event.currentTarget));
   $('permission-picker').addEventListener('click', event => openPermissionMenu(event.currentTarget));
   $('attachment-add').addEventListener('click', () => {
     if (document.querySelector('#command-popover')) closeComposerPopovers();
@@ -7946,6 +9617,7 @@ function boot() {
     const value = $('message').value;
     drafts.set(draftKey(), value);
     saveDrafts();
+    queueDraftScan(draftKey(), value);
     if (/^\/[a-z-]*$/.test(value.trim())) openSlashMenu(); else $('command-popover')?.remove();
   });
   $('message').addEventListener('keydown', event => {
@@ -8093,6 +9765,8 @@ function resizeComposer() {
 }
 
 async function submitComposer(complement = false) {
+  if (!current) await ensureProviderState();
+  if (!current && providerConfigurationBlocksStart()) { composerError(providerSetupMessage()); return; }
   const content = $('message').value.trim();
   const intent = slashIntent(content, commandCatalog());
   if (intent.kind === 'action') { executeCommand(intent.id); return; }
@@ -8102,6 +9776,18 @@ async function submitComposer(complement = false) {
   if ((!content && !refs.length) || loading || uncertain || uploadPending()) return;
   const unsupported = attachmentSubmissionError(refs);
   if (unsupported) { composerError(unsupported); return; }
+  // Review before anything leaves the client. A scan that has not finished is
+  // awaited for this exact text; a draft containing a candidate never uses
+  // the plain submission path.
+  const secretScan = content ? await scanForSubmit(content) : null;
+  if (secretScan?.findings?.length) {
+    const running = ['running', 'waiting_user'].includes(current?.status);
+    const steer = running && !!content && (complement ? settings.busySend !== 'steer' : settings.busySend === 'steer');
+    if (running && !steer) { composerError('回合仍在运行：排队发送不支持凭据接管；请选择插话发送或等待回合结束'); return; }
+    if (steer && refs.length) { composerError('运行中插话不支持附件；请移除附件或等待回合结束'); return; }
+    openSecretReview({ original: content, refs, scan: secretScan, complement });
+    return;
+  }
   composerError('');
   action(async () => {
     if (!current) await createTask();

@@ -1733,6 +1733,24 @@ impl ScheduleStore {
         row.as_ref().map(run_from_row).transpose()
     }
 
+    /// The run a claimed occurrence produced, if one exists.
+    ///
+    /// A run-now slot is claimed once; the query still orders by start so a
+    /// legacy duplicate can never make the caller follow an older attempt.
+    pub async fn run_for_occurrence(
+        &self,
+        occurrence_id: &OccurrenceId,
+    ) -> Result<Option<ScheduleRun>, ScheduleError> {
+        let row = sqlx::query(&format!(
+            "SELECT {RUN_COLUMNS} FROM {RUN_FROM} WHERE r.occurrence_id = ? \
+             ORDER BY r.started_at DESC, r.id DESC LIMIT 1"
+        ))
+        .bind(occurrence_id.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(run_from_row).transpose()
+    }
+
     /// Create the next occurrence from the rule's own grid.
     ///
     /// The successor is `next_after` the latest materialized slot, not
@@ -2868,6 +2886,127 @@ mod tests {
         // The missed row is a terminal fact: policy never rewrites it.
         assert_eq!(store.reconcile_misfires(now).await.unwrap(), 0);
         assert_eq!(store.reconcile_misfires(now).await.unwrap(), 0);
+    }
+
+    /// Replays dispatch passes over a one-minute grid at the product wake
+    /// cadence. A pass settles the prior run at the next pass, as `run_shell`
+    /// hands a running shell to a later observation, then applies the same
+    /// store steps as `dispatch_pass`: ensure, overlap, misfire, claim.
+    ///
+    /// Windows keeps the one-minute Task Scheduler cadence, so the sub-minute
+    /// cadence contract is exercised on the platforms that register one.
+    #[cfg(not(windows))]
+    async fn replay_grid_claims(pass_offsets: &[i64]) -> (Vec<i64>, usize) {
+        let store = store().await;
+        let start = leveler_core::now();
+        let created = store
+            .create_definition(definition_with_misfire(
+                ScheduleTrigger::Every {
+                    anchor: start,
+                    every: Duration::from_secs(60),
+                },
+                MisfirePolicy::RunOnceOnRecovery,
+                Duration::from_secs(180),
+            ))
+            .await
+            .unwrap();
+        let mut active: Option<RunId> = None;
+        let mut latencies = Vec::new();
+        for offset in pass_offsets {
+            let now = start + chrono::Duration::seconds(*offset);
+            if let Some(run_id) = active.take() {
+                store
+                    .finish_run(&run_id, RunOutcome::Succeeded { exit_code: Some(0) })
+                    .await
+                    .unwrap();
+            }
+            let current = store.definition(&created.id).await.unwrap().unwrap();
+            store.ensure_next_occurrence(&current, now).await.unwrap();
+            store.reconcile_overlaps(now).await.unwrap();
+            store.reconcile_misfires(now).await.unwrap();
+            for claim in store
+                .claim_due(now, Duration::from_secs(120), 8)
+                .await
+                .unwrap()
+            {
+                latencies.push((now - claim.occurrence.scheduled_for).num_seconds());
+                assert!(active.is_none(), "one active run per definition per pass");
+                active = Some(claim.run_id);
+            }
+        }
+        assert!(active.is_some(), "the simulation must have claimed work");
+        let missed = store
+            .occurrences(&created.id, pass_offsets.len() + 10)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|occurrence| occurrence.state == OccurrenceState::Missed)
+            .count();
+        (latencies, missed)
+    }
+
+    /// A one-minute grid polled even slightly slower than the grid parks every
+    /// claim in the run-once grace band. Each pass creates one slot and claims
+    /// one; the newly created slot is a minute newer than the claimed one, so
+    /// the oldest slot crosses the grace a minute before the newest does. The
+    /// run-once policy keeps the newest overdue slot and misses the older one,
+    /// which resets the band at grace + one slot instead of draining it. The OS
+    /// wake has timer overhead on top of `StartInterval`, so the product
+    /// cadence must stay below the grid; this drives the same store calls as a
+    /// dispatch pass and checks the frozen claim gate.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn a_wake_cadence_below_the_grid_keeps_claims_out_of_the_grace_band() {
+        let interval = (crate::wakeup::WAKE_INTERVAL + Duration::from_secs(1)).as_secs() as i64;
+        let passes = 300;
+        let offsets: Vec<i64> = (0..passes).map(|step| step * interval).collect();
+        let (mut latencies, missed) = replay_grid_claims(&offsets).await;
+        assert_eq!(
+            missed, 0,
+            "a cadence below the grid must not age slots past the grace"
+        );
+        latencies.sort_unstable();
+        let p95 = latencies[latencies.len() * 95 / 100];
+        assert!(
+            p95 <= 180,
+            "claim p95 {p95}s over {passes} passes at {interval}s; highest samples: {:?}",
+            &latencies[latencies.len().saturating_sub(10)..]
+        );
+    }
+
+    /// A late OS wake leaves the slots that were already waiting late by
+    /// definition, but the queue must return to the cadence within a few
+    /// passes instead of parking at the grace band. Two gaps (three and two
+    /// cadences) exercise a single delayed wake and consecutive delayed wakes
+    /// while every sample still counts toward the gate.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn a_slow_wake_returns_to_the_cadence_instead_of_parking() {
+        let interval = (crate::wakeup::WAKE_INTERVAL + Duration::from_secs(1)).as_secs() as i64;
+        let mut offsets = Vec::new();
+        let mut now = 0;
+        for step in 0..240 {
+            offsets.push(now);
+            now += match step {
+                60 => 3 * interval,
+                120 => 2 * interval,
+                _ => interval,
+            };
+        }
+        let (mut latencies, missed) = replay_grid_claims(&offsets).await;
+        assert_eq!(missed, 0, "both gaps are shorter than the grace");
+        latencies.sort_unstable();
+        let p95 = latencies[latencies.len() * 95 / 100];
+        assert!(
+            p95 <= 180,
+            "claim p95 {p95}s after the wake gaps; highest samples: {:?}",
+            &latencies[latencies.len().saturating_sub(10)..]
+        );
+        let tail = &latencies[latencies.len() - 60..];
+        assert!(
+            tail.iter().all(|latency| *latency <= 2 * interval),
+            "the queue must be back on the cadence; tail: {tail:?}"
+        );
     }
 
     #[tokio::test]

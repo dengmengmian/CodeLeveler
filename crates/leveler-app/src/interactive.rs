@@ -322,7 +322,7 @@ use crate::prompt_bridge::{
     ChannelApprover, ChannelClarifier, PendingApprovals, PendingClarifications, resolve_approval,
     resolve_clarification, supersede_pending_approvals, validate_pending_session,
 };
-use crate::session::MAX_GOAL_RECOVERY_ATTEMPTS;
+use crate::session::{MAX_GOAL_RECOVERY_ATTEMPTS, MAX_GOAL_WINDOWS_WITHOUT_WORK};
 use crate::workspace_view::{compute_diff, detect_branch_label};
 
 fn spawn_auxiliary_assist(
@@ -5584,6 +5584,12 @@ impl InProcessRuntimeClient {
                 // count is also durable, so this is a presentation-side view.
                 let mut recovery_context: Option<leveler_agent::coding::GoalRecoveryContext> = None;
                 let mut recovery_attempts: u32 = 0;
+                // Consecutive yielded windows that executed no work at all. A
+                // window that acts (any tool other than the goal-resolution
+                // declaration) proves the continuation is buying something;
+                // an empty window does not, and two in a row end the automatic
+                // loop instead of letting a model that always yields spin it.
+                let mut windows_without_work: u32 = 0;
                 loop {
                     // Each window owns its bridge: the terminal publisher is
                     // single-use. The terminal event is held in the slot so
@@ -5604,8 +5610,22 @@ impl InProcessRuntimeClient {
                             }
                         });
                     let observer_acceptance = accepted_tx.clone();
+                    // Whether THIS window executed anything that can justify
+                    // opening another one. A continuation that only declares
+                    // `update_goal(yield)` again has nothing new to carry.
+                    let mut window_executed_work = false;
                     let result = {
                         let mut observer = |event: leveler_engine::EngineEvent| {
+                            if let leveler_engine::EngineEvent::ToolCallStarted {
+                                name,
+                                agent_id,
+                                ..
+                            } = &event
+                                && agent_id.is_none()
+                                && name != leveler_agent::UPDATE_GOAL_TOOL
+                            {
+                                window_executed_work = true;
+                            }
                             steering.note_window(&event);
                             if matches!(event, leveler_engine::EngineEvent::TurnStarted { .. })
                                 && let Some(tx) = observer_acceptance
@@ -5722,6 +5742,28 @@ impl InProcessRuntimeClient {
                             // yielded. Nothing more is owed to publish: the
                             // goal keeps its resumable truth.
                             user_cancelled = true;
+                            active.finish(&admission);
+                            break;
+                        }
+                        // An automatic continuation is only worth spending
+                        // when the window it follows actually did something.
+                        // A window that executed no tool other than its own
+                        // `update_goal(yield)` declaration carries the same
+                        // objective and no new facts into the next one; enough
+                        // of those in a row is a model↔runtime loop, not work.
+                        // The last window's yielded terminal is already
+                        // published, so the person sees the truth: the window
+                        // ended, the goal still owes its work, and automatic
+                        // continuation stopped here.
+                        if window_executed_work {
+                            windows_without_work = 0;
+                        } else {
+                            windows_without_work = windows_without_work.saturating_add(1);
+                        }
+                        if windows_without_work >= MAX_GOAL_WINDOWS_WITHOUT_WORK {
+                            let _ = events.send(RuntimeEvent::GoalContinuationStopped {
+                                consecutive_windows_without_work: windows_without_work,
+                            });
                             active.finish(&admission);
                             break;
                         }
@@ -8001,28 +8043,41 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 query_id,
                 request,
             } => {
-                let run_now = matches!(
-                    *request,
-                    leveler_client_protocol::schedule::ScheduleRequest::RunNow { .. }
-                );
+                let mut run_now_occurrence = None;
                 let mut response = match self.app.schedule_manager().await {
-                    Ok(manager) => manager.handle(*request).await,
+                    Ok(manager) => match *request {
+                        leveler_client_protocol::schedule::ScheduleRequest::RunNow { id } => {
+                            match manager.run_now_occurrence(&id).await {
+                                Ok((response, occurrence)) => {
+                                    run_now_occurrence = Some(occurrence);
+                                    response
+                                }
+                                Err(error) => {
+                                    leveler_client_protocol::schedule::ScheduleResponse::Error {
+                                        message: error.to_string(),
+                                    }
+                                }
+                            }
+                        }
+                        other => manager.handle(other).await,
+                    },
                     Err(error) => leveler_client_protocol::schedule::ScheduleResponse::Error {
                         message: error.to_string(),
                     },
                 };
                 // Run-now is an explicit user request; leaving the slot for a
                 // later OS wake would make the button appear broken when
-                // background scheduling is off. Start the existing dispatcher
-                // command, which connects to this runtime as an ordinary local
-                // client; nothing here executes the action itself.
-                if run_now
+                // background scheduling is off. Start one dispatcher scoped to
+                // this exact slot; it claims this slot, follows the run to its
+                // terminal fact, and never consumes another schedule's due
+                // occurrence.
+                if let Some(occurrence) = run_now_occurrence
                     && let leveler_client_protocol::schedule::ScheduleResponse::Changed {
                         message,
                         ..
                     } = &mut response
                 {
-                    match spawn_schedule_dispatch(self.app.as_ref()) {
+                    match spawn_schedule_dispatch(self.app.as_ref(), occurrence.as_str()) {
                         Ok(()) => message.push_str("; the dispatcher was started"),
                         Err(error) => message.push_str(&format!(
                             "; but this process could not start the dispatcher: {error}"
@@ -9453,6 +9508,44 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                         self.notify_error(&session_id, format!("session history: {error}"));
                     }
                 }
+                Ok(())
+            }
+            ClientCommand::QueryToolOutput {
+                session_id,
+                query_id,
+                call_id,
+                index,
+                offset,
+                max_bytes,
+            } => {
+                // The transcript is the authority for what the model actually
+                // received. A result the runtime never persisted has no full
+                // text to serve, and the answer says so instead of inventing
+                // an empty one.
+                let db = self
+                    .app
+                    .open_database()
+                    .await
+                    .map_err(|error| ClientError::Runtime(error.to_string()))?;
+                let stored = crate::tool_output::stored_result(&db, &session_id, &call_id)
+                    .await
+                    .map_err(|error| ClientError::Runtime(error.to_string()))?;
+                let store = crate::tool_output::artifact_store(&self.app);
+                let output = crate::tool_output::project(
+                    &call_id,
+                    stored.as_ref(),
+                    index,
+                    offset,
+                    max_bytes,
+                    &store,
+                );
+                let _ = self
+                    .events_for(&session_id)
+                    .send(RuntimeEvent::ToolOutputLoaded {
+                        query_id,
+                        session_id: session_id.clone(),
+                        output,
+                    });
                 Ok(())
             }
             ClientCommand::ListAgents {
@@ -12937,14 +13030,15 @@ compatibility: { synthesize_tool_call_ids: true, drop_unsupported_fields: true }
     }
 }
 
-/// Start the existing short-lived dispatch command for an explicit run-now.
+/// Start the short-lived dispatcher for one explicit run-now slot.
 ///
-/// The action itself is still claimed and executed by the dispatcher through
-/// this runtime; the child only performs one due pass, exactly as an OS wake
-/// would. Its output is discarded because a run's observed outcome belongs to
-/// the schedule store, never to an unobserved pipe.
-fn spawn_schedule_dispatch(app: &Application) -> Result<(), String> {
-    crate::schedule_tools::dispatch_trigger(&app.layout)()
+/// The action is still claimed and executed by the shared dispatcher through
+/// this runtime. The child claims only the named occurrence, follows that run
+/// to its terminal fact, and exits; it never performs a generic due pass. Its
+/// output is discarded because a run's observed outcome belongs to the
+/// schedule store, never to an unobserved pipe.
+fn spawn_schedule_dispatch(app: &Application, occurrence: &str) -> Result<(), String> {
+    crate::schedule_tools::dispatch_trigger(&app.layout)(occurrence)
 }
 
 #[cfg(test)]

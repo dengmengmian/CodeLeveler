@@ -71,10 +71,16 @@ pub mod settings;
 mod skills;
 mod snapshot;
 mod terminal;
+/// Read-only paging of a tool call's full recorded output.
+pub mod tool_output;
 /// Durable usage reporting: the runtime's own model-call ledger, projected.
 mod usage;
 mod version;
 pub use terminal::{TerminalOperation, TerminalRequest, TerminalState};
+pub use tool_output::{
+    TOOL_OUTPUT_PAGE_DEFAULT_BYTES, TOOL_OUTPUT_PAGE_MAX_BYTES, UiToolOutput, UiToolOutputPart,
+    UiToolOutputReference, UiToolOutputState, UiToolOutputUnavailable,
+};
 mod wire_types;
 
 pub use agents::{

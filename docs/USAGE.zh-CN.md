@@ -125,7 +125,7 @@ leveler schedule add --name nightly --command "cargo test" --daily 02:00 --timez
 
 无人值守的运行需要 `--grant-unattended`；动作会向工作区外发送或修改内容时，再加 `--allow-external-side-effects`。修改动作、工作区、触发器、权限模式或该选择会使授权失效：用 `leveler schedule grant <id> [--allow-external-side-effects]` 为新身份重新授权。Full 权限不能替代授权。
 
-`leveler schedule list|show|update|runs|pause|resume|run-now|cancel|remove` 查看和管理定义。`leveler schedule dispatch` 执行一轮；加 `--wait` 会继续观察已经交出的运行直到终态，不会派发后续时刻的任务或开启系统唤醒；`leveler schedule serve` 在前台持续调度。macOS 上 `leveler schedule enable` 注册 launchd agent，Windows 上注册当前用户的 Task Scheduler 任务；`disable` 与 `uninstall` 移除注册，`status` 与 `wakeups` 报告注册，`doctor` 列出诊断项。Linux 没有唤醒后端，会如实报告；可用 `serve` 或由系统调度器调用 `dispatch`。
+`leveler schedule list|show|update|runs|pause|resume|run-now|cancel|remove` 查看和管理定义。`leveler schedule dispatch` 执行一轮；`--occurrence <id> --follow` 只执行该 run-now 槽位并观察其终态，不会占用其它到期任务，且 `--follow` 必须配合 `--occurrence`；`leveler schedule serve` 在前台持续调度。macOS 上 `leveler schedule enable` 注册 launchd agent，Windows 上注册当前用户的 Task Scheduler 任务；`disable` 与 `uninstall` 移除注册，`status` 与 `wakeups` 报告注册，`doctor` 列出诊断项。Linux 没有唤醒后端，会如实报告；可用 `serve` 或由系统调度器调用 `dispatch`。
 
 TUI 中用 `/schedules` 打开定义列表、详情和编辑表单。Agent 通过 `schedule_inspect` 与 `schedule_manage` 工具执行同样的操作。
 

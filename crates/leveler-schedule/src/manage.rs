@@ -5,7 +5,9 @@
 //! authority and projects the result into the protocol's view types; it never
 //! keeps a second list, parses human CLI output, or runs the scheduler itself.
 //! A `RunNow` request only creates the explicit slot the existing dispatcher
-//! claims, so no entry point becomes a second execution authority.
+//! claims; [`ScheduleManager::run_now_occurrence`] additionally returns that
+//! slot's identity so an in-process surface can ask a dispatcher to claim
+//! exactly it, never an unrelated due slot.
 //!
 //! Timezone rules are real IANA zones: a calendar trigger that omits one uses
 //! the host's current wall-clock zone, never a UTC assumption.
@@ -23,10 +25,10 @@ use leveler_client_protocol::schedule::{
 use leveler_client_protocol::{ModelRef, PermissionProfile};
 
 use crate::{
-    DefinitionUpdate, LocalTime, MisfirePolicy, NewScheduleDefinition, Occurrence, OverlapPolicy,
-    RunState, ScheduleAction, ScheduleDefinition, ScheduleError, ScheduleId, ScheduleRun,
-    ScheduleStore, ScheduleTrigger, SessionPolicy, UnattendedRequest, WeekdaySet, host_timezone,
-    parse_cron, parse_timezone, wakeup,
+    DefinitionUpdate, LocalTime, MisfirePolicy, NewScheduleDefinition, Occurrence, OccurrenceId,
+    OverlapPolicy, RunState, ScheduleAction, ScheduleDefinition, ScheduleError, ScheduleId,
+    ScheduleRun, ScheduleStore, ScheduleTrigger, SessionPolicy, UnattendedRequest, WeekdaySet,
+    host_timezone, parse_cron, parse_timezone, wakeup,
 };
 
 /// Longest identifier accepted from a client. Generated ids are UUIDs; the
@@ -321,17 +323,33 @@ impl ScheduleManager {
     }
 
     async fn run_now(&self, id: &str) -> Result<ScheduleResponse, ScheduleError> {
+        Ok(self.run_now_occurrence(id).await?.0)
+    }
+
+    /// Queue one explicit run-now slot and return its identity.
+    ///
+    /// The response is the same one every client receives. The identity is for
+    /// an in-process caller that immediately starts a dispatcher: passing it
+    /// back makes the manual path claim exactly this slot instead of letting a
+    /// generic pass consume an unrelated overdue occurrence first.
+    pub async fn run_now_occurrence(
+        &self,
+        id: &str,
+    ) -> Result<(ScheduleResponse, OccurrenceId), ScheduleError> {
         let id = parse_id(id)?;
         let definition = self.load(&id).await?;
         let occurrence = self.store.create_run_now(&definition).await?;
-        Ok(ScheduleResponse::Changed {
-            schedule: Some(self.view(&definition).await?),
-            message: format!(
-                "run-now slot {} queued at {}; the existing dispatcher executes it",
-                occurrence.id,
-                render_time(occurrence.scheduled_for)
-            ),
-        })
+        Ok((
+            ScheduleResponse::Changed {
+                schedule: Some(self.view(&definition).await?),
+                message: format!(
+                    "run-now slot {} queued at {}; the existing dispatcher executes it",
+                    occurrence.id,
+                    render_time(occurrence.scheduled_for)
+                ),
+            },
+            occurrence.id,
+        ))
     }
 
     async fn cancel(&self, id: &str) -> Result<ScheduleResponse, ScheduleError> {

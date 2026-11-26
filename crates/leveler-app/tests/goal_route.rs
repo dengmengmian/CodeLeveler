@@ -658,6 +658,106 @@ async fn a_yielded_window_is_continued_by_the_runtime_without_a_user_message() {
     );
 }
 
+/// A model that only ever yields must not keep the runtime opening empty
+/// windows forever. Two consecutive windows that executed no work stop the
+/// automatic continuation: the goal still owes its work, the last window's
+/// durable terminal is `yielded`, and no completion or failure is fabricated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn yielded_windows_without_work_stop_automatic_continuation() {
+    let f = fixture(
+        // One scripted response repeated for every window: the model can only
+        // ever call update_goal(yield). Nothing else in the window runs.
+        vec![yielded_turn("没有可执行的工作，下一窗口继续。")],
+        leveler_agent::CollaborationMode::Goal,
+    )
+    .await;
+    let runtime = client(&f);
+    let mut rx = runtime.subscribe();
+
+    runtime
+        .send(ClientCommand::SubmitMessage {
+            session_id: f.session.clone(),
+            content: OBJECTIVE.to_string(),
+            attachments: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    // Two windows exist; the second one trips the no-work guard.
+    settled(&f, 2).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut yielded_windows = 0u32;
+    let mut completed_terminals = 0u32;
+    let mut stop = None;
+    while tokio::time::Instant::now() < deadline {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(left, rx.recv()).await {
+            Ok(Ok(leveler_client_protocol::RuntimeEvent::GoalContinuationStopped {
+                consecutive_windows_without_work,
+            })) => {
+                stop = Some(consecutive_windows_without_work);
+                break;
+            }
+            Ok(Ok(leveler_client_protocol::RuntimeEvent::TurnYielded { .. })) => {
+                yielded_windows += 1;
+            }
+            Ok(Ok(
+                leveler_client_protocol::RuntimeEvent::TurnCompleted
+                | leveler_client_protocol::RuntimeEvent::TurnAnswered
+                | leveler_client_protocol::RuntimeEvent::TurnIncomplete { .. }
+                | leveler_client_protocol::RuntimeEvent::TurnFailed { .. },
+            )) => completed_terminals += 1,
+            Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+            Err(_) => break,
+        }
+    }
+
+    assert_eq!(
+        stop,
+        Some(2),
+        "the runtime stops automatic continuation after two empty windows"
+    );
+    assert_eq!(
+        yielded_windows, 2,
+        "each empty window publishes its own yielded terminal"
+    );
+    assert_eq!(
+        completed_terminals, 0,
+        "an empty window is never completion or failure"
+    );
+    assert_eq!(
+        f.server.request_count(),
+        2,
+        "no third window was opened: the model was not asked again"
+    );
+    let goals = goals(&f).await;
+    assert_eq!(goals.len(), 1, "one goal, never duplicated: {goals:?}");
+    assert_eq!(goals[0].objective, OBJECTIVE);
+    assert_eq!(
+        goals[0].state,
+        GoalState::Running,
+        "the goal still owes its work and stays resumable"
+    );
+    assert_eq!(
+        goals[0].windows_run, 2,
+        "exactly the windows that ran are counted: {goals:?}"
+    );
+    let db = f.app.open_database().await.unwrap();
+    let turns = TurnRepository::new(&db).list(&f.session).await.unwrap();
+    assert_eq!(turns.len(), 2, "one durable turn row per window: {turns:?}");
+    assert!(
+        turns.iter().all(|turn| turn.status != "running"),
+        "the logical turn is no longer running: {turns:?}"
+    );
+    assert_eq!(
+        user_input_count(&f).await,
+        1,
+        "every continuation window was the runtime's, not the user's"
+    );
+}
+
 #[cfg(unix)]
 fn os_process_exists(pid: u32) -> bool {
     std::process::Command::new("kill")

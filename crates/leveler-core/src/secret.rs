@@ -219,19 +219,29 @@ fn is_target_path_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-' | b'/' | b'\\')
 }
 
-/// Every dotenv target the user's own text names.
+/// One dotenv target or field name and the byte range where the user's own
+/// text mentioned it. The range addresses the original text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DotenvMention {
+    /// Normalized target (`apps/web/.env`) or dotenv field name.
+    pub value: String,
+    /// Inclusive byte offset of the mention.
+    pub start: usize,
+    /// Exclusive byte offset of the mention.
+    pub end: usize,
+}
+
+/// Every dotenv target the user's own text names, with its position.
 ///
-/// This is the authorization source for a captured credential's write target:
-/// a message that says "configure this in `.env`" lets the broker write that
-/// reference to `.env`, and nowhere else. It deliberately does not parse
-/// natural language — it extracts path-shaped tokens whose file name is a
-/// dotenv file. A message that names no target authorizes none.
-pub fn dotenv_targets_in(text: &str) -> Vec<String> {
+/// Positions let the admission layer bind a target to the one reference that
+/// shares its clause, instead of granting every named target to every captured
+/// reference in the message.
+pub fn dotenv_target_mentions(text: &str) -> Vec<DotenvMention> {
     if text.is_empty() {
         return Vec::new();
     }
     let bytes = text.as_bytes();
-    let mut targets = std::collections::BTreeSet::new();
+    let mut mentions = Vec::new();
     let mut cursor = 0usize;
     while let Some(relative) = text[cursor..].find(".env") {
         let hit = cursor + relative;
@@ -244,12 +254,31 @@ pub fn dotenv_targets_in(text: &str) -> Vec<String> {
             end += 1;
         }
         if let Some(target) = normalize_dotenv_target(&text[start..end]) {
-            targets.insert(target);
+            mentions.push(DotenvMention {
+                value: target,
+                start,
+                end,
+            });
         }
-        if targets.len() >= 16 {
+        if mentions.len() >= 64 {
             break;
         }
         cursor = end.max(hit + 1);
+    }
+    mentions
+}
+
+/// Every distinct dotenv target the user's own text names.
+///
+/// This is only a summary. Authorization binds per reference; see
+/// [`dotenv_use_declarations`].
+pub fn dotenv_targets_in(text: &str) -> Vec<String> {
+    let mut targets = std::collections::BTreeSet::new();
+    for mention in dotenv_target_mentions(text) {
+        targets.insert(mention.value);
+        if targets.len() >= 16 {
+            break;
+        }
     }
     targets.into_iter().collect()
 }
@@ -267,17 +296,18 @@ fn is_dotenv_field_name(name: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// Every dotenv field the user's own text assigns (`NAME=`).
+/// Every dotenv field the user's own text assigns (`NAME=`), with its
+/// position.
 ///
 /// Only explicit assignment syntax counts. A label in prose ("password: …")
 /// is not reliably the environment variable name the user wants, so it is not
 /// turned into a field authorization.
-pub fn dotenv_fields_in(text: &str) -> Vec<String> {
+pub fn dotenv_field_mentions(text: &str) -> Vec<DotenvMention> {
     if text.is_empty() {
         return Vec::new();
     }
     let bytes = text.as_bytes();
-    let mut fields = std::collections::BTreeSet::new();
+    let mut mentions = Vec::new();
     for (index, byte) in bytes.iter().enumerate() {
         if *byte != b'=' {
             continue;
@@ -307,13 +337,314 @@ pub fn dotenv_fields_in(text: &str) -> Vec<String> {
         }
         let name = &text[start..end];
         if is_dotenv_field_name(name) {
-            fields.insert(name.to_string());
-            if fields.len() >= 16 {
+            mentions.push(DotenvMention {
+                value: name.to_string(),
+                start,
+                end,
+            });
+            if mentions.len() >= 64 {
                 break;
             }
         }
     }
+    mentions
+}
+
+/// Every distinct dotenv field the user's own text assigns (`NAME=`).
+pub fn dotenv_fields_in(text: &str) -> Vec<String> {
+    let mut fields = std::collections::BTreeSet::new();
+    for mention in dotenv_field_mentions(text) {
+        fields.insert(mention.value);
+        if fields.len() >= 16 {
+            break;
+        }
+    }
     fields.into_iter().collect()
+}
+
+/// The uses the user's own message declares for one captured reference.
+///
+/// This is authorization data, not a detection result. `targets` and `fields`
+/// contain only names structurally attributable to this reference; the model
+/// may use those dimensions exactly as declared. `denied_targets` and
+/// `denied_fields` are explicit prohibitions and are enforced in every
+/// permission mode, including Full. `ambiguous` means the message named a
+/// target or field it could not attribute to a specific reference — an
+/// unbound choice must then be confirmed instead of guessed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DotenvUseDeclaration {
+    /// Targets in this reference's own clause, excluding prohibited ones.
+    pub targets: Vec<String>,
+    /// Fields in this reference's own clause, excluding prohibited ones.
+    pub fields: Vec<String>,
+    /// Targets the user explicitly prohibited for this reference.
+    pub denied_targets: Vec<String>,
+    /// Fields the user explicitly prohibited for this reference.
+    pub denied_fields: Vec<String>,
+    /// A positive mention could not be attributed to this reference.
+    pub ambiguous: bool,
+}
+
+/// How the user's own text scopes each captured reference it mentions.
+///
+/// The rules are structural and deliberately conservative:
+///
+/// * A target or field in the same clause as exactly one reference is bound
+///   to that reference.
+/// * When the whole message mentions exactly one reference, a target or field
+///   in another clause is still unambiguous and is bound to it.
+/// * A mention shared by several references, or a positive mention in a
+///   multi-reference message that sits in no reference's clause, makes those
+///   references ambiguous. It grants nothing: the exact use must be confirmed.
+/// * A clause that reads as a prohibition never grants. Its targets/fields are
+///   recorded as denied; a prohibition outside every reference's clause denies
+///   them for all references.
+///
+/// Values are deduplicated, sorted, and a denial always wins over a positive
+/// mention of the same name.
+pub fn dotenv_use_declarations(text: &str) -> Vec<(String, DotenvUseDeclaration)> {
+    let references = secret_reference_mentions(text);
+    if references.is_empty() {
+        return Vec::new();
+    }
+    let targets = dotenv_target_mentions(text);
+    let fields = dotenv_field_mentions(text);
+    let clauses = dotenv_clauses(text);
+
+    let mut names: Vec<String> = Vec::new();
+    for (name, _, _) in &references {
+        if !names.contains(name) {
+            names.push(name.clone());
+        }
+    }
+    let single_reference = names.len() == 1;
+    let mut declarations: std::collections::BTreeMap<String, DotenvUseDeclaration> = names
+        .iter()
+        .cloned()
+        .map(|name| (name, DotenvUseDeclaration::default()))
+        .collect();
+    let mut globally_denied_targets = std::collections::BTreeSet::new();
+    let mut globally_denied_fields = std::collections::BTreeSet::new();
+
+    for range in clauses {
+        let clause = &text[range.clone()];
+        let clause_refs: Vec<String> = names
+            .iter()
+            .filter(|name| {
+                references
+                    .iter()
+                    .any(|(candidate, start, _)| candidate == *name && range.contains(start))
+            })
+            .cloned()
+            .collect();
+        let clause_targets: Vec<&DotenvMention> = targets
+            .iter()
+            .filter(|mention| range.contains(&mention.start))
+            .collect();
+        let clause_fields: Vec<&DotenvMention> = fields
+            .iter()
+            .filter(|mention| range.contains(&mention.start))
+            .collect();
+        let prohibited = clause_prohibits(clause);
+
+        if clause_refs.is_empty() {
+            if prohibited {
+                globally_denied_targets
+                    .extend(clause_targets.iter().map(|mention| mention.value.clone()));
+                globally_denied_fields
+                    .extend(clause_fields.iter().map(|mention| mention.value.clone()));
+            } else if single_reference {
+                let declaration = declarations
+                    .get_mut(&names[0])
+                    .expect("the only reference was inserted");
+                declaration
+                    .targets
+                    .extend(clause_targets.iter().map(|mention| mention.value.clone()));
+                declaration
+                    .fields
+                    .extend(clause_fields.iter().map(|mention| mention.value.clone()));
+            } else if !clause_targets.is_empty() || !clause_fields.is_empty() {
+                for name in &names {
+                    if let Some(declaration) = declarations.get_mut(name) {
+                        declaration.ambiguous = true;
+                    }
+                }
+            }
+            continue;
+        }
+
+        if prohibited {
+            for name in &clause_refs {
+                if let Some(declaration) = declarations.get_mut(name) {
+                    declaration
+                        .denied_targets
+                        .extend(clause_targets.iter().map(|mention| mention.value.clone()));
+                    declaration
+                        .denied_fields
+                        .extend(clause_fields.iter().map(|mention| mention.value.clone()));
+                }
+            }
+        } else if clause_refs.len() == 1 {
+            if let Some(declaration) = declarations.get_mut(&clause_refs[0]) {
+                declaration
+                    .targets
+                    .extend(clause_targets.iter().map(|mention| mention.value.clone()));
+                declaration
+                    .fields
+                    .extend(clause_fields.iter().map(|mention| mention.value.clone()));
+            }
+        } else if !clause_targets.is_empty() || !clause_fields.is_empty() {
+            for name in &clause_refs {
+                if let Some(declaration) = declarations.get_mut(name) {
+                    declaration.ambiguous = true;
+                }
+            }
+        }
+    }
+
+    for declaration in declarations.values_mut() {
+        declaration
+            .denied_targets
+            .extend(globally_denied_targets.iter().cloned());
+        declaration
+            .denied_fields
+            .extend(globally_denied_fields.iter().cloned());
+        sort_and_deduplicate(&mut declaration.targets);
+        sort_and_deduplicate(&mut declaration.fields);
+        sort_and_deduplicate(&mut declaration.denied_targets);
+        sort_and_deduplicate(&mut declaration.denied_fields);
+        declaration
+            .targets
+            .retain(|target| !declaration.denied_targets.contains(target));
+        declaration
+            .fields
+            .retain(|field| !declaration.denied_fields.contains(field));
+        declaration.targets.truncate(32);
+        declaration.fields.truncate(32);
+        declaration.denied_targets.truncate(32);
+        declaration.denied_fields.truncate(32);
+    }
+
+    names
+        .into_iter()
+        .map(|name| {
+            let declaration = declarations.remove(&name).unwrap_or_default();
+            (name, declaration)
+        })
+        .collect()
+}
+
+fn sort_and_deduplicate(values: &mut Vec<String>) {
+    values.sort();
+    values.dedup();
+}
+
+/// Byte ranges of the clauses a scope declaration is read from. Newlines,
+/// sentence punctuation and commas separate clauses. ASCII `.` is deliberately
+/// not a boundary: it is part of `.env` and `.env.production`.
+fn dotenv_clauses(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    for (index, character) in text.char_indices() {
+        if matches!(
+            character,
+            '\n' | '。' | '！' | '？' | '；' | '，' | '!' | '?' | ';' | ','
+        ) {
+            if index > start {
+                ranges.push(start..index);
+            }
+            start = index + character.len_utf8();
+        }
+    }
+    if start < text.len() {
+        ranges.push(start..text.len());
+    }
+    ranges
+}
+
+/// Every `[secret:sec_…]` token in `text` as `(reference, start, end)`.
+fn secret_reference_mentions(text: &str) -> Vec<(String, usize, usize)> {
+    let mut mentions = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(relative) = text[cursor..].find("[secret:") {
+        let start = cursor + relative;
+        let Some(close) = text[start..].find(']') else {
+            break;
+        };
+        let end = start + close + 1;
+        if let Some(reference) = parse_secret_reference_token(&text[start..end]) {
+            mentions.push((reference.to_string(), start, end));
+        }
+        cursor = end;
+        if cursor >= text.len() {
+            break;
+        }
+    }
+    mentions
+}
+
+/// Cues that mark a clause as an explicit prohibition. These are used only to
+/// withhold or deny authorization, never to grant it: a false positive makes
+/// the broker ask or refuse, while a false negative would widen authority.
+const PROHIBITION_CUES: &[&str] = &[
+    "不要",
+    "不需",
+    "不必",
+    "禁止",
+    "严禁",
+    "不得",
+    "不准",
+    "不可",
+    "不能",
+    "切勿",
+    "勿",
+    "避免",
+    "无需",
+    "不用",
+    "除了",
+    "除外",
+    "do not",
+    "don't",
+    "dont",
+    "never",
+    "must not",
+    "mustn't",
+    "should not",
+    "shouldn't",
+    "cannot",
+    "can't",
+    "avoid",
+    "without",
+    "except",
+    "not",
+    "no need",
+    "need not",
+    "not needed",
+    "skip",
+];
+
+/// Whether the clause reads as a prohibition.
+fn clause_prohibits(clause: &str) -> bool {
+    let lower = clause.to_ascii_lowercase();
+    // "Don't forget to write .env" is a positive instruction, not a denial.
+    let neutral = lower
+        .replace("do not forget", "")
+        .replace("don't forget", "")
+        .replace("dont forget", "")
+        .replace("不要忘记", "")
+        .replace("不要忘了", "");
+    PROHIBITION_CUES.iter().any(|cue| {
+        if cue.is_ascii() {
+            neutral.match_indices(cue).any(|(index, _)| {
+                let before = neutral[..index].chars().next_back();
+                let after = neutral[index + cue.len()..].chars().next();
+                before.is_none_or(|character| !character.is_ascii_alphanumeric())
+                    && after.is_none_or(|character| !character.is_ascii_alphanumeric())
+            })
+        } else {
+            neutral.contains(cue)
+        }
+    })
 }
 
 /// Detect credential candidates in text a person typed.
@@ -2670,5 +3001,192 @@ mod tests {
         ] {
             assert!(dotenv_fields_in(text).is_empty(), "{text}");
         }
+    }
+
+    #[test]
+    fn dotenv_use_is_bound_to_the_reference_that_shares_its_clause() {
+        let a = "sec_00000000000000000000000000000001";
+        let b = "sec_00000000000000000000000000000002";
+        let text = format!("A_KEY=[secret:{a}] 写到 .env\nB_KEY=[secret:{b}] 写到 .env.production");
+        let declarations = dotenv_use_declarations(&text);
+        let by_name: std::collections::BTreeMap<_, _> = declarations.into_iter().collect();
+        assert_eq!(by_name[a].targets, vec![".env".to_string()]);
+        assert_eq!(by_name[a].fields, vec!["A_KEY".to_string()]);
+        assert_eq!(by_name[b].targets, vec![".env.production".to_string()]);
+        assert_eq!(by_name[b].fields, vec!["B_KEY".to_string()]);
+        assert!(!by_name[a].ambiguous);
+        assert!(!by_name[b].ambiguous);
+    }
+
+    #[test]
+    fn a_single_capture_may_name_its_target_in_another_clause() {
+        let reference = "sec_00000000000000000000000000000003";
+        let text =
+            format!("这是测试 Key：\n\nDEMO_KEY=[secret:{reference}]\n\n请把上面的值配置到 .env。");
+        let declarations = dotenv_use_declarations(&text);
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(declarations[0].1.targets, vec![".env".to_string()]);
+        assert_eq!(declarations[0].1.fields, vec!["DEMO_KEY".to_string()]);
+        assert!(!declarations[0].1.ambiguous);
+    }
+
+    #[test]
+    fn several_references_do_not_share_an_unattributed_target() {
+        let a = "sec_00000000000000000000000000000004";
+        let b = "sec_00000000000000000000000000000005";
+        let text = format!(
+            "这是两个测试 Key：\n\nSERVICE_A_KEY=[secret:{a}]\nSERVICE_B_KEY=[secret:{b}]\n\n\
+             只把 A 配置到 .env。\n不要修改 .env.production。"
+        );
+        let declarations = dotenv_use_declarations(&text);
+        assert_eq!(declarations.len(), 2);
+        for (_, declaration) in &declarations {
+            assert!(
+                declaration.targets.is_empty(),
+                "an unattributed target must not be granted: {declaration:?}"
+            );
+            assert!(
+                declaration.ambiguous,
+                "the mapping must be marked ambiguous: {declaration:?}"
+            );
+            assert!(
+                declaration
+                    .denied_targets
+                    .contains(&".env.production".to_string()),
+                "the explicit prohibition applies to every captured reference: {declaration:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_prohibition_never_grants_and_denial_wins() {
+        let reference = "sec_00000000000000000000000000000006";
+        let text = format!(
+            "把 [secret:{reference}] 写到 .env 和 .env.production，但不要修改 .env.production"
+        );
+        let declarations = dotenv_use_declarations(&text);
+        let declaration = &declarations[0].1;
+        assert_eq!(declaration.targets, vec![".env".to_string()]);
+        assert_eq!(
+            declaration.denied_targets,
+            vec![".env.production".to_string()]
+        );
+
+        let only_denied = format!("不要修改 .env.production，[secret:{reference}] 在这里");
+        let declaration = &dotenv_use_declarations(&only_denied)[0].1;
+        assert!(declaration.targets.is_empty(), "{declaration:?}");
+        assert_eq!(
+            declaration.denied_targets,
+            vec![".env.production".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_target_shared_by_two_references_is_ambiguous_not_a_cartesian_grant() {
+        let a = "sec_00000000000000000000000000000007";
+        let b = "sec_00000000000000000000000000000008";
+        let text = format!("A=[secret:{a}] B=[secret:{b}]，都写到 .env");
+        let declarations = dotenv_use_declarations(&text);
+        assert_eq!(declarations.len(), 2);
+        for (_, declaration) in &declarations {
+            assert!(declaration.targets.is_empty(), "{declaration:?}");
+            assert!(declaration.ambiguous, "{declaration:?}");
+        }
+    }
+
+    #[test]
+    fn one_capture_may_declare_two_targets_explicitly() {
+        let reference = "sec_00000000000000000000000000000009";
+        let text = format!("把 [secret:{reference}] 同时写到 .env 和 .env.local");
+        let declaration = &dotenv_use_declarations(&text)[0].1;
+        assert_eq!(
+            declaration.targets,
+            vec![".env".to_string(), ".env.local".to_string()]
+        );
+        assert!(!declaration.ambiguous);
+    }
+
+    #[test]
+    fn fields_are_bound_per_reference_like_targets() {
+        let a = "sec_0000000000000000000000000000000a";
+        let b = "sec_0000000000000000000000000000000b";
+        let text = format!("A_KEY=[secret:{a}] 写到 .env\nB_KEY=[secret:{b}] 写到 .env");
+        let declarations = dotenv_use_declarations(&text);
+        let by_name: std::collections::BTreeMap<_, _> = declarations.into_iter().collect();
+        assert_eq!(by_name[a].fields, vec!["A_KEY".to_string()]);
+        assert_eq!(by_name[b].fields, vec!["B_KEY".to_string()]);
+        assert_eq!(by_name[a].targets, vec![".env".to_string()]);
+        assert_eq!(by_name[b].targets, vec![".env".to_string()]);
+        assert!(!by_name[a].ambiguous);
+        assert!(!by_name[b].ambiguous);
+
+        let shared = format!("A_KEY=[secret:{a}] B_KEY=[secret:{b}] 写到 .env");
+        for (_, declaration) in dotenv_use_declarations(&shared) {
+            assert!(declaration.fields.is_empty(), "{declaration:?}");
+            assert!(declaration.ambiguous, "{declaration:?}");
+        }
+    }
+
+    #[test]
+    fn two_references_may_be_bound_to_different_targets_and_fields() {
+        let a = "sec_0000000000000000000000000000000d";
+        let b = "sec_0000000000000000000000000000000e";
+        let text = format!(
+            "SERVICE_A_KEY=[secret:{a}] 只写到 .env\n\
+             SERVICE_B_KEY=[secret:{b}] 只写到 .env.production\n\
+             不要修改 .env.local"
+        );
+        let by_name: std::collections::BTreeMap<_, _> =
+            dotenv_use_declarations(&text).into_iter().collect();
+        assert_eq!(by_name[a].targets, vec![".env".to_string()]);
+        assert_eq!(by_name[a].fields, vec!["SERVICE_A_KEY".to_string()]);
+        assert_eq!(by_name[b].targets, vec![".env.production".to_string()]);
+        assert_eq!(by_name[b].fields, vec!["SERVICE_B_KEY".to_string()]);
+        for name in [a, b] {
+            assert!(
+                by_name[name]
+                    .denied_targets
+                    .contains(&".env.local".to_string()),
+                "{:?}",
+                by_name[name]
+            );
+            assert!(!by_name[name].ambiguous, "{:?}", by_name[name]);
+        }
+    }
+
+    #[test]
+    fn a_positive_reminder_is_not_a_prohibition() {
+        let reference = "sec_0000000000000000000000000000000c";
+        let text = format!("不要忘记把 DEMO_KEY=[secret:{reference}] 写到 .env");
+        let declaration = &dotenv_use_declarations(&text)[0].1;
+        assert_eq!(declaration.targets, vec![".env".to_string()]);
+        assert_eq!(declaration.fields, vec!["DEMO_KEY".to_string()]);
+        assert!(declaration.denied_targets.is_empty());
+    }
+
+    #[test]
+    fn a_negative_instruction_without_a_slash_word_is_still_a_prohibition() {
+        let reference = "sec_0000000000000000000000000000000f";
+        let english =
+            format!("No need to touch .env.production。把 [secret:{reference}] 写到 .env");
+        let declaration = &dotenv_use_declarations(&english)[0].1;
+        assert_eq!(declaration.targets, vec![".env".to_string()]);
+        assert_eq!(
+            declaration.denied_targets,
+            vec![".env.production".to_string()]
+        );
+
+        let chinese = format!("不需要修改 .env.production，[secret:{reference}] 写到 .env");
+        let declaration = &dotenv_use_declarations(&chinese)[0].1;
+        assert_eq!(declaration.targets, vec![".env".to_string()]);
+        assert_eq!(
+            declaration.denied_targets,
+            vec![".env.production".to_string()]
+        );
+    }
+
+    #[test]
+    fn text_without_a_reference_declares_nothing() {
+        assert!(dotenv_use_declarations("把 DEMO_KEY=abc 写到 .env").is_empty());
     }
 }

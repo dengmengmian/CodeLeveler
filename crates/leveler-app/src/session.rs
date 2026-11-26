@@ -332,6 +332,19 @@ fn report_to_result(report: TaskReport) -> Result<AgentOutcome, AppError> {
 /// next message is a new authorization with its own budget.
 pub(crate) const MAX_GOAL_RECOVERY_ATTEMPTS: u32 = 3;
 
+/// Consecutive yielded Goal work windows that may execute no work at all
+/// before the runtime stops continuing the goal on its own.
+///
+/// A yielded window is continued with no user message, so an endless stream of
+/// empty windows is a model↔runtime loop with no new information: the next
+/// window's context is the same objective plus the previous window's note. The
+/// input is binary (a window either executed a tool or did not), which is the
+/// same shape as [`leveler_lifecycle::ProgressCaps::no_progress_rounds`]. The
+/// cap is not a task budget: any window that actually acts resets it, a goal
+/// that still owes work keeps it (the user can continue), and configured
+/// resource limits remain the authority on spend.
+pub(crate) const MAX_GOAL_WINDOWS_WITHOUT_WORK: u32 = 2;
+
 impl Application {
     /// Whether this session currently owes an unambiguous goal that may be
     /// continued automatically.
