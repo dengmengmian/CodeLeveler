@@ -8,10 +8,20 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use leveler_client_protocol::{ClientCommand, InteractiveRuntimeClient};
+use leveler_execution::execution_host::{ExecutionHostClient, ExecutionHostConfig};
+use leveler_execution::{BackgroundTaskLifetime, ProcessRequest};
 use leveler_local_transport::{
     CreateSessionRequest, LocalRuntimeService, LocalSocketRuntimeClient,
 };
 use leveler_test_support::{ManagedChild, MockResponse, MockServer};
+
+/// The product binary under test. Cross-host acceptance runs override this
+/// with `LEVELER_TEST_BIN`; normal `cargo test` uses the binary Cargo built.
+fn leveler_binary() -> PathBuf {
+    std::env::var_os("LEVELER_TEST_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_leveler")))
+}
 
 struct Environment {
     _temp: tempfile::TempDir,
@@ -85,7 +95,7 @@ compatibility:
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_leveler"));
+        let mut command = Command::new(leveler_binary());
         command
             .arg("--repo")
             .arg(&self.repo)
@@ -348,7 +358,7 @@ impl Drop for HostCleanup {
     fn drop(&mut self) {
         // Ask the actual owner to stop every test task before terminating the
         // independent host. Killing the host alone cannot prove tree cleanup.
-        let mut inventory = Command::new(env!("CARGO_BIN_EXE_leveler"));
+        let mut inventory = Command::new(leveler_binary());
         inventory
             .arg("--repo")
             .arg(&self.repo)
@@ -366,7 +376,7 @@ impl Drop for HostCleanup {
                     .or_else(|| task.get("snapshot").and_then(|v| v.get("id")))
                     .and_then(|v| v.as_str());
                 if let Some(id) = id {
-                    let _ = Command::new(env!("CARGO_BIN_EXE_leveler"))
+                    let _ = Command::new(leveler_binary())
                         .arg("--repo")
                         .arg(&self.repo)
                         .args(["background", "stop", id])
@@ -694,7 +704,7 @@ fn execution_host_sigkill_reports_unknown_and_does_not_adopt_or_signal_services(
             let config = leveler_execution::execution_host::ExecutionHostConfig {
                 state_dir: host_state.clone(),
                 repo_root: std::fs::canonicalize(&env.repo).unwrap(),
-                executable: PathBuf::from(env!("CARGO_BIN_EXE_leveler")),
+                executable: leveler_binary(),
             };
             // Recovery reads the real OS evidence, not the archive: the
             // service is still there, so its record becomes `unknown` with
@@ -868,6 +878,113 @@ fn sigterm_shuts_the_host_down_without_leaving_a_ready_file() {
                 "a stopped host must leave no ready file behind"
             );
             eprintln!("DOGFOOD PASS sigterm_pid={pid} clean_exit=true ready_removed=true");
+        },
+    );
+}
+
+/// A host reclaimed for idleness is a normal lifecycle event, not a
+/// user-visible failure. The next background spawn must discover/start a new
+/// host and admit the task without asking the user to resubmit.
+#[test]
+fn a_reaped_host_is_restarted_by_the_next_background_spawn() {
+    leveler_test_support::bounded_test(
+        "a_reaped_host_is_restarted_by_the_next_background_spawn",
+        Duration::from_secs(90),
+        || async {
+            let env = Environment::new("http://127.0.0.1:1");
+            let state = env.home.join("host-state");
+            let config = ExecutionHostConfig {
+                state_dir: state.clone(),
+                // The host publishes the canonical path; a symlinked temp root
+                // would otherwise fail the endpoint's repository check.
+                repo_root: std::fs::canonicalize(&env.repo).unwrap(),
+                executable: leveler_binary(),
+            };
+            let _cleanup = HostCleanup {
+                state: state.clone(),
+                repo: env.repo.clone(),
+                home: env.home.clone(),
+                config: env.config.clone(),
+            };
+            let ready = state.join("ready.json");
+            let first = ExecutionHostClient::ensure(config.clone())
+                .await
+                .expect("the first host starts on demand");
+            let first_pid: u32 = serde_json::from_slice::<serde_json::Value>(
+                &std::fs::read(&ready).expect("first readiness"),
+            )
+            .expect("valid readiness")["pid"]
+                .as_u64()
+                .expect("pid") as u32;
+            first
+                .shutdown_if_idle()
+                .await
+                .expect("an idle host accepts its own reclaim");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while ready.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the reclaimed host left an endpoint"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            // No runtime request names the host; the production spawn path must
+            // discover that it is gone and start the next generation itself.
+            let registry = leveler_execution::BackgroundTaskRegistry::default()
+                .with_execution_host(config.clone());
+            let id = registry
+                .spawn_owned_with_lifetime(
+                    ProcessRequest::new(
+                        "sh",
+                        vec!["-c".into(), "sleep 30".into()],
+                        env.repo.clone(),
+                    ),
+                    None,
+                    Some("session"),
+                    BackgroundTaskLifetime::Persistent,
+                )
+                .await
+                .expect("a reaped host is restarted, not a user error");
+            assert!(id.starts_with("host-"), "hosted identity: {id}");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !ready.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the replacement host never published readiness"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            let second_pid: u32 = serde_json::from_slice::<serde_json::Value>(
+                &std::fs::read(&ready).expect("second readiness"),
+            )
+            .expect("valid readiness")["pid"]
+                .as_u64()
+                .expect("pid") as u32;
+            assert_ne!(first_pid, second_pid, "a new host generation owns the task");
+            let client = ExecutionHostClient::connect(config)
+                .await
+                .expect("the replacement host serves the admitted task");
+            let task = client.get_owned(&id, "session").await.expect("task fact");
+            assert_eq!(
+                task.status,
+                leveler_execution::BackgroundTaskStatus::Running,
+                "{task:?}"
+            );
+            client.kill_owned(&id, "session").await.expect("task stop");
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                if let Ok(task) = client.get_owned(&id, "session").await
+                    && task.status.is_terminal()
+                {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "the task never became terminal");
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            client.shutdown_if_idle().await.ok();
+            eprintln!(
+                "DOGFOOD PASS reaped_host_pid={first_pid} replacement_host_pid={second_pid} task={id} auto_restart_no_resubmit=true"
+            );
         },
     );
 }

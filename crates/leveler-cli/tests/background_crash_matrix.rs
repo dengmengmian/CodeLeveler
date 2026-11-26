@@ -24,6 +24,14 @@ use leveler_local_transport::{CreateSessionRequest, LocalSocketRuntimeClient};
 use leveler_storage::{Database, EventStore as _};
 use leveler_test_support::{ManagedChild, MockResponse, MockServer};
 
+/// The product binary under test. Cross-host acceptance runs override this
+/// with `LEVELER_TEST_BIN`; normal `cargo test` uses the binary Cargo built.
+fn leveler_binary() -> PathBuf {
+    std::env::var_os("LEVELER_TEST_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_leveler")))
+}
+
 struct Environment {
     _temp: tempfile::TempDir,
     home: PathBuf,
@@ -94,7 +102,7 @@ compatibility:
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_leveler"));
+        let mut command = Command::new(leveler_binary());
         command
             .arg("--repo")
             .arg(&self.repo)
@@ -174,7 +182,7 @@ compatibility:
         ExecutionHostConfig {
             state_dir: self.host_state(),
             repo_root: std::fs::canonicalize(&self.repo).unwrap(),
-            executable: PathBuf::from(env!("CARGO_BIN_EXE_leveler")),
+            executable: leveler_binary(),
         }
     }
 }
@@ -266,6 +274,19 @@ fn alive(pid: u32) -> bool {
         .success()
 }
 
+/// The debug fault marker records the dying host's pid. Reading the ready
+/// file after the fault is racy now that an unknown spawn outcome triggers
+/// recovery (which removes readiness); the marker is written before death.
+fn pid_from_marker(marker: &Path) -> u32 {
+    std::fs::read_to_string(marker)
+        .expect("fault marker")
+        .split_whitespace()
+        .nth(1)
+        .expect("marker pid")
+        .parse()
+        .expect("numeric marker pid")
+}
+
 fn host_pid(state_dir: &Path) -> u32 {
     let ready: serde_json::Value =
         serde_json::from_slice(&std::fs::read(state_dir.join("ready.json")).unwrap()).unwrap();
@@ -285,6 +306,28 @@ fn find_task(tasks: &[serde_json::Value], id: &str) -> Option<serde_json::Value>
         .iter()
         .find(|task| task["snapshot"]["id"].as_str() == Some(id))
         .cloned()
+}
+
+/// A spawn intent is durable in the active file until a recovery pass archives
+/// it into the unresolved file. Both are the same fact; a test must not depend
+/// on which pass has won the race.
+fn durable_intents(state_dir: &Path) -> Vec<serde_json::Value> {
+    let read_if_present = |name: &str| {
+        let path = state_dir.join(name);
+        if path.exists() {
+            read_json(&path)
+        } else {
+            Vec::new()
+        }
+    };
+    let active = read_if_present("intents.json");
+    if !active.is_empty() {
+        return active;
+    }
+    read_if_present("intents.unresolved.json")
+        .into_iter()
+        .map(|entry| entry["intent"].clone())
+        .collect()
 }
 
 fn read_json(path: &Path) -> Vec<serde_json::Value> {
@@ -536,12 +579,12 @@ fn h1_host_crash_before_spawn_keeps_an_intent_and_never_fabricates_running() {
                 .await
                 .unwrap();
             let host_state = env.host_state();
-            let host = host_pid(&host_state);
+            let host = pid_from_marker(&marker);
             wait_until(|| Ok(!alive(host)), "the injected host death")
                 .await
                 .unwrap();
 
-            let intents = read_json(&host_state.join("intents.json"));
+            let intents = durable_intents(&host_state);
             assert_eq!(
                 intents.len(),
                 1,
@@ -644,7 +687,7 @@ fn h2_host_crash_after_spawn_before_started_never_replays_the_side_effect() {
                 .await
                 .unwrap();
             let host_state = env.host_state();
-            let host = host_pid(&host_state);
+            let host = pid_from_marker(&marker);
             wait_until(|| Ok(!alive(host)), "the injected host death")
                 .await
                 .unwrap();
@@ -669,7 +712,7 @@ fn h2_host_crash_after_spawn_before_started_never_replays_the_side_effect() {
                 .parse()
                 .unwrap();
             assert!(alive(child), "the OS spawn really happened");
-            let intents = read_json(&host_state.join("intents.json"));
+            let intents = durable_intents(&host_state);
             assert_eq!(intents.len(), 1, "{intents:?}");
             let intent_id = intents[0]["id"].as_str().unwrap().to_string();
             assert!(
@@ -925,7 +968,7 @@ fn h4_host_crash_after_exit_before_result_is_unknown_not_completed() {
                 .await
                 .unwrap();
             let host_state = env.host_state();
-            let host = host_pid(&host_state);
+            let host = pid_from_marker(&marker);
             wait_until(|| Ok(!alive(host)), "the injected host death")
                 .await
                 .unwrap();

@@ -732,9 +732,29 @@ impl leveler_runtime_host::HandoffUi for TuiHandoffUi {
             HandoffEvent::MigrationFailed { reason } => {
                 tracing::warn!(%reason, "runtime handoff could not be confirmed");
             }
-            HandoffEvent::LegacyExitRequired { block, version, pid } => eprintln!(
+            HandoffEvent::LegacyExitRequired {
+                block,
+                version,
+                pid,
+                active_turns,
+                active_background_tasks,
+                local_waiters,
+            } => eprintln!(
                 "{}",
-                legacy_exit_message(lang, block, self.workspace.as_deref(), version.as_deref(), pid)
+                legacy_exit_message(
+                    lang,
+                    block,
+                    self.workspace.as_deref(),
+                    version.as_deref(),
+                    pid,
+                    active_turns,
+                    active_background_tasks,
+                    local_waiters,
+                )
+            ),
+            HandoffEvent::LegacyRetirementRequested { version, pid } => eprintln!(
+                "{}",
+                legacy_retirement_message(lang, self.workspace.as_deref(), version.as_deref(), pid)
             ),
         }
     }
@@ -763,22 +783,15 @@ impl leveler_runtime_host::HandoffUi for TuiHandoffUi {
 }
 
 #[cfg(any(unix, windows))]
-fn legacy_exit_message(
+fn legacy_identity_lines(
     lang: HandoffLang,
-    block: leveler_runtime_host::LegacyHandoffBlock,
+    message: &mut String,
     workspace: Option<&str>,
     version: Option<&str>,
     pid: Option<u32>,
-) -> String {
+) {
     use std::fmt::Write as _;
 
-    use leveler_runtime_host::LegacyHandoffBlock;
-    let mut message = lang
-        .pick(
-            "CodeLeveler 无法安全接管旧版 Runtime",
-            "CodeLeveler cannot safely take over the previous runtime",
-        )
-        .to_string();
     if let Some(workspace) = workspace {
         let workspace = leveler_core::sanitize_terminal_output(workspace).replace('\n', " ");
         let _ = write!(
@@ -795,30 +808,164 @@ fn legacy_exit_message(
             lang.pick("旧版本：", "Previous version:")
         );
     }
+    let current = leveler_core::BuildIdentity::current().version;
+    if !current.is_empty() {
+        let _ = write!(
+            message,
+            "\n  {} {current}",
+            lang.pick("当前版本：", "Current version:")
+        );
+    }
     if let Some(pid) = pid {
         let _ = write!(message, "\n  {} {pid}", lang.pick("进程：", "PID:"));
     }
+}
+
+/// The state the old runtime reported about itself, in one line.
+///
+/// `None` for either count means the runtime did not report a populated health
+/// object; the shell then says the state is unknown rather than inventing
+/// "idle" from a defaulted zero.
+#[cfg(any(unix, windows))]
+fn legacy_reported_state(
+    lang: HandoffLang,
+    active_turns: Option<u32>,
+    active_background_tasks: Option<u32>,
+    local_waiters: Option<usize>,
+) -> String {
+    if let Some(waiters) = local_waiters
+        && waiters > 0
+    {
+        return format!(
+            "{} {waiters} {}",
+            lang.pick("仍有", "still"),
+            lang.pick("个本地界面连接该实例", "local UI(s) attached to it")
+        );
+    }
+    match (active_turns, active_background_tasks) {
+        (Some(turns), Some(tasks)) if turns > 0 || tasks > 0 => format!(
+            "{} {turns} {} · {tasks} {}",
+            lang.pick("仍有", "still"),
+            lang.pick("个轮次", "turn(s)"),
+            lang.pick("个后台任务", "background task(s)")
+        ),
+        (Some(0), Some(0)) if local_waiters == Some(0) => lang
+            .pick(
+                "实例空闲（无任务，无本地界面）",
+                "The instance is idle (no work, no local UI)",
+            )
+            .to_string(),
+        (Some(_), Some(_)) => lang
+            .pick("未报告未完成的工作", "It reports no outstanding work")
+            .to_string(),
+        _ => lang
+            .pick(
+                "无法读取旧实例的任务状态",
+                "Its work state could not be read",
+            )
+            .to_string(),
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn legacy_exit_message(
+    lang: HandoffLang,
+    block: leveler_runtime_host::LegacyHandoffBlock,
+    workspace: Option<&str>,
+    version: Option<&str>,
+    pid: Option<u32>,
+    active_turns: Option<u32>,
+    active_background_tasks: Option<u32>,
+    local_waiters: Option<usize>,
+) -> String {
+    use std::fmt::Write as _;
+
+    use leveler_runtime_host::LegacyHandoffBlock;
+    let mut message = lang
+        .pick(
+            "CodeLeveler 检测到旧版 Runtime",
+            "CodeLeveler found a previous runtime",
+        )
+        .to_string();
+    legacy_identity_lines(lang, &mut message, workspace, version, pid);
+    let _ = write!(
+        message,
+        "\n  {} {}",
+        lang.pick("状态：", "State:"),
+        legacy_reported_state(lang, active_turns, active_background_tasks, local_waiters)
+    );
     let reason = match block {
         LegacyHandoffBlock::AccessTokenUnavailable => lang.pick(
-            "无法完成安全交接所需的身份验证。",
-            "The previous runtime cannot authenticate a safe handover.",
+            "该版本不支持自动交接所需的身份验证。",
+            "This version does not support the authentication an automatic handover needs.",
         ),
         LegacyHandoffBlock::AtomicRetirementUnavailable => lang.pick(
-            "旧版 Runtime 无法确认安全交接。",
-            "The previous runtime could not confirm safe handover.",
+            "该版本无法确认安全交接。",
+            "This version could not confirm a safe handover.",
         ),
+    };
+    let _ = write!(message, "\n  {reason}");
+    let next = if local_waiters.is_some_and(|waiters| waiters > 0) {
+        lang.pick(
+            "请先退出使用该实例的旧界面；它正常退出后会自动继续启动。",
+            "Exit the old UI attached to this instance first; startup resumes automatically after it exits.",
+        )
+    } else if active_turns.is_some_and(|turns| turns > 0)
+        || active_background_tasks.is_some_and(|tasks| tasks > 0)
+    {
+        lang.pick(
+            "旧实例不会被打断，任务完成后请让它正常退出；随后会自动继续启动。",
+            "The previous instance is not interrupted; let it exit normally after its work finishes. Startup then resumes automatically.",
+        )
+    } else {
+        lang.pick(
+            "未终止任何进程，也未取消任何任务。请让旧实例正常退出；它退出后会自动继续启动。若已确认无任务且它仍不退出，可显式结束该进程。",
+            "No process was terminated and no work was cancelled. Let the previous instance exit normally; startup resumes automatically after it exits. If it is confirmed idle and still does not exit, end that process explicitly.",
+        )
     };
     let _ = write!(
         message,
-        "\n  {reason}\n\n  {}\n  {}",
+        "\n\n  {next}\n  {}",
         lang.pick(
-            "旧实例仍由原进程管理，正在执行的任务会继续运行。",
-            "The previous instance remains in control and any running tasks can continue.",
+            "可按 Ctrl+C 取消本次启动。",
+            "Press Ctrl+C to cancel this launch.",
+        )
+    );
+    message
+}
+
+#[cfg(any(unix, windows))]
+fn legacy_retirement_message(
+    lang: HandoffLang,
+    workspace: Option<&str>,
+    version: Option<&str>,
+    pid: Option<u32>,
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut message = lang
+        .pick(
+            "CodeLeveler 正在接管空闲的旧版 Runtime",
+            "CodeLeveler is taking over an idle previous runtime",
+        )
+        .to_string();
+    legacy_identity_lines(lang, &mut message, workspace, version, pid);
+    let _ = write!(
+        message,
+        "\n  {} {}\n\n  {}\n  {}",
+        lang.pick("状态：", "State:"),
+        lang.pick(
+            "已请求旧实例安全退出（不再接收新工作，完成任务后退出）",
+            "The previous instance was asked to retire safely (stop admitting work, exit after its work settles)"
         ),
         lang.pick(
-            "请等待任务完成并让旧实例正常退出，随后自动继续启动。可按 Ctrl+C 取消本次启动。",
-            "Let any running work finish and the previous instance exit normally. Startup will then resume automatically. Press Ctrl+C to cancel this launch.",
+            "正在等待旧实例释放端点，随后自动继续启动。",
+            "Waiting for the previous instance to release the endpoint; startup then resumes automatically.",
         ),
+        lang.pick(
+            "可按 Ctrl+C 取消本次启动。",
+            "Press Ctrl+C to cancel this launch.",
+        )
     );
     message
 }
@@ -873,6 +1020,20 @@ fn format_ensure_error(host: &leveler_runtime_host::EnsureError) -> String {
                 lang.pick(
                     "处理完后重新启动 CodeLeveler 即可切换到当前版本；如需一直等待，设置 LEVELER_HANDOVER_DRAIN_TIMEOUT_SECS=0。",
                     "Start CodeLeveler again afterwards to switch to this version; set LEVELER_HANDOVER_DRAIN_TIMEOUT_SECS=0 to wait forever instead.",
+                ),
+            )
+        }
+        EnsureError::LegacyRetirementPending { .. } => {
+            let lang = HandoffLang::current();
+            format!(
+                "{}\n  {}",
+                lang.pick(
+                    "旧版 Runtime 已接受安全退出，正在释放端点。",
+                    "The previous runtime accepted safe retirement and is releasing its endpoint.",
+                ),
+                lang.pick(
+                    "请稍后重新启动 CodeLeveler；现有任务不会被取消。",
+                    "Start CodeLeveler again shortly; no existing work was cancelled.",
                 ),
             )
         }
@@ -1597,6 +1758,25 @@ pub(crate) async fn cmd_serve(
     } else {
         runtime.finish_daemon_retirement().await
     };
+    // A host with nothing left to own has no reason to outlive this runtime.
+    // It decides for itself: a live workload or an unresolved spawn intent
+    // keeps it serving through the replacement. Run it on EVERY exit path —
+    // including a serve/cleanup error — because this runtime is about to stop
+    // being the host's client either way. Bounded: an unresponsive host must
+    // not delay the runtime's own exit. The host also reclaims itself when no
+    // runtime ever asks (a crash or kill), so this stays best-effort.
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        app.background_tasks().retire_execution_host_if_idle(),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::info!(%error, "the execution host kept running after this runtime exited");
+        }
+        Err(_) => tracing::info!("timed out asking the execution host to retire"),
+    }
     unix_result?;
     tcp_result?;
     cleanup?;
@@ -3143,10 +3323,57 @@ mod handoff_status_tests {
             Some("AgentGate"),
             Some("\x1b[31m1.0.27\x1b[0m"),
             Some(42),
+            Some(0),
+            Some(0),
+            Some(0),
         );
         assert!(zh.contains("AgentGate") && zh.contains("1.0.27") && zh.contains("42"));
         assert!(zh.contains("身份验证") && zh.contains("自动继续启动"));
+        assert!(zh.contains("实例空闲"), "{zh}");
         assert!(!zh.contains('\x1b'));
+
+        let attached = legacy_exit_message(
+            HandoffLang::Zh,
+            LegacyHandoffBlock::AccessTokenUnavailable,
+            Some("AgentGate"),
+            Some("1.0.27"),
+            Some(42),
+            Some(0),
+            Some(0),
+            Some(1),
+        );
+        assert!(attached.contains("1 个本地界面"), "{attached}");
+        assert!(!attached.contains("实例空闲"), "{attached}");
+
+        let busy = legacy_exit_message(
+            HandoffLang::Zh,
+            LegacyHandoffBlock::AccessTokenUnavailable,
+            Some("AgentGate"),
+            Some("1.0.27"),
+            Some(42),
+            Some(1),
+            Some(2),
+            Some(0),
+        );
+        assert!(
+            busy.contains("1 个轮次") && busy.contains("2 个后台任务"),
+            "{busy}"
+        );
+
+        let unobserved = legacy_exit_message(
+            HandoffLang::Zh,
+            LegacyHandoffBlock::AccessTokenUnavailable,
+            None,
+            Some("1.0.27"),
+            Some(42),
+            None,
+            None,
+            None,
+        );
+        assert!(
+            unobserved.contains("无法读取旧实例的任务状态"),
+            "{unobserved}"
+        );
 
         let en = legacy_exit_message(
             HandoffLang::En,
@@ -3154,10 +3381,27 @@ mod handoff_status_tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
         );
-        assert!(en.contains("could not confirm safe handover"));
-        assert!(en.contains("resume automatically"));
+        assert!(en.contains("could not confirm a safe handover"));
+        assert!(en.contains("resumes automatically"));
         assert!(!en.contains("Previous version:") && !en.contains("PID:"));
+    }
+
+    #[test]
+    fn legacy_retirement_copy_reports_the_request_that_was_sent() {
+        let zh =
+            legacy_retirement_message(HandoffLang::Zh, Some("AgentGate"), Some("1.0.27"), Some(42));
+        assert!(zh.contains("已请求旧实例安全退出"), "{zh}");
+        assert!(zh.contains("自动继续启动"), "{zh}");
+        assert!(zh.contains("Ctrl+C"), "{zh}");
+
+        let en =
+            legacy_retirement_message(HandoffLang::En, Some("AgentGate"), Some("1.0.27"), Some(42));
+        assert!(en.contains("asked to retire safely"), "{en}");
+        assert!(en.contains("resumes automatically"), "{en}");
     }
 
     /// PV1/PV2 — the version-handover copy is bilingual product text, and the

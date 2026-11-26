@@ -16,76 +16,92 @@ pub(crate) async fn run(layout: &Layout, command: RuntimeCommand) -> anyhow::Res
             print_status(layout, inspection, json, zh)?;
             return Ok(ExitCode::SUCCESS);
         }
-        RuntimeCommand::Stop => match leveler_runtime_host::stop_runtime(&path).await? {
-            StopRuntime::Absent => (
-                text(
-                    "当前项目没有运行中的 Runtime。",
-                    "No runtime is serving this workspace.",
-                ),
-                ExitCode::SUCCESS,
-            ),
-            StopRuntime::Stopped => (
-                text("Runtime 已正常退出。", "The runtime stopped."),
-                ExitCode::SUCCESS,
-            ),
-            StopRuntime::Busy {
-                active_turns,
-                active_background_tasks,
-            } => {
-                eprintln!(
-                    "{} ({active_turns} {}, {active_background_tasks} {})",
+        RuntimeCommand::Stop => {
+            match leveler_runtime_host::stop_runtime(&path, layout.primary_workspace()).await? {
+                StopRuntime::Absent => (
                     text(
-                        "请等待现有任务完成后再停止 Runtime",
-                        "Wait for the existing work to finish before stopping the runtime"
+                        "当前项目没有运行中的 Runtime。",
+                        "No runtime is serving this workspace.",
                     ),
-                    text("个轮次", "turns"),
-                    text("个后台任务", "background tasks"),
-                );
-                return Ok(ExitCode::FAILURE);
+                    ExitCode::SUCCESS,
+                ),
+                StopRuntime::Stopped => (
+                    text("Runtime 已正常退出。", "The runtime stopped."),
+                    ExitCode::SUCCESS,
+                ),
+                StopRuntime::Busy {
+                    active_turns,
+                    active_background_tasks,
+                } => {
+                    eprintln!(
+                        "{} ({active_turns} {}, {active_background_tasks} {})",
+                        text(
+                            "请等待现有任务完成后再停止 Runtime",
+                            "Wait for the existing work to finish before stopping the runtime"
+                        ),
+                        text("个轮次", "turns"),
+                        text("个后台任务", "background tasks"),
+                    );
+                    return Ok(ExitCode::FAILURE);
+                }
+                StopRuntime::LegacyAttached { local_waiters } => {
+                    eprintln!(
+                        "{local_waiters} {}\n{}",
+                        text(
+                            "个本地界面正在使用此 Runtime，未请求退出。",
+                            "local UI(s) are using this runtime; it was not asked to stop."
+                        ),
+                        text(
+                            "请先退出使用它的界面；或等待其正常退出。",
+                            "Exit the UI using it first, or wait for it to exit normally.",
+                        ),
+                    );
+                    return Ok(ExitCode::FAILURE);
+                }
+                StopRuntime::Legacy => (
+                    text(
+                        "无法验证此版本的安全退出。请待任务完成后从旧实例正常退出。",
+                        "Safe retirement cannot be verified for this version. Let its work finish and exit the old instance normally.",
+                    ),
+                    ExitCode::FAILURE,
+                ),
+                StopRuntime::IdentityUnknown => (
+                    text(
+                        "无法验证 Runtime 身份。请查看 runtime status。",
+                        "The runtime identity could not be verified. Check runtime status.",
+                    ),
+                    ExitCode::FAILURE,
+                ),
+                StopRuntime::GenerationChanged => (
+                    text(
+                        "Runtime 实例已变更。请查看 runtime status。",
+                        "The runtime changed during the request. Check runtime status.",
+                    ),
+                    ExitCode::FAILURE,
+                ),
+                StopRuntime::Unresponsive => (
+                    text(
+                        "Runtime 未响应。请查看 runtime status。",
+                        "The runtime did not respond. Check runtime status.",
+                    ),
+                    ExitCode::FAILURE,
+                ),
+                StopRuntime::OutcomeUnknown => (
+                    text(
+                        "无法确认 Runtime 是否接受退出。请查看 runtime status。",
+                        "The retirement decision could not be confirmed. Check runtime status.",
+                    ),
+                    ExitCode::FAILURE,
+                ),
+                StopRuntime::ExitUnconfirmed => (
+                    text(
+                        "Runtime 已接受退休，尚未确认退出。请查看 runtime status。",
+                        "The runtime accepted retirement and its exit is pending. Check runtime status.",
+                    ),
+                    ExitCode::FAILURE,
+                ),
             }
-            StopRuntime::Legacy => (
-                text(
-                    "无法验证此版本的安全退出。请待任务完成后从旧实例正常退出。",
-                    "Safe retirement cannot be verified for this version. Let its work finish and exit the old instance normally.",
-                ),
-                ExitCode::FAILURE,
-            ),
-            StopRuntime::IdentityUnknown => (
-                text(
-                    "无法验证 Runtime 身份。请查看 runtime status。",
-                    "The runtime identity could not be verified. Check runtime status.",
-                ),
-                ExitCode::FAILURE,
-            ),
-            StopRuntime::GenerationChanged => (
-                text(
-                    "Runtime 实例已变更。请查看 runtime status。",
-                    "The runtime changed during the request. Check runtime status.",
-                ),
-                ExitCode::FAILURE,
-            ),
-            StopRuntime::Unresponsive => (
-                text(
-                    "Runtime 未响应。请查看 runtime status。",
-                    "The runtime did not respond. Check runtime status.",
-                ),
-                ExitCode::FAILURE,
-            ),
-            StopRuntime::OutcomeUnknown => (
-                text(
-                    "无法确认 Runtime 是否接受退出。请查看 runtime status。",
-                    "The retirement decision could not be confirmed. Check runtime status.",
-                ),
-                ExitCode::FAILURE,
-            ),
-            StopRuntime::ExitUnconfirmed => (
-                text(
-                    "Runtime 已接受退休，尚未确认退出。请查看 runtime status。",
-                    "The runtime accepted retirement and its exit is pending. Check runtime status.",
-                ),
-                ExitCode::FAILURE,
-            ),
-        },
+        }
     };
     if code == ExitCode::SUCCESS {
         println!("{message}");

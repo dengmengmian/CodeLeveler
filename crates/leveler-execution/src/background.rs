@@ -1199,6 +1199,24 @@ impl BackgroundTaskRegistry {
             .collect())
     }
 
+    /// Ask this generation's Execution Host to reclaim itself when it holds no
+    /// workload.
+    ///
+    /// The host owns the decision (`ShutdownIfIdle`): it refuses while a child
+    /// process or an unresolved spawn intent exists, and the service keeps
+    /// running through the replacement. Only a host with nothing left to own
+    /// exits, and the next runtime re-spawns one on demand.
+    pub async fn retire_execution_host_if_idle(&self) -> Result<(), String> {
+        let Some(config) = &self.execution_host else {
+            return Ok(());
+        };
+        let probe = crate::execution_host::ExecutionHostClient::probe(config).await?;
+        let Some(client) = probe.client else {
+            return Ok(());
+        };
+        client.shutdown_if_idle().await
+    }
+
     /// Work that graceful Quit would end must finish before retirement.
     pub async fn try_update_blockers(&self) -> Result<Vec<BackgroundTaskSnapshot>, String> {
         tokio::time::timeout(UPDATE_BLOCKER_TIMEOUT, self.observe_update_blockers())
@@ -1299,35 +1317,38 @@ impl BackgroundTaskRegistry {
         if request.pty.is_none() {
             return Err("terminal requires PTY dimensions".into());
         }
+        let size = request.pty.expect("checked above");
         let config = self
             .execution_host
             .clone()
             .ok_or("persistent execution is not configured")?;
-        let client = crate::execution_host::ExecutionHostClient::ensure(config).await?;
-        client.require_terminal()?;
-        let already_exists = client
-            .list()
-            .await?
-            .iter()
-            .any(|task| task.snapshot.id == id);
+        let already_exists =
+            match crate::execution_host::ExecutionHostClient::ensure(config.clone()).await {
+                Ok(client) => client
+                    .list()
+                    .await?
+                    .iter()
+                    .any(|task| task.snapshot.id == id),
+                Err(_) => false,
+            };
         self.journal()?
             .prepare_with_scope(id, owner, owner, None, request.write_scope.clone())
             .await?;
-        let task = match client
-            .spawn(
-                id,
-                request,
-                owner,
-                owner,
-                BackgroundTaskLifetime::Session,
-                BackgroundTaskOrigin::default(),
-                // A session terminal survives runtime replacement by design;
-                // it is not owned by the generation that opened it.
-                None,
-            )
-            .await
+        let (client, task) = match crate::execution_host::ExecutionHostClient::spawn_recovering(
+            config,
+            id,
+            request,
+            owner,
+            owner,
+            BackgroundTaskLifetime::Session,
+            BackgroundTaskOrigin::default(),
+            // A session terminal survives runtime replacement by design;
+            // it is not owned by the generation that opened it.
+            None,
+        )
+        .await
         {
-            Ok(task) => task,
+            Ok(admitted) => admitted,
             Err(crate::execution_host::SpawnError::Rejected(error)) => {
                 if !already_exists {
                     self.journal()?.abandon_prepared(id)?;
@@ -1336,8 +1357,31 @@ impl BackgroundTaskRegistry {
             }
             Err(crate::execution_host::SpawnError::OutcomeUnknown(error)) => return Err(error),
         };
-        self.monitor_hosted(task)?;
-        client.terminal_observe(id, owner, 0, 64 * 1024).await
+        if !task.status.is_terminal() {
+            self.monitor_hosted(task.clone())?;
+        }
+        match client {
+            Some(client) => client.terminal_observe(id, owner, 0, 64 * 1024).await,
+            // The host was already gone when the admitted fact was recovered.
+            // The retained log is the only real output left; report exactly
+            // that window instead of inventing a live terminal.
+            None => Ok(crate::background::TerminalObservation {
+                snapshot: task.clone(),
+                cols: size.cols,
+                rows: size.rows,
+                output_start: task.log.len().saturating_sub(64 * 1024) as u64,
+                output_end: task.log.len() as u64,
+                next_cursor: task.log.len() as u64,
+                data: task
+                    .log
+                    .as_bytes()
+                    .get(task.log.len().saturating_sub(64 * 1024)..)
+                    .unwrap_or_default()
+                    .to_vec(),
+                truncated: task.log.len() > 64 * 1024,
+                output_error: None,
+            }),
+        }
     }
 
     pub async fn terminal_write(&self, id: &str, owner: &str, data: Vec<u8>) -> Result<(), String> {
@@ -1480,7 +1524,6 @@ impl BackgroundTaskRegistry {
             .execution_host
             .clone()
             .ok_or("persistent execution is not configured")?;
-        let client = crate::execution_host::ExecutionHostClient::ensure(config).await?;
         let id = format!("host-{}", crate::execution_host::fresh_id()?);
         // The semantic admission is durable before the process can exist.
         // A later runtime can attribute an exit from the same Execution Host.
@@ -1494,20 +1537,23 @@ impl BackgroundTaskRegistry {
                 origin.clone(),
             )
             .await?;
-        // Transport failure is ambiguous: retain the prepared write reservation.
-        let task = match client
-            .spawn(
-                &id,
-                request,
-                owner,
-                writer,
-                lifetime,
-                origin,
-                self.owner_boot_wire().as_deref(),
-            )
-            .await
+        // A host retired between discovery and this request is a normal
+        // lifecycle event, not a user-visible failure: the same id is retried
+        // against a rediscovered host, and the host's identity-keyed admission
+        // makes a replay return the existing fact instead of a second process.
+        let (client, task) = match crate::execution_host::ExecutionHostClient::spawn_recovering(
+            config,
+            &id,
+            request,
+            owner,
+            writer,
+            lifetime,
+            origin,
+            self.owner_boot_wire().as_deref(),
+        )
+        .await
         {
-            Ok(task) => task,
+            Ok(admitted) => admitted,
             Err(crate::execution_host::SpawnError::Rejected(error)) => {
                 self.journal()?.abandon_prepared(&id)?;
                 return Err(error);
@@ -1521,9 +1567,20 @@ impl BackgroundTaskRegistry {
         };
         let _ = self.lifecycle_events.send(BackgroundTaskEvent::Started {
             owner_scope: Some(owner.into()),
-            task,
+            task: task.clone(),
         });
-        self.monitor_hosted(self.host_client().await?.get_owned(&id, owner).await?)?;
+        // A terminal fact recovered from a host that is already gone has
+        // nothing left to observe. Emit the paired terminal event here; the
+        // journal reconciliation settles its semantic changes. A live task is
+        // monitored until its own exit.
+        if task.status.is_terminal() {
+            let _ = self.lifecycle_events.send(BackgroundTaskEvent::Exited {
+                owner_scope: Some(owner.into()),
+                task,
+            });
+        } else if client.is_some() {
+            self.monitor_hosted(task)?;
+        }
         Ok(id)
     }
 

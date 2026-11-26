@@ -573,6 +573,13 @@ impl std::fmt::Display for SpawnError {
 }
 impl std::error::Error for SpawnError {}
 
+/// The host's live inventory answer for one spawn identity.
+enum SpawnInventory {
+    Admitted(Box<BackgroundTaskSnapshot>),
+    Absent,
+    Unreadable(String),
+}
+
 /// What the host's own durable records say about the processes it owned.
 ///
 /// `tasks.json` archives every admitted task; `intents.json` holds the spawn
@@ -1336,8 +1343,8 @@ impl ExecutionHostClient {
             self.require_terminal().map_err(SpawnError::Rejected)?;
         }
         let lifetime = hosted_wire_lifetime(self.peer_major, lifetime);
-        match self
-            .call(Request::Spawn {
+        let reply = match self
+            .call_classified(Request::Spawn {
                 id: id.into(),
                 request: Box::new(request),
                 owner: owner.into(),
@@ -1347,8 +1354,21 @@ impl ExecutionHostClient {
                 owner_boot: owner_boot.map(str::to_string),
             })
             .await
-            .map_err(SpawnError::OutcomeUnknown)?
         {
+            Ok(reply) => reply,
+            // The connection was never accepted, so no request reached any
+            // host: this spawn provably launched nothing. Calling that an
+            // unknown outcome would reserve the writer's scope for a task
+            // that cannot exist — exactly what a host retiring between
+            // `ensure` and this request would cause on every retry.
+            Err(ConnectFailure::Refused(error)) => {
+                return Err(SpawnError::Rejected(format!(
+                    "Execution Host is unavailable; no task was launched: {error}"
+                )));
+            }
+            Err(error) => return Err(SpawnError::OutcomeUnknown(error.message())),
+        };
+        match reply {
             Reply::Task(t) => Ok(t),
             Reply::SpawnRejected(e) => Err(SpawnError::Rejected(e)),
             Reply::SpawnUnknown(e) => Err(SpawnError::OutcomeUnknown(e)),
@@ -1356,6 +1376,139 @@ impl ExecutionHostClient {
                 "invalid Execution Host spawn reply".into(),
             )),
         }
+    }
+
+    /// Spawn with bounded recovery when the host retired between the caller's
+    /// discovery and this request.
+    ///
+    /// A refused connection never carried a request, and an explicit host
+    /// rejection is the host's own "not admitted" answer. Both are safe to
+    /// retry with the SAME task id: admission is keyed by that id, so a replay
+    /// can only return the existing fact, never start a second process.
+    ///
+    /// An unknown outcome is different. The request may have been accepted, so
+    /// it is never resent. The host's own inventory (or the recovered durable
+    /// archive when the host is gone) is consulted; only a task that is
+    /// actually there is returned. If the task cannot be found in a state that
+    /// proves it was never admitted, the unknown stands.
+    pub async fn spawn_recovering(
+        config: ExecutionHostConfig,
+        id: &str,
+        request: ProcessRequest,
+        owner: &str,
+        writer: &str,
+        lifetime: BackgroundTaskLifetime,
+        origin: crate::BackgroundTaskOrigin,
+        owner_boot: Option<&str>,
+    ) -> Result<(Option<Self>, BackgroundTaskSnapshot), SpawnError> {
+        const ATTEMPTS: usize = 4;
+        const BACKOFF: [Duration; 3] = [
+            Duration::from_millis(100),
+            Duration::from_millis(300),
+            Duration::from_millis(800),
+        ];
+        let mut last: Option<SpawnError> = None;
+        for attempt in 0..ATTEMPTS {
+            // Re-discover on every attempt: the host observed by the caller may
+            // have retired, and a new generation is the normal outcome.
+            let client = Self::ensure(config.clone())
+                .await
+                .map_err(SpawnError::Rejected)?;
+            match client
+                .spawn(
+                    id,
+                    request.clone(),
+                    owner,
+                    writer,
+                    lifetime,
+                    origin.clone(),
+                    owner_boot,
+                )
+                .await
+            {
+                Ok(task) => return Ok((Some(client), task)),
+                Err(SpawnError::Rejected(error)) => {
+                    // A host may have admitted this id before answering (a
+                    // replay of a durable fact). The inventory settles that
+                    // without launching anything.
+                    if let SpawnInventory::Admitted(task) = client.lookup_spawn(id, owner).await {
+                        return Ok((Some(client), *task));
+                    }
+                    last = Some(SpawnError::Rejected(error));
+                }
+                Err(SpawnError::OutcomeUnknown(error)) => {
+                    return match Self::resolve_unknown_spawn(&config, id, owner).await {
+                        Ok((client, task)) => Ok((client, task)),
+                        Err(reason) => Err(SpawnError::OutcomeUnknown(format!(
+                            "{error}; the original spawn outcome remains unknown: {reason}"
+                        ))),
+                    };
+                }
+            }
+            if attempt + 1 < ATTEMPTS {
+                tokio::time::sleep(BACKOFF[attempt.min(BACKOFF.len() - 1)]).await;
+            }
+        }
+        Err(last
+            .unwrap_or_else(|| SpawnError::Rejected("Execution Host spawn made no attempt".into())))
+    }
+
+    /// What the host's own live inventory says about one spawn identity.
+    async fn lookup_spawn(&self, id: &str, owner: &str) -> SpawnInventory {
+        match self.list().await {
+            Ok(tasks) => match tasks.into_iter().find(|task| task.snapshot.id == id) {
+                Some(task) if task.snapshot.owner_scope.as_deref() == Some(owner) => {
+                    SpawnInventory::Admitted(Box::new(task.snapshot))
+                }
+                Some(_) => SpawnInventory::Unreadable(
+                    "the recorded task id belongs to another session".into(),
+                ),
+                None => SpawnInventory::Absent,
+            },
+            Err(error) => SpawnInventory::Unreadable(error),
+        }
+    }
+
+    /// Establish what an unknown spawn actually did, without ever resending it.
+    ///
+    /// A live host answers from the same admission-serialized inventory a
+    /// duplicate spawn would hit. A dead host must have been recovered first:
+    /// its archive is then the authority. A terminal archived task is an
+    /// admitted result; an `Unknown` record or a live record proves only that
+    /// the outcome is lost, never that it was an exit. An unresolved intent is
+    /// ownership of a possible process, so it never authorizes a replay.
+    async fn resolve_unknown_spawn(
+        config: &ExecutionHostConfig,
+        id: &str,
+        owner: &str,
+    ) -> Result<(Option<Self>, BackgroundTaskSnapshot), String> {
+        let probe = Self::probe(config).await?;
+        if let Some(client) = probe.client {
+            return match client.lookup_spawn(id, owner).await {
+                SpawnInventory::Admitted(task) => Ok((Some(client), *task)),
+                SpawnInventory::Absent => {
+                    Err("the Execution Host has no record of this spawn".into())
+                }
+                SpawnInventory::Unreadable(error) => Err(error),
+            };
+        }
+        let records = HostRecords::read(&config.state_dir)?;
+        if let Some(task) = records.task(id) {
+            if task.snapshot.owner_scope.as_deref() != Some(owner) {
+                return Err("the archived task id belongs to another session".into());
+            }
+            if task.snapshot.status.is_terminal() {
+                return Ok((None, task.snapshot.clone()));
+            }
+            return Err(format!(
+                "the admitted task was lost with its host (status {:?})",
+                task.snapshot.status
+            ));
+        }
+        if records.has_active_intent(id) || records.has_unresolved_intent(id) {
+            return Err("a spawn intent for this task was never resolved".into());
+        }
+        Err("no task or spawn intent was recorded".into())
     }
 
     /// Record that a goal task's admitting runtime generation is gone.
@@ -1584,7 +1737,9 @@ fn debug_fault(point: &str) {
         return;
     };
     let marker = std::path::PathBuf::from(marker);
-    if marker.exists() || std::fs::write(&marker, point).is_err() {
+    if marker.exists()
+        || std::fs::write(&marker, format!("{point} {}", std::process::id())).is_err()
+    {
         return;
     }
     #[cfg(unix)]
@@ -1603,6 +1758,46 @@ fn debug_fault(point: &str) {
     #[cfg(not(unix))]
     std::process::abort();
 }
+
+/// Test-only gates inside the host's own writer.
+///
+/// A test cannot reliably time a graceful exit against the persistence loop's
+/// terminal write. A gate keyed by the state directory pauses exactly one
+/// writer after it observed a terminal event, so the shutdown path can be
+/// exercised while that fact is still not durable. The gate is compiled out of
+/// production builds and only affects the directory that registered it.
+#[cfg(test)]
+pub(crate) mod test_holds {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    pub(crate) struct ExitPersistHold {
+        pub entered: tokio::sync::Notify,
+        pub release: tokio::sync::Notify,
+    }
+
+    static HOLDS: StdMutex<Vec<(PathBuf, Arc<ExitPersistHold>)>> = StdMutex::new(Vec::new());
+
+    pub(crate) fn register(state_dir: &Path) -> Arc<ExitPersistHold> {
+        let hold = Arc::new(ExitPersistHold {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        HOLDS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((state_dir.to_path_buf(), Arc::clone(&hold)));
+        hold
+    }
+
+    pub(crate) fn take(state_dir: &Path) -> Option<Arc<ExitPersistHold>> {
+        let mut holds = HOLDS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let index = holds.iter().position(|(path, _)| path == state_dir)?;
+        Some(holds.remove(index).1)
+    }
+}
 struct Host {
     registry: BackgroundTaskRegistry,
     entries: Mutex<HashMap<String, Entry>>,
@@ -1612,6 +1807,11 @@ struct Host {
     shutdown: tokio_util::sync::CancellationToken,
     retiring: std::sync::atomic::AtomicBool,
     persistence: Mutex<()>,
+    /// When this host last answered an authenticated request. The idle reaper
+    /// uses it to reclaim a host whose runtime died without asking it to stop.
+    /// A live runtime that is simply idle makes no requests, so the reaper's
+    /// expiry is a resource decision, never a sign that a session ended.
+    last_activity: std::sync::Mutex<std::time::Instant>,
     ready: Ready,
     config: ExecutionHostConfig,
 }
@@ -1887,14 +2087,29 @@ impl Host {
                     },
                 );
                 drop(entries);
+                // Never hold `intents` across `persist(): persistence takes
+                // `entries`, while the admission paths (`ShutdownIfIdle`, the
+                // idle reaper, a concurrent spawn) take `entries` and then
+                // `intents`. Holding both in the opposite order lets a spawn
+                // and the reaper wait on each other forever. The intent stays
+                // durable until the task fact is committed, so an observer
+                // during this window still sees the spawn as unresolved.
+                drop(intents);
                 if let Err(e) = self.persist().await {
                     let _ = self.registry.kill_owned(&local, &owner).await;
                     return Err(format!(
                         "host state persistence failed; spawned task stopped: {e}"
                     ));
                 }
-                intents.retain(|i| i.id != id);
-                atomic_json(&self.config.state_dir.join("intents.json"), &*intents)?;
+                // Scope the intent removal: the guard must be gone before
+                // `persisted_tasks()` takes `entries`, or this thread would
+                // hold `intents` while waiting for `entries` again — the same
+                // inversion, one step later.
+                {
+                    let mut intents = self.intents.lock().await;
+                    intents.retain(|i| i.id != id);
+                    atomic_json(&self.config.state_dir.join("intents.json"), &*intents)?;
+                }
                 let t = self
                     .persisted_tasks()
                     .await?
@@ -2091,7 +2306,50 @@ fn constant_time_equal(a: &str, b: &str) -> bool {
     difference == 0
 }
 /// Run in the composition-root daemon process, never within an agent runtime.
+/// How long an Execution Host may sit with no request and no live workload
+/// before it reclaims itself.
+///
+/// A runtime asks its host to stop when the runtime retires (see
+/// [`BackgroundTaskRegistry::retire_execution_host_if_idle`]); this timer is
+/// the fallback for a runtime that crashed or was killed and never asked.
+/// Reclaiming the host never kills a task: a host with a live process or an
+/// unresolved spawn intent stays. Re-spawning is on demand and cheap, so an
+/// idle host is a pure resource decision.
+pub const DEFAULT_EXECUTION_HOST_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const EXECUTION_HOST_IDLE_TIMEOUT_ENV: &str = "LEVELER_EXECUTION_HOST_IDLE_TIMEOUT_SECS";
+
+/// The configured self-reclaim timeout; `None` disables it (`0`).
+pub fn execution_host_idle_timeout() -> Option<Duration> {
+    parse_execution_host_idle_timeout(
+        std::env::var(EXECUTION_HOST_IDLE_TIMEOUT_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn parse_execution_host_idle_timeout(value: Option<&str>) -> Option<Duration> {
+    match value.map(str::trim) {
+        None => Some(DEFAULT_EXECUTION_HOST_IDLE_TIMEOUT),
+        Some("0") => None,
+        Some(raw) => raw
+            .parse::<u64>()
+            .ok()
+            .map(Duration::from_secs)
+            .filter(|timeout| !timeout.is_zero())
+            .or(Some(DEFAULT_EXECUTION_HOST_IDLE_TIMEOUT)),
+    }
+}
+
 pub async fn serve(config: ExecutionHostConfig) -> Result<(), String> {
+    serve_with_idle_timeout(config, execution_host_idle_timeout()).await
+}
+
+/// [`serve`] with an explicit self-reclaim timeout, so tests can exercise the
+/// reclaim without mutating process-global environment.
+pub async fn serve_with_idle_timeout(
+    config: ExecutionHostConfig,
+    idle_timeout: Option<Duration>,
+) -> Result<(), String> {
     secure_dir(&config.state_dir)?;
     // The host is the durable owner of background processes. On Windows a
     // per-task job's kill-on-drop never runs when the host itself is killed,
@@ -2176,6 +2434,7 @@ pub async fn serve(config: ExecutionHostConfig) -> Result<(), String> {
         shutdown: tokio_util::sync::CancellationToken::new(),
         retiring: std::sync::atomic::AtomicBool::new(false),
         persistence: Mutex::new(()),
+        last_activity: std::sync::Mutex::new(std::time::Instant::now()),
         ready: ready.clone(),
         config,
     });
@@ -2209,6 +2468,45 @@ pub async fn serve(config: ExecutionHostConfig) -> Result<(), String> {
             }
         });
     }
+    // Fallback reclaim for a host whose runtime died before it could ask.
+    // The decision is taken under the SAME admission lock as an explicit
+    // `ShutdownIfIdle` request, so a spawn either finished (and its live
+    // process blocks the reclaim) or has not started (and sees `retiring`).
+    if let Some(idle_timeout) = idle_timeout {
+        let reaper = host.clone();
+        tokio::spawn(async move {
+            let poll = (idle_timeout / 5).clamp(Duration::from_millis(50), Duration::from_secs(5));
+            loop {
+                tokio::select! {
+                    _ = reaper.shutdown.cancelled() => return,
+                    _ = tokio::time::sleep(poll) => {}
+                }
+                let idle_for = reaper
+                    .last_activity
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .elapsed();
+                if idle_for < idle_timeout {
+                    continue;
+                }
+                let _admission = reaper.entries.lock().await;
+                if reaper.registry.alive_count().await != 0
+                    || !reaper.intents.lock().await.is_empty()
+                {
+                    continue;
+                }
+                reaper
+                    .retiring
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                tracing::info!(
+                    idle_secs = idle_timeout.as_secs(),
+                    "reclaiming an idle Execution Host"
+                );
+                reaper.shutdown.cancel();
+                return;
+            }
+        });
+    }
     // Subscribe before readiness permits the first client spawn.
     let mut events = host.registry.subscribe();
     host.persist().await?;
@@ -2219,7 +2517,7 @@ pub async fn serve(config: ExecutionHostConfig) -> Result<(), String> {
     // newest output tail, never the exit fact: every terminal observation goes
     // through `get_owned`, which forces a write before it is acknowledged.
     let persistence = host.clone();
-    tokio::spawn(async move {
+    let persistence_handle = tokio::spawn(async move {
         const PERSIST_INTERVAL: Duration = Duration::from_millis(200);
         let mut ticker = tokio::time::interval(PERSIST_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -2247,6 +2545,14 @@ pub async fn serve(config: ExecutionHostConfig) -> Result<(), String> {
                             if exited {
                                 debug_fault("after-exit-event");
                             }
+                            #[cfg(test)]
+                            if exited
+                                && let Some(hold) =
+                                    test_holds::take(&persistence.config.state_dir)
+                            {
+                                hold.entered.notify_one();
+                                hold.release.notified().await;
+                            }
                             if let Err(e) = persistence.persist().await {
                                 tracing::error!("Execution Host persistence failed: {e}");
                             }
@@ -2260,10 +2566,18 @@ pub async fn serve(config: ExecutionHostConfig) -> Result<(), String> {
         }
     });
     let permits = Arc::new(tokio::sync::Semaphore::new(32));
+    let mut accept_error: Option<String> = None;
     loop {
-        let (mut stream, _) = tokio::select! {
-            _=host.shutdown.cancelled()=>{std::fs::remove_file(host.config.state_dir.join("ready.json")).map_err(|e|e.to_string())?;return Ok(());},
-            accepted=listener.accept()=>accepted.map_err(|e|e.to_string())?,
+        let mut stream = match tokio::select! {
+            biased;
+            _ = host.shutdown.cancelled() => break,
+            accepted = listener.accept() => accepted,
+        } {
+            Ok((stream, _)) => stream,
+            Err(error) => {
+                accept_error = Some(error.to_string());
+                break;
+            }
         };
         let permit = match permits.clone().try_acquire_owned() {
             Ok(p) => p,
@@ -2284,6 +2598,10 @@ pub async fn serve(config: ExecutionHostConfig) -> Result<(), String> {
             if !constant_time_equal(&envelope.token, &host.ready.token) {
                 return;
             }
+            *host
+                .last_activity
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = std::time::Instant::now();
             let shutdown_requested = matches!(&envelope.request, Request::ShutdownIfIdle);
             let reply = if envelope.major != PROTOCOL_MAJOR
                 && !SUPPORTED_LEGACY_MAJORS.contains(&envelope.major)
@@ -2311,6 +2629,60 @@ pub async fn serve(config: ExecutionHostConfig) -> Result<(), String> {
                 host.shutdown.cancel();
             }
         });
+    }
+    let finished = finish_host(&host, persistence_handle, &permits).await;
+    match (accept_error, finished) {
+        (Some(error), Ok(())) => Err(error),
+        (Some(error), Err(persist)) => Err(format!("{error}; {persist}")),
+        (None, finished) => finished,
+    }
+}
+
+/// Close one host: stop the periodic writer, let in-flight request handlers
+/// finish, commit the final durable state, then stop advertising the endpoint.
+///
+/// A host that exits before this write loses the newest terminal facts even
+/// though it observed them. The abort is safe because `persist` writes through
+/// an atomic replacement; the final write below is the commit point. Endpoint
+/// removal happens even when that write fails: leaving a `ready.json` behind
+/// would advertise a process that is gone, while the returned error states the
+/// durability failure instead of pretending the exit was clean.
+async fn finish_host(
+    host: &Host,
+    persistence: tokio::task::JoinHandle<()>,
+    permits: &Arc<tokio::sync::Semaphore>,
+) -> Result<(), String> {
+    const HOST_EXIT_DRAIN: Duration = Duration::from_secs(10);
+    persistence.abort();
+    let _ = persistence.await;
+    // A request handler may still be committing a stop or a spawn. Its write
+    // and the final one are serialized by the persistence lock; waiting for
+    // the permits makes the final snapshot include what it observed instead of
+    // racing it. A handler that cannot finish in the bound is reported, not
+    // silently treated as done.
+    if tokio::time::timeout(HOST_EXIT_DRAIN, permits.acquire_many(32))
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            timeout_secs = HOST_EXIT_DRAIN.as_secs(),
+            "Execution Host exited with request handlers still in flight"
+        );
+    }
+    let durable = host.persist().await;
+    let endpoint = match std::fs::remove_file(host.config.state_dir.join("ready.json")) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    };
+    match (durable, endpoint) {
+        (Err(error), _) => Err(format!(
+            "Execution Host state was not durable when it exited: {error}"
+        )),
+        (Ok(()), Err(error)) => Err(format!(
+            "could not remove the Execution Host readiness file: {error}"
+        )),
+        (Ok(()), Ok(())) => Ok(()),
     }
 }
 
@@ -4010,5 +4382,730 @@ mod tests {
         assert!(after.client.is_none());
         assert!(after.recovery.is_some(), "the dead host's residue is read");
         assert!(!config.state_dir.join("ready.json").exists());
+    }
+
+    /// A connection that was never accepted proves the spawn never reached a
+    /// host. Reporting that as an unknown outcome would reserve the writer's
+    /// scope for a task that cannot exist, and `spawn_hosted` would keep the
+    /// reservation. The definite class is a rejection.
+    #[tokio::test]
+    async fn a_refused_spawn_connection_is_a_definite_rejection() {
+        let root = tempfile::tempdir().unwrap();
+        let config = idle_host_config(root.path());
+        let client = ExecutionHostClient {
+            config: config.clone(),
+            ready: Ready {
+                // Port 1 is not served; the connect itself fails before any
+                // request bytes exist.
+                address: "127.0.0.1:1".parse().unwrap(),
+                token: "test-token".into(),
+                instance: "test-instance".into(),
+                pid: 1,
+                repo: config.repo_root.clone(),
+                major: PROTOCOL_MAJOR,
+                minor: PROTOCOL_MINOR,
+                capabilities: vec![],
+            },
+            peer_major: PROTOCOL_MAJOR,
+            peer_capabilities: vec![],
+        };
+        let id = format!("host-{}", fresh_id().unwrap());
+        let request = ProcessRequest::new(
+            "sh",
+            vec!["-c".into(), "true".into()],
+            config.repo_root.clone(),
+        );
+        let error = client
+            .spawn(
+                &id,
+                request,
+                "session",
+                "parent",
+                BackgroundTaskLifetime::Session,
+                crate::BackgroundTaskOrigin::default(),
+                None,
+            )
+            .await
+            .expect_err("a refused connection cannot launch a task");
+        assert!(
+            matches!(error, SpawnError::Rejected(_)),
+            "a spawn that never reached a host is not an unknown outcome: {error:?}"
+        );
+    }
+
+    fn idle_host_config(root: &Path) -> ExecutionHostConfig {
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        ExecutionHostConfig {
+            state_dir: root.join("host"),
+            repo_root: repo,
+            executable: PathBuf::from("unused-test-executable"),
+        }
+    }
+
+    async fn connect_until_ready(config: &ExecutionHostConfig) -> ExecutionHostClient {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(client) = ExecutionHostClient::connect(config.clone()).await {
+                    break client;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the host publishes readiness")
+    }
+
+    /// A runtime that dies without asking must not leave its host forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_idle_host_reclaims_itself_and_removes_its_endpoint() {
+        let root = tempfile::tempdir().unwrap();
+        let config = idle_host_config(root.path());
+        let serve_config = config.clone();
+        let server = tokio::spawn(async move {
+            serve_with_idle_timeout(serve_config, Some(Duration::from_millis(600))).await
+        });
+        let _client = connect_until_ready(&config).await;
+        let result = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("an idle host reclaims itself")
+            .unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        assert!(!config.state_dir.join("ready.json").exists());
+    }
+
+    /// Live work is ownership: the idle timeout never kills a service.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_host_with_a_live_task_is_not_reclaimed_until_it_finishes() {
+        let root = tempfile::tempdir().unwrap();
+        let config = idle_host_config(root.path());
+        let serve_config = config.clone();
+        let server = tokio::spawn(async move {
+            serve_with_idle_timeout(serve_config, Some(Duration::from_millis(600))).await
+        });
+        let client = connect_until_ready(&config).await;
+        let id = format!("host-{}", fresh_id().unwrap());
+        let request = ProcessRequest::new(
+            "sh",
+            vec!["-c".into(), "sleep 30".into()],
+            config.repo_root.clone(),
+        );
+        client
+            .spawn(
+                &id,
+                request,
+                "session",
+                "parent",
+                BackgroundTaskLifetime::Session,
+                crate::BackgroundTaskOrigin::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(1_800)).await;
+        assert!(
+            ExecutionHostClient::connect(config.clone()).await.is_ok(),
+            "a host owning a live process must keep serving"
+        );
+        assert!(config.state_dir.join("ready.json").exists());
+        client.kill_owned(&id, "session").await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("the host reclaims itself after its last task ends")
+            .unwrap();
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    /// The runtime-exit hook: the host's own decision, asked explicitly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_runtime_exit_retires_an_idle_host() {
+        let root = tempfile::tempdir().unwrap();
+        let config = idle_host_config(root.path());
+        let serve_config = config.clone();
+        let server = tokio::spawn(async move { serve_with_idle_timeout(serve_config, None).await });
+        let _client = connect_until_ready(&config).await;
+        let registry = BackgroundTaskRegistry::default().with_execution_host(config.clone());
+        registry.retire_execution_host_if_idle().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("an idle host accepts the runtime's exit")
+            .unwrap()
+            .unwrap();
+        assert!(!config.state_dir.join("ready.json").exists());
+    }
+
+    /// Regression for the lock-order inversion a concurrent spawn could hit:
+    /// a spawn must not hold `intents` while persistence takes `entries`, or a
+    /// second spawn / an idle check can wait on it forever. Concurrent spawns
+    /// plus idle questions must all answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_spawns_and_idle_checks_do_not_deadlock() {
+        let root = tempfile::tempdir().unwrap();
+        let config = idle_host_config(root.path());
+        let serve_config = config.clone();
+        let server = tokio::spawn(async move { serve_with_idle_timeout(serve_config, None).await });
+        let first = connect_until_ready(&config).await;
+        let second = connect_until_ready(&config).await;
+        let mut tasks = Vec::new();
+        for client in [first, second] {
+            for _ in 0..8 {
+                let id = format!("host-{}", fresh_id().unwrap());
+                let request = ProcessRequest::new(
+                    "sh",
+                    vec!["-c".into(), "true".into()],
+                    config.repo_root.clone(),
+                );
+                let client = client.clone();
+                tasks.push(tokio::spawn(async move {
+                    let _ = client
+                        .spawn(
+                            &id,
+                            request,
+                            "session",
+                            "parent",
+                            BackgroundTaskLifetime::Session,
+                            crate::BackgroundTaskOrigin::default(),
+                            None,
+                        )
+                        .await;
+                }));
+            }
+        }
+        let observer = connect_until_ready(&config).await;
+        for _ in 0..4 {
+            let observer = observer.clone();
+            tasks.push(tokio::spawn(async move {
+                let _ = observer.shutdown_if_idle().await;
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(20), async {
+            for task in tasks {
+                let _ = task.await;
+            }
+        })
+        .await
+        .expect("no spawn or idle check may hang on a lock inversion");
+        server.abort();
+        let _ = server.await;
+    }
+
+    /// Every admitted id must describe one process, even when the same request
+    /// is replayed. The host's admission is keyed by the id, and the second
+    /// reply must be the first fact rather than a second launch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn duplicate_spawn_requests_for_one_id_share_one_process_fact() {
+        let root = tempfile::tempdir().unwrap();
+        let config = idle_host_config(root.path());
+        let serve_config = config.clone();
+        let server = tokio::spawn(async move { serve_with_idle_timeout(serve_config, None).await });
+        let client = connect_until_ready(&config).await;
+        let id = format!("host-{}", fresh_id().unwrap());
+        let request = ProcessRequest::new(
+            "sh",
+            vec!["-c".into(), "exit 0".into()],
+            config.repo_root.clone(),
+        );
+        let first = client
+            .spawn(
+                &id,
+                request.clone(),
+                "session",
+                "parent",
+                BackgroundTaskLifetime::Session,
+                crate::BackgroundTaskOrigin::default(),
+                None,
+            )
+            .await
+            .expect("first admission");
+        let second = client
+            .spawn(
+                &id,
+                request,
+                "session",
+                "parent",
+                BackgroundTaskLifetime::Session,
+                crate::BackgroundTaskOrigin::default(),
+                None,
+            )
+            .await
+            .expect("replay returns the admitted fact");
+        assert_eq!(first.id, id);
+        assert_eq!(second.id, id);
+        assert_eq!(
+            first.pid, second.pid,
+            "a replay must not launch a second process"
+        );
+        let tasks = client.list().await.expect("inventory");
+        assert_eq!(
+            tasks.iter().filter(|task| task.snapshot.id == id).count(),
+            1
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
+    /// A host can retire between the caller's `ensure` and the spawn request.
+    /// The request was explicitly not admitted, so the same identity is retried
+    /// against the next host and admitted once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_retiring_host_is_rediscovered_and_the_same_id_is_admitted_once() {
+        let root = tempfile::tempdir().unwrap();
+        let config = idle_host_config(root.path());
+        let fake = FakeHost::start(config.clone(), FakeSpawn::RejectOnceThenAdmit).await;
+        let id = format!("host-{}", fresh_id().unwrap());
+        let request = ProcessRequest::new(
+            "sh",
+            vec!["-c".into(), "exit 0".into()],
+            config.repo_root.clone(),
+        );
+        let (client, task) = ExecutionHostClient::spawn_recovering(
+            config.clone(),
+            &id,
+            request,
+            "session",
+            "parent",
+            BackgroundTaskLifetime::Session,
+            crate::BackgroundTaskOrigin::default(),
+            None,
+        )
+        .await
+        .expect("the next host admits the same identity");
+        let client = client.expect("the admitting generation is connected");
+        assert_eq!(
+            Some(&client.ready.instance),
+            fake.next_instance.as_ref(),
+            "the retry reached the NEW generation, not the retiring one"
+        );
+        assert_eq!(task.id, id);
+        assert_eq!(fake.spawn_requests(), 2);
+        assert_eq!(fake.admitted_ids().await, vec![id]);
+    }
+
+    /// An ACK lost after the host committed the spawn must not replay it. The
+    /// inventory is the authority: the admitted task is returned as-is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lost_spawn_reply_is_resolved_from_the_inventory_without_replay() {
+        let root = tempfile::tempdir().unwrap();
+        let config = idle_host_config(root.path());
+        let fake = FakeHost::start(config.clone(), FakeSpawn::AdmitThenDropReply).await;
+        let id = format!("host-{}", fresh_id().unwrap());
+        let request = ProcessRequest::new(
+            "sh",
+            vec!["-c".into(), "exit 0".into()],
+            config.repo_root.clone(),
+        );
+        let (_, task) = ExecutionHostClient::spawn_recovering(
+            config.clone(),
+            &id,
+            request,
+            "session",
+            "parent",
+            BackgroundTaskLifetime::Session,
+            crate::BackgroundTaskOrigin::default(),
+            None,
+        )
+        .await
+        .expect("the committed fact resolves the unknown");
+        assert_eq!(task.id, id);
+        assert_eq!(
+            fake.spawn_requests(),
+            1,
+            "an unknown outcome must never be resent"
+        );
+        assert_eq!(fake.admitted_ids().await, vec![id]);
+    }
+
+    /// When the outcome is unknown and the inventory cannot answer, the honest
+    /// result stays unknown. A replay would risk a duplicate side effect.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unresolvable_spawn_outcome_is_never_resent() {
+        let root = tempfile::tempdir().unwrap();
+        let config = idle_host_config(root.path());
+        let fake =
+            FakeHost::start(config.clone(), FakeSpawn::AdmitThenDropReplyAndRefuseList).await;
+        let id = format!("host-{}", fresh_id().unwrap());
+        let request = ProcessRequest::new(
+            "sh",
+            vec!["-c".into(), "exit 0".into()],
+            config.repo_root.clone(),
+        );
+        let error = match ExecutionHostClient::spawn_recovering(
+            config.clone(),
+            &id,
+            request,
+            "session",
+            "parent",
+            BackgroundTaskLifetime::Session,
+            crate::BackgroundTaskOrigin::default(),
+            None,
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("an unprovable outcome is not success"),
+        };
+        assert!(matches!(error, SpawnError::OutcomeUnknown(_)), "{error:?}");
+        assert_eq!(
+            fake.spawn_requests(),
+            1,
+            "an unknown outcome must never be resent"
+        );
+    }
+
+    /// An admitted task whose host is already gone is read from the recovered
+    /// durable archive. A terminal fact is a result; a loss is not turned into
+    /// one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_terminal_admitted_fact_survives_its_host_and_resolves_the_unknown() {
+        let root = tempfile::tempdir().unwrap();
+        let config = idle_host_config(root.path());
+        let fake = FakeHost::start(config.clone(), FakeSpawn::AdmitDropReplyAndExit).await;
+        let id = format!("host-{}", fresh_id().unwrap());
+        let request = ProcessRequest::new(
+            "sh",
+            vec!["-c".into(), "exit 0".into()],
+            config.repo_root.clone(),
+        );
+        let (client, task) = ExecutionHostClient::spawn_recovering(
+            config.clone(),
+            &id,
+            request,
+            "session",
+            "parent",
+            BackgroundTaskLifetime::Session,
+            crate::BackgroundTaskOrigin::default(),
+            None,
+        )
+        .await
+        .expect("the recovered terminal fact is an admitted result");
+        assert!(client.is_none(), "the host that owned it is gone");
+        assert_eq!(task.id, id);
+        assert_eq!(task.status, BackgroundTaskStatus::Exited);
+        assert_eq!(fake.spawn_requests(), 1);
+        assert!(!config.state_dir.join("ready.json").exists());
+    }
+
+    /// A minimal host that speaks enough of the wire protocol to drive the
+    /// recovery paths deterministically. It is not a product mock: tests that
+    /// need a real process use `serve_with_idle_timeout` above.
+    struct FakeHost {
+        spawns: Arc<std::sync::atomic::AtomicUsize>,
+        admitted: Arc<Mutex<HashMap<String, HostedTask>>>,
+        servers: Vec<tokio::task::JoinHandle<()>>,
+        /// The generation the retry must reach after the first one rejects.
+        next_instance: Option<String>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum FakeSpawn {
+        RejectOnceThenAdmit,
+        AdmitThenDropReply,
+        AdmitThenDropReplyAndRefuseList,
+        AdmitDropReplyAndExit,
+    }
+
+    impl Drop for FakeHost {
+        fn drop(&mut self) {
+            for server in &self.servers {
+                server.abort();
+            }
+        }
+    }
+
+    impl FakeHost {
+        async fn start(config: ExecutionHostConfig, behavior: FakeSpawn) -> Self {
+            secure_dir(&config.state_dir).unwrap();
+            let spawns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let admitted: Arc<Mutex<HashMap<String, HostedTask>>> =
+                Arc::new(Mutex::new(HashMap::new()));
+            let first_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let first = fake_ready(&config, &first_listener);
+            atomic_json(&config.state_dir.join("ready.json"), &first).unwrap();
+            // The retirement case needs a real next generation: the retry must
+            // read a NEW ready file, not merely retry the same endpoint.
+            let next = if matches!(behavior, FakeSpawn::RejectOnceThenAdmit) {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let ready = fake_ready(&config, &listener);
+                Some((listener, ready))
+            } else {
+                None
+            };
+            let next_ready = next.as_ref().map(|(_, ready)| ready.clone());
+            let next_instance = next_ready.as_ref().map(|ready| ready.instance.clone());
+            let mut servers = Vec::new();
+            if let Some((listener, ready)) = next {
+                servers.push(tokio::spawn(serve_fake(
+                    listener,
+                    ready,
+                    config.state_dir.clone(),
+                    spawns.clone(),
+                    admitted.clone(),
+                    behavior,
+                    None,
+                )));
+            }
+            servers.push(tokio::spawn(serve_fake(
+                first_listener,
+                first,
+                config.state_dir.clone(),
+                spawns.clone(),
+                admitted.clone(),
+                behavior,
+                next_ready,
+            )));
+            Self {
+                spawns,
+                admitted,
+                servers,
+                next_instance,
+            }
+        }
+
+        fn spawn_requests(&self) -> usize {
+            self.spawns.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        async fn admitted_ids(&self) -> Vec<String> {
+            let mut ids: Vec<_> = self.admitted.lock().await.keys().cloned().collect();
+            ids.sort();
+            ids
+        }
+    }
+
+    fn fake_ready(config: &ExecutionHostConfig, listener: &TcpListener) -> Ready {
+        Ready {
+            address: listener.local_addr().unwrap(),
+            token: "fake-host-token".to_string(),
+            instance: fresh_id().unwrap(),
+            pid: std::process::id(),
+            repo: config.repo_root.clone(),
+            major: PROTOCOL_MAJOR,
+            minor: PROTOCOL_MINOR,
+            capabilities: REQUIRED_CAPABILITIES
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
+        }
+    }
+
+    async fn serve_fake(
+        listener: TcpListener,
+        ready: Ready,
+        state_dir: PathBuf,
+        spawns: Arc<std::sync::atomic::AtomicUsize>,
+        admitted: Arc<Mutex<HashMap<String, HostedTask>>>,
+        behavior: FakeSpawn,
+        next_ready: Option<Ready>,
+    ) {
+        loop {
+            let (mut stream, _) = match listener.accept().await {
+                Ok(accepted) => accepted,
+                Err(_) => return,
+            };
+            let envelope = match read_frame(&mut stream).await {
+                Ok(bytes) => match serde_json::from_slice::<Envelope>(&bytes) {
+                    Ok(envelope) => envelope,
+                    Err(_) => continue,
+                },
+                Err(_) => continue,
+            };
+            let reply = match envelope.request {
+                Request::Hello => Reply::Hello {
+                    major: PROTOCOL_MAJOR,
+                    minor: PROTOCOL_MINOR,
+                    capabilities: REQUIRED_CAPABILITIES
+                        .iter()
+                        .map(|value| value.to_string())
+                        .collect(),
+                    instance: ready.instance.clone(),
+                },
+                Request::List => {
+                    if matches!(behavior, FakeSpawn::AdmitThenDropReplyAndRefuseList) {
+                        Reply::Error("inventory unavailable".into())
+                    } else {
+                        Reply::Tasks(admitted.lock().await.values().cloned().collect())
+                    }
+                }
+                Request::Spawn {
+                    id,
+                    request,
+                    owner,
+                    writer,
+                    lifetime,
+                    ..
+                } => {
+                    let attempt = spawns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if matches!(behavior, FakeSpawn::RejectOnceThenAdmit) && attempt == 0 {
+                        if let Some(next) = &next_ready {
+                            // The retiring generation is already gone; a
+                            // successful retry must reach this new one.
+                            atomic_json(&state_dir.join("ready.json"), next).unwrap();
+                        }
+                        Reply::SpawnRejected("Execution Host is retiring".into())
+                    } else {
+                        let task = fake_hosted_task(&id, &request, &owner, &writer, lifetime);
+                        admitted.lock().await.insert(id.clone(), task.clone());
+                        if matches!(
+                            behavior,
+                            FakeSpawn::AdmitThenDropReply
+                                | FakeSpawn::AdmitThenDropReplyAndRefuseList
+                        ) {
+                            drop(stream);
+                            continue;
+                        }
+                        if matches!(behavior, FakeSpawn::AdmitDropReplyAndExit) {
+                            atomic_json(&state_dir.join("tasks.json"), &vec![task.clone()])
+                                .unwrap();
+                            let _ = std::fs::remove_file(state_dir.join("ready.json"));
+                            drop(stream);
+                            return;
+                        }
+                        Reply::Task(task.snapshot)
+                    }
+                }
+                _ => Reply::Error("fake host does not implement this request".into()),
+            };
+            let _ = write_frame(&mut stream, &reply).await;
+        }
+    }
+
+    fn fake_hosted_task(
+        id: &str,
+        request: &ProcessRequest,
+        owner: &str,
+        writer: &str,
+        lifetime: BackgroundTaskLifetime,
+    ) -> HostedTask {
+        HostedTask {
+            snapshot: BackgroundTaskSnapshot {
+                id: id.to_string(),
+                program: request.program.clone(),
+                args: request.args.clone(),
+                cwd: request.cwd.clone(),
+                status: BackgroundTaskStatus::Exited,
+                exit_code: Some(0),
+                log: String::new(),
+                duration_ms: 1,
+                pid: Some(std::process::id()),
+                owner_scope: Some(owner.to_string()),
+                goal_id: None,
+                origin_call_id: None,
+                log_truncated: false,
+                ready: None,
+                silent_ms: 0,
+                lifetime,
+                expired_exit_waits: 0,
+                output_bytes: 0,
+                start_identity: None,
+                signal: None,
+            },
+            lifetime,
+            writer_scope: writer.to_string(),
+            write_scope: request.write_scope.clone(),
+            process_id: Some(std::process::id()),
+            started_at_ms: 1,
+            finished_at_ms: Some(2),
+            log_end: 0,
+            log_prefix_len: 0,
+            owner_boot: None,
+            owner_loss: None,
+            loss: None,
+            result: None,
+        }
+    }
+
+    /// A terminal fact the host has already observed must be durable before a
+    /// graceful exit. The gate holds the event-driven writer after it saw the
+    /// exit; the shutdown path must not abort that write and leave `Running`
+    /// in the archive.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_terminal_fact_observed_before_shutdown_is_durable_before_exit() {
+        let root = tempfile::tempdir().unwrap();
+        let config = idle_host_config(root.path());
+        let hold = super::test_holds::register(&config.state_dir);
+        let serve_config = config.clone();
+        let server = tokio::spawn(async move { serve_with_idle_timeout(serve_config, None).await });
+        let client = connect_until_ready(&config).await;
+        let id = format!("host-{}", fresh_id().unwrap());
+        // The process must outlive the spawn handler's own write, so the
+        // archive still holds Running when the exit event is observed.
+        let request = ProcessRequest::new(
+            "sh",
+            vec!["-c".into(), "sleep 1; exit 0".into()],
+            config.repo_root.clone(),
+        );
+        client
+            .spawn(
+                &id,
+                request,
+                "session",
+                "parent",
+                BackgroundTaskLifetime::Session,
+                crate::BackgroundTaskOrigin::default(),
+                None,
+            )
+            .await
+            .expect("admitted");
+        tokio::time::timeout(Duration::from_secs(5), hold.entered.notified())
+            .await
+            .expect("the terminal event reached the writer");
+        // The process is gone and there is no intent: this is an ordinary idle
+        // retirement, requested while its terminal fact is still not durable.
+        client
+            .shutdown_if_idle()
+            .await
+            .expect("no live workload blocks the reclaim");
+        let result = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("the host exits")
+            .unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        let tasks: Vec<HostedTask> = serde_json::from_slice(
+            &std::fs::read(config.state_dir.join("tasks.json")).expect("durable archive"),
+        )
+        .expect("valid archive");
+        let task = tasks
+            .iter()
+            .find(|task| task.snapshot.id == id)
+            .expect("the admitted task is archived");
+        assert_eq!(task.snapshot.status, BackgroundTaskStatus::Exited);
+        assert!(task.finished_at_ms.is_some());
+        assert!(
+            task.result.is_some(),
+            "the committed completion record must survive the exit"
+        );
+        assert!(!config.state_dir.join("ready.json").exists());
+    }
+
+    /// A final write that cannot commit is reported as a failure, never as a
+    /// clean exit, and the stale endpoint is still removed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_final_persist_is_reported_and_still_removes_the_endpoint() {
+        let root = tempfile::tempdir().unwrap();
+        let config = idle_host_config(root.path());
+        let serve_config = config.clone();
+        let server = tokio::spawn(async move { serve_with_idle_timeout(serve_config, None).await });
+        let client = connect_until_ready(&config).await;
+        // Atomic replacement cannot rename a file over a directory.
+        let archive = config.state_dir.join("tasks.json");
+        std::fs::remove_file(&archive).unwrap();
+        std::fs::create_dir(&archive).unwrap();
+        client
+            .shutdown_if_idle()
+            .await
+            .expect("the reclaim decision does not depend on a writable archive");
+        let result = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("the host stops even when its archive cannot commit")
+            .unwrap();
+        let error = result.expect_err("a durability failure is not a clean exit");
+        assert!(
+            error.contains("not durable"),
+            "the failure names durability: {error}"
+        );
+        assert!(
+            !config.state_dir.join("ready.json").exists(),
+            "a failed write must not leave a stale endpoint"
+        );
     }
 }

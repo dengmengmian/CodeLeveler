@@ -119,6 +119,9 @@ impl RuntimeLifecycleState {
                 }
             }
             EnsureError::LegacyMigrationRefused { .. } => Self::MigrationFailed,
+            // The old runtime accepted the request and is draining its own
+            // work: nothing failed, and a later launch attaches.
+            EnsureError::LegacyRetirementPending { .. } => Self::Retiring,
             // A different build answered and cannot be adopted by this client.
             // The runtime is untouched and a human must restart the client.
             EnsureError::BuildMismatch { .. } => Self::Incompatible,

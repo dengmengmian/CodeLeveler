@@ -69,6 +69,21 @@ const DRAIN_DECISION_TIMEOUT_ENV: &str = "LEVELER_HANDOVER_DRAIN_TIMEOUT_SECS";
 #[cfg(unix)]
 const LEGACY_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// A cooperative retirement request is sent only after two observations agree
+/// that the runtime owes no work and has no attached local UI. This is the
+/// settle between them: a UI that is reconnecting attaches within it, and a
+/// freshly admitted turn shows up in the runtime's own health.
+#[cfg(unix)]
+const LEGACY_RETIREMENT_SETTLE: Duration = Duration::from_millis(500);
+#[cfg(unix)]
+const LEGACY_RETIREMENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long a programmatic shell waits for a quiescent legacy runtime that
+/// accepted the request to release its endpoint. A shell with an operator
+/// waits as long as the drain needs; this bound only keeps a bridge or CI
+/// caller from spinning on a state it cannot see.
+#[cfg(unix)]
+const LEGACY_RETIREMENT_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// How long a shell that cannot answer may wait for an old runtime to drain.
 ///
 /// A shell WITH a handover prompt keeps waiting for as long as the old runtime
@@ -459,8 +474,25 @@ pub enum HandoffEvent {
         reason: String,
     },
     /// The shell is waiting for the previous owner to exit on its own.
+    ///
+    /// The counts are what that owner reported about itself, `None` when it
+    /// could not be observed. They are facts, never a guess: a shell must not
+    /// promise a wait that the reported state contradicts.
     LegacyExitRequired {
         block: LegacyHandoffBlock,
+        version: Option<String>,
+        pid: Option<u32>,
+        active_turns: Option<u32>,
+        active_background_tasks: Option<u32>,
+        local_waiters: Option<usize>,
+    },
+    /// A verified, idle runtime too old to authenticate a handover accepted a
+    /// cooperative retirement request.
+    ///
+    /// The old runtime stops admitting work and exits after the work it owns
+    /// settles. Reported as its own event so the shell can say what actually
+    /// happened instead of implying the user must stop the process themselves.
+    LegacyRetirementRequested {
         version: Option<String>,
         pid: Option<u32>,
     },
@@ -609,6 +641,19 @@ pub enum EnsureError {
         socket.display()
     )]
     LegacyMigrationRefused { socket: PathBuf, reason: String },
+    /// A pre-token runtime ACCEPTED cooperative retirement and is still
+    /// releasing its endpoint.
+    ///
+    /// Distinct from [`Self::LegacyMigrationRefused`]: the old runtime did not
+    /// refuse, it is draining its own work after closing admission. Nothing is
+    /// wrong and nothing was cancelled; a later launch (or a shell that can
+    /// wait) attaches once the endpoint is released. Typed so a programmatic
+    /// caller can retry without parsing a sentence.
+    #[error(
+        "the previous runtime at {} accepted retirement and is still releasing its endpoint",
+        socket.display()
+    )]
+    LegacyRetirementPending { socket: PathBuf },
     /// The runtime that answered is a different artifact from this client.
     ///
     /// Typed, not prose: the revive loop must be able to recognise a stable
@@ -1115,10 +1160,14 @@ async fn retire_runtime(
             // The startup probe has a local subscription. Keeping it while
             // we wait would prevent an idle legacy runtime from self-evicting.
             drop(client);
+            let observed = LegacyObservation {
+                info: (*info).clone(),
+                local_waiters: None,
+            };
             wait_for_legacy_exit(
                 socket_path,
                 LegacyHandoffBlock::AtomicRetirementUnavailable,
-                Some(&info),
+                Some(&observed),
                 ui,
             )
             .await;
@@ -1212,17 +1261,96 @@ pub async fn reconcile_runtime_generation(
             #[cfg(unix)]
             Ok(EndpointProbe::NotReady) => return Err(EnsureError::UnknownGeneration.into()),
             Err(TransportError::PredatesAccessToken(observed)) => {
-                let info = observe_legacy_runtime(&observed).await;
+                // A pre-token runtime cannot prove a generation or answer the
+                // atomic retirement question, but every generation that answers
+                // `runtime_info` also honors `shutdown_when_idle` over the same
+                // unauthenticated protocol. That request is COOPERATIVE: the
+                // old runtime stops admitting work and exits only after the
+                // work it already owns drains. Send it only to an instance this
+                // client can name by process facts, and only while it reports
+                // no work and no attached local UI — the command closes
+                // admission immediately, so a busy or watched runtime must keep
+                // serving its own clients.
+                let observation = observe_legacy(&observed).await;
+                #[cfg(unix)]
+                let requested = legacy_retirement_is_safe(layout, &observed, observation.as_ref())
+                    .await
+                    && request_legacy_retirement(&observed, observation.as_ref(), ui).await;
+                #[cfg(not(unix))]
+                let requested = false;
                 if !ui.waits_for_legacy_exit() {
-                    return Err(legacy_runtime_refusal(socket_path, info.as_ref(), ui));
+                    if requested {
+                        if wait_for_endpoint_release_bounded(
+                            &observed,
+                            LEGACY_RETIREMENT_RELEASE_TIMEOUT,
+                        )
+                        .await
+                        {
+                            continue;
+                        }
+                        // The request WAS accepted; the runtime is draining,
+                        // not refusing. A programmatic caller must retry, not
+                        // start a competitor or claim the old build refused.
+                        ui.emit(HandoffEvent::MigrationFailed {
+                            reason: "the previous runtime accepted cooperative retirement and is \
+                                     still releasing its endpoint; retry once it exits"
+                                .to_string(),
+                        });
+                        return Err(EnsureError::LegacyRetirementPending {
+                            socket: socket_path.to_path_buf(),
+                        }
+                        .into());
+                    }
+                    // No request was acknowledged. That does not prove the
+                    // runtime refused: the frame may have been processed while
+                    // its reply was lost, or another shell may have asked.
+                    // Only the runtime's own current state can tell an
+                    // accepted retirement from a refusal, so read it again.
+                    if endpoint_released(
+                        &observed,
+                        LegacyHandoffBlock::AccessTokenUnavailable,
+                        None,
+                    )
+                    .await
+                    {
+                        continue;
+                    }
+                    let after = observe_legacy(&observed).await;
+                    if after
+                        .as_ref()
+                        .is_some_and(|observed| observed.info.health.shutting_down)
+                    {
+                        if wait_for_endpoint_release_bounded(
+                            &observed,
+                            LEGACY_RETIREMENT_RELEASE_TIMEOUT,
+                        )
+                        .await
+                        {
+                            continue;
+                        }
+                        ui.emit(HandoffEvent::MigrationFailed {
+                            reason: "the previous runtime is already retiring and is still \
+                                     releasing its endpoint"
+                                .to_string(),
+                        });
+                        return Err(EnsureError::LegacyRetirementPending {
+                            socket: socket_path.to_path_buf(),
+                        }
+                        .into());
+                    }
+                    return Err(legacy_runtime_refusal(
+                        socket_path,
+                        after.as_ref().or(observation.as_ref()),
+                        ui,
+                    ));
                 }
-                wait_for_legacy_exit(
-                    &observed,
-                    LegacyHandoffBlock::AccessTokenUnavailable,
-                    info.as_ref(),
-                    ui,
-                )
-                .await;
+                if requested {
+                    wait_for_legacy_handoff(layout, &observed, observation.as_ref(), ui, true)
+                        .await;
+                } else {
+                    wait_for_legacy_handoff(layout, &observed, observation.as_ref(), ui, false)
+                        .await;
+                }
                 continue;
             }
             Err(error) => return Err(error.into()),
@@ -1266,13 +1394,397 @@ pub async fn reconcile_runtime_generation(
     Err(EnsureError::UnknownGeneration.into())
 }
 
+/// What a pre-token endpoint said about itself, read without adopting it.
+///
+/// `info` is the runtime's own authoritative health report; `local_waiters` is
+/// the transport's attached-UI count. Both are read-only requests that every
+/// generation answered before the access token existed.
 #[cfg(any(unix, windows))]
-async fn observe_legacy_runtime(_socket_path: &Path) -> Option<RuntimeInfo> {
+struct LegacyObservation {
+    info: RuntimeInfo,
+    local_waiters: Option<usize>,
+}
+
+#[cfg(any(unix, windows))]
+async fn observe_legacy(_socket_path: &Path) -> Option<LegacyObservation> {
     #[cfg(unix)]
-    return leveler_local_transport::legacy_runtime_info(_socket_path, LEGACY_OBSERVATION_TIMEOUT)
-        .await;
+    {
+        let (info, local_waiters) = tokio::join!(
+            leveler_local_transport::legacy_runtime_info(_socket_path, LEGACY_OBSERVATION_TIMEOUT),
+            leveler_local_transport::legacy_local_waiter_count(
+                _socket_path,
+                LEGACY_OBSERVATION_TIMEOUT
+            ),
+        );
+        info.map(|info| LegacyObservation {
+            info,
+            local_waiters,
+        })
+    }
     #[cfg(windows)]
     None
+}
+
+/// Whether the runtime itself reports "no work owed right now".
+#[cfg(unix)]
+fn legacy_reports_no_work(info: &RuntimeInfo) -> bool {
+    // A legacy reply that omits `turn_capacity` is not a populated health
+    // object; its zeroed counts prove nothing and must never authorize a
+    // retirement request.
+    info.health.turn_capacity.is_some()
+        && info.health.active_turns == 0
+        && info.health.active_background_tasks == 0
+        && info.health.quiescent()
+        && !info.health.shutting_down
+}
+
+/// The kernel-visible identity of the runtime a gate verified.
+///
+/// A pid alone is a reusable number and a path alone can be rebound. The start
+/// marker and the socket object are what make "the same instance" a fact the
+/// settle can re-check instead of a claim the runtime made about itself.
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+struct LegacyIdentity {
+    witness: crate::legacy::ProcessWitness,
+    socket: crate::legacy::SocketObject,
+}
+
+/// The pure identity half of the cooperative-retirement gate: the runtime
+/// reports no work, and the pid it names is a live process of this user whose
+/// command line identifies it as a runtime for this workspace. The returned
+/// witness and socket object are revalidated by the settle.
+#[cfg(unix)]
+fn legacy_verified_idle(
+    socket_path: &Path,
+    workspace: Option<&Path>,
+    info: &RuntimeInfo,
+) -> Option<LegacyIdentity> {
+    if !legacy_reports_no_work(info) {
+        return None;
+    }
+    if info.pid == 0
+        || info.pid == std::process::id()
+        || info.runtime_id.as_str().is_empty()
+        || !info.build.is_known()
+        || info.build == leveler_core::BuildIdentity::current()
+    {
+        return None;
+    }
+    let socket = crate::legacy::socket_object(socket_path)?;
+    if !crate::legacy::process_alive(info.pid)
+        || !crate::legacy::process_owned_by_current_user(info.pid)
+    {
+        return None;
+    }
+    let witness = crate::legacy::process_witness(info.pid)?;
+    let command = crate::legacy::process_command(info.pid)?;
+    if !crate::legacy::serves_workspace(&command, workspace) {
+        return None;
+    }
+    Some(LegacyIdentity { witness, socket })
+}
+
+/// Whether the second observation still describes the instance the identity
+/// gate verified. Kept pure so the settle's facts are testable without a real
+/// PID reuse or socket rebind: the witness and the socket object are what
+/// distinguish "the same process" from "the same number".
+#[cfg(unix)]
+fn legacy_settle_agrees(
+    first: &RuntimeInfo,
+    identity: &LegacyIdentity,
+    second: &LegacyObservation,
+    second_witness: Option<&crate::legacy::ProcessWitness>,
+    second_socket: Option<&crate::legacy::SocketObject>,
+) -> bool {
+    second.local_waiters == Some(0)
+        && second.info.pid == first.pid
+        && second.info.runtime_id == first.runtime_id
+        && legacy_reports_no_work(&second.info)
+        && second_witness == Some(&identity.witness)
+        && second_socket == Some(&identity.socket)
+}
+
+/// The identity gate plus the settle every caller must use: two observations,
+/// `LEGACY_RETIREMENT_SETTLE` apart, must agree that the runtime is idle,
+/// unattached, and still the SAME instance. A UI that attaches between the
+/// probe and the request is not retired underneath, a runtime replaced under
+/// the caller is re-examined instead of being asked on stale facts, and a pid
+/// reused inside the window cannot pass for the process that was verified.
+#[cfg(unix)]
+async fn legacy_retirement_settles(
+    socket_path: &Path,
+    workspace: Option<&Path>,
+    first: &RuntimeInfo,
+) -> bool {
+    let Some(identity) = legacy_verified_idle(socket_path, workspace, first) else {
+        return false;
+    };
+    tokio::time::sleep(LEGACY_RETIREMENT_SETTLE).await;
+    let Some(second) = observe_legacy(socket_path).await else {
+        return false;
+    };
+    let witness = crate::legacy::process_witness(second.info.pid);
+    let socket = crate::legacy::socket_object(socket_path);
+    legacy_settle_agrees(first, &identity, &second, witness.as_ref(), socket.as_ref())
+}
+
+/// Observe `socket_path` and return the runtime only when it passes the SAME
+/// gate the startup handshake uses, so `runtime stop` cannot be more willing
+/// to close admission than a launch.
+#[cfg(unix)]
+pub(crate) async fn legacy_cooperative_retirement_target(
+    socket_path: &Path,
+    workspace: Option<&Path>,
+) -> Option<RuntimeInfo> {
+    let observation = observe_legacy(socket_path).await?;
+    if observation.local_waiters != Some(0) {
+        return None;
+    }
+    legacy_retirement_settles(socket_path, workspace, &observation.info)
+        .await
+        .then_some(observation.info)
+}
+
+/// The startup-path gate: the caller already has one observation (used for the
+/// reported event); the settle re-observes the same instance.
+#[cfg(unix)]
+async fn legacy_retirement_is_safe(
+    layout: &Layout,
+    socket_path: &Path,
+    observation: Option<&LegacyObservation>,
+) -> bool {
+    let Some(first) = observation else {
+        return false;
+    };
+    first.local_waiters == Some(0)
+        && legacy_retirement_settles(socket_path, layout.primary_workspace(), &first.info).await
+}
+
+/// Send the cooperative retirement request. A refusal is not a failure of the
+/// launch: the caller keeps waiting and reports what the runtime did.
+#[cfg(unix)]
+async fn request_legacy_retirement(
+    socket_path: &Path,
+    observation: Option<&LegacyObservation>,
+    ui: &dyn HandoffUi,
+) -> bool {
+    let Some(observed) = observation else {
+        return false;
+    };
+    match leveler_local_transport::legacy_request_shutdown_when_idle(
+        socket_path,
+        RestartReason::BuildMismatch,
+        LEGACY_RETIREMENT_REQUEST_TIMEOUT,
+        observed.info.pid,
+    )
+    .await
+    {
+        Ok(()) => {
+            tracing::info!(
+                pid = observed.info.pid,
+                version = %observed.info.version,
+                "the idle legacy runtime accepted cooperative retirement"
+            );
+            ui.emit(HandoffEvent::LegacyRetirementRequested {
+                version: (!observed.info.version.is_empty()).then(|| observed.info.version.clone()),
+                pid: (observed.info.pid != 0).then_some(observed.info.pid),
+            });
+            true
+        }
+        Err(error) => {
+            tracing::info!(
+                %error,
+                pid = observed.info.pid,
+                "the legacy runtime did not accept cooperative retirement"
+            );
+            false
+        }
+    }
+}
+
+/// Wait until a legacy endpoint is released, without asking it to change state.
+///
+/// A current-generation runtime answering on the endpoint means the previous
+/// owner released it (another shell finished the same handover). That is a
+/// completed release, not "still draining": the caller must re-probe and
+/// attach instead of reporting a pending retirement.
+#[cfg(unix)]
+async fn wait_for_endpoint_release_bounded(socket_path: &Path, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if endpoint_released(
+            socket_path,
+            LegacyHandoffBlock::AccessTokenUnavailable,
+            None,
+        )
+        .await
+        {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Wait for a pre-token runtime to hand over.
+///
+/// This wait is not passive forever: a runtime that was busy or watched when
+/// the launch began can become a safe cooperative-retirement target later (its
+/// last turn ends, the old UI attached to it is closed). Each refresh
+/// re-observes the runtime and sends the same verified request, so the user
+/// does not have to wait out the old build's own idle timer — the exact delay
+/// this handover exists to remove. A runtime that never becomes safe is never
+/// asked, and its state is reported instead.
+///
+/// A DIFFERENT pre-token instance appearing on the endpoint (the old owner
+/// exited and an old client restarted it) is a new target: it is evaluated
+/// again instead of inheriting the previous request.
+#[cfg(unix)]
+async fn wait_for_legacy_handoff(
+    layout: &Layout,
+    socket_path: &Path,
+    previous: Option<&LegacyObservation>,
+    ui: &dyn HandoffUi,
+    requested: bool,
+) {
+    let mut requested = if requested {
+        previous.map(|observed| (observed.info.pid, observed.info.runtime_id.clone()))
+    } else {
+        None
+    };
+    if requested.is_none() {
+        emit_legacy_exit_required(
+            socket_path,
+            LegacyHandoffBlock::AccessTokenUnavailable,
+            previous,
+            ui,
+        );
+    }
+    loop {
+        tokio::time::sleep(HANDOVER_STATUS_INTERVAL).await;
+        let current = observe_legacy(socket_path).await;
+        if let Some((pid, runtime_id)) = requested.as_ref()
+            && current.as_ref().is_some_and(|observed| {
+                observed.info.pid != *pid || observed.info.runtime_id != *runtime_id
+            })
+        {
+            // The instance this client asked is gone; a new one answers.
+            requested = None;
+        }
+        if requested.is_none()
+            && let Some(observed) = current.as_ref()
+            && observed.local_waiters == Some(0)
+            && legacy_retirement_settles(socket_path, layout.primary_workspace(), &observed.info)
+                .await
+            && request_legacy_retirement(socket_path, Some(observed), ui).await
+        {
+            requested = Some((observed.info.pid, observed.info.runtime_id.clone()));
+        }
+        if endpoint_released(
+            socket_path,
+            LegacyHandoffBlock::AccessTokenUnavailable,
+            previous,
+        )
+        .await
+        {
+            return;
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_legacy_handoff(
+    _layout: &Layout,
+    socket_path: &Path,
+    previous: Option<&LegacyObservation>,
+    ui: &dyn HandoffUi,
+    _requested: bool,
+) {
+    emit_legacy_exit_required(
+        socket_path,
+        LegacyHandoffBlock::AccessTokenUnavailable,
+        previous,
+        ui,
+    );
+    wait_for_endpoint_release(
+        socket_path,
+        LegacyHandoffBlock::AccessTokenUnavailable,
+        previous,
+    )
+    .await;
+}
+
+/// One observation step: has the endpoint been released (or replaced)?
+#[cfg(any(unix, windows))]
+async fn endpoint_released(
+    socket_path: &Path,
+    block: LegacyHandoffBlock,
+    previous: Option<&LegacyObservation>,
+) -> bool {
+    match probe_endpoint_as(
+        socket_path,
+        DEFAULT_DAEMON_CONNECT_TIMEOUT,
+        leveler_local_transport::ClientKind::Remote,
+    )
+    .await
+    {
+        Ok(EndpointProbe::Absent) => true,
+        Ok(EndpointProbe::Ready(client)) => {
+            if block == LegacyHandoffBlock::AccessTokenUnavailable {
+                return true;
+            }
+            if let Some(previous) = previous
+                && let Ok(Ok(observed)) = tokio::time::timeout(
+                    READY_CONNECT_TIMEOUT,
+                    LocalRuntimeService::runtime_info(&client),
+                )
+                .await
+                && (observed.pid != previous.info.pid
+                    || observed.runtime_id != previous.info.runtime_id
+                    || observed.build != previous.info.build)
+            {
+                return true;
+            }
+            false
+        }
+        Ok(_) | Err(TransportError::PredatesAccessToken(_)) => false,
+        Err(error) => {
+            tracing::debug!(%error, "could not observe legacy runtime exit");
+            false
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn emit_legacy_exit_required(
+    socket_path: &Path,
+    block: LegacyHandoffBlock,
+    previous: Option<&LegacyObservation>,
+    ui: &dyn HandoffUi,
+) {
+    tracing::info!(
+        ?block,
+        socket = %socket_path.display(),
+        pid = previous.map(|observed| observed.info.pid),
+        build = previous.map(|observed| observed.info.build.diagnostic()),
+        "waiting for legacy runtime exit"
+    );
+    let info = previous.map(|observed| &observed.info);
+    ui.emit(HandoffEvent::LegacyExitRequired {
+        block,
+        version: info.and_then(|info| (!info.version.is_empty()).then(|| info.version.clone())),
+        pid: info.and_then(|info| (info.pid != 0).then_some(info.pid)),
+        active_turns: info.and_then(|info| {
+            (info.health.turn_capacity.is_some()).then_some(info.health.active_turns)
+        }),
+        active_background_tasks: info.and_then(|info| {
+            (info.health.turn_capacity.is_some()).then_some(info.health.active_background_tasks)
+        }),
+        local_waiters: previous.and_then(|observed| observed.local_waiters),
+    });
 }
 
 /// A passive wait never asks a legacy peer to change state. When the endpoint
@@ -1282,50 +1794,46 @@ async fn observe_legacy_runtime(_socket_path: &Path) -> Option<RuntimeInfo> {
 async fn wait_for_legacy_exit(
     socket_path: &Path,
     block: LegacyHandoffBlock,
-    previous: Option<&RuntimeInfo>,
+    previous: Option<&LegacyObservation>,
     ui: &dyn HandoffUi,
 ) {
     tracing::info!(
         ?block,
         socket = %socket_path.display(),
-        pid = previous.map(|info| info.pid),
-        build = previous.map(|info| info.build.diagnostic()),
+        pid = previous.map(|observed| observed.info.pid),
+        build = previous.map(|observed| observed.info.build.diagnostic()),
         "waiting for legacy runtime exit"
     );
+    let info = previous.map(|observed| &observed.info);
     ui.emit(HandoffEvent::LegacyExitRequired {
         block,
-        version: previous.and_then(|info| (!info.version.is_empty()).then(|| info.version.clone())),
-        pid: previous.and_then(|info| (info.pid != 0).then_some(info.pid)),
+        version: info.and_then(|info| (!info.version.is_empty()).then(|| info.version.clone())),
+        pid: info.and_then(|info| (info.pid != 0).then_some(info.pid)),
+        active_turns: info.and_then(|info| {
+            (info.health.turn_capacity.is_some()).then_some(info.health.active_turns)
+        }),
+        active_background_tasks: info.and_then(|info| {
+            (info.health.turn_capacity.is_some()).then_some(info.health.active_background_tasks)
+        }),
+        local_waiters: previous.and_then(|observed| observed.local_waiters),
     });
+    wait_for_endpoint_release(socket_path, block, previous).await;
+}
+
+/// Observe the endpoint until its owner releases it (or is replaced).
+///
+/// Failed observations do not prove release: only an absent endpoint, or a
+/// different generation answering on it, ends the wait.
+#[cfg(any(unix, windows))]
+async fn wait_for_endpoint_release(
+    socket_path: &Path,
+    block: LegacyHandoffBlock,
+    previous: Option<&LegacyObservation>,
+) {
     loop {
         tokio::time::sleep(HANDOVER_STATUS_INTERVAL).await;
-        match probe_endpoint_as(
-            socket_path,
-            DEFAULT_DAEMON_CONNECT_TIMEOUT,
-            leveler_local_transport::ClientKind::Remote,
-        )
-        .await
-        {
-            Ok(EndpointProbe::Absent) => return,
-            Ok(EndpointProbe::Ready(client)) => {
-                if block == LegacyHandoffBlock::AccessTokenUnavailable {
-                    return;
-                }
-                if let Some(previous) = previous
-                    && let Ok(Ok(observed)) = tokio::time::timeout(
-                        READY_CONNECT_TIMEOUT,
-                        LocalRuntimeService::runtime_info(&client),
-                    )
-                    .await
-                    && (observed.pid != previous.pid
-                        || observed.runtime_id != previous.runtime_id
-                        || observed.build != previous.build)
-                {
-                    return;
-                }
-            }
-            Ok(_) | Err(TransportError::PredatesAccessToken(_)) => {}
-            Err(error) => tracing::debug!(%error, "could not observe legacy runtime exit"),
+        if endpoint_released(socket_path, block, previous).await {
+            return;
         }
     }
 }
@@ -1334,10 +1842,11 @@ async fn wait_for_legacy_exit(
 #[cfg(any(unix, windows))]
 fn legacy_runtime_refusal(
     socket_path: &Path,
-    info: Option<&RuntimeInfo>,
+    observation: Option<&LegacyObservation>,
     ui: &dyn HandoffUi,
 ) -> anyhow::Error {
-    if let Some(info) = info {
+    if let Some(observed) = observation {
+        let info = &observed.info;
         let active_turns = info.health.active_turns;
         let active_background_tasks = info.health.active_background_tasks;
         if active_turns > 0 || active_background_tasks > 0 {
@@ -1353,9 +1862,17 @@ fn legacy_runtime_refusal(
             .into();
         }
     }
+    // Name the fact that actually blocks this launch. An attached local UI is
+    // not "work"; reporting it as work would tell a programmatic caller to
+    // wait for a turn that does not exist.
+    let attached = observation
+        .and_then(|observed| observed.local_waiters)
+        .filter(|waiters| *waiters > 0)
+        .map(|waiters| format!("; {waiters} local UI(s) are attached to it"))
+        .unwrap_or_default();
     let reason = format!(
         "the previous runtime at {} predates the access token and does not support atomic \
-         retirement; let it finish its work and exit normally, then restart this build",
+         retirement{attached}; let it exit normally, then restart this build",
         socket_path.display()
     );
     ui.emit(HandoffEvent::MigrationFailed {
@@ -2563,6 +3080,7 @@ mod generation_attach_tests {
                 block: LegacyHandoffBlock::AtomicRetirementUnavailable,
                 version: Some(version),
                 pid: Some(pid),
+                ..
             }] if version == "previous" && *pid == std::process::id()
         ));
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -2710,12 +3228,20 @@ mod generation_attach_tests {
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let serving = tokio::spawn(async move {
             loop {
-                let (mut stream, _) = listener.accept().await.unwrap();
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
                 if let Ok(length) = stream.read_u32().await {
                     let mut frame = vec![0; length as usize];
                     stream.read_exact(&mut frame).await.unwrap();
                     let request: serde_json::Value = serde_json::from_slice(&frame).unwrap();
-                    assert_eq!(request["body"]["type"], "runtime_info");
+                    assert!(
+                        matches!(
+                            request["body"]["type"].as_str(),
+                            Some("runtime_info" | "local_waiters")
+                        ),
+                        "unexpected observation: {request}"
+                    );
                 }
             }
         });
@@ -2745,6 +3271,9 @@ mod generation_attach_tests {
                 block: LegacyHandoffBlock::AccessTokenUnavailable,
                 version: None,
                 pid: None,
+                active_turns: None,
+                active_background_tasks: None,
+                local_waiters: None,
             }]
         ));
     }
@@ -2763,43 +3292,49 @@ mod generation_attach_tests {
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let serving = tokio::spawn(async move {
             loop {
-                let (mut stream, _) = listener.accept().await.unwrap();
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
                 // The probe's liveness connect writes nothing and is dropped.
                 let Ok(length) = stream.read_u32().await else {
                     continue;
                 };
                 let mut request = vec![0; length as usize];
                 stream.read_exact(&mut request).await.unwrap();
-                let info = serde_json::json!({
-                    "type": "runtime_info",
-                    "body": {
-                        "runtime_id": "legacy-busy",
-                        "version": "1.0.11",
-                        "build": {
+                let request: serde_json::Value = serde_json::from_slice(&request).unwrap();
+                let body = if request["body"]["type"] == "local_waiters" {
+                    serde_json::json!({"type": "local_waiters", "body": 0})
+                } else {
+                    serde_json::json!({
+                        "type": "runtime_info",
+                        "body": {
+                            "runtime_id": "legacy-busy",
                             "version": "1.0.11",
-                            "revision": "0000000000000000000000000000000000000000",
-                            "fingerprint": "legacy",
-                            "dirty": false
-                        },
-                        "config_fingerprint": null,
-                        "pid": std::process::id(),
-                        "health": {
-                            "accepting_work": true,
-                            "active_turns": 1,
-                            "active_background_tasks": 0,
-                            "quiescent": false,
-                            "shutting_down": false
+                            "build": {
+                                "version": "1.0.11",
+                                "revision": "0000000000000000000000000000000000000000",
+                                "fingerprint": "legacy",
+                                "dirty": false
+                            },
+                            "config_fingerprint": null,
+                            "pid": std::process::id(),
+                            "health": {
+                                "accepting_work": true,
+                                "active_turns": 1,
+                                "active_background_tasks": 0,
+                                "quiescent": false,
+                                "shutting_down": false
+                            }
                         }
-                    }
-                });
+                    })
+                };
                 let bytes = serde_json::to_vec(&serde_json::json!({
                     "protocol": {"major": 1, "minor": 0},
-                    "body": info
+                    "body": body
                 }))
                 .unwrap();
                 stream.write_u32(bytes.len() as u32).await.unwrap();
                 stream.write_all(&bytes).await.unwrap();
-                break;
             }
         });
         let ui = Ui::default();
@@ -2827,6 +3362,747 @@ mod generation_attach_tests {
             )),
             "the shell must see the deferral, not a migration failure: {events:?}"
         );
+    }
+
+    /// A separate process that speaks the pre-token protocol on a Unix socket.
+    ///
+    /// The cooperative request is bound to the kernel's peer credential, so a
+    /// listener in this test process would not exercise the production path:
+    /// the verified pid would name one process while the connection belonged
+    /// to another. This child both listens and reports its own pid, exactly as
+    /// a real runtime does, and its command line names a `serve` runtime for
+    /// the workspace (the trailing positional arguments).
+    #[cfg(unix)]
+    struct FakeLegacyProcess {
+        child: std::process::Child,
+        command_log: std::path::PathBuf,
+        #[allow(dead_code)]
+        ready: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    const FAKE_LEGACY_RUNTIME: &str = r#"
+import json, os, socket, struct, sys
+
+sock_path, mode, command_log, flag_path, ready_path = sys.argv[1:6]
+
+server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+try:
+    os.unlink(sock_path)
+except OSError:
+    pass
+server.bind(sock_path)
+server.listen(64)
+open(ready_path, "w").write("ready")
+sent = False
+
+def waiters():
+    if mode == "attached_until_flag":
+        return 1 if os.path.exists(flag_path) else 0
+    return 0
+
+def shutting_down():
+    return mode == "retiring" or (mode == "acklost" and sent)
+
+def info():
+    sd = shutting_down()
+    return {
+        "runtime_id": "legacy-fake",
+        "version": "1.0.27",
+        "build": {
+            "version": "1.0.27",
+            "revision": "0000000000000000000000000000000000000000",
+            "fingerprint": "legacy",
+            "dirty": False,
+        },
+        "config_fingerprint": None,
+        "pid": os.getpid(),
+        "health": {
+            "accepting_work": not sd,
+            "active_turns": 0,
+            "active_background_tasks": 0,
+            "quiescent": not sd,
+            "turn_capacity": 4,
+            "shutting_down": sd,
+        },
+    }
+
+def read_exact(conn, n):
+    data = b""
+    while len(data) < n:
+        chunk = conn.recv(n - len(data))
+        if not chunk:
+            return None
+        data += chunk
+    return data
+
+def send(conn, body):
+    payload = json.dumps({"protocol": {"major": 1, "minor": 0}, "body": body}).encode()
+    conn.sendall(struct.pack(">I", len(payload)) + payload)
+
+while True:
+    conn, _ = server.accept()
+    header = read_exact(conn, 4)
+    if header is None:
+        conn.close()
+        continue
+    frame = read_exact(conn, struct.unpack(">I", header)[0])
+    if frame is None:
+        conn.close()
+        continue
+    try:
+        body = json.loads(frame).get("body", {})
+    except ValueError:
+        conn.close()
+        continue
+    kind = body.get("type")
+    if kind == "local_waiters":
+        send(conn, {"type": "local_waiters", "body": waiters()})
+        conn.close()
+    elif kind == "send":
+        with open(command_log, "a") as log:
+            # Record the whole request body, exactly as the in-process fake did,
+            # so a test asserts the wire shape the runtime receives.
+            log.write(json.dumps(body) + "\n")
+        sent = True
+        if mode == "acklost":
+            # The command was processed, its reply never reached the sender.
+            conn.close()
+        else:
+            send(conn, {"type": "ack"})
+            conn.close()
+            if mode in ("idle", "attached_until_flag"):
+                try:
+                    os.unlink(sock_path)
+                except OSError:
+                    pass
+                break
+    else:
+        send(conn, {"type": "runtime_info", "body": info()})
+        conn.close()
+"#;
+
+    #[cfg(unix)]
+    impl FakeLegacyProcess {
+        // The returned value owns the child and its Drop kills and reaps it on
+        // every path, including panics; clippy cannot see through the guard.
+        #[allow(clippy::zombie_processes)]
+        fn start(root: &Path, socket: &Path, mode: &str, repo: &Path) -> Self {
+            let script = root.join(format!("fake-legacy-{mode}.py"));
+            std::fs::write(&script, FAKE_LEGACY_RUNTIME).unwrap();
+            let command_log = root.join(format!("legacy-commands-{mode}.jsonl"));
+            let ready = root.join(format!("legacy-ready-{mode}"));
+            let flag = root.join("legacy-attached");
+            let _ = std::fs::remove_file(&command_log);
+            let _ = std::fs::remove_file(&ready);
+            let _ = std::fs::remove_file(&flag);
+            if mode == "attached_until_flag" {
+                std::fs::write(&flag, b"1").unwrap();
+            }
+            let mut child = std::process::Command::new("python3")
+                .arg(&script)
+                .arg(socket)
+                .arg(mode)
+                .arg(&command_log)
+                .arg(&flag)
+                .arg(&ready)
+                // Positional tokens that make the process command line name a
+                // runtime serving this workspace, as a real runtime's does.
+                .arg(repo)
+                .arg("serve")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("the legacy test harness needs python3");
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                if ready.exists() && socket.exists() {
+                    return Self {
+                        child,
+                        command_log,
+                        ready,
+                    };
+                }
+                if let Some(status) = child.try_wait().unwrap() {
+                    panic!("the fake legacy runtime exited before readiness: {status}");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let _ = child.kill();
+            panic!("the fake legacy runtime did not bind within 5s");
+        }
+
+        fn commands(&self) -> Vec<serde_json::Value> {
+            std::fs::read_to_string(&self.command_log)
+                .map(|text| {
+                    text.lines()
+                        .filter_map(|line| serde_json::from_str(line).ok())
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+
+        fn wait_for_commands(&self, count: usize) -> Vec<serde_json::Value> {
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            loop {
+                let commands = self.commands();
+                if commands.len() >= count || std::time::Instant::now() >= deadline {
+                    return commands;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        fn release_attachment(&self, root: &Path) {
+            std::fs::remove_file(root.join("legacy-attached")).unwrap();
+        }
+    }
+
+    /// The settle must reject the same pid number when the process behind it
+    /// changed, and the same path when the socket object changed. Those are
+    /// the two facts a pid and a runtime id cannot prove on their own.
+    #[cfg(unix)]
+    #[test]
+    fn the_settle_rejects_a_reused_pid_or_a_rebound_socket() {
+        use crate::legacy::{ProcessWitness, SocketObject};
+
+        fn info(runtime_id: &str) -> RuntimeInfo {
+            RuntimeInfo {
+                runtime_id: leveler_core::RuntimeId::new(runtime_id),
+                version: "1.0.27".into(),
+                build: leveler_core::BuildIdentity {
+                    version: "1.0.27".into(),
+                    revision: "0".repeat(40),
+                    dirty: false,
+                    fingerprint: "legacy".into(),
+                },
+                config_fingerprint: None,
+                pid: 42,
+                idle_eviction: None,
+                health: leveler_client_protocol::RuntimeHealth {
+                    accepting_work: true,
+                    active_turns: 0,
+                    active_background_tasks: 0,
+                    quiescent: true,
+                    turn_capacity: Some(4),
+                    shutting_down: false,
+                    ..Default::default()
+                },
+            }
+        }
+
+        let first = info("legacy-idle");
+        let identity = LegacyIdentity {
+            witness: ProcessWitness {
+                pid: 42,
+                started: "100".into(),
+            },
+            socket: SocketObject {
+                device: 1,
+                inode: 2,
+            },
+        };
+        let second = LegacyObservation {
+            info: info("legacy-idle"),
+            local_waiters: Some(0),
+        };
+        assert!(legacy_settle_agrees(
+            &first,
+            &identity,
+            &second,
+            Some(&identity.witness),
+            Some(&identity.socket),
+        ));
+
+        let reused_pid = ProcessWitness {
+            pid: 42,
+            started: "101".into(),
+        };
+        assert!(
+            !legacy_settle_agrees(
+                &first,
+                &identity,
+                &second,
+                Some(&reused_pid),
+                Some(&identity.socket),
+            ),
+            "a different start marker is a different process"
+        );
+        let rebound = SocketObject {
+            device: 1,
+            inode: 3,
+        };
+        assert!(
+            !legacy_settle_agrees(
+                &first,
+                &identity,
+                &second,
+                Some(&identity.witness),
+                Some(&rebound),
+            ),
+            "a different socket object is a different endpoint"
+        );
+        let attached = LegacyObservation {
+            info: info("legacy-idle"),
+            local_waiters: Some(1),
+        };
+        assert!(!legacy_settle_agrees(
+            &first,
+            &identity,
+            &attached,
+            Some(&identity.witness),
+            Some(&identity.socket),
+        ));
+        let replaced = LegacyObservation {
+            info: info("different-generation"),
+            local_waiters: Some(0),
+        };
+        assert!(!legacy_settle_agrees(
+            &first,
+            &identity,
+            &replaced,
+            Some(&identity.witness),
+            Some(&identity.socket),
+        ));
+    }
+
+    #[cfg(unix)]
+    impl Drop for FakeLegacyProcess {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// A process whose command line identifies it as a runtime for `repo`,
+    /// without starting a real runtime. Used only to give the identity check a
+    /// pid that the kernel agrees belongs to this workspace's `serve` process.
+    #[cfg(unix)]
+    fn spawn_serving_process(repo: &Path) -> std::process::Child {
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            // A compound command keeps the shell as the process: a bare
+            // `sleep` is exec'd in place and would replace this argv.
+            .arg("sleep 30; :")
+            .arg(repo)
+            .arg("serve")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command.spawn().unwrap()
+    }
+
+    /// A pre-token endpoint: `runtime_info` and `local_waiters` are answered
+    /// without a credential, and a `send` is recorded. When `release_on_send`
+    /// is set, a `shutdown_when_idle` command is acknowledged and the endpoint
+    /// is released — the cooperative behaviour a real old runtime has.
+    #[cfg(unix)]
+    fn fake_legacy_endpoint(
+        socket: &Path,
+        pid: u32,
+        waiters: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        quiescent: bool,
+        shutting_down: bool,
+        release_on_send: bool,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
+    ) {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::UnixListener::bind(socket).unwrap();
+        let socket = socket.to_path_buf();
+        let (commands, received) = tokio::sync::mpsc::unbounded_channel();
+        let serving = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                // A liveness probe connects and writes nothing; it is not a
+                // request and must not be answered.
+                let Ok(length) = stream.read_u32().await else {
+                    continue;
+                };
+                let mut frame = vec![0; length as usize];
+                if stream.read_exact(&mut frame).await.is_err() {
+                    continue;
+                }
+                let request: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+                let reply = match request["body"]["type"].as_str() {
+                    Some("local_waiters") => serde_json::json!({
+                        "type": "local_waiters",
+                        "body": waiters.load(Ordering::SeqCst)
+                    }),
+                    Some("send") => {
+                        commands.send(request["body"].clone()).ok();
+                        serde_json::json!({"type": "ack"})
+                    }
+                    _ => serde_json::json!({
+                        "type": "runtime_info",
+                        "body": {
+                            "runtime_id": "legacy-idle",
+                            "version": "1.0.27",
+                            "build": {
+                                "version": "1.0.27",
+                                "revision": "0000000000000000000000000000000000000000",
+                                "fingerprint": "legacy",
+                                "dirty": false
+                            },
+                            "config_fingerprint": null,
+                            "pid": pid,
+                            "health": {
+                                "accepting_work": true,
+                                "active_turns": 0,
+                                "active_background_tasks": 0,
+                                "quiescent": quiescent,
+                                "turn_capacity": 4,
+                                "shutting_down": shutting_down
+                            }
+                        }
+                    }),
+                };
+                let bytes = serde_json::to_vec(&serde_json::json!({
+                    "protocol": {"major": 1, "minor": 0},
+                    "body": reply
+                }))
+                .unwrap();
+                let _ = stream.write_u32(bytes.len() as u32).await;
+                let _ = stream.write_all(&bytes).await;
+                let _ = stream.flush().await;
+                if release_on_send && request["body"]["type"] == "send" {
+                    // A retired runtime releases its endpoint.
+                    let _ = std::fs::remove_file(&socket);
+                    break;
+                }
+            }
+        });
+        (serving, received)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_idle_unattended_legacy_runtime_is_asked_to_retire_cooperatively() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = layout(tmp.path());
+        let socket = layout.socket_path();
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let server = FakeLegacyProcess::start(
+            tmp.path(),
+            &socket,
+            "idle",
+            layout.primary_workspace().unwrap(),
+        );
+        let pid = server.child.id();
+        let ui = Arc::new(WaitingUi::default());
+        let result = tokio::time::timeout(
+            Duration::from_secs(15),
+            reconcile_runtime_generation(&socket, &layout, ui.as_ref()),
+        )
+        .await
+        .expect("a cooperative retirement releases its endpoint")
+        .unwrap();
+        assert!(result.is_none(), "a retiring runtime is never attached to");
+        let commands = server.wait_for_commands(1);
+        assert_eq!(commands.len(), 1, "one request, not a repeated broadcast");
+        let command = &commands[0];
+        assert_eq!(command["type"], "send");
+        assert_eq!(command["body"]["type"], "shutdown_when_idle");
+        assert_eq!(command["body"]["reason"], "build_mismatch");
+        let events = ui.events.lock().unwrap();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                HandoffEvent::LegacyRetirementRequested {
+                    version: Some(version),
+                    pid: Some(reported),
+                } if version == "1.0.27" && *reported == pid
+            )),
+            "the shell must be told what was actually requested: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, HandoffEvent::LegacyExitRequired { .. })),
+            "a requested retirement is not a passive wait: {events:?}"
+        );
+    }
+
+    /// An accepted retirement that is still draining is NOT a refusal. A
+    /// programmatic shell must retry, not report that the old build refused.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_accepted_legacy_retirement_still_draining_is_reported_as_pending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = layout(tmp.path());
+        let socket = layout.socket_path();
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let server = FakeLegacyProcess::start(
+            tmp.path(),
+            &socket,
+            "drain",
+            layout.primary_workspace().unwrap(),
+        );
+        let ui = Ui::default();
+        let error = tokio::time::timeout(
+            Duration::from_secs(15),
+            reconcile_runtime_generation(&socket, &layout, &ui),
+        )
+        .await
+        .expect("the bounded wait ends")
+        .err()
+        .expect("a draining runtime is not attached to");
+        assert!(
+            matches!(
+                error.downcast_ref::<EnsureError>(),
+                Some(EnsureError::LegacyRetirementPending { .. })
+            ),
+            "{error}"
+        );
+        let commands = server.wait_for_commands(1);
+        assert_eq!(commands.len(), 1, "the request was accepted");
+        assert_eq!(commands[0]["body"]["type"], "shutdown_when_idle");
+    }
+
+    /// The reply to an accepted request can be lost. The runtime's own state
+    /// is the only honest evidence then: reporting that the old build refused
+    /// would send the operator to stop a process that is already retiring.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_ack_lost_legacy_retirement_is_pending_not_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = layout(tmp.path());
+        let socket = layout.socket_path();
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let server = FakeLegacyProcess::start(
+            tmp.path(),
+            &socket,
+            "acklost",
+            layout.primary_workspace().unwrap(),
+        );
+        let ui = Ui::default();
+        let error = tokio::time::timeout(
+            Duration::from_secs(15),
+            reconcile_runtime_generation(&socket, &layout, &ui),
+        )
+        .await
+        .expect("the bounded wait ends")
+        .err()
+        .expect("a draining runtime is not attached to");
+        assert!(
+            matches!(
+                error.downcast_ref::<EnsureError>(),
+                Some(EnsureError::LegacyRetirementPending { .. })
+            ),
+            "an accepted retirement with a lost reply must not be reported as a refusal: {error}"
+        );
+        let commands = server.wait_for_commands(1);
+        assert_eq!(commands.len(), 1, "the command was delivered");
+        assert_eq!(commands[0]["body"]["type"], "shutdown_when_idle");
+    }
+
+    /// Another shell already asked this runtime to retire. That is an accepted
+    /// retirement in progress, not a version that refused: a programmatic
+    /// caller must retry, never send the operator to stop it by hand.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_legacy_runtime_already_retiring_is_reported_as_pending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = layout(tmp.path());
+        let socket = layout.socket_path();
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let mut child = spawn_serving_process(layout.primary_workspace().unwrap());
+        let pid = child.id();
+        let (serving, mut commands) = fake_legacy_endpoint(
+            &socket,
+            pid,
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            true,
+            true,
+            false,
+        );
+        let ui = Ui::default();
+        let error = tokio::time::timeout(
+            Duration::from_secs(15),
+            reconcile_runtime_generation(&socket, &layout, &ui),
+        )
+        .await
+        .expect("the bounded wait ends")
+        .err()
+        .expect("a retiring runtime is not attached to");
+        assert!(
+            matches!(
+                error.downcast_ref::<EnsureError>(),
+                Some(EnsureError::LegacyRetirementPending { .. })
+            ),
+            "{error}"
+        );
+        assert!(
+            commands.try_recv().is_err(),
+            "a runtime that is already retiring is not asked a second time"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        serving.abort();
+    }
+
+    /// An idle runtime with a local UI attached is NOT retired: the command
+    /// closes admission immediately, which would strand the person using it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_attached_legacy_runtime_is_never_told_to_retire() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = layout(tmp.path());
+        let socket = layout.socket_path();
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let mut child = spawn_serving_process(layout.primary_workspace().unwrap());
+        let pid = child.id();
+        let (serving, mut commands) = fake_legacy_endpoint(
+            &socket,
+            pid,
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            true,
+            false,
+            false,
+        );
+        let ui = Arc::new(WaitingUi::default());
+        let reconciling = tokio::spawn({
+            let ui = ui.clone();
+            let layout = layout.clone();
+            async move {
+                reconcile_runtime_generation(&layout.socket_path(), &layout, ui.as_ref()).await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(3), ui.reported.notified())
+            .await
+            .expect("the shell is told why it must wait");
+        assert!(
+            commands.try_recv().is_err(),
+            "an attached runtime must not be asked to stop serving"
+        );
+        let events = ui.events.lock().unwrap();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                HandoffEvent::LegacyExitRequired {
+                    local_waiters: Some(1),
+                    ..
+                }
+            )),
+            "the wait must carry the attached-UI fact: {events:?}"
+        );
+        reconciling.abort();
+        let _ = child.kill();
+        let _ = child.wait();
+        serving.abort();
+    }
+
+    /// The wait must not outlive the blocker: when the old UI that was holding
+    /// the runtime closes, the same launch asks the now-idle runtime to retire
+    /// instead of waiting out its 30-minute idle timer.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_legacy_runtime_that_becomes_unattached_is_retired_without_waiting_out_its_timer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = layout(tmp.path());
+        let socket = layout.socket_path();
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let server = FakeLegacyProcess::start(
+            tmp.path(),
+            &socket,
+            "attached_until_flag",
+            layout.primary_workspace().unwrap(),
+        );
+        let ui = Arc::new(WaitingUi::default());
+        let reconciling = tokio::spawn({
+            let ui = ui.clone();
+            let layout = layout.clone();
+            async move {
+                reconcile_runtime_generation(&layout.socket_path(), &layout, ui.as_ref()).await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(3), ui.reported.notified())
+            .await
+            .expect("the attached state is reported first");
+        assert!(server.commands().is_empty());
+        // The old UI closes. The next refresh must observe the new state.
+        server.release_attachment(tmp.path());
+        let result = tokio::time::timeout(Duration::from_secs(20), reconciling)
+            .await
+            .expect("a now-idle runtime is retired without the old idle timer")
+            .unwrap()
+            .unwrap();
+        assert!(result.is_none(), "a retiring runtime is never attached to");
+        let commands = server.wait_for_commands(1);
+        assert_eq!(commands.len(), 1, "the now-idle runtime is asked to retire");
+        assert_eq!(commands[0]["body"]["type"], "shutdown_when_idle");
+        let events = ui.events.lock().unwrap();
+        let positions: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| {
+                matches!(
+                    event,
+                    HandoffEvent::LegacyExitRequired { .. }
+                        | HandoffEvent::LegacyRetirementRequested { .. }
+                )
+            })
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(positions.len(), 2, "one wait, then one request: {events:?}");
+        assert!(matches!(
+            events[positions[0]],
+            HandoffEvent::LegacyExitRequired {
+                local_waiters: Some(1),
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[positions[1]],
+            HandoffEvent::LegacyRetirementRequested { .. }
+        ));
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unverifiable_legacy_pid_is_never_asked_to_retire() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = layout(tmp.path());
+        let socket = layout.socket_path();
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let (serving, mut commands) = fake_legacy_endpoint(
+            &socket,
+            std::process::id(),
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            true,
+            false,
+            false,
+        );
+        let ui = Arc::new(WaitingUi::default());
+        let reconciling = tokio::spawn({
+            let ui = ui.clone();
+            let layout = layout.clone();
+            async move {
+                reconcile_runtime_generation(&layout.socket_path(), &layout, ui.as_ref()).await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(3), ui.reported.notified())
+            .await
+            .expect("the shell is told why it must wait");
+        assert!(
+            commands.try_recv().is_err(),
+            "an unverified pid must never receive a retirement request"
+        );
+        let events = ui.events.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, HandoffEvent::LegacyExitRequired { .. })),
+            "{events:?}"
+        );
+        reconciling.abort();
+        serving.abort();
     }
 
     #[tokio::test]

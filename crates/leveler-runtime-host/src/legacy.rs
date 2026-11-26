@@ -192,6 +192,19 @@ fn current_uid() -> Option<u32> {
     }
 }
 
+/// Whether `pid` is a live process owned by the user running this client.
+///
+/// A cooperative retirement request does not signal the process, but a shell
+/// still names the pid it is about to ask. Reading the kernel's owner keeps
+/// that name honest: a runtime that reports another user's pid is not this
+/// user's to retire, and the client says so instead of acting on the report.
+pub fn process_owned_by_current_user(pid: u32) -> bool {
+    match (process_uid(pid), current_uid()) {
+        (Some(owner), Some(current)) => owner == current,
+        _ => false,
+    }
+}
+
 /// How strongly the *endpoint* is tied to the process this migration is about
 /// to signal, and that the process is a runtime for THIS repository.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,6 +227,19 @@ pub enum OwnershipEvidence {
 /// read as "not a runtime for this workspace", turning every migration into a
 /// refusal.
 pub fn process_command(pid: u32) -> Option<String> {
+    // Linux publishes the exact argv in the kernel's own per-process file.
+    // Reading it here is not just cheaper than `ps`: a minimal Linux userland
+    // (containers, servers without procps) has no `ps`, and a security gate
+    // must not fail merely because an external viewer is absent.
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(command) = std::fs::read(format!("/proc/{pid}/cmdline"))
+            .ok()
+            .and_then(|raw| parse_proc_cmdline(&raw))
+        {
+            return Some(command);
+        }
+    }
     #[cfg(unix)]
     {
         let output = std::process::Command::new("ps")
@@ -236,6 +262,18 @@ pub fn process_command(pid: u32) -> Option<String> {
         let _ = pid;
         None
     }
+}
+
+/// Join a Linux `/proc/<pid>/cmdline` blob (NUL-separated argv) into the
+/// command-line shape [`serves_workspace`] inspects.
+#[cfg(any(target_os = "linux", test))]
+fn parse_proc_cmdline(raw: &[u8]) -> Option<String> {
+    let args: Vec<String> = raw
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .map(|arg| String::from_utf8_lossy(arg).into_owned())
+        .collect();
+    (!args.is_empty()).then(|| args.join(" "))
 }
 
 /// Whether a command line is a runtime serving `workspace`.
@@ -653,6 +691,20 @@ mod tests {
             ),
             "a changed start marker must read as a reused pid"
         );
+    }
+
+    #[test]
+    fn a_proc_cmdline_is_joined_without_nul_bytes() {
+        // Linux publishes argv NUL-separated; a command line with a missing
+        // viewer (no `ps`) must still identify the runtime for this workspace.
+        let raw = b"leveler\0--repo\0/tmp/example-repo\0serve\0";
+        let command = parse_proc_cmdline(raw).unwrap();
+        assert_eq!(command, "leveler --repo /tmp/example-repo serve");
+        assert!(serves_workspace(
+            &command,
+            Some(std::path::Path::new("/tmp/example-repo"))
+        ));
+        assert!(parse_proc_cmdline(b"\0\0").is_none());
     }
 
     #[test]

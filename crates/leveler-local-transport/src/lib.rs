@@ -829,6 +829,74 @@ mod transport {
         }
     }
 
+    /// Ask a runtime that predates the access token to retire once its work
+    /// settles.
+    ///
+    /// This is a COOPERATIVE request, not an authenticated decision: the legacy
+    /// protocol has no token to prove who asked, and no atomic admission close.
+    /// The receiving runtime stops admitting new work and exits only after the
+    /// work it already owns drains, so sending it to a busy runtime delays but
+    /// never cancels a task. Callers must still verify the endpoint's process
+    /// identity and must not send it while a local UI is attached or work is
+    /// owed — the runtime would stop serving that client.
+    ///
+    /// A peer that does not understand the command closes the connection
+    /// (`PeerClosed`) or answers an error; both are surfaced, never treated as
+    /// consent.
+    ///
+    /// `expected_peer_pid` is the runtime the caller verified a moment ago.
+    /// The socket path alone proves nothing: another process can rebind it
+    /// between the observation and this request, and a command line can be
+    /// forged. The kernel names the process that actually accepted the
+    /// connection, so the request is bound to that process, never to the path.
+    #[cfg(unix)]
+    pub async fn legacy_request_shutdown_when_idle(
+        path: &Path,
+        reason: leveler_client_protocol::RestartReason,
+        timeout: Duration,
+        expected_peer_pid: u32,
+    ) -> Result<(), TransportError> {
+        let exchange = async {
+            let mut stream = UnixStream::connect(path).await?;
+            // The kernel answers for the process that actually accepted this
+            // connection. A path can be rebound and a command line can be
+            // forged; this credential cannot be chosen by the peer.
+            let peer = stream.peer_cred().map_err(|error| {
+                TransportError::Unavailable(format!(
+                    "the legacy runtime's peer identity could not be read: {error}"
+                ))
+            })?;
+            let peer_pid = peer.pid().map(|pid| pid as u32);
+            if peer_pid != Some(expected_peer_pid) {
+                return Err(TransportError::Unavailable(format!(
+                    "the endpoint is served by pid {peer_pid:?}, not the verified runtime pid \
+                     {expected_peer_pid}; no retirement request was sent"
+                )));
+            }
+            write_frame(
+                &mut stream,
+                &ProtocolEnvelope::wrap(WireRequest::Send(
+                    leveler_client_protocol::ClientCommand::ShutdownWhenIdle { reason },
+                )),
+            )
+            .await?;
+            match read_response_frame(&mut stream).await? {
+                WireResponse::Ack => Ok(()),
+                WireResponse::Error(error) => Err(TransportError::Unavailable(error.message)),
+                _ => Err(TransportError::Unavailable(
+                    "the legacy runtime answered an unexpected reply to a retirement request"
+                        .into(),
+                )),
+            }
+        };
+        tokio::time::timeout(timeout, exchange)
+            .await
+            .map_err(|_| TransportError::NoAnswer {
+                operation: "shutdown_when_idle",
+                timeout_ms: timeout.as_millis() as u64,
+            })?
+    }
+
     #[cfg(unix)]
     async fn legacy_read(
         path: &Path,
@@ -3013,7 +3081,9 @@ pub use transport::{
     LocalSocketRuntimeClient, LocalSocketServer, RetirementTarget, TcpRuntimeServer,
 };
 #[cfg(unix)]
-pub use transport::{legacy_local_waiter_count, legacy_runtime_info};
+pub use transport::{
+    legacy_local_waiter_count, legacy_request_shutdown_when_idle, legacy_runtime_info,
+};
 
 #[cfg(not(any(unix, windows)))]
 mod unsupported {
@@ -3177,6 +3247,7 @@ pub use unsupported::{LocalSocketRuntimeClient, LocalSocketServer, TcpRuntimeSer
 mod tests {
     use std::net::SocketAddr;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     use leveler_client_protocol::{ClientCommand, RuntimeEvent, SessionId, UiSessionSnapshot};
     use tokio::sync::broadcast;
@@ -3271,6 +3342,111 @@ mod tests {
     /// The failure is deterministic: the writer's staging name is occupied by
     /// a directory, so the token cannot be installed. What matters is where
     /// the sequence stops, not why it failed.
+    /// A cooperative retirement request has to be the legacy wire verb with
+    /// the typed reason, acknowledged by the peer — not a local shortcut.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_legacy_retirement_request_is_the_typed_shutdown_command() {
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let serving = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_json_frame(&mut stream).await;
+            assert_eq!(request["body"]["type"], "send");
+            assert_eq!(request["body"]["body"]["type"], "shutdown_when_idle");
+            assert_eq!(request["body"]["body"]["reason"], "build_mismatch");
+            write_ack(&mut stream).await;
+        });
+        legacy_request_shutdown_when_idle(
+            &path,
+            leveler_client_protocol::RestartReason::BuildMismatch,
+            Duration::from_secs(2),
+            std::process::id(),
+        )
+        .await
+        .unwrap();
+        serving.await.unwrap();
+    }
+
+    /// A socket path proves nothing about the process listening on it. The
+    /// request must never be written to a peer other than the verified pid,
+    /// even when the path is the expected one: the caller's identity check is
+    /// about a process, and a rebind between observation and request must not
+    /// turn into a command sent to an unverified instance.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_retirement_request_is_never_written_to_a_different_peer() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let serving = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // The refused request must close without a frame. A delivered
+            // command would leave these four length bytes readable.
+            let mut header = [0u8; 4];
+            let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut header))
+                .await
+                .expect("the refused connection closes");
+            assert_eq!(read.unwrap_or(0), 0, "no frame may reach a mismatched peer");
+        });
+        let error = legacy_request_shutdown_when_idle(
+            &path,
+            leveler_client_protocol::RestartReason::BuildMismatch,
+            Duration::from_secs(2),
+            // pid 1 is never this test process, so its peer credential cannot
+            // match. Whether pid 1 exists is irrelevant: the kernel's answer
+            // for this connection names the test process.
+            1,
+        )
+        .await
+        .expect_err("a mismatched peer identity must refuse the request");
+        assert!(
+            error.to_string().contains("peer") || error.to_string().contains("pid"),
+            "{error}"
+        );
+        serving.await.unwrap();
+    }
+
+    /// A peer that answers an error did NOT accept retirement; the caller must
+    /// see a failure, never a silent success.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refused_legacy_retirement_request_is_an_error() {
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let serving = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_json_frame(&mut stream).await;
+            write_json_frame(
+                &mut stream,
+                serde_json::json!({
+                    "protocol": leveler_client_protocol::PROTOCOL_VERSION,
+                    "body": {"type": "error", "body": {"message": "not supported"}}
+                }),
+            )
+            .await;
+        });
+        let error = legacy_request_shutdown_when_idle(
+            &path,
+            leveler_client_protocol::RestartReason::BuildMismatch,
+            Duration::from_secs(2),
+            std::process::id(),
+        )
+        .await
+        .expect_err("an error reply is a refusal");
+        assert!(error.to_string().contains("not supported"), "{error}");
+        serving.await.unwrap();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn a_failed_access_token_publication_never_publishes_the_endpoint() {
