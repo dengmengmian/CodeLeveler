@@ -114,13 +114,43 @@ const openWorkspace = async () => {
   await page.waitForFunction(() => document.querySelector('#workspace-picker')?.textContent.includes('workspace'));
 };
 const sessionId = () => page.locator('.session-row[aria-selected="true"]').getAttribute('data-session-id');
+// The composer is briefly disabled while background bookkeeping settles; a
+// click in that window is a no-op by design. Wait for the real enabled state,
+// then confirm the message was accepted (a session may be created first).
 const send = async text => {
   await page.locator('#message').fill(text);
-  await page.locator('#send').click();
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    await page.waitForFunction(() => {
+      const button = document.querySelector('#send');
+      return button && !button.disabled && !button.hidden;
+    });
+    const before = await page.locator('.message.user').count();
+    await page.locator('#send').click();
+    try {
+      await page.waitForFunction(before => document.querySelectorAll('.message.user').length > before, before, { timeout: 10000 });
+      return;
+    } catch {
+      const inFlight = await page.evaluate(() => {
+        const button = document.querySelector('#send');
+        const input = document.querySelector('#message');
+        return Boolean(button && button.disabled && input && input.value !== '');
+      });
+      if (inFlight) {
+        await page.waitForFunction(before => document.querySelectorAll('.message.user').length > before, before, { timeout: 30000 });
+        return;
+      }
+    }
+  }
+  throw new Error(`message was not sent: ${text}`);
 };
 const waitDone = async (scenario, timeout = 60000) => {
-  await page.waitForFunction(text => [...document.querySelectorAll('.message.assistant .markdown')].some(node => node.textContent.includes(text))
-    && !['运行中', '等待你处理'].includes(document.querySelector('#conversation-status').textContent), `${scenario}_DONE`, { timeout });
+  await page.waitForFunction(async text => {
+    if (![...document.querySelectorAll('.message.assistant .markdown')].some(node => node.textContent.includes(text))) return false;
+    const id = document.querySelector('.session-row[aria-selected="true"]')?.dataset.sessionId;
+    if (!id) return false;
+    const snapshot = await window.desktop.snapshot(id);
+    return !['running', 'waiting_user'].includes(snapshot.task_status);
+  }, `${scenario}_DONE`, { timeout });
 };
 const card = () => page.locator('.definition-trust-card');
 const expand = async () => {
@@ -189,6 +219,9 @@ try {
   await card().waitFor();
   await decide('允许本次使用');
   await waitDone('TRUST_ALLOW_ONCE');
+  for (let attempt = 0; attempt < 50 && !toolContents.some(content => content.includes('TRUST_ALLOW_BODY_MARKER')); attempt += 1) {
+    await page.waitForTimeout(100);
+  }
   assert.ok(toolContents.some(content => content.includes('TRUST_ALLOW_BODY_MARKER')), 'the admitted content must reach the model');
   evidence.allow_once_loaded = true;
 
@@ -197,6 +230,9 @@ try {
   await card().waitFor();
   await decide('信任当前版本');
   await waitDone('TRUST_PERSIST');
+  for (let attempt = 0; attempt < 50 && !toolContents.some(content => content.includes('TRUST_PERSIST_BODY_MARKER')); attempt += 1) {
+    await page.waitForTimeout(100);
+  }
   assert.ok(toolContents.some(content => content.includes('TRUST_PERSIST_BODY_MARKER')));
   // A later session in the same workspace must inherit the persistent
   // approval without a second prompt.
@@ -205,6 +241,9 @@ try {
   await send('TRUST_PERSIST_AGAIN');
   await waitDone('TRUST_PERSIST_AGAIN');
   assert.equal(await card().count(), 0, 'a persistent approval must answer a later session without a second prompt');
+  for (let attempt = 0; attempt < 50 && toolContents.filter(content => content.includes('TRUST_PERSIST_BODY_MARKER')).length < 2; attempt += 1) {
+    await page.waitForTimeout(100);
+  }
   assert.ok(toolContents.filter(content => content.includes('TRUST_PERSIST_BODY_MARKER')).length >= 2, 'the later session must load the approved content');
   evidence.persistent_trust_across_sessions = true;
 
@@ -214,6 +253,7 @@ try {
   await send('TRUST_CANCEL');
   await card().waitFor();
   await page.keyboard.press('Escape');
+  await page.waitForTimeout(150);
   await page.keyboard.press('Escape');
   await page.waitForFunction(() => !document.querySelector('.definition-trust-card'));
   await page.waitForFunction(() => document.querySelector('#conversation')?.innerText.includes('已取消'), null, { timeout: 30000 });

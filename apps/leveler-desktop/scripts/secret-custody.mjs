@@ -78,8 +78,17 @@ const storedDrafts = () => page.evaluate(key => localStorage.getItem(key) ?? '',
 const send = async text => { await page.locator('#message').fill(text); await page.locator('#send').click(); };
 const okCount = () => page.evaluate(() => [...document.querySelectorAll('.message.assistant .markdown')].filter(node => node.textContent.includes('SECRET_OK')).length);
 const waitOk = async (previous, timeout = 60000) => {
-  await page.waitForFunction(previous => [...document.querySelectorAll('.message.assistant .markdown')].filter(node => node.textContent.includes('SECRET_OK')).length > previous
-    && !['运行中', '等待你处理'].includes(document.querySelector('#conversation-status').textContent), previous, { timeout });
+  // The durable session status is the authority; the header text can lag or be
+  // empty while a takeover owns the composer.
+  await page.waitForFunction(async previous => {
+    const replies = [...document.querySelectorAll('.message.assistant .markdown')]
+      .filter(node => node.textContent.includes('SECRET_OK')).length;
+    if (!(replies > previous)) return false;
+    const id = document.querySelector('.session-row[aria-selected="true"]')?.dataset.sessionId;
+    if (!id) return false;
+    const snapshot = await window.desktop.snapshot(id);
+    return !['running', 'waiting_user'].includes(snapshot.task_status);
+  }, previous, { timeout });
 };
 
 try {
@@ -122,6 +131,9 @@ try {
   const beforeCapture = await okCount();
   await review.getByRole('button', { name: '安全接管并发送', exact: true }).click();
   await waitOk(beforeCapture);
+  // The snapshot terminal can arrive before the transcript paints the user
+  // row; the reference must be visible before it is read.
+  await page.waitForFunction(() => document.querySelector('#conversation')?.innerText.includes('[secret:sec_'), null, { timeout: 30000 });
   const captureRequest = requestText();
   assert.doesNotMatch(captureRequest, new RegExp(CAPTURE_KEY), 'the capture path must not send the value to the provider');
   assert.match(captureRequest, /\[secret:sec_[0-9a-f]{32}\]/);
