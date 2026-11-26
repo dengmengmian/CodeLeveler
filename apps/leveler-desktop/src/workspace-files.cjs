@@ -14,12 +14,13 @@ const READ_FLAGS = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0);
 const MAX_PATH_LENGTH = 4096;
 
 class WorkspaceFiles {
+  /** @param {{root: string}} options */
   constructor({ root }) {
     if (typeof root !== 'string' || !root) throw new Error('当前会话没有可读取的工作区');
     this.root = root;
   }
 
-  /** Reject absolute-outside and traversal paths before touching the disk. */
+  /** Reject absolute-outside and traversal paths before touching the disk. @param {string} relative */
   candidate(relative) {
     if (typeof relative !== 'string' || relative.length > MAX_PATH_LENGTH || relative.includes('\0')) {
       throw new Error('无效的文件路径');
@@ -29,6 +30,7 @@ class WorkspaceFiles {
     return resolved;
   }
 
+  /** @param {string} candidate */
   assertInside(candidate) {
     const relative = path.relative(this.root, candidate);
     if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
@@ -36,7 +38,7 @@ class WorkspaceFiles {
     }
   }
 
-  /** Resolve the real path (following links) and enforce the same boundary. */
+  /** Resolve the real path (following links) and enforce the same boundary. @param {string} relative */
   async realEntry(relative) {
     const candidate = this.candidate(relative);
     let real;
@@ -80,6 +82,7 @@ class WorkspaceFiles {
     return { path: entry.relative, entries, truncated: names.length > MAX_ENTRIES };
   }
 
+  /** @param {string} relative */
   async readImage(relative) {
     const entry = await this.realEntry(relative);
     const stat = await fsp.stat(entry.absolute);
@@ -99,6 +102,7 @@ class WorkspaceFiles {
     };
   }
 
+  /** @param {string} relative */
   async read(relative) {
     const entry = await this.realEntry(relative);
     const stat = await fsp.stat(entry.absolute);
@@ -139,6 +143,7 @@ class WorkspaceFiles {
   }
 }
 
+/** @param {Buffer} content */
 function imageMime(content) {
   if (content.length >= 8 && content.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return 'image/png';
   if (content.length >= 3 && content[0] === 0xff && content[1] === 0xd8 && content[2] === 0xff) return 'image/jpeg';
@@ -147,4 +152,4 @@ function imageMime(content) {
   return null;
 }
 
-module.exports = { WorkspaceFiles, MAX_ENTRIES, MAX_READ_BYTES, MAX_IMAGE_BYTES };
+module.exports = { WorkspaceFiles, imageMime, MAX_ENTRIES, MAX_READ_BYTES, MAX_IMAGE_BYTES };

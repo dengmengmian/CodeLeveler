@@ -103,6 +103,7 @@ fn validate_command(session: &SessionId, command: &ClientCommand) -> anyhow::Res
         | ClientCommand::SetPermissionProfile { .. }
         | ClientCommand::RenameSession { .. }
         | ClientCommand::ArchiveSession { .. }
+        | ClientCommand::UnarchiveSession { .. }
         | ClientCommand::ForkSession { .. }
         | ClientCommand::CompactContext { .. }
         | ClientCommand::ApprovalDecision { .. }
@@ -359,7 +360,19 @@ impl Bridge {
         self.subscription = Some(tokio::spawn(async move {
             loop {
                 let payload = match events.recv().await {
-                    Ok(event) => json!({"event":"runtime", "session_id":session, "data":event}),
+                    Ok(mut event) => {
+                        // Desktop submits opaque refs; local preview paths are
+                        // terminal-only metadata, never renderer authority.
+                        if let leveler_client_protocol::RuntimeEvent::AttachmentAdded {
+                            attachment,
+                            ..
+                        } = &mut event
+                        {
+                            attachment.source_path = None;
+                            attachment.preview_path = None;
+                        }
+                        json!({"event":"runtime", "session_id":session, "data":event})
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         match client.snapshot(&session).await {
                             Ok(snapshot) => {
@@ -795,6 +808,9 @@ mod tests {
                     name: "Renamed task".into(),
                 },
                 ClientCommand::ArchiveSession {
+                    session_id: id.clone(),
+                },
+                ClientCommand::UnarchiveSession {
                     session_id: id.clone(),
                 },
             ];

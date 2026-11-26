@@ -95,7 +95,7 @@ try {
   assert.equal(saved.performance, 'compact');
   assert.equal(saved.textFontFamily, 'Menlo, monospace');
   evidence.settings_controls = saved;
-  await page.getByRole('button', { name: '编辑快捷键' }).click();
+  await page.getByRole('button', { name: '查看快捷键' }).click();
   assert.ok(await page.locator('.menu .menu-item').count() >= 8);
   await page.keyboard.press('Escape');
   await page.locator('#settings-nav-list button').filter({ hasText: '模型' }).click();

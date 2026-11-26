@@ -557,10 +557,19 @@ pub async fn cmd_schedule(
                 }
             }
         }
-        ScheduleCommand::Dispatch { max, source, json } => {
-            let summary = dispatcher(config_dir, store)
+        ScheduleCommand::Dispatch {
+            max,
+            source,
+            wait,
+            json,
+        } => {
+            let dispatcher = dispatcher(config_dir, store);
+            let summary = dispatcher
                 .dispatch_due_with_source(max, wake_source(source))
                 .await?;
+            if wait {
+                dispatcher.observe_until_settled().await?;
+            }
             print_summary(&summary, json)?;
         }
         ScheduleCommand::Serve { max, poll_secs } => {

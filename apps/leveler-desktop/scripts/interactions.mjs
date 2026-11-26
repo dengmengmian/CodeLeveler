@@ -69,7 +69,7 @@ await application.evaluate(({dialog})=>{globalThis.__quitDialogs=[];dialog.showM
 // Regression: reopening a workspace session renders the workbench while the
 // open action still holds `loading`; once idle the diff action must be enabled.
 await page.waitForFunction(()=>document.querySelector('#conversation-status').textContent!=='连接 Runtime…');
-await page.locator('#message').fill('/diff');await page.locator('#message').press('Enter');await page.waitForSelector('.review-head, .review-status',{timeout:15000});
+await page.locator('#message').fill('/diff');await page.waitForFunction(()=>!document.querySelector('#send').disabled);await page.locator('#message').press('Enter');await page.waitForSelector('.review-head, .review-status',{timeout:15000});
 const reopenedGroup=page.locator('.tool-row[data-tool-id="fixture-read"]').locator('xpath=ancestor::details[contains(@class,"execution-group")]').first();if(await reopenedGroup.count()&&!(await reopenedGroup.evaluate(n=>n.open)))await reopenedGroup.locator('.execution-summary').first().click();
 const reopenedRead=page.locator('.tool-row[data-tool-id="fixture-read"]');if(!(await reopenedRead.evaluate(n=>n.open)))await reopenedRead.locator('.tool-summary').click();await page.locator('.tool-row[data-tool-id="fixture-read"] .tool-read-card').waitFor();assert.match(await page.locator('.tool-row[data-tool-id="fixture-read"]').innerText(),/desktop-real-tool-evidence/);await page.locator('.tool-row[data-tool-id="fixture-read"] .tool-open-file').click();await page.waitForFunction(()=>document.querySelector('.preview-body')?.textContent.includes('desktop-real-tool-evidence'));
  assert.equal(await page.getByRole('button',{name:'拒绝',exact:true}).count(),0);
@@ -89,7 +89,8 @@ const reopenedRead=page.locator('.tool-row[data-tool-id="fixture-read"]');if(!(a
  assert.equal(rows(interruptSource,'SELECT COUNT(*) AS count FROM turns WHERE session_id = ?',interruptedId)[0].count,1);
  assert.equal(rows(interruptSource,'SELECT owner_boot_id FROM tasks WHERE session_id = ?',interruptedId)[0].owner_boot_id,null);
  const beforeResume=agentRequests();
- await page.locator('#message').fill('继续，fixture-turn-resume');await page.locator('#message').press('Enter');
+ // Explicit continuation is a typed protocol command; prose is model input.
+ const resumed=await deliver(interruptedId,'resume_task','继续，fixture-turn-resume');assert.equal(resumed.ok,true);
  await page.getByText('fixture-resumed-answer',{exact:true}).waitFor();await waitStatus(interruptedId,'answered');
  assert.equal(agentRequests(),beforeResume+1,'continuation must issue one actual agent request');
  const resumedTask=rows(interruptSource,'SELECT * FROM tasks WHERE session_id = ?',interruptedId)[0];assert.equal(resumedTask.id,originalTask.id);

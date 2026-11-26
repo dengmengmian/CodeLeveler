@@ -16,10 +16,10 @@ test('desktop rejects cross-session submission but accepts scoped text and live 
  assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'approval_decision',request_id:'a1',decision:'approve_once'})));
 });
 test('desktop accepts current-session model, title, and archive commands using existing contracts',()=>{
- for(const command of [{type:'select_model',session_id:'s1',model:{provider:'openai',model:'gpt-4o'}},{type:'rename_session',session_id:'s1',name:'新名称'},{type:'archive_session',session_id:'s1'}])assert.doesNotThrow(()=>security.validateEnvelope(envelope(command)));
+ for(const command of [{type:'select_model',session_id:'s1',model:{provider:'openai',model:'gpt-4o'}},{type:'rename_session',session_id:'s1',name:'新名称'},{type:'archive_session',session_id:'s1'},{type:'unarchive_session',session_id:'s1'}])assert.doesNotThrow(()=>security.validateEnvelope(envelope(command)));
 });
 test('model, rename, archive commands reject wrong session, missing fields, and unknown authority',()=>{
- const commands=[{type:'select_model',session_id:'s1',model:{provider:'openai',model:'gpt-4o'}},{type:'rename_session',session_id:'s1',name:'新名称'},{type:'archive_session',session_id:'s1'}];
+ const commands=[{type:'select_model',session_id:'s1',model:{provider:'openai',model:'gpt-4o'}},{type:'rename_session',session_id:'s1',name:'新名称'},{type:'archive_session',session_id:'s1'},{type:'unarchive_session',session_id:'s1'}];
  for(const command of commands){
   for(const session_id of ['s2','',null,undefined])assert.throws(()=>security.validateEnvelope(envelope({...command,session_id})));
   assert.throws(()=>security.validateEnvelope(envelope({...command,permission:'full'})));
@@ -29,7 +29,7 @@ test('model, rename, archive commands reject wrong session, missing fields, and 
  for(const type of ['delete_session','set_default_model','set_permission_profile'])assert.throws(()=>security.validateEnvelope(envelope({type,session_id:'s1'})));
 });
 test('new session commands cannot target blank session identities',()=>{
- for(const type of ['select_model','rename_session','archive_session']){
+ for(const type of ['select_model','rename_session','archive_session','unarchive_session']){
   const command={type,session_id:'   ',...(type==='select_model'?{model:{provider:'p',model:'m'}}:type==='rename_session'?{name:'title'}:{})};
   assert.throws(()=>security.validateEnvelope({...envelope(command),session_id:'   '}));
  }

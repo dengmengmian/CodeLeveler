@@ -2,6 +2,7 @@ const {open}=require('node:fs/promises');
 const {constants}=require('node:fs');
 const {basename}=require('node:path');
 const {randomUUID}=require('node:crypto');
+const {imageMime}=require('./workspace-files.cjs');
 const MAX_UPLOAD_BYTES=20*1024*1024;
 /** @typedef {{id:string,kind:string,name:string,mime_type:string,size_bytes:number,sha256:string,width:number|null,height:number|null}} AttachmentRef */
 /** @typedef {{sourceId:string,sessionId:string,vision:boolean}} SelectedSession */
@@ -29,7 +30,9 @@ async function readPickedUpload(path){
   while(offset<bytes.length){const read=await file.read(bytes,offset,bytes.length-offset,offset);if(!read.bytesRead)break;offset+=read.bytesRead;}
   const after=await file.stat();
   if(offset!==before.size||after.size!==before.size||after.mtimeMs!==before.mtimeMs||after.ctimeMs!==before.ctimeMs)throw new Error('文件在上传读取期间发生变化，请重新选择');
-  return {name:basename(path),data_base64:bytes.subarray(0,offset).toString('base64')};
+  const content = bytes.subarray(0, offset);
+  if (!imageMime(content)) throw new Error('附件仅支持 PNG、JPEG、GIF 和 WebP 图片。普通文件请从工作区文件中引用。');
+  return {name:basename(path),data_base64:content.toString('base64')};
  }finally{await file.close();}
 }
 class AttachmentIngress {

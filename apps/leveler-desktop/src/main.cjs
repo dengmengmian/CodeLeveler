@@ -59,7 +59,7 @@ async function appIcon(bundle){
   appIcons.set(bundle,icon);
   return icon;
 }
-const attachments=new AttachmentIngress({pickFile:async()=>{const result=await dialog.showOpenDialog(window,{title:'上传附件',properties:['openFile']});return result.canceled?null:result.filePaths[0]??null;},deliver:envelope=>bridge.request('deliver',{envelope})});
+const attachments=new AttachmentIngress({pickFile:async()=>{const result=await dialog.showOpenDialog(window,{title:'添加图片',properties:['openFile'],filters:[{name:'图片',extensions:['png','jpg','jpeg','gif','webp']}]});return result.canceled?null:result.filePaths[0]??null;},deliver:envelope=>bridge.request('deliver',{envelope})});
 function attachmentSession(snapshot){if(selectedSource&&snapshot?.id)attachments.activate({sourceId:selectedSource,sessionId:snapshot.id,vision:snapshot.vision===true});}
 const recentWorkspaces=new RecentWorkspaceSelection(folders);
 function authorize(event){if(!window || event.sender!==window.webContents || event.senderFrame!==window.webContents.mainFrame || !event.senderFrame.url.startsWith('leveler-desktop://desktop/'))throw new Error('Unauthorized desktop frame');}

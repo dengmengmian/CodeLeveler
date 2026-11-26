@@ -47,7 +47,7 @@ pub(crate) fn dispatch_trigger(layout: &Layout) -> DispatchTrigger {
     })
 }
 
-/// One short-lived dispatch pass, started detached.
+/// One dispatch pass and its terminal observer, started detached.
 ///
 /// Its output is discarded because a run's observed outcome belongs to the
 /// schedule store, never to an unobserved pipe.
@@ -59,6 +59,7 @@ fn start_dispatch(
     tokio::process::Command::new(executable)
         .arg("schedule")
         .arg("dispatch")
+        .arg("--wait")
         .arg("--source")
         .arg("manual")
         .arg("--home")

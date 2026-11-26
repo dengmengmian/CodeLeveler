@@ -41,7 +41,8 @@ test('discard is unknown-only and exact-owner; abandoning pending bytes makes th
 });
 test('native upload ingress keeps bytes private and imports only bounded chosen immutable data',async()=>{
  const dir=await mkdtemp(path.join(tmpdir(),'leveler-upload-'));try{
- const file=path.join(dir,'note.txt');await writeFile(file,'hello');const result=await readPickedUpload(file);assert.equal(result.name,'note.txt');assert.equal(result.data_base64,'aGVsbG8=');assert.equal(result.path,undefined);
+ const document=path.join(dir,'note.png');await writeFile(document,'hello');await assert.rejects(readPickedUpload(document),/工作区文件/);
+ const file=path.join(dir,'picture.png');const image=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC','base64');await writeFile(file,image);const result=await readPickedUpload(file);assert.equal(result.name,'picture.png');assert.equal(result.data_base64,image.toString('base64'));assert.equal(result.path,undefined);
  const tooBig=path.join(dir,'huge');await writeFile(tooBig,'');await truncate(tooBig,MAX_UPLOAD_BYTES+1);await assert.rejects(readPickedUpload(tooBig));await assert.rejects(readPickedUpload(dir));
  const link=path.join(dir,'link');await symlink(file,link);await assert.rejects(readPickedUpload(link));
  }finally{await rm(dir,{recursive:true,force:true});}

@@ -58,7 +58,7 @@ try{
  const raceInputs=['First concurrent title','Second concurrent title'].map(name=>envelope(id,{type:'rename_session',session_id:id,name},sameVersion));
  const race=await page.evaluate(inputs=>Promise.all(inputs.map(input=>window.desktop.deliver(input))),raceInputs);
  assert.equal(race.filter(reply=>reply.ok).length,1);const winner=race.findIndex(reply=>reply.ok);const loser=1-winner;assert.match(race[loser].error.message,/version conflict/);
- const raced=await snapshot(id);assert.equal(raced.goal,raceInputs[winner].command.name);assert.equal(raced.last_sequence,sameVersion+1);
+ const raced=await snapshot(id);assert.equal(raced.title,raceInputs[winner].command.name);assert.equal(raced.last_sequence,sameVersion+1);
  assert.equal(rows(initialTask.source_id,'SELECT COALESCE(MAX(sequence),0) AS version FROM events WHERE session_id = ?',id)[0].version,raced.last_sequence);
  const renameInput=envelope(id,{type:'rename_session',session_id:id,name:'Isolated renamed acceptance task'},raced.last_sequence);
  const rename=await deliver(renameInput);assert.equal(rename.ok,true);
@@ -66,19 +66,27 @@ try{
  assert.deepEqual(await snapshot(id),renamed,'same CommandId replay must not change the snapshot');
  assert.equal(rows(initialTask.source_id,'SELECT COALESCE(MAX(sequence),0) AS version FROM events WHERE session_id = ?',id)[0].version,renamed.last_sequence);
  assert.equal(rows(initialTask.source_id,'SELECT COUNT(*) AS count FROM command_receipts WHERE command_id = ? AND status = ?',renameInput.command_id,'completed')[0].count,1);
-assert.equal(renamed.goal,'Isolated renamed acceptance task');const task=(await index()).tasks.find(t=>t.id===id);assert.equal(task.title,renamed.goal);
+assert.equal(renamed.title,'Isolated renamed acceptance task');assert.equal(renamed.goal,original.goal,'renaming must preserve the task objective');const task=(await index()).tasks.find(t=>t.id===id);assert.equal(task.title,renamed.title);
  const select=await command(id,{type:'select_model',session_id:id,model:{provider:'fixture',model:'second'}});assert.equal(select.ok,true);assert.deepEqual((await snapshot(id)).model,{provider:'fixture',model:'second'});
  const invalid=await command(id,{type:'select_model',session_id:id,model:{provider:'fixture',model:'not-configured'}});assert.equal(invalid.ok,false);assert.match(invalid.error.message,/not configured/);assert.deepEqual((await snapshot(id)).model,{provider:'fixture',model:'second'});
- // Close/reopen the Desktop client; the real detached Runtime remains its owner.
- await close();process.kill(runtime.pid,0);await launch();const refreshed=(await index()).tasks.find(t=>t.id===id);assert.equal(refreshed.title,renamed.goal);
- await page.evaluate(task=>window.desktop.openTask(task),{id,source_id:task.source_id});const restored=await snapshot(id);assert.equal(restored.goal,renamed.goal);assert.deepEqual(restored.model,{provider:'fixture',model:'second'});
+ // Reopening must restore durable settings even if the idle Runtime exited.
+ await close();await launch();const refreshed=(await index()).tasks.find(t=>t.id===id);assert.equal(refreshed.title,renamed.title);
+ await page.evaluate(task=>window.desktop.openTask(task),{id,source_id:task.source_id});const restored=await snapshot(id);assert.equal(restored.title,renamed.title);assert.deepEqual(restored.model,{provider:'fixture',model:'second'});
  const archive=await command(id,{type:'archive_session',session_id:id});assert.equal(archive.ok,true);assert.equal((await index()).tasks.some(t=>t.id===id),false);
  // Archiving hides navigation entries and preserves the existing session record.
- const preserved=await snapshot(id);assert.equal(preserved.goal,renamed.goal);assert.deepEqual(preserved.model,restored.model);
+ const preserved=await snapshot(id);assert.equal(preserved.title,renamed.title);assert.deepEqual(preserved.model,restored.model);
  await close();await launch();assert.equal((await index()).tasks.some(t=>t.id===id),false);
- await page.evaluate(task=>window.desktop.openTask(task),{id,source_id:task.source_id});const archivedReattach=await snapshot(id);assert.equal(archivedReattach.goal,renamed.goal);assert.equal((await index()).tasks.some(t=>t.id===id),false);
+ await page.evaluate(task=>window.desktop.openTask(task),{id,source_id:task.source_id});const archivedReattach=await snapshot(id);assert.equal(archivedReattach.title,renamed.title);assert.equal((await index()).tasks.some(t=>t.id===id),false);
+ await page.locator('#view-options').click();await page.getByRole('menuitemradio',{name:'仅归档',exact:true}).click();
+ const archivedRow=page.locator(`.session-row[data-session-id="${id}"]`);await archivedRow.waitFor();
+ await archivedRow.locator('.session-more').click();await page.getByRole('menuitem',{name:'取消归档',exact:true}).click();
+ await page.waitForFunction(id=>window.desktop.listTasks().then(index=>index.tasks.some(task=>task.id===id)),id);
+ await page.locator('#view-options').click();await page.getByRole('menuitemradio',{name:'默认（不含归档）',exact:true}).click();
+ await page.locator(`.session-row[data-session-id="${id}"]`).waitFor();
+ assert.equal((await index()).tasks.some(t=>t.id===id),true);
+ await close();await launch();assert.equal((await index()).tasks.find(t=>t.id===id)?.title,renamed.title);
  assert.equal(await readFile(path.join(home,'config.toml'),'utf8'),config,'SelectModel must not rewrite the user default');assert.deepEqual(errors,[]);assert.equal(fixture.requests.length,0);
- const evidence={creation_request_id:creationId,same_creation_id_returned_original_session:true,durable_sessions:1,durable_tasks:1,same_snapshot_rename_replies:race,rename_winner:raceInputs[winner].command.name,duplicate_command_id:renameInput.command_id,duplicate_command_no_new_version:true,scope:'real Electron Main/preload + Rust bridge + Runtime; no inference, test-only isolated configuration',temporary_home:home,session_id:id,source_id:task.source_id,runtime_pid:runtime.pid,rename_snapshot_and_index:true,desktop_reopen_rename_persisted:true,select_model_observed:restored.model,invalid_model_rejected:invalid.error.message,invalid_model_preserved_previous:true,default_config_unchanged:true,archive_hidden_from_default_index:true,archive_session_record_retained:true,archive_reattach_possible_with_known_source_and_id:true,archive_still_hidden_after_reattach:true,unarchive_ui_supported:false,provider_requests:fixture.requests.length,page_errors:errors,passed:true};
+ const evidence={creation_request_id:creationId,same_creation_id_returned_original_session:true,durable_sessions:1,durable_tasks:1,same_snapshot_rename_replies:race,rename_winner:raceInputs[winner].command.name,duplicate_command_id:renameInput.command_id,duplicate_command_no_new_version:true,scope:'real Electron Main/preload + Rust bridge + Runtime; no inference, test-only isolated configuration',temporary_home:home,session_id:id,source_id:task.source_id,runtime_pid:runtime.pid,rename_snapshot_and_index:true,desktop_reopen_rename_persisted:true,select_model_observed:restored.model,invalid_model_rejected:invalid.error.message,invalid_model_preserved_previous:true,default_config_unchanged:true,archive_hidden_from_default_index:true,archive_session_record_retained:true,archive_reattach_possible_with_known_source_and_id:true,archive_still_hidden_after_reattach:true,unarchive_menu_and_restart_verified:true,provider_requests:fixture.requests.length,page_errors:errors,passed:true};
  await writeFile(path.join(output,'session-actions-evidence.json'),JSON.stringify(evidence,null,2)+'\n');console.log(JSON.stringify(evidence,null,2));
 }catch(error){await writeFile(path.join(output,'session-actions-evidence.json'),JSON.stringify({passed:false,error:error.message,page_errors:errors},null,2)+'\n');throw error;}
 finally{

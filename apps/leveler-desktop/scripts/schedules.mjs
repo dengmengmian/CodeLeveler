@@ -60,7 +60,7 @@ const launch = async () => {
   page = await app.firstWindow();
   page.setDefaultTimeout(20000);
   page.on('pageerror', error => errors.push(error.message));
-  await page.waitForFunction(() => window.desktop && document.querySelector('#new-session') && document.querySelector('#brand-version')?.textContent.startsWith('v'));
+  await page.waitForFunction(() => window.desktop && document.querySelector('#new-session') && !document.querySelector('#new-session').disabled && document.querySelector('#brand-version')?.textContent.startsWith('v'));
 };
 
 const cli = async args => {
@@ -74,6 +74,7 @@ const cliJson = async args => JSON.parse((await cli(args)).stdout);
 const cliList = () => cliJson(['schedule', 'list', '--repo', canonicalWorkspace, '--json']);
 
 const openAutomation = async () => {
+  await page.waitForFunction(() => document.querySelector('.session-row[aria-selected="true"]') && !document.querySelector('#permission-picker').disabled);
   await page.locator('#nav-automation').click();
   await page.waitForSelector('#entry-page:not([hidden]) .schedule-status');
   await page.waitForFunction(() => !document.querySelector('.schedule-status')?.innerText.includes('正在读取后台调度状态'));

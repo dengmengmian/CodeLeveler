@@ -1187,6 +1187,10 @@ pub enum ScheduleCommand {
         /// Who started this pass. Recorded with the wake.
         #[arg(long, value_enum, default_value = "manual")]
         source: ScheduleSource,
+        /// Keep observing delivered runs until their persisted terminal outcome.
+        /// Does not dispatch future occurrences or enable OS wakeup.
+        #[arg(long)]
+        wait: bool,
         /// Print the summary as JSON.
         #[arg(long)]
         json: bool,
@@ -1434,6 +1438,7 @@ mod tests {
             Some(Command::Schedule(ScheduleCommand::Dispatch {
                 max: 2,
                 source: ScheduleSource::Manual,
+                wait: false,
                 json: true
             }))
         ));

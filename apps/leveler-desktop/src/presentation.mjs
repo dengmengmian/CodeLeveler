@@ -121,7 +121,7 @@ export function workspaceTaskGroups(tasks){
 }
 
 /** @param {string} message */
-export function attachmentErrorPresentation(message){const label=message.includes('附件不能超过 20 MiB')?'附件不能超过 20 MiB，请选择较小的文件。':message.includes('文件在上传读取期间发生变化')?'读取期间文件发生变化，请重新选择。':message.includes('请选择普通文件')?'请选择可读取的普通文件。':'无法读取或上传附件，请检查文件后重试。';return {label,detail:message};}
+export function attachmentErrorPresentation(message){const label=message.includes('附件仅支持 PNG')?'这里只能添加图片。普通文件请从工作区文件中引用。':message.includes('附件不能超过 20 MiB')?'附件不能超过 20 MiB，请选择较小的文件。':message.includes('文件在上传读取期间发生变化')?'读取期间文件发生变化，请重新选择。':message.includes('请选择普通文件')?'请选择可读取的普通文件。':'无法读取或上传附件，请检查文件后重试。';return {label,detail:message};}
 
 /** @param {{connected:boolean,visible:boolean,enabled:boolean,inWorkbench:boolean}[]} candidates @param {boolean} overlay */
 export function focusRestoreIndex(candidates,overlay){return candidates.findIndex(candidate=>candidate.connected&&candidate.visible&&candidate.enabled&&(!overlay||candidate.inWorkbench));}

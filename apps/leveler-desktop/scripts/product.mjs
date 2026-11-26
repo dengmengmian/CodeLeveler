@@ -15,8 +15,12 @@ const output = process.env.LEVELER_ACCEPTANCE_OUTPUT || path.join(root, '../../t
 await mkdir(home, { recursive: true });
 await mkdir(workspace, { recursive: true });
 await writeFile(path.join(workspace, 'readme.txt'), 'PRODUCT_FIRST_USE\n');
+let fileReferenceSent = false;
 const server = createServer(async (request, response) => {
-  for await (const _chunk of request) { /* drain */ }
+  let body = '';
+  for await (const chunk of request) body += chunk;
+  const messages = JSON.parse(body).messages ?? [];
+  fileReferenceSent ||= messages.some(message => message.role === 'user' && typeof message.content === 'string' && message.content.includes('请检查') && message.content.includes('readme.txt'));
   response.writeHead(200, { 'content-type': 'text/event-stream' });
   response.write(`data: ${JSON.stringify({ id: 'p', object: 'chat.completion.chunk', created: 1, model: 'm', choices: [{ index: 0, delta: { content: 'PRODUCT_OK' }, finish_reason: null }] })}\n\n`);
   response.write(`data: ${JSON.stringify({ id: 'p', object: 'chat.completion.chunk', created: 1, model: 'm', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
@@ -74,6 +78,13 @@ try {
   await page.locator('.files-row[data-path="readme.txt"]').click();
   await page.waitForFunction(() => document.querySelector('.preview-body')?.innerText.includes('PRODUCT_FIRST_USE'));
   evidence.file_preview = true;
+  await page.locator('#message').fill('请检查');
+  await page.getByRole('button', { name: '引用到消息', exact: true }).click({ timeout: 3000 });
+  assert.equal(await page.locator('#message').inputValue(), '请检查\n工作区文件："readme.txt"');
+  await page.locator('#send').click();
+  await page.waitForFunction(() => document.querySelectorAll('.message.assistant .markdown').length === 2 && ['已回答','已完成'].includes(document.querySelector('#conversation-status').textContent));
+  assert.equal(fileReferenceSent, true);
+  evidence.workspace_file_reference_sent = true;
   // Settings persist across a renderer reload.
   await page.keyboard.press('Meta+,');
   await page.waitForSelector('#settings-dialog[open]');
@@ -97,7 +108,7 @@ try {
   await page.waitForFunction(id => !!document.querySelector(`.session-row[data-session-id="${id}"]`), workspaceId);
   await page.locator(`.session-row[data-session-id="${workspaceId}"]`).click();
   await page.waitForFunction(() => document.querySelector('.message.assistant .markdown')?.textContent.includes('PRODUCT_OK'));
-  assert.equal(await page.locator('.message.user').count(), 1);
+  assert.equal(await page.locator('.message.user').count(), 2);
   assert.equal(await page.evaluate(id => window.desktop.snapshot(id).then(snapshot => snapshot.repository), workspaceId), await realpath(workspace));
   evidence.history_reopened = true;
   await page.screenshot({ path: path.join(output, 'product-first-use.png') });

@@ -270,6 +270,40 @@ impl Dispatcher {
         }
     }
 
+    /// Observe the currently delivered runs without claiming another occurrence.
+    /// Explicit desktop run-now keeps this observer alive when no OS wake is
+    /// registered. The persisted deadline and existing reconcilers own timeout,
+    /// cancellation and unknown outcomes; no action is delivered again.
+    pub async fn observe_until_settled(&self) -> Result<(), ScheduleError> {
+        let mut pending: Vec<RunId> = self
+            .store
+            .observable_shell_runs()
+            .await?
+            .into_iter()
+            .chain(self.store.handed_off_runs().await?)
+            .map(|observed| observed.run.id)
+            .collect();
+        while !pending.is_empty() {
+            let now = leveler_core::now();
+            self.reconcile_shell_runs(now).await?;
+            self.reconcile_agent_runs(now).await?;
+            let mut active = Vec::new();
+            for id in pending {
+                let run = self.store.run(&id).await?.ok_or_else(|| {
+                    ScheduleError::Invalid(format!("observed schedule run {id} disappeared"))
+                })?;
+                if !run.state.is_terminal() {
+                    active.push(id);
+                }
+            }
+            pending = active;
+            if !pending.is_empty() {
+                tokio::time::sleep(self.poll_interval).await;
+            }
+        }
+        Ok(())
+    }
+
     async fn dispatch_pass(&self, max: usize) -> Result<DispatchSummary, ScheduleError> {
         let now = leveler_core::now();
         let recovered = self.store.recover_expired(now).await?;

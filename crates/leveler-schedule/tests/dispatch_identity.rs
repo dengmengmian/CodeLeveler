@@ -480,25 +480,12 @@ async fn identical_text_from_two_clients_and_a_schedule_keeps_three_identities()
     .with_poll_interval(Duration::from_millis(25));
     let summary = dispatcher.dispatch_due(10).await.unwrap();
     assert_eq!(summary.claimed, 1, "{summary:?}");
-    // A fast shell can still be `running` on the first snapshot. That is a
-    // handoff, not success. Later read-only passes settle the same delivery.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
-    loop {
-        let runs = store.runs(Some(&definition.id), 10).await.unwrap();
-        if runs.len() == 1 && runs[0].state == RunState::Succeeded {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the scheduled shell did not settle on its own execution: {runs:?}"
-        );
-        let observed = dispatcher.dispatch_due(0).await.unwrap();
-        assert_eq!(
-            observed.claimed, 0,
-            "observation must not deliver the shell again: {observed:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    // Without an OS wake, the explicit observer must settle the handed-off
+    // execution itself without another dispatch pass or another delivery.
+    tokio::time::timeout(Duration::from_secs(8), dispatcher.observe_until_settled())
+        .await
+        .expect("the explicit observer must see the shell terminal")
+        .unwrap();
 
     let runs = store.runs(Some(&definition.id), 10).await.unwrap();
     assert_eq!(runs.len(), 1);
