@@ -133,6 +133,7 @@ fn is_turn_terminal(event: &RuntimeEvent) -> bool {
             | RuntimeEvent::TurnPaused { .. }
             | RuntimeEvent::TurnFailed { .. }
             | RuntimeEvent::TurnCancelled
+            | RuntimeEvent::TurnInterrupted
             | RuntimeEvent::TurnTruncated { .. }
             | RuntimeEvent::TurnIncomplete { .. }
     )

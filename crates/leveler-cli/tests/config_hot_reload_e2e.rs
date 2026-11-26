@@ -220,6 +220,7 @@ async fn submit_and_settle(
                 | RuntimeEvent::TurnIncomplete { .. }
                 | RuntimeEvent::TurnFailed { .. }
                 | RuntimeEvent::TurnCancelled
+                | RuntimeEvent::TurnInterrupted
                 | RuntimeEvent::TaskCancelled => return,
                 _ => continue,
             },

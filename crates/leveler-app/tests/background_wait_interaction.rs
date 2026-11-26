@@ -289,6 +289,7 @@ impl Fixture {
                 | Ok(Ok(RuntimeEvent::TurnBlocked { .. }))
                 | Ok(Ok(RuntimeEvent::TurnFailed { .. }))
                 | Ok(Ok(RuntimeEvent::TurnCancelled))
+                | Ok(Ok(RuntimeEvent::TurnInterrupted))
                 | Ok(Ok(RuntimeEvent::TaskCancelled)) => panic!(
                     "the turn ended before every input was delivered: {delivered:?} of {ids:?}"
                 ),
@@ -309,7 +310,8 @@ impl Fixture {
                 Ok(Ok(RuntimeEvent::TurnCompleted))
                 | Ok(Ok(RuntimeEvent::TurnAnswered))
                 | Ok(Ok(RuntimeEvent::TurnFailed { .. }))
-                | Ok(Ok(RuntimeEvent::TurnCancelled)) => return,
+                | Ok(Ok(RuntimeEvent::TurnCancelled))
+                | Ok(Ok(RuntimeEvent::TurnInterrupted)) => return,
                 Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
                     continue;
                 }

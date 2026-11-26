@@ -627,6 +627,7 @@ fn runtime_sigkill_with_dangling_mcp_call_resumes_as_unknown() {
                         | RuntimeEvent::TurnAnswered
                         | RuntimeEvent::TurnPaused { .. }
                         | RuntimeEvent::TurnCancelled
+                        | RuntimeEvent::TurnInterrupted
                         | RuntimeEvent::TaskCancelled
                 )
             })

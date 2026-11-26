@@ -203,6 +203,7 @@ async fn wait_terminal(rx: &mut tokio::sync::broadcast::Receiver<RuntimeEvent>) 
                 | RuntimeEvent::TurnIncomplete { .. }
                 | RuntimeEvent::TurnFailed { .. }
                 | RuntimeEvent::TurnCancelled
+                | RuntimeEvent::TurnInterrupted
                 // An explicit logical-task cancellation is terminal too; without
                 // this arm a test waiting on it would hang instead of failing.
                 | RuntimeEvent::TaskCancelled => return,

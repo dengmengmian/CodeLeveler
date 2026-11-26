@@ -315,6 +315,7 @@ async fn run_turn(
             | Ok(Ok(RuntimeEvent::TurnCompletedWithWarnings { .. }))
             | Ok(Ok(RuntimeEvent::TurnAnswered))
             | Ok(Ok(RuntimeEvent::TurnCancelled))
+            | Ok(Ok(RuntimeEvent::TurnInterrupted))
             | Ok(Ok(RuntimeEvent::TurnIncomplete { .. }))
             | Ok(Ok(RuntimeEvent::TurnTruncated { .. })) => terminal = true,
             Ok(Ok(RuntimeEvent::TurnFailed { error, .. })) => {
