@@ -112,6 +112,7 @@ fn snapshot(origin: Option<UiForeignOrigin>) -> leveler_client_protocol::UiSessi
         execution_task: None,
         children: Vec::new(),
         foreign_origin: origin,
+        startup_recovery: None,
     }
 }
 

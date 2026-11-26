@@ -1141,6 +1141,7 @@ fn a_reconnect_restores_the_running_clock_and_output() {
         execution_task: None,
         children: Vec::new(),
         foreign_origin: None,
+        startup_recovery: None,
     };
     snap.active_tools = vec![UiActiveToolCall {
         timing: None,
@@ -1375,6 +1376,7 @@ fn background_command_identity_is_complete_live_and_restored() {
         execution_task: None,
         children: Vec::new(),
         foreign_origin: None,
+        startup_recovery: None,
     };
     snap.active_background_tasks = vec![leveler_client_protocol::UiActiveBackgroundTask {
         task_id: "full-command".into(),

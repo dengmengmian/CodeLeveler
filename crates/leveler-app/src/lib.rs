@@ -46,6 +46,7 @@ pub mod session_projection;
 mod settings_service;
 mod side_question;
 pub mod skills;
+mod startup_recovery;
 pub mod usage;
 mod user_shell;
 mod vcs;
@@ -1042,6 +1043,9 @@ pub struct Application {
     /// stream has no subscriber at creation time; the created session's
     /// bootstrap is the one channel a client is guaranteed to read.
     default_model_notice: std::sync::Mutex<Option<String>>,
+    /// Execution-service/owed-continuation recovery, structured so clients can
+    /// open immediately and still see whether their background facts are final.
+    startup_recovery: std::sync::Arc<startup_recovery::StartupRecovery>,
 }
 
 impl Drop for Application {
@@ -1399,6 +1403,7 @@ impl Application {
                 plaintext_disclosure::PlaintextDisclosures::new(),
             ),
             default_model_notice: std::sync::Mutex::new(None),
+            startup_recovery: std::sync::Arc::new(startup_recovery::StartupRecovery::new()),
             permission_profiles: std::sync::Mutex::new(std::collections::HashMap::new()),
             definition_trust_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
             capability_activations: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1652,25 +1657,103 @@ impl Application {
         Ok(db)
     }
 
-    /// Recover hosted process settlements at an explicit runtime startup
-    /// boundary. Merely reading the session database never performs this work.
+    /// Bind this boot to the background registry without touching the host.
     ///
-    /// The same boundary binds this runtime's boot identity to the background
-    /// registry. A hosted goal task is attributed to the boot that admitted it,
-    /// and a replacement boot can then prove the previous generation gone
-    /// instead of silently adopting its live process as its own.
-    pub async fn reconcile_execution_services(
-        &self,
-    ) -> Result<Option<leveler_execution::HostRecovery>, AppError> {
+    /// A hosted goal task is attributed to the boot that admitted it, and a
+    /// replacement boot can then prove the previous generation gone instead of
+    /// silently adopting its live process as its own. Binding is local and
+    /// cheap; it belongs before clients are served, while host reconciliation
+    /// does not.
+    pub fn bind_runtime_boot(&self) -> Result<(), AppError> {
         let boot = self.boot_id()?;
         let probe: std::sync::Arc<dyn leveler_core::BootLivenessProbe> = std::sync::Arc::new(
             runtime_boot::StateDirBootLiveness::new(&self.layout.state_dir),
         );
         self.background_tasks.bind_runtime_boot(boot, probe);
-        self.background_tasks
+        Ok(())
+    }
+
+    /// Recover hosted process settlements at an explicit runtime startup
+    /// boundary. Merely reading the session database never performs this work.
+    ///
+    /// Prefer [`Self::spawn_execution_services_recovery`] on a path a client is
+    /// waiting on, and [`Self::bind_runtime_boot`] first: this await includes
+    /// calls to a process that another workload can leave busy.
+    pub async fn reconcile_execution_services(
+        &self,
+    ) -> Result<Option<leveler_execution::HostRecovery>, AppError> {
+        self.bind_runtime_boot()?;
+        self.reconcile_hosted_backgrounds().await
+    }
+
+    async fn reconcile_hosted_backgrounds(
+        &self,
+    ) -> Result<Option<leveler_execution::HostRecovery>, AppError> {
+        let started = std::time::Instant::now();
+        let result = self
+            .background_tasks
             .reconcile_hosted()
             .await
-            .map_err(AppError::ExecutionHost)
+            .map_err(AppError::ExecutionHost);
+        tracing::info!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            ok = result.is_ok(),
+            "execution services reconciled at startup"
+        );
+        result
+    }
+
+    /// Reconcile hosted background services without making a client wait.
+    ///
+    /// The boot must already be bound (or this binds it synchronously before
+    /// spawning). The outcome is recorded in [`Self::startup_recovery`] and
+    /// logged; a failure never takes the runtime down, because the client can
+    /// still read canonical session state and must be told what is unknown.
+    pub fn spawn_execution_services_recovery(self: &Arc<Self>) {
+        if let Err(error) = self.bind_runtime_boot() {
+            self.startup_recovery
+                .finish(startup_recovery::EXECUTION_SERVICES, Err(error.to_string()));
+            return;
+        }
+        let app = self.clone();
+        self.startup_recovery
+            .begin(startup_recovery::EXECUTION_SERVICES);
+        tokio::spawn(async move {
+            let result = app
+                .reconcile_hosted_backgrounds()
+                .await
+                .map_err(|error| error.to_string());
+            app.startup_recovery
+                .finish_with_recovery(startup_recovery::EXECUTION_SERVICES, result);
+        });
+    }
+
+    /// The recovery ledger every session projection reads.
+    pub(crate) fn startup_recovery(&self) -> &startup_recovery::StartupRecovery {
+        &self.startup_recovery
+    }
+
+    /// Wait a bounded grace for recovery to settle before building a snapshot.
+    /// A stalled host does not hold the snapshot past the grace; the snapshot
+    /// then reports `running` and omits host-only facts.
+    pub(crate) async fn wait_startup_recovery(&self) -> startup_recovery::RecoveryReadout {
+        self.startup_recovery
+            .wait_settled(std::time::Duration::from_millis(500))
+            .await
+    }
+
+    /// The structured recovery state a client must see on the snapshot.
+    pub(crate) fn startup_recovery_wire(
+        &self,
+    ) -> Option<leveler_client_protocol::UiStartupRecovery> {
+        self.startup_recovery.read().to_wire()
+    }
+
+    /// Whether a projection or health reading may ask the Execution Host for
+    /// live tasks. While recovery is in flight or failed, only durable/local
+    /// facts are available.
+    pub(crate) fn startup_recovery_permits_host_reads(&self) -> bool {
+        self.startup_recovery.read().permits_host_reads()
     }
 
     /// All configured model references.

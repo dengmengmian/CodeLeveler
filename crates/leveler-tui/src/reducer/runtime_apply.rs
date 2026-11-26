@@ -1600,6 +1600,9 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             }
             state.notification = Some(Notification { level, message });
         }
+        RuntimeEvent::StartupRecovery { recovery } => {
+            apply_startup_recovery_event(state, &recovery);
+        }
         RuntimeEvent::BtwStarted { question } => {
             state.btw.begin(question);
         }
@@ -2976,6 +2979,93 @@ fn apply_session(state: &mut AppState, session: UiSessionSnapshot) {
     apply_session_with(state, session, TranscriptAdoption::Replace);
 }
 
+/// Surface the runtime's structured start-up recovery state.
+///
+/// The runtime serves canonical session state before no-host recovery finishes,
+/// so a failure here is not a blank or absent field: it is the reason live
+/// host-only facts may be missing. One row per distinct fact; a resync that
+/// carries the same failure must not duplicate it. A command-confirmation
+/// snapshot is older than the live turn it confirms, so it never introduces a
+/// recovery row.
+fn apply_startup_recovery(
+    state: &mut AppState,
+    recovery: Option<&leveler_client_protocol::UiStartupRecovery>,
+    adoption: TranscriptAdoption,
+) {
+    if adoption != TranscriptAdoption::Replace {
+        return;
+    }
+    let Some(recovery) = recovery else {
+        state.startup_recovery_notice = None;
+        return;
+    };
+    match startup_recovery_message(state, recovery) {
+        Some((level, message)) => show_startup_recovery(state, level, message),
+        None => {
+            // Everything still in flight may become a failure; a settled clean
+            // read clears the latch so a future distinct failure can surface.
+            if !recovery.running {
+                state.startup_recovery_notice = None;
+            }
+        }
+    }
+}
+
+/// A settlement event for a failure that landed after the first snapshot.
+fn apply_startup_recovery_event(
+    state: &mut AppState,
+    recovery: &leveler_client_protocol::UiStartupRecovery,
+) {
+    if let Some((level, message)) = startup_recovery_message(state, recovery) {
+        show_startup_recovery(state, level, message);
+    }
+}
+
+fn startup_recovery_message(
+    state: &AppState,
+    recovery: &leveler_client_protocol::UiStartupRecovery,
+) -> Option<(NotificationLevel, String)> {
+    let t = state.t();
+    let stage = |name: &str| -> String {
+        match name {
+            "execution_services" => t.startup_recovery_execution_services.to_string(),
+            "owed_continuations" => t.startup_recovery_owed_continuations.to_string(),
+            other => other.to_string(),
+        }
+    };
+    if !recovery.failures.is_empty() {
+        let failures = recovery
+            .failures
+            .iter()
+            .map(|failure| format!("{}: {}", stage(&failure.stage), failure.message))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        Some((
+            NotificationLevel::Error,
+            format!("{} · {failures}", t.startup_recovery_failed),
+        ))
+    } else if recovery.recovered_tasks > 0 || recovery.unresolved_intents > 0 {
+        let message = t
+            .startup_recovery_host_lost
+            .replace("{tasks}", &recovery.recovered_tasks.to_string())
+            .replace("{intents}", &recovery.unresolved_intents.to_string());
+        Some((NotificationLevel::Warning, message))
+    } else {
+        None
+    }
+}
+
+fn show_startup_recovery(state: &mut AppState, level: NotificationLevel, message: String) {
+    if state.startup_recovery_notice.as_deref() == Some(message.as_str()) {
+        return;
+    }
+    state.startup_recovery_notice = Some(message.clone());
+    if level == NotificationLevel::Error {
+        state.transcript.push_error(message.clone());
+    }
+    state.notification = Some(Notification { level, message });
+}
+
 /// Adopt the runtime's durable projection of the goal this session owes.
 ///
 /// The snapshot is the only authority for WHICH goal is owed, whether a window
@@ -3055,6 +3145,7 @@ fn apply_session_with(
     // token state intact.
     let switching = state.session_id != session.id;
     apply_meta(state, &session);
+    apply_startup_recovery(state, session.startup_recovery.as_ref(), adoption);
     // A snapshot names a session the runtime actually has; the deleted-view
     // latch is over.
     state.session_deleted = false;
@@ -3544,5 +3635,115 @@ pub(super) fn mode_label(mode: PermissionProfile) -> &'static str {
         PermissionProfile::RequestApproval => "RequestApproval",
         PermissionProfile::Assisted => "Assisted",
         PermissionProfile::FullAccess => "FullAccess",
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use leveler_client_protocol::{SessionId, UiStartupRecovery, UiStartupRecoveryFailure};
+
+    fn state() -> AppState {
+        let mut state = AppState::new(
+            crate::theme::Theme::no_color(),
+            crate::state::Boot {
+                session_id: SessionId::new("s1"),
+                user: "u".into(),
+                version: "0.1.0".into(),
+                show_welcome: false,
+                draft_path: None,
+                history_path: None,
+                context_window: 200_000,
+                locale: crate::i18n::Locale::Zh,
+                untrusted_config: Vec::new(),
+                model_notice: None,
+                thinking: None,
+            },
+        );
+        state.size = (100, 40);
+        state
+    }
+
+    fn failed(stage: &str, message: &str) -> UiStartupRecovery {
+        UiStartupRecovery {
+            running: false,
+            failures: vec![UiStartupRecoveryFailure {
+                stage: stage.into(),
+                message: message.into(),
+            }],
+            recovered_tasks: 0,
+            unresolved_intents: 0,
+        }
+    }
+
+    #[test]
+    fn a_structured_recovery_failure_reaches_the_user_once() {
+        let mut state = state();
+        let recovery = failed("execution_services", "host timed out");
+        apply_startup_recovery(&mut state, Some(&recovery), TranscriptAdoption::Replace);
+        let notice = state.notification.clone().expect("a failure is shown");
+        assert_eq!(notice.level, NotificationLevel::Error);
+        assert!(notice.message.contains("后台恢复失败"));
+        assert!(notice.message.contains("host timed out"));
+        let errors_after_first = state
+            .transcript
+            .items()
+            .iter()
+            .filter(|item| matches!(item, crate::transcript::TranscriptItem::Error(_)))
+            .count();
+        assert_eq!(errors_after_first, 1);
+
+        // The same failure in a resync is the same fact; it must not duplicate.
+        apply_startup_recovery(&mut state, Some(&recovery), TranscriptAdoption::Replace);
+        let errors = state
+            .transcript
+            .items()
+            .iter()
+            .filter(|item| matches!(item, crate::transcript::TranscriptItem::Error(_)))
+            .count();
+        assert_eq!(errors, 1);
+
+        // A different failure is new information and does get its own row.
+        let other = failed("owed_continuations", "model missing");
+        apply_startup_recovery(&mut state, Some(&other), TranscriptAdoption::Replace);
+        let errors = state
+            .transcript
+            .items()
+            .iter()
+            .filter(|item| matches!(item, crate::transcript::TranscriptItem::Error(_)))
+            .count();
+        assert_eq!(errors, 2);
+    }
+
+    #[test]
+    fn a_lost_host_is_a_warning_and_never_a_completed_claim() {
+        let mut state = state();
+        let recovery = UiStartupRecovery {
+            running: false,
+            failures: Vec::new(),
+            recovered_tasks: 2,
+            unresolved_intents: 1,
+        };
+        apply_startup_recovery(&mut state, Some(&recovery), TranscriptAdoption::Replace);
+        let notice = state.notification.clone().expect("a loss is shown");
+        assert_eq!(notice.level, NotificationLevel::Warning);
+        assert!(notice.message.contains('2') && notice.message.contains('1'));
+        assert!(
+            !state
+                .transcript
+                .items()
+                .iter()
+                .any(|item| matches!(item, crate::transcript::TranscriptItem::Error(_))),
+            "a converged task is not an error row"
+        );
+    }
+
+    #[test]
+    fn a_confirmation_snapshot_never_introduces_a_recovery_row() {
+        let mut state = state();
+        let recovery = failed("execution_services", "host timed out");
+        apply_startup_recovery(&mut state, Some(&recovery), TranscriptAdoption::KeepLive);
+        assert!(state.notification.is_none());
+        assert!(state.startup_recovery_notice.is_none());
     }
 }

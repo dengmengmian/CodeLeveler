@@ -111,10 +111,12 @@ pub async fn prepare_daemon(
     });
     let service: Arc<dyn LocalRuntimeService> = runtime.clone();
     let bound = bind_daemon_transports(socket_path, tcp, token, service, local_waiters).await?;
-    app.reconcile_execution_services().await?;
     let runtime_id = app.runtime_id()?;
     let db = app.open_database().await?;
     let engine = app.task_engine(&db)?;
+    // Turn truth stays before readiness: a resumed client must never see a
+    // killed turn painted as live. This is local DB work, bounded by running
+    // turns, and it carries the crash-recovery gate a client reads.
     let reap =
         leveler_engine::reap_after_restart(&engine, None, leveler_engine::ReapScope::EndedBoots)
             .await?;
@@ -130,17 +132,13 @@ pub async fn prepare_daemon(
             "reaped zombie turns before daemon startup"
         );
     }
-    // A crash between committing a durable answer and admitting its next
-    // window leaves an answered goal with nobody driving it. Restart is the
-    // point where the runtime finishes that work; the answer is durable, so
-    // losing its continuation would silently strand the user's decision.
-    let resumed = runtime.reconcile_owed_clarification_continuations().await?;
-    if resumed > 0 {
-        tracing::warn!(
-            resumed,
-            "resumed goal windows whose durable answer had no continuation"
-        );
-    }
+    // Execution-host reconciliation and owed continuations call out of process
+    // and can wait out an Execution Host deadline. They must not decide when the
+    // terminal may appear: start them here, publish readiness, and let every
+    // snapshot carry the structured running/failed state. A crash between
+    // committing a durable answer and admitting its next window still resumes;
+    // it just no longer holds the first frame hostage.
+    runtime.spawn_startup_recovery(true);
     if let Some(path) = ready_path {
         let ready = ready_json(socket_path, bound.tcp.as_ref(), runtime_id.as_str())?;
         publish_ready_json(path, &serde_json::to_vec_pretty(&ready)?)?;

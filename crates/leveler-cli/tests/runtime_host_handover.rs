@@ -114,6 +114,7 @@ impl FakeOldRuntime {
             state: Arc::new(Mutex::new(FakeState {
                 pid: std::process::id(),
                 health: RuntimeHealth {
+                    background_tasks_unknown: false,
                     accepting_work: false,
                     active_turns: 1,
                     active_background_tasks: 1,
@@ -148,6 +149,7 @@ impl FakeOldRuntime {
             state: Arc::new(Mutex::new(FakeState {
                 pid: std::process::id(),
                 health: RuntimeHealth {
+                    background_tasks_unknown: false,
                     accepting_work: true,
                     quiescent: true,
                     ..RuntimeHealth::default()
@@ -588,6 +590,7 @@ impl LocalRuntimeService for AnonymousRuntime {
             pid: std::process::id(),
             idle_eviction: None,
             health: RuntimeHealth {
+                background_tasks_unknown: false,
                 accepting_work: true,
                 quiescent: true,
                 ..RuntimeHealth::default()

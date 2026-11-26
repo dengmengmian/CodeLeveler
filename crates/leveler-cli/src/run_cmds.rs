@@ -314,55 +314,6 @@ impl HandoffLang {
     }
 }
 
-/// Say what a lost Execution Host meant for the user's background services.
-///
-/// This is a startup fact, so it goes to stderr before the alternate screen: a
-/// converged task is no longer running under this product, and the wording says
-/// exactly which evidence decided that. Nothing here was killed or restarted.
-fn report_host_recovery(recovery: &leveler_execution::execution_host::HostRecovery) {
-    use leveler_execution::execution_host::ProcessPresence;
-    let zh = matches!(leveler_tui::Locale::resolve(None), leveler_tui::Locale::Zh);
-    let pick = |zh_text: &'static str, en_text: &'static str| {
-        if zh { zh_text } else { en_text }
-    };
-    for task in &recovery.tasks {
-        let command = blocker_command_line(&task.program, &task.args);
-        let state = match task.process {
-            ProcessPresence::Gone => pick(
-                "进程已确认结束，退出状态未能记录",
-                "the process is confirmed gone; its exit status was never recorded",
-            ),
-            ProcessPresence::Present => pick(
-                "进程可能仍在运行：未终止，也未重新执行",
-                "its process may still be running: not signalled and not started again",
-            ),
-            ProcessPresence::Unobservable => pick(
-                "无法确认进程状态：未终止，也未重新执行",
-                "its process state could not be verified: not signalled and not started again",
-            ),
-        };
-        eprintln!(
-            "{} {}\n  {} ({state})",
-            pick(
-                "上一个执行宿主已退出；后台任务控制权丢失：",
-                "The previous execution host is gone; background task control was lost:",
-            ),
-            task.task_id,
-            command,
-        );
-    }
-    if !recovery.unresolved_intents.is_empty() {
-        eprintln!(
-            "{} {}",
-            pick(
-                "上一个执行宿主留下未决启动意图（是否启动无法确认，已保留记录）：",
-                "The previous execution host left unresolved spawn intents (launch unproven, records kept):",
-            ),
-            recovery.unresolved_intents.join(", "),
-        );
-    }
-}
-
 /// The lifecycle line a retiring runtime reports, in the user's language.
 ///
 /// The user thinks in *versions*, never in "runtimes": this text says "the
@@ -1123,18 +1074,12 @@ fn map_ensure_error(error: anyhow::Error) -> anyhow::Error {
 
 #[cfg(any(unix, windows))]
 async fn ensure_tui_runtime(layout: &Layout) -> anyhow::Result<LocalSocketRuntimeClient> {
-    // Reconcile the durable execution state BEFORE asking for a daemon: a lost
-    // host must not make the runtime's own startup fail, and the user has to be
-    // told which service lost its controlling host before the screen changes.
-    let probe = leveler_execution::execution_host::ExecutionHostClient::probe(
-        &leveler_app::execution_host_config(layout)?,
-    )
-    .await
-    .map_err(anyhow::Error::msg)?;
-    if let Some(recovery) = probe.recovery.as_ref() {
-        report_host_recovery(recovery);
-    }
-    let client = leveler_runtime_host::ensure_default_runtime(
+    // Execution-service recovery belongs to the runtime that will own the
+    // state, and it must not delay this client's first frame. The daemon
+    // reconciles the host after publishing readiness; the session snapshot
+    // carries the structured running/failed state. Probing here (or listing
+    // hosted tasks before the screen opens) made a busy host a startup blocker.
+    leveler_runtime_host::ensure_default_runtime(
         layout,
         &daemon_launch()?,
         Arc::new(TuiHandoffUi {
@@ -1146,35 +1091,7 @@ async fn ensure_tui_runtime(layout: &Layout) -> anyhow::Result<LocalSocketRuntim
         }),
     )
     .await
-    .map_err(map_ensure_error)?;
-    if let Some(host) = probe.client.as_ref() {
-        // This count is informational; a host that vanished while the daemon
-        // was starting must not fail the launch (the daemon reconciles it).
-        match host.list().await {
-            Ok(tasks) => {
-                let count = tasks
-                    .into_iter()
-                    .filter(|task| {
-                        matches!(
-                            task.snapshot.status,
-                            leveler_execution::BackgroundTaskStatus::Running
-                                | leveler_execution::BackgroundTaskStatus::Killing
-                        )
-                    })
-                    .count();
-                if count > 0 {
-                    eprintln!("{} {count}", HandoffLang::current().pick(
-                        "后台服务继续由独立执行宿主持有，不阻塞版本更新：",
-                        "Background services remain owned by the execution host and do not block version updates:",
-                    ));
-                }
-            }
-            Err(error) => {
-                tracing::warn!(%error, "could not count hosted background tasks");
-            }
-        }
-    }
-    Ok(client)
+    .map_err(map_ensure_error)
 }
 
 #[cfg(test)]
@@ -1484,9 +1401,6 @@ pub(crate) async fn cmd_tui(
     }
 
     let app = Arc::new(Application::assemble(layout)?);
-    if let Some(recovery) = app.reconcile_execution_services().await? {
-        report_host_recovery(&recovery);
-    }
     let (model_ref, model_notice) = resolve_model_with_notice(app.as_ref(), model)?;
 
     // One resolution per launch. A resume falls back to the PERSISTED mode
@@ -1542,6 +1456,11 @@ pub(crate) async fn cmd_tui(
     // generations to the attached client without restarting the runtime.
     app.start_config_watcher();
     in_process_client.spawn_config_bridge();
+    // Recovery is real background work with out-of-process waits. Bind this
+    // boot synchronously, start the stages, and let them finish behind the UI:
+    // snapshots and the settlement event carry the structured result, so a slow
+    // or broken host is reported instead of leaving the terminal blank.
+    in_process_client.spawn_startup_recovery(false);
     // A previous process may have quit while an extraction was in flight.
     // The durable job survived that quit; resume it now, before the user has
     // to touch the original session again.
@@ -3434,6 +3353,7 @@ mod handoff_status_tests {
     #[test]
     fn the_handover_copy_is_bilingual_and_never_says_runtime() {
         let health = RuntimeHealth {
+            background_tasks_unknown: false,
             active_background_tasks: 1,
             blockers: vec![blocker("bg-1", "make", &["up"], 1_080_000)],
             ..Default::default()
@@ -3455,6 +3375,7 @@ mod handoff_status_tests {
     #[test]
     fn the_handover_status_has_no_raw_build_hash() {
         let health = RuntimeHealth {
+            background_tasks_unknown: false,
             quiescent: true,
             ..Default::default()
         };
@@ -3466,6 +3387,7 @@ mod handoff_status_tests {
     #[test]
     fn an_idle_runtime_shows_no_blocker_list() {
         let health = RuntimeHealth {
+            background_tasks_unknown: false,
             quiescent: true,
             ..Default::default()
         };
@@ -3477,6 +3399,7 @@ mod handoff_status_tests {
     #[test]
     fn a_blocked_handover_names_the_command_age_and_stop_path() {
         let health = RuntimeHealth {
+            background_tasks_unknown: false,
             active_background_tasks: 1,
             blockers: vec![blocker("bg-1", "make", &["up"], 90_061_000)],
             ..Default::default()
@@ -3496,6 +3419,7 @@ mod handoff_status_tests {
     #[test]
     fn every_live_blocker_is_listed_oldest_first() {
         let health = RuntimeHealth {
+            background_tasks_unknown: false,
             active_background_tasks: 3,
             blockers: vec![
                 blocker("bg-1", "make", &["up"], 90_061_000),
@@ -3539,11 +3463,13 @@ mod handoff_key_tests {
     #[test]
     fn a_growing_age_does_not_change_the_key() {
         let a = RuntimeHealth {
+            background_tasks_unknown: false,
             active_background_tasks: 1,
             blockers: vec![blocker("bg-1", 1_000)],
             ..Default::default()
         };
         let b = RuntimeHealth {
+            background_tasks_unknown: false,
             active_background_tasks: 1,
             blockers: vec![blocker("bg-1", 90_000)],
             ..Default::default()
@@ -3554,6 +3480,7 @@ mod handoff_key_tests {
     #[test]
     fn a_changed_blocker_set_changes_the_key() {
         let a = RuntimeHealth {
+            background_tasks_unknown: false,
             active_background_tasks: 1,
             blockers: vec![blocker("bg-1", 1_000)],
             ..Default::default()
@@ -3585,6 +3512,7 @@ mod handover_recovery_tests {
     #[test]
     fn a_long_but_active_turn_is_not_stalled() {
         let health = RuntimeHealth {
+            background_tasks_unknown: false,
             active_turns: 1,
             turn_blockers: vec![turn("s1", 4 * 60 * 60 * 1_000, 1_000)],
             ..Default::default()
@@ -3601,6 +3529,7 @@ mod handover_recovery_tests {
     #[test]
     fn a_quiet_turn_is_described_but_not_acted_on() {
         let health = RuntimeHealth {
+            background_tasks_unknown: false,
             active_turns: 1,
             turn_blockers: vec![turn("s1", 6 * 24 * 3_600_000, stale_ms() + 1)],
             ..Default::default()
@@ -3635,6 +3564,7 @@ mod handover_recovery_tests {
     #[test]
     fn force_is_refused_while_background_work_runs() {
         let busy = RuntimeHealth {
+            background_tasks_unknown: false,
             active_turns: 1,
             active_background_tasks: 1,
             ..Default::default()
@@ -3642,6 +3572,7 @@ mod handover_recovery_tests {
         assert!(!force_handover_allowed(&busy));
 
         let settled = RuntimeHealth {
+            background_tasks_unknown: false,
             active_turns: 1,
             active_background_tasks: 0,
             ..Default::default()
@@ -3654,11 +3585,13 @@ mod handover_recovery_tests {
     #[test]
     fn the_key_restates_only_when_the_stall_flag_changes() {
         let below = RuntimeHealth {
+            background_tasks_unknown: false,
             active_turns: 1,
             turn_blockers: vec![turn("s1", 10_000, stale_ms() - 1)],
             ..Default::default()
         };
         let at = RuntimeHealth {
+            background_tasks_unknown: false,
             active_turns: 1,
             turn_blockers: vec![turn("s1", 20_000, stale_ms() + 1)],
             ..Default::default()
@@ -3666,6 +3599,7 @@ mod handover_recovery_tests {
         assert_ne!(handoff_key(&below), handoff_key(&at));
 
         let later = RuntimeHealth {
+            background_tasks_unknown: false,
             active_turns: 1,
             turn_blockers: vec![turn("s1", 90_000, stale_ms() + 60_000)],
             ..Default::default()
@@ -3678,6 +3612,7 @@ mod handover_recovery_tests {
     #[test]
     fn the_turn_blocker_line_is_specific_and_leaks_nothing_internal() {
         let health = RuntimeHealth {
+            background_tasks_unknown: false,
             active_turns: 1,
             turn_blockers: vec![turn("sess-42", 90_061_000, stale_ms() + 1)],
             ..Default::default()
@@ -3696,6 +3631,7 @@ mod handover_recovery_tests {
     #[test]
     fn a_healthy_handover_offers_no_recovery_prompt() {
         let health = RuntimeHealth {
+            background_tasks_unknown: false,
             active_turns: 1,
             turn_blockers: vec![turn("s1", 5_000, 1_000)],
             ..Default::default()

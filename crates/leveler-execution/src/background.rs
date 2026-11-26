@@ -1190,6 +1190,45 @@ impl BackgroundTaskRegistry {
             .collect())
     }
 
+    /// Active tasks this process already holds, across every session, WITHOUT
+    /// calling the Execution Host.
+    pub async fn local_active_snapshots(&self) -> Vec<BackgroundTaskSnapshot> {
+        let st = self.inner.lock().await;
+        st.tasks
+            .values()
+            .map(|task| {
+                let mut snap = snapshot(task);
+                st.attach_readiness(&mut snap);
+                snap
+            })
+            .filter(|snap| snap.status.is_active())
+            .collect()
+    }
+
+    /// Active tasks this process already holds, WITHOUT calling the Execution
+    /// Host.
+    ///
+    /// A client projection must stay answerable while the host is slow or
+    /// unreachable. Hosted tasks are still visible through the durable task
+    /// records and the host's local archive; this only omits the live RPC
+    /// refresh, which the background recovery performs.
+    pub async fn local_active_snapshots_for_scope(
+        &self,
+        scope: &str,
+    ) -> Vec<BackgroundTaskSnapshot> {
+        let st = self.inner.lock().await;
+        st.tasks
+            .values()
+            .filter(|task| task.owner_scope.as_deref() == Some(scope))
+            .map(|task| {
+                let mut snap = snapshot(task);
+                st.attach_readiness(&mut snap);
+                snap
+            })
+            .filter(|snap| snap.status.is_active())
+            .collect()
+    }
+
     pub async fn try_active_snapshots(&self) -> Result<Vec<BackgroundTaskSnapshot>, String> {
         Ok(self
             .try_all_snapshots()

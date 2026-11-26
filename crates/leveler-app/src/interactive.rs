@@ -658,6 +658,21 @@ impl RuntimeQuiescence {
     fn quiescent(&self) -> bool {
         self.active_turns == 0 && self.background_tasks.is_empty()
     }
+
+    /// The reading available without asking the Execution Host: this process's
+    /// own turns and locally held tasks. It is a lower bound, never an idle
+    /// proof, and callers mark the hosted side unknown.
+    async fn local(
+        active: &ActiveTurns,
+        background: &leveler_execution::BackgroundTaskRegistry,
+    ) -> Self {
+        let (turns, capacity) = active.load();
+        Self {
+            active_turns: turns as u32,
+            turn_capacity: capacity as u32,
+            background_tasks: background.local_active_snapshots().await,
+        }
+    }
 }
 
 /// The ONE runtime-quiescence computation. `runtime_info` (what a client
@@ -2056,6 +2071,63 @@ impl InProcessRuntimeClient {
             }
         }
         Ok(started)
+    }
+
+    /// Run the owed-continuation scan without making readiness wait for it.
+    ///
+    /// A continuation starts a live goal window; the scan itself is local DB
+    /// work, but starting windows is real side-effecting work that must not
+    /// gate the first client frame. Its result is part of the same structured
+    /// startup-recovery projection as Execution Host reconciliation.
+    pub fn spawn_owed_clarification_recovery(self: &Arc<Self>) {
+        let runtime = self.clone();
+        let app = self.app.clone();
+        self.app
+            .startup_recovery()
+            .begin(crate::startup_recovery::OWED_CONTINUATIONS);
+        tokio::spawn(async move {
+            let result = runtime
+                .reconcile_owed_clarification_continuations()
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+            app.startup_recovery()
+                .finish(crate::startup_recovery::OWED_CONTINUATIONS, result);
+        });
+    }
+
+    /// Start every recovery stage this runtime owns, then tell already-attached
+    /// session streams when the whole set settles.
+    ///
+    /// The initial snapshot carries the same state. This notification exists for
+    /// the failure that lands AFTER a client has opened: without it, a stalled
+    /// Execution Host would leave the first frame healthy and the failure
+    /// invisible until the next reconnect.
+    pub fn spawn_startup_recovery(self: &Arc<Self>, include_owed_continuations: bool) {
+        self.app.spawn_execution_services_recovery();
+        if include_owed_continuations {
+            self.spawn_owed_clarification_recovery();
+        }
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            let mut changes = runtime.app.startup_recovery().subscribe();
+            let settled = changes.wait_for(|state| !state.running).await;
+            let Ok(settled) = settled else {
+                return;
+            };
+            let Some(recovery) = settled.to_wire() else {
+                return;
+            };
+            // Only streams a client actually attached to exist here; a session
+            // whose stream was never created owes nothing and will read the
+            // state from its first snapshot instead.
+            let streams = runtime.session_events.streams.lock().unwrap();
+            for stream in streams.values() {
+                let _ = stream.events.send(RuntimeEvent::StartupRecovery {
+                    recovery: recovery.clone(),
+                });
+            }
+        });
     }
 
     /// Like [`Self::new`], with an explicit auto-approve switch for unattended
@@ -9753,6 +9825,12 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 "could not resume a clarification continuation left owed by a crash"
             );
         }
+        // Startup recovery (Execution Host reconciliation) must never own the
+        // first snapshot. A healthy host settles inside this bounded grace and
+        // the snapshot is complete; a stalled host leaves it `running`, and the
+        // projection below uses the durable/local facts it already has instead
+        // of making the client wait on an RPC that may not answer.
+        let startup_recovery = self.app.wait_startup_recovery().await;
         // Phase times include pool checkout and SQLite busy-wait. They are not
         // a separate pool-acquire measurement: the pool handle stays inside
         // the storage crate.
@@ -10064,12 +10142,19 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
         let children = crate::children::project_children(&db, session_id, runtime_active)
             .await
             .map_err(|e| ClientError::Runtime(e.to_string()))?;
-        let active_background_tasks: Vec<leveler_client_protocol::UiActiveBackgroundTask> = self
-            .app
-            .background_tasks()
-            .try_active_snapshots()
-            .await
-            .map_err(ClientError::Runtime)?
+        let active_background_tasks: Vec<leveler_client_protocol::UiActiveBackgroundTask> =
+            if startup_recovery.permits_host_reads() {
+                self.app
+                    .background_tasks()
+                    .try_active_snapshots()
+                    .await
+                    .map_err(ClientError::Runtime)?
+            } else {
+                self.app
+                    .background_tasks()
+                    .local_active_snapshots_for_scope(session_id.as_str())
+                    .await
+            }
             .into_iter()
             .filter(|task| task.owner_scope.as_deref() == Some(session_id.as_str()))
             .map(|task| leveler_client_protocol::UiActiveBackgroundTask {
@@ -10151,6 +10236,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             execution_task,
             children,
             foreign_origin,
+            startup_recovery: self.app.startup_recovery_wire(),
         })
     }
 }
@@ -10919,14 +11005,40 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
             .runtime_id()
             .map_err(|error| ClientError::Runtime(error.to_string()))?;
         // Read the same blocker inventory once for both counts and details.
-        let quiescence = runtime_quiescence(&self.active, self.app.background_tasks()).await?;
+        // The readiness handshake must answer even while start-up recovery is
+        // still observing a slow host: in that window only local facts are
+        // known, and `background_tasks_unknown` says so. A host failure after
+        // recovery is likewise a lower bound, never a proven idle runtime.
+        let (quiescence, background_tasks_unknown) = if self
+            .app
+            .startup_recovery_permits_host_reads()
+        {
+            match runtime_quiescence(&self.active, self.app.background_tasks()).await {
+                Ok(quiescence) => (quiescence, false),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "runtime health: hosted background observation failed; reporting local facts"
+                    );
+                    (
+                        RuntimeQuiescence::local(&self.active, self.app.background_tasks()).await,
+                        true,
+                    )
+                }
+            }
+        } else {
+            (
+                RuntimeQuiescence::local(&self.active, self.app.background_tasks()).await,
+                true,
+            )
+        };
         let shutting_down = self.shutting_down.load(std::sync::atomic::Ordering::SeqCst);
         let retiring_reason = self
             .retiring_reason
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .to_owned();
-        let quiescent = quiescence.quiescent();
+        let quiescent = quiescence.quiescent() && !background_tasks_unknown;
         let active_background_tasks = quiescence.background_tasks.len() as u32;
         let blockers = quiescence
             .background_tasks
@@ -10970,6 +11082,7 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
                     && quiescence.active_turns < quiescence.turn_capacity,
                 active_turns: quiescence.active_turns,
                 active_background_tasks,
+                background_tasks_unknown,
                 quiescent,
                 turn_capacity: Some(quiescence.turn_capacity),
                 shutting_down,
@@ -11577,6 +11690,7 @@ async fn compact_conversation(
                 execution_task: None,
                 children: Vec::new(),
                 foreign_origin,
+                startup_recovery: app.startup_recovery_wire(),
             },
         });
     }
