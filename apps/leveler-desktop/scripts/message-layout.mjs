@@ -32,9 +32,6 @@ try{
  await page.waitForFunction(()=>window.desktop&&document.querySelector('#brand-version')?.textContent.startsWith('v'));
  await app.evaluate(({dialog},folder)=>{dialog.showOpenDialog=async()=>({canceled:false,filePaths:[folder]});},workspace);
  await page.locator('#add-workspace').click();
- await page.locator('.directory-picker-modal .button.primary').filter({hasText:'使用系统选择器'}).click();
- await page.waitForSelector('.directory-picker-modal .directory-selected:not([hidden])');
- await page.locator('.directory-picker-modal .button.primary').filter({hasText:/^打开$/}).click();
  await page.waitForFunction(()=>document.querySelector('#workspace-picker')?.textContent.includes('workspace'));
  await page.locator('#message').fill('把 README.md 改成 After，并创建相加函数 src/util.ts。');await page.locator('#send').click();
  await page.waitForFunction(()=>document.querySelector('.message.assistant .markdown')?.textContent.includes('不代表已创建文件。')&&document.querySelector('.execution-group.execution-edit')&&['已回答','已完成'].includes(document.querySelector('#conversation-status').textContent));

@@ -37,10 +37,6 @@ let clipboardCaptured = false;
 const chooseWorkspace = async folder => {
   await app.evaluate(({ dialog }, selected) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [selected] }); }, folder);
   await page.locator('#add-workspace').click();
-  await page.waitForSelector('.directory-picker-modal[open]');
-  await page.locator('.directory-picker-modal .button.primary').filter({ hasText: '使用系统选择器' }).click();
-  await page.waitForSelector('.directory-picker-modal .directory-selected:not([hidden])');
-  await page.locator('.directory-picker-modal .button.primary').filter({ hasText: /^打开$/ }).click();
   await page.waitForFunction(() => document.querySelector('#workspace-picker')?.textContent.includes('shared'));
 };
 try {

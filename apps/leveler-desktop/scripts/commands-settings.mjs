@@ -54,21 +54,47 @@ try {
   page.setDefaultTimeout(15000);
   page.on('pageerror', error => errors.push(error.message));
   await page.waitForFunction(() => window.desktop && document.querySelector('#new-session') && document.querySelector('#brand-version')?.textContent.startsWith('v'));
+  // Removed surfaces must be gone from the DOM, not merely hidden.
+  assert.deepEqual(
+    await page.evaluate(() => ['nav-plugins', 'header-more', 'header-schedule', 'plan-mode', 'preset-picker'].filter(id => document.getElementById(id))),
+    [],
+  );
+  evidence.removed_surfaces_absent = true;
+  // "未接入" is reserved for commands the product has not implemented; a
+  // command that only needs a session states that in its tooltip.
+  await page.locator('#attachment-add').click();
+  await page.waitForSelector('#command-popover');
+  const commandBadges = await page.evaluate(() => [...document.querySelectorAll('#command-popover .menu-item')].map(item => ({
+    id: item.dataset.commandId,
+    badge: item.querySelector('.badge-unconnected')?.textContent ?? null,
+  })));
+  await page.keyboard.press('Escape');
+  assert.deepEqual(commandBadges.filter(item => item.badge).map(item => item.id).sort(), ['export', 'plan']);
+  for (const id of ['compact', 'permission', 'model']) {
+    assert.equal(commandBadges.find(item => item.id === id)?.badge, null, `${id} must not claim 未接入`);
+  }
+  evidence.command_badges_truthful = commandBadges;
   await app.evaluate(({ dialog }, folder) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [folder] }); }, workspace);
   await page.locator('#add-workspace').click();
-  await page.waitForSelector('.directory-picker-modal[open]');
-  await page.locator('.directory-picker-modal .button.primary').filter({ hasText: '使用系统选择器' }).click();
-  await page.waitForSelector('.directory-picker-modal .directory-selected:not([hidden])');
-  await page.locator('.directory-picker-modal .button.primary').filter({ hasText: /^打开$/ }).click();
   await page.waitForFunction(() => document.querySelector('#workspace-picker')?.textContent.includes('workspace'));
   await page.locator('#message').fill('settings probe');
   await page.locator('#send').click();
   await page.waitForFunction(() => document.querySelector('.message.assistant .markdown')?.textContent.includes('SETTINGS_OK'));
   const sessionId = await page.locator('.session-row[aria-selected="true"]').getAttribute('data-session-id');
 
+  // The workspace card promises ⌘P; the shortcut must actually open the files
+  // view for the selected session.
+  if (await page.evaluate(() => document.querySelector('#rightbar').hidden)) await page.locator('#header-right-toggle').click();
+  await page.keyboard.press('Meta+P');
+  await page.waitForSelector('.files-row[data-path="a.txt"]', { timeout: 10000 });
+  evidence.meta_p_opens_workspace_files = true;
+
   // Settings controls are real pointer operations; dropdowns must be inside
   // the modal dialog's top layer or the pointer never reaches them.
   await openSettings();
+  const generalText = await page.locator('#settings-content').innerText();
+  assert.doesNotMatch(generalText, /语言|显示代码工作视图|上传 Session 日志/);
+  evidence.dead_settings_removed = true;
   await page.locator('.theme-card').filter({ hasText: '深色' }).click();
   assert.equal(await page.evaluate(() => document.documentElement.dataset.theme), 'dark');
   await page.locator('.theme-card').filter({ hasText: '浅色' }).click();
@@ -81,15 +107,11 @@ try {
   await page.locator('input[aria-label="文本字体"]').fill('Menlo, monospace');
   await page.locator('input[aria-label="文本字体"]').press('Enter');
   await chooseMenu('权限', '完全权限');
-  await chooseMenu('工作步骤展示', '详细');
-  await chooseMenu('工作步骤收起时机', '下次有新消息时');
   await chooseMenu('网页链接默认打开方式', '默认浏览器');
   await chooseMenu('繁忙时的发送行为', '插话发送');
   await chooseMenu('性能与用量', '简洁');
   let saved = await settings();
   assert.equal(saved.defaultPermission, 'full_access');
-  assert.equal(saved.workSteps, 'detailed');
-  assert.equal(saved.collapseAfter, 'next');
   assert.equal(saved.linkOpen, 'system');
   assert.equal(saved.busySend, 'steer');
   assert.equal(saved.performance, 'compact');
@@ -103,14 +125,12 @@ try {
   await useModel.click();
   await page.waitForFunction(async id => (await window.desktop.snapshot(id)).model.model === 'n', sessionId);
   evidence.model_switch = (await page.evaluate(id => window.desktop.snapshot(id), sessionId)).model;
-  await page.locator('#settings-nav-list button').filter({ hasText: '内置插件' }).click();
-  assert.match(await page.locator('#settings-content').innerText(), /未提供插件目录/);
-  await page.locator('#settings-nav-list button').filter({ hasText: 'Agent 预设' }).click();
+  await page.locator('#settings-nav-list button').filter({ hasText: 'Agent 与技能' }).click();
   await page.waitForFunction(() => document.querySelector('#settings-content')?.innerText.includes('code-architect'));
   await page.getByRole('button', { name: '查看配置' }).first().click();
   await page.waitForSelector('.preset-dialog[open]');
   await page.locator('.preset-dialog .modal-head button').click();
-  assert.equal(await page.getByRole('button', { name: '设为默认' }).first().isDisabled(), true);
+  assert.equal(await page.getByRole('button', { name: '设为默认' }).count(), 0);
   await closeSettings();
   await page.reload();
   await page.waitForFunction(() => window.desktop && document.querySelector('#new-session') && document.querySelector('#brand-version')?.textContent.startsWith('v'));
@@ -119,6 +139,34 @@ try {
   assert.equal(saved.defaultPermission, 'full_access');
   assert.equal(saved.busySend, 'steer');
   evidence.settings_persisted_after_reload = true;
+
+  // A layout saved before the delivery and task-detail tabs were removed must
+  // load without them and without losing the remaining tabs.
+  await page.evaluate(({ key, id }) => {
+    const layout = {
+      panes: [{ id: 'pane1', tabs: ['start-tab', 'files-tab', 'legacy-schedule', 'legacy-deliverables'], activeId: 'files-tab' }],
+      tabs: {
+        'start-tab': { id: 'start-tab', kind: 'start', title: '开始' },
+        'files-tab': { id: 'files-tab', kind: 'files', title: '文件' },
+        'legacy-schedule': { id: 'legacy-schedule', kind: 'schedule', title: '任务详情' },
+        'legacy-deliverables': { id: 'legacy-deliverables', kind: 'deliverables', title: '交付' },
+      },
+      activePane: 'pane1', seq: 5, expanded: false, paneShare: 0.5,
+      floats: [{ id: 'float1', tabId: 'legacy-deliverables', x: 160, y: 120, w: 380, h: 300, z: 1 }],
+    };
+    localStorage.setItem(key, JSON.stringify({ bySession: { [id]: layout } }));
+  }, { key: 'codeleveler.rightbar.v1', id: sessionId });
+  await page.reload();
+  await page.waitForFunction(() => window.desktop && document.querySelector('#new-session'));
+  await page.locator(`.session-row[data-session-id="${sessionId}"]`).click();
+  await page.waitForFunction(() => document.querySelector('#conversation-status')?.textContent !== '连接 Runtime…');
+  if (await page.evaluate(() => document.querySelector('#rightbar').hidden)) await page.locator('#header-right-toggle').click();
+  const paneTabs = await page.evaluate(() => [...document.querySelectorAll('.pane-tab')].map(node => node.innerText.trim()));
+  assert.ok(paneTabs.some(text => text.includes('文件')), `remaining tab must render: ${JSON.stringify(paneTabs)}`);
+  assert.equal(paneTabs.some(text => /任务详情|交付/.test(text)), false, `removed tabs must not render: ${JSON.stringify(paneTabs)}`);
+  assert.equal(await page.locator('.float-window').count(), 0, 'floats of removed tabs must be dropped');
+  evidence.legacy_rightbar_layout_migrated = { tabs: paneTabs };
+  assert.deepEqual(errors, []);
 
   // The same anchor opens the view menu repeatedly; each selection must
   // survive. A stale outside-click listener used to swallow every menu after
@@ -139,12 +187,14 @@ try {
   await page.waitForSelector('.menu');
   await page.locator('.menu .menu-item').filter({ hasText: '最近更新' }).first().click();
   for (let index = 0; index < 2; index += 1) {
-    await page.locator('#header-more').click();
+    await page.locator('#account-menu').click();
     await page.waitForSelector('.menu');
-    assert.ok(await page.locator('.menu .menu-item').count() >= 2);
+    const items = await page.locator('.menu .menu-item').allInnerTexts();
+    assert.ok(items.some(text => text.includes('设置')) && items.some(text => text.includes('意见反馈')));
+    assert.equal(items.some(text => text.includes('登录')), false);
     await page.keyboard.press('Escape');
   }
-  evidence.repeated_header_menu = true;
+  evidence.repeated_account_menu = true;
 
   // Slash commands are keyboard-driven and must operate on the same session.
   await page.locator('#message').fill('/diff');
@@ -152,12 +202,13 @@ try {
   await page.locator('#message').press('Enter');
   await page.waitForSelector('.review-head, .review-status', { timeout: 15000 });
   evidence.slash_diff = true;
+  // The removed @-reference promise must not resurface as a popover, and the
+  // typed text stays a plain draft.
   await page.locator('#message').fill('@');
-  await page.waitForFunction(() => document.querySelector('#at-popover'));
-  assert.match(await page.locator('#at-popover').innerText(), /尚未接入/);
-  await page.locator('#message').press('Escape');
-  await page.waitForFunction(() => !document.querySelector('#at-popover'));
-  evidence.at_reference_is_explicit_ui_only = true;
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  assert.equal(await page.evaluate(() => document.querySelector('#at-popover')), null);
+  assert.equal(await page.locator('#message').inputValue(), '@');
+  evidence.at_reference_is_a_plain_draft = true;
   assert.deepEqual(errors, []);
   evidence.page_errors = errors;
   evidence.passed = true;

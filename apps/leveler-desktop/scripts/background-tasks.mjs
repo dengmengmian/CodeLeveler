@@ -87,10 +87,6 @@ try {
   await page.evaluate(() => { globalThis.__bgEvents = []; window.desktop.onEvent(frame => { if (frame.event === 'runtime' && String(frame.data?.type).startsWith('background_')) globalThis.__bgEvents.push(frame.data); }); });
   await app.evaluate(({ dialog }, folder) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [folder] }); }, workspace);
   await page.locator('#add-workspace').click();
-  await page.waitForSelector('.directory-picker-modal[open]');
-  await page.locator('.directory-picker-modal .button.primary').filter({ hasText: '使用系统选择器' }).click();
-  await page.waitForSelector('.directory-picker-modal .directory-selected:not([hidden])');
-  await page.locator('.directory-picker-modal .button.primary').filter({ hasText: /^打开$/ }).click();
   await page.waitForFunction(() => document.querySelector('#workspace-picker')?.textContent.includes('workspace'));
   // Create the workspace session with a plain answer first, then switch to
   // full access before any command tool is requested.

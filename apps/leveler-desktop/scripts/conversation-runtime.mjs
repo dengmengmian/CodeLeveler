@@ -146,10 +146,6 @@ try {
   await page.waitForFunction(() => window.desktop && !!document.querySelector('#new-session'));
   await application.evaluate(({ dialog }, directory) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [directory] }); }, workspace);
   await page.locator('#add-workspace').click();
-  await page.waitForSelector('.directory-picker-modal[open]');
-  await page.locator('.directory-picker-empty .button.primary').click();
-  await page.waitForSelector('.directory-picker-modal .directory-selected:not([hidden])');
-  await page.locator('.directory-picker-modal .button.primary').filter({ hasText: /^打开$/ }).first().click();
   await page.waitForFunction(name => document.querySelector('#workspace-picker')?.innerText.includes(name), path.basename(workspace));
   await page.evaluate(() => { window.__presentationWire = []; window.desktop.onEvent(frame => window.__presentationWire.push(frame)); });
   page.setDefaultTimeout(20000); page.on('pageerror', error => pageErrors.push(error.message));

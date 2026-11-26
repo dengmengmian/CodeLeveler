@@ -450,11 +450,6 @@ export function shortcutLabel(mac, other) {
   return /darwin/.test(navigator.platform) ? mac : other;
 }
 
-/** Add a small "未接入" badge. */
-export function unconnected(label = '未接入') {
-  return el('span', 'badge-unconnected', label);
-}
-
 /** Trap Tab inside a modal element. */
 export function trapTab(container, event) {
   if (event.key !== 'Tab') return;

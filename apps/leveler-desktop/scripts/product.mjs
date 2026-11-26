@@ -55,10 +55,6 @@ try {
   evidence.blank_session = blankId;
   await app.evaluate(({ dialog }, folder) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [folder] }); }, workspace);
   await page.locator('#add-workspace').click();
-  await page.waitForSelector('.directory-picker-modal[open]');
-  await page.locator('.directory-picker-modal .button.primary').filter({ hasText: '使用系统选择器' }).click();
-  await page.waitForSelector('.directory-picker-modal .directory-selected:not([hidden])');
-  await page.locator('.directory-picker-modal .button.primary').filter({ hasText: /^打开$/ }).click();
   await page.waitForFunction(() => document.querySelector('#workspace-picker')?.textContent.includes('workspace'));
   await page.locator('#message').fill('workspace first use');
   await page.locator('#send').click();

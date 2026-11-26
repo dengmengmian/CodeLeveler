@@ -90,10 +90,6 @@ const selectedId = () => page.locator('.session-row[aria-selected="true"]').getA
 const addWorkspace = async () => {
   await app.evaluate(({ dialog }, folder) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [folder] }); }, workspace);
   await page.locator('#add-workspace').click();
-  await page.waitForSelector('.directory-picker-modal[open]');
-  await page.locator('.directory-picker-empty .button.primary').click();
-  await page.waitForSelector('.directory-picker-modal .directory-selected:not([hidden])');
-  await page.locator('.directory-picker-modal .button.primary').filter({ hasText: /^打开$/ }).first().click();
   await page.waitForFunction(name => document.querySelector('#workspace-picker')?.innerText.includes(name), path.basename(workspace));
 };
 const send = async text => { await page.locator('#message').fill(text); await page.locator('#send').click(); await page.waitForSelector('.session-row[aria-selected="true"]'); };

@@ -25,7 +25,7 @@ import {
 import { projectTrajectory, searchTrajectory, buildTimeline, formatDuration, trajectoryWindow } from './trajectory.mjs';
 import {
   el, iconNode, iconButton, installTooltips, toast, openMenu, closeMenu, openPopover, closePopover, confirmDialog,
-  copyText, unconnected, trapTab,
+  copyText, trapTab,
 } from './ui.mjs';
 
 const api = window.desktop;
@@ -45,8 +45,7 @@ const LABELS = {
 };
 const TAB_ICON = {
   start: 'compass', files: 'folder', preview: 'file', terminal: 'terminal',
-  browser: 'globe', changes: 'diff', plan: 'list', deliverables: 'archive', subagent: 'bot',
-  schedule: 'clock',
+  browser: 'globe', changes: 'diff', plan: 'list', subagent: 'bot',
 };
 const PERMISSION_MODES = [
   ['full_access', '完全权限'],
@@ -103,7 +102,6 @@ let scheduleMutation = null;
 let scheduleBulkOutstanding = 0;
 let scheduleRefreshQueued = false;
 let schedulePollTimer = null;
-let headerMenuButton = null;
 let headerSubagentButton = null;
 let headerJobsButton = null;
 let wideSidebarCollapsed = false;
@@ -925,7 +923,6 @@ function openAccountMenu(anchor) {
     items: [
       { label: '设置', icon: 'settings', shortcut: '⌘ ,', onSelect: () => openSettings('general') },
       { label: '意见反馈', icon: 'feedback', onSelect: openFeedbackDialog },
-      { label: '登录', icon: 'user', disabled: true, badge: '未接入', title: '当前版本未接入登录' },
     ],
   });
 }
@@ -1263,35 +1260,7 @@ function openJobsPopover(anchor) {
   });
 }
 
-function openSchedulePopover(anchor) {
-  openPopover({
-    anchor, width: 336, align: 'end', className: 'schedule-popover',
-    render: node => {
-      node.append(el('div', 'header-popover-title', '定时任务'));
-      node.append(el('div', 'header-popover-empty', '定时任务由运行时统一管理，定义和运行记录不保存在桌面。'));
-      node.append(el('div', 'header-popover-note', '在自动化任务页查看状态、创建、编辑、运行记录与无人值守授权。'));
-      const open = el('button', 'header-popover-action', '打开自动化任务');
-      open.type = 'button';
-      open.addEventListener('click', () => { closePopover(); openPage('automation'); });
-      node.append(open);
-    },
-  });
-}
-
 function ensureHeaderActions() {
-  if (headerMenuButton) return;
-  headerMenuButton = $('header-more');
-  headerMenuButton.append(iconNode('more', { size: 16 }));
-  headerMenuButton.addEventListener('click', () => {
-    if (!current) return;
-    openMenu({
-      anchor: headerMenuButton, align: 'end', width: 240,
-      items: [
-        { label: '下载 Session 日志', icon: 'download', disabled: true, badge: '未接入', title: 'Runtime 未提供 Session 打包导出接口' },
-        { label: '反馈', icon: 'feedback', onSelect: openFeedbackDialog },
-      ],
-    });
-  });
   const preset = $('header-preset');
   if (preset && !preset.querySelector('svg')) preset.replaceChildren(iconNode('shield', { size: 14 }), el('span', undefined, '默认模式'));
   const sessionActions = $('header-session-actions');
@@ -1300,9 +1269,6 @@ function ensureHeaderActions() {
   sessionActions.append(headerSubagentButton, headerJobsButton);
   headerSubagentButton.addEventListener('click', () => openSubagentPopover(headerSubagentButton));
   headerJobsButton.addEventListener('click', () => openJobsPopover(headerJobsButton));
-  const schedule = $('header-schedule');
-  schedule.append(iconNode('clock', { size: 16 }));
-  schedule.addEventListener('click', () => openSchedulePopover(schedule));
   installViewTabs();
 }
 
@@ -1408,21 +1374,11 @@ function openFeedbackDialog(options = {}) {
   detail.focus();
 }
 
-function openJobsMenu(anchor) {
-  const jobs = current?.backgroundTasks ?? [];
-  openMenu({
-    anchor, width: 320, align: 'end',
-    items: jobs.length
-      ? jobs.map(job => ({
-        label: `${job.program ?? '进程'} ${(job.args ?? []).join(' ')}`.slice(0, 60),
-        icon: 'terminal',
-        badge: job.pid ? `PID ${job.pid}` : undefined,
-        disabled: true,
-        title: '后台任务取消接口尚未接入桌面',
-      }))
-      : [{ label: '暂无后台任务', disabled: true }],
-  });
-}
+/**
+ * Scheduled-task cards open the automation page: definitions, runs and grants
+ * live only there. The projection carries no definition id, so the page cannot
+ * preselect a task without inventing one.
+ */
 
 function beginTitleEdit() {
   if (!current || loading || uncertain || titleEditing) return;
@@ -1521,12 +1477,6 @@ function renderHeader() {
     headerJobsButton.querySelector('.header-count-label').textContent = jobs.length ? `${jobs.length} 个后台任务运行中` : `${settledJobs.length} 个后台任务`;
     headerJobsButton.querySelector('.header-state-dot').dataset.state = jobs.length ? 'running' : 'done';
     headerJobsButton.setAttribute('aria-label', jobs.length ? `${jobs.length} 个后台任务运行中` : `${settledJobs.length} 个后台任务`);
-  }
-  const schedule = $('header-schedule');
-  if (schedule) {
-    schedule.hidden = !current;
-    schedule.dataset.tooltip = '提醒（目录未接入）';
-    schedule.setAttribute('aria-label', '提醒（目录未接入）');
   }
   renderOpenInAppControls();
 }
@@ -1746,12 +1696,6 @@ function renderComposerMeta() {
     iconNode('chevronDown', { size: 12, className: 'trigger-chevron' }),
   );
   workspace.dataset.tooltip = workspacePath || '选择或打开工作区';
-  const preset = $('preset-picker');
-  preset.replaceChildren(
-    iconNode('bot', { size: 14 }),
-    el('span', 'trigger-label', '默认模式'),
-    iconNode('chevronDown', { size: 12, className: 'trigger-chevron' }),
-  );
   const mode = current?.session.mode;
   const permission = $('permission-picker');
   permission.replaceChildren(
@@ -1909,11 +1853,13 @@ function userMessageNode(existing, message) {
     imageRow.replaceChildren();
     imageRow.classList.toggle('single', images === 1);
     for (let index = 0; index < Math.min(images, 4); index += 1) {
-      const tile = el('button', 'message-image-tile');
-      tile.type = 'button';
-      tile.setAttribute('aria-label', `查看大图 ${index + 1}`);
+      // The runtime reports only how many images a message carries; the
+      // content is not readable, so the tile states that instead of offering
+      // a preview it cannot show.
+      const tile = el('span', 'message-image-tile');
+      tile.setAttribute('aria-label', `图片 ${index + 1}：运行时只提供数量，未提供图片内容`);
+      tile.title = '运行时只提供图片数量，未提供图片内容';
       tile.append(iconNode('image', { size: images === 1 ? 28 : 18 }));
-      tile.addEventListener('click', () => openImagePreview(images));
       imageRow.append(tile);
     }
     if (images > 4) imageRow.append(el('span', 'message-image-more', `+${images - 4}`));
@@ -2017,26 +1963,6 @@ function renderUserExtras(row, message) {
     }
     extras.append(chips);
   }
-}
-
-function openImagePreview(count) {
-  const dialog = el('dialog', 'modal image-preview-modal');
-  const card = el('div', 'image-preview-card');
-  card.setAttribute('aria-label', '图片预览');
-  const head = el('div', 'image-preview-head');
-  head.append(el('h2', undefined, '图片预览'));
-  const close = iconButton('close', '关闭图片预览', { size: 16, tooltip: '关闭图片预览' });
-  head.append(close);
-  const body = el('div', 'image-preview-body');
-  body.append(iconNode('image', { size: 48 }), el('p', undefined, `运行时只提供图片数量（${count} 张），未提供图片内容，无法预览。`));
-  card.append(head, body);
-  dialog.append(card);
-  close.addEventListener('click', () => dialog.close());
-  dialog.addEventListener('close', () => { dialog.remove(); window.dispatchEvent(new Event('ui-overlay-change')); }, { once: true });
-  document.body.append(dialog);
-  dialog.showModal();
-  window.dispatchEvent(new Event('ui-overlay-change'));
-  close.focus();
 }
 
 function decorateMessageActions(row, message) {
@@ -2300,7 +2226,7 @@ function renderToolDetails(row, id) {
   let card;
   if (String(tool.name ?? '').startsWith('workflow')) {
     card = workflowRunPanel(tool, args, output);
-  } else if (tool.name === 'schedule_create') {
+  } else if (tool.name === 'schedule_manage') {
     card = scheduleTurnCard(tool, args, output);
   } else if (kind === 'command') {
     card = el('div', 'tool-terminal');
@@ -2562,21 +2488,23 @@ function workflowRunPanel(tool, args, output) {
 function scheduleTurnCard(tool, args, output) {
   const data = parseToolJson(output) ?? (typeof args === 'object' ? args : null);
   const card = el('div', 'schedule-turn-card');
-  card.dataset.tool = 'schedule_create';
+  card.dataset.tool = 'schedule_manage';
   const leading = el('span', 'schedule-turn-leading');
   leading.append(iconNode('clock', { size: 18 }));
   const body = el('span', 'schedule-turn-body');
-  const title = typeof data?.title === 'string' && data.title ? data.title
-    : typeof args?.title === 'string' && args.title ? args.title : 'schedule_create';
+  const title = typeof data?.name === 'string' && data.name ? data.name
+    : typeof data?.title === 'string' && data.title ? data.title : '定时任务';
   body.append(el('span', 'schedule-turn-title', title));
-  const rule = data?.rule ?? data?.frequency ?? data?.cron ?? args?.rule ?? args?.frequency ?? args?.cron;
-  const frequency = typeof rule === 'string' ? rule
-    : rule && typeof rule === 'object' ? Object.entries(rule).map(([key, value]) => `${key} ${value}`).join(' · ') : '';
-  body.append(el('span', 'schedule-turn-frequency', frequency || '规则未提供'));
-  const open = el('button', 'button secondary small', '打开');
+  const trigger = data?.trigger;
+  const legacy = data?.rule ?? data?.frequency ?? data?.cron;
+  const frequency = trigger && typeof trigger === 'object' ? triggerLabel(trigger)
+    : typeof legacy === 'string' ? legacy
+      : legacy && typeof legacy === 'object' ? Object.entries(legacy).map(([key, value]) => `${key} ${value}`).join(' · ') : '';
+  if (frequency) body.append(el('span', 'schedule-turn-frequency', frequency));
+  const open = el('button', 'button secondary small', '打开自动化任务');
   open.type = 'button';
-  open.title = '打开任务详情';
-  open.addEventListener('click', () => openRightbarTab('schedule'));
+  open.title = '定义、运行记录与无人值守授权都在自动化任务页';
+  open.addEventListener('click', () => openPage('automation'));
   card.append(leading, body, open);
   return card;
 }
@@ -2760,48 +2688,8 @@ function planCard() {
   copy.append(el('span', 'plan-card-title', `执行计划${planStateLabel}`), el('span', 'plan-card-desc', `${done} / ${steps.length} 步骤已完成`));
   main.append(icon, copy, el('span', 'plan-card-open', '打开'));
   main.addEventListener('click', () => openRightbarTab('plan'));
-  const review = el('button', 'plan-review-open', '审阅');
-  review.type = 'button';
-  review.title = '只读审阅；运行时未提供计划审批';
-  review.addEventListener('click', () => openPlanReviewPanel());
-  card.append(main, review);
+  card.append(main);
   return card;
-}
-
-function openPlanReviewPanel() {
-  const steps = current?.plan?.steps ?? [];
-  if (!steps.length) return;
-  const dialog = el('dialog', 'modal plan-review-modal');
-  const card = el('div', 'plan-review-card');
-  card.setAttribute('aria-label', '执行计划');
-  const strip = el('div', 'plan-review-strip');
-  strip.append(el('span', 'plan-review-dot'), el('span', undefined, '执行计划'));
-  const summary = el('div', 'plan-review-summary');
-  summary.append(el('h3', 'plan-review-title', steps[0]?.description ?? '执行计划'));
-  if (steps.length > 1) summary.append(el('p', 'plan-review-description', steps.slice(1).map(step => step.description).join(' · ')));
-  const note = el('p', 'plan-review-note', '当前 Runtime 没有计划审批与接管语义；此面板只读展示计划内容。');
-  const footer = el('div', 'plan-review-footer');
-  const feedback = el('div', 'plan-review-feedback', '');
-  const actions = el('div', 'plan-review-actions');
-  const revise = el('button', 'button secondary', '要求修改');
-  const approve = el('button', 'button primary', '同意执行');
-  for (const [button, reason] of [[revise, '运行时未提供计划修改请求'], [approve, '运行时未提供计划审批']]) {
-    button.type = 'button';
-    button.disabled = true;
-    button.title = reason;
-  }
-  const close = el('button', 'button secondary', '关闭');
-  close.type = 'button';
-  close.addEventListener('click', () => dialog.close());
-  actions.append(revise, approve, close);
-  footer.append(feedback, actions);
-  card.append(strip, summary, note, footer);
-  dialog.append(card);
-  dialog.addEventListener('close', () => { dialog.remove(); window.dispatchEvent(new Event('ui-overlay-change')); }, { once: true });
-  document.body.append(dialog);
-  dialog.showModal();
-  window.dispatchEvent(new Event('ui-overlay-change'));
-  close.focus();
 }
 
 function presentedFiles() {
@@ -2838,7 +2726,7 @@ function presentedFilesCard() {
       el('span', 'presented-file-status', { running: '正在交付', success: '在侧边栏预览', failed: '交付失败' }[file.status] ?? '已请求打开'),
     );
     row.append(icon, body);
-    row.addEventListener('click', () => openRightbarTab('deliverables'));
+    row.addEventListener('click', () => openPreviewForPath(file.path));
     wrap.append(row);
   }
   if (files.length > 4) wrap.append(el('div', 'presented-file-more', `其余 ${files.length - 4} 个文件`));
@@ -2855,8 +2743,8 @@ function deliveredCard() {
   icon.append(iconNode('archive', { size: 20 }));
   const copy = el('span', 'plan-card-copy');
   copy.append(el('span', 'plan-card-title', '本轮交付'), el('span', 'plan-card-desc', `${report.files_changed ?? 0} 个文件变更 · +${report.added ?? 0} −${report.removed ?? 0}`));
-  card.append(icon, copy, unconnected(), el('span', 'plan-card-open', '查看'));
-  card.addEventListener('click', () => openRightbarTab('deliverables'));
+  card.append(icon, copy, el('span', 'plan-card-open', '查看变更'));
+  card.addEventListener('click', () => openRightbarTab('changes'));
   return card;
 }
 
@@ -3874,92 +3762,13 @@ function renderInteractions() {
 
 /* --------------------------------------------------------------- composer */
 
+// The native picker is the only directory browser. An in-app shell with
+// disabled navigation overstated what the bridge can read.
 function openDirectoryPicker(onPicked = selectWorkspace) {
-  if (document.querySelector('.directory-picker-modal')) return;
-  const dialog = el('dialog', 'modal directory-picker-modal');
-  const card = el('div', 'directory-picker-card');
-  const head = el('div', 'directory-picker-head');
-  head.append(el('h2', 'directory-picker-title', '选择工作区目录'));
-  const crumbBar = el('div', 'directory-crumb-bar');
-  const crumbs = el('div', 'directory-crumbs');
-  const home = el('button', 'directory-crumb is-disabled', '主目录');
-  home.type = 'button';
-  home.disabled = true;
-  home.title = '桌面桥接未提供目录列表';
-  crumbs.append(home);
-  const edit = el('button', 'directory-crumb-edit');
-  edit.type = 'button';
-  edit.disabled = true;
-  edit.setAttribute('aria-label', '编辑路径');
-  edit.title = '桌面桥接未提供目录列表';
-  edit.append(iconNode('edit', { size: 14 }));
-  crumbBar.append(crumbs, edit);
-  head.append(crumbBar);
-  const content = el('div', 'directory-picker-content');
-  const empty = el('div', 'directory-picker-empty');
-  empty.append(
-    iconNode('folder', { size: 24 }),
-    el('p', undefined, '应用内目录浏览未接入：桌面桥接没有目录列表读取接口。'),
-    el('p', 'directory-picker-hint', '可使用系统选择器选择工作区目录。'),
-  );
-  const choose = el('button', 'button primary', '使用系统选择器');
-  choose.type = 'button';
-  empty.append(choose);
-  const selected = el('div', 'directory-selected');
-  selected.hidden = true;
-  const selectedIcon = el('span', 'directory-selected-icon');
-  selectedIcon.append(iconNode('folder', { size: 18 }));
-  selected.append(selectedIcon, el('span', 'directory-selected-path'));
-  content.append(empty, selected);
-  const footer = el('div', 'directory-picker-footer');
-  const create = el('button', 'button ghost small', '新建文件夹');
-  create.type = 'button';
-  create.disabled = true;
-  create.title = '桌面桥接未提供目录写入';
-  const hiddenToggle = el('button', 'directory-hidden-toggle', '显示隐藏文件');
-  hiddenToggle.type = 'button';
-  hiddenToggle.disabled = true;
-  hiddenToggle.setAttribute('aria-pressed', 'false');
-  hiddenToggle.title = '桌面桥接未提供目录列表';
-  const gap = el('span', 'directory-footer-gap');
-  const cancel = el('button', 'button secondary', '取消');
-  const open = el('button', 'button primary', '打开');
-  cancel.type = 'button';
-  open.type = 'button';
-  open.disabled = true;
-  footer.append(create, hiddenToggle, gap, cancel, open);
-  card.append(head, content, footer);
-  dialog.append(card);
-  document.body.append(dialog);
-  let picked = null;
-  const showPicked = folder => {
-    picked = folder;
-    crumbs.replaceChildren();
-    const parts = String(folder.path ?? '').split('/').filter(Boolean);
-    parts.forEach((part, index) => {
-      if (index) crumbs.append(iconNode('chevronRight', { size: 12 }));
-      crumbs.append(el('span', index === parts.length - 1 ? 'directory-crumb directory-crumb-current' : 'directory-crumb', part));
-    });
-    selected.querySelector('.directory-selected-path').textContent = folder.path ?? '';
-    selected.hidden = false;
-    empty.hidden = true;
-    open.disabled = false;
-  };
-  choose.addEventListener('click', () => action(async () => {
+  action(async () => {
     const folder = await api.chooseFolder();
-    if (folder) showPicked(folder);
-  }));
-  cancel.addEventListener('click', () => dialog.close());
-  open.addEventListener('click', () => {
-    if (!picked) return;
-    dialog.close();
-    onPicked(picked);
+    if (folder) onPicked(folder);
   });
-  dialog.addEventListener('cancel', event => { event.preventDefault(); dialog.close(); });
-  dialog.addEventListener('close', () => { dialog.remove(); window.dispatchEvent(new Event('ui-overlay-change')); }, { once: true });
-  dialog.showModal();
-  window.dispatchEvent(new Event('ui-overlay-change'));
-  choose.focus();
 }
 
 function openWorkspaceMenu(anchor) {
@@ -4002,18 +3811,6 @@ function selectWorkspace(folder) {
   composerError('');
   render();
   $('message').focus();
-}
-
-function openPresetMenu(anchor) {
-  openMenu({
-    anchor, width: 250, side: 'top',
-    items: [
-      { heading: '内置' },
-      { label: '默认模式', icon: 'bot', checked: true, onSelect: () => {} },
-      { divider: true },
-      { label: 'Agent 模式切换', icon: 'bot', disabled: true, badge: '未接入' },
-    ],
-  });
 }
 
 function openModelMenu(anchor) {
@@ -4108,7 +3905,10 @@ function openCommandMenu(candidates = commandCatalog()) {
     button.append(iconNode(command.icon ?? 'command', { size: 14 }), el('span', 'menu-label', command.label));
     if (!command.enabled) {
       button.disabled = true;
-      button.append(unconnected(command.badge ?? undefined));
+      // "未接入" is a capability claim: show it only where the command itself
+      // is unimplemented. A command that merely needs a session or workspace
+      // states its reason in the tooltip instead.
+      if (command.badge) button.append(el('span', 'badge-unconnected', command.badge));
       button.title = command.reason ?? '当前不可用';
     }
     button.addEventListener('click', () => executeCommand(command.id));
@@ -4673,7 +4473,12 @@ function loadRightbar(sessionKey) {
     rightbarExpanded = false;
     rightbarFloats = [];
   }
-  const singleton = new Set(['files', 'changes', 'plan', 'deliverables', 'subagent']);
+  const singleton = new Set(['files', 'changes', 'plan', 'subagent']);
+  // A layout saved before a surface was removed must not resurrect it.
+  for (const [id, tab] of Object.entries(rightbarTabs)) {
+    if (!TAB_TITLES[tab.kind]) delete rightbarTabs[id];
+  }
+  rightbarFloats = rightbarFloats.filter(float => rightbarTabs[float.tabId]);
   const seen = new Set();
   for (const pane of rightbarPanes) {
     pane.tabs = pane.tabs.filter(id => {
@@ -4727,7 +4532,7 @@ function changesTabTitle() {
 
 const TAB_TITLES = {
   start: '开始', files: '文件', terminal: '终端', browser: '浏览器', changes: '变更',
-  preview: '预览', deliverables: '交付', plan: '计划', subagent: '子智能体', schedule: '任务详情',
+  preview: '预览', plan: '计划', subagent: '子智能体',
 };
 
 function tabTitle(kind, extra = {}) {
@@ -4754,7 +4559,7 @@ function openRightbarTab(kind, extra = {}) {
   // instead of consuming it.
   const reusable = kind === 'preview'
     ? Object.values(rightbarTabs).find(tab => tab.kind === 'preview' && tab.path === extra.path && !rightbarFloats.some(float => float.tabId === tab.id))
-    : ['files', 'changes', 'plan', 'deliverables', 'subagent', 'schedule'].includes(kind)
+    : ['files', 'changes', 'plan', 'subagent'].includes(kind)
       ? Object.values(rightbarTabs).find(tab => tab.kind === kind && !rightbarFloats.some(float => float.tabId === tab.id)) : null;
   const tab = reusable ?? newTabRecord(kind, extra);
   if (kind === 'changes') {
@@ -5201,10 +5006,8 @@ function renderTabView(tab, pane) {
   if (tab.kind === 'browser') return browserView(tab, pane);
   if (tab.kind === 'changes') return changesView(tab);
   if (tab.kind === 'preview') return previewView(tab);
-  if (tab.kind === 'deliverables') return deliverablesView();
   if (tab.kind === 'plan') return planView();
   if (tab.kind === 'subagent') return subagentView();
-  if (tab.kind === 'schedule') return scheduleView();
   return startView();
 }
 
@@ -5213,14 +5016,10 @@ function startView() {
   const mark = el('span', 'start-guide-mark');
   mark.append(iconNode('compass', { size: 56, stroke: 1.1 }));
   const cards = el('div', 'start-cards');
-  const card = (kind, icon, tone, title, description, shortcut, onClick, unavailable) => {
+  const card = (icon, tone, title, description, shortcut, onClick) => {
     const button = el('button', 'start-card');
     button.type = 'button';
     button.setAttribute('aria-keyshortcuts', shortcut === '⌘ P' ? 'Meta+P' : shortcut === '⌃ `' ? 'Control+`' : 'Meta+T');
-    if (unavailable) {
-      button.dataset.tooltip = `未接入：${unavailable}`;
-      button.setAttribute('aria-description', `未接入：${unavailable}`);
-    }
     const iconWrap = el('span', `start-card-icon ${tone}`);
     iconWrap.append(iconNode(icon, { size: 26 }));
     const text = el('span', 'start-card-text');
@@ -5231,9 +5030,9 @@ function startView() {
   };
   // Start is pinned: the cards open a tab beside it instead of consuming it.
   const launch = kind => openRightbarTab(kind);
-  cards.append(card('files', 'folder', 'folder', '工作区文件', '浏览会话工作区的文件', '⌘ P', () => launch('files')));
-  cards.append(card('terminal', 'terminal', 'terminal', '新建终端', '在会话工作区运行命令', '⌃ `', () => launch('terminal')));
-  cards.append(card('browser', 'globe', 'globe', '浏览器', '浏览网页', '⌘ T', () => launch('browser')));
+  cards.append(card('folder', 'folder', '工作区文件', '浏览会话工作区的文件', '⌘ P', () => launch('files')));
+  cards.append(card('terminal', 'terminal', '新建终端', '在会话工作区运行命令', '⌃ `', () => launch('terminal')));
+  cards.append(card('globe', 'globe', '浏览器', '浏览网页', '⌘ T', () => launch('browser')));
   guide.append(mark, cards);
   return guide;
 }
@@ -5780,6 +5579,21 @@ function changesView(tab) {
   if (!confirmed && hasWorkspace() && !current.diff && !current.diffError && current.diffQuery?.status !== 'pending') setTimeout(requestDiff, 0);
   const view = el('div');
   view.style.display = 'flex'; view.style.flexDirection = 'column'; view.style.flex = '1'; view.style.minHeight = '0';
+  const report = current?.session?.completion_report ?? current?.completionReport;
+  if (report) {
+    const delivery = el('div', 'review-delivery');
+    const summary = el('div', 'deliverable-summary-card');
+    const icon = el('span', 'delivered-icon');
+    icon.append(iconNode('archive', { size: 20 }));
+    const copy = el('span', 'delivered-copy');
+    copy.append(
+      el('span', 'delivered-name', '本轮交付'),
+      el('span', 'delivered-meta', `${report.files_changed ?? 0} 个文件变更 · +${report.added ?? 0} −${report.removed ?? 0}`),
+    );
+    summary.append(icon, copy);
+    delivery.append(summary, el('div', 'deliverable-note', '交付统计来自 Runtime 的完成报告；下方是当前工作区的 Git 变更。'));
+    view.append(delivery);
+  }
   const files = confirmed ? confirmedChangeFiles(tab.toolIds ?? [], current?.tools ?? []) : current?.diff?.files ?? [];
   if (!tab.selected || !files.some(file => file.path === tab.selected)) tab.selected = files[0]?.path ?? null;
   const selected = files.find(file => file.path === tab.selected);
@@ -6236,56 +6050,6 @@ function previewView(tab) {
   return view;
 }
 
-function deliverablesView() {
-  const report = current?.session?.completion_report ?? current?.completionReport;
-  const presented = presentedFiles();
-  if (!report && !presented.length) {
-    const empty = el('div', 'right-empty');
-    const mark = el('span', 'empty-icon'); mark.append(iconNode('archive', { size: 48, stroke: 1.1 }));
-    empty.append(mark, el('h3', undefined, '暂无交付内容'), el('p', undefined, '当前 Runtime 不暴露交付物/产物列表，桌面不会伪造文件卡片。'));
-    return empty;
-  }
-  const view = el('div', 'deliverable-list');
-  if (current?.session.repository) {
-    const toolbar = el('div', 'view-toolbar deliverable-toolbar');
-    toolbar.append(el('div', 'toolbar-path', '工作区'));
-    const open = el('div', 'open-in-app-pane');
-    toolbar.append(open);
-    renderOpenInAppInto(open, current.session.repository, 'directory');
-    view.append(toolbar);
-  }
-  const card = el('div', 'deliverable-summary-card');
-  const icon = el('span', 'delivered-icon');
-  icon.append(iconNode('archive', { size: 20 }));
-  const copy = el('span', 'delivered-copy');
-  copy.append(
-    el('span', 'delivered-name', '本轮交付'),
-    el('span', 'delivered-meta', `${report.files_changed ?? 0} 个文件变更 · +${report.added ?? 0} −${report.removed ?? 0}`),
-  );
-  card.append(icon, copy);
-  const note = el('div', 'deliverable-note');
-  note.append(el('span', undefined, report
-    ? 'Runtime 只提供变更聚合统计；以下文件来自本轮真实交付工具调用。'
-    : '以下文件来自本轮真实交付工具调用；Runtime 未提供变更聚合。'));
-  view.append(card, note);
-  if (presented.length) {
-    const list = el('div', 'presented-files-card');
-    for (const file of presented) {
-      const row = el('button', 'presented-file');
-      row.type = 'button';
-      const icon = el('span', 'presented-file-icon');
-      icon.append(iconNode('fileText', { size: 18 }));
-      const body = el('span', 'presented-file-body');
-      body.append(el('span', 'presented-file-name', file.path), el('span', 'presented-file-status', { running: '正在交付', success: '已交付', failed: '交付失败' }[file.status] ?? '已请求打开'));
-      row.append(icon, body);
-      row.addEventListener('click', () => openPreviewForPath(file.path));
-      list.append(row);
-    }
-    view.append(list);
-  }
-  return view;
-}
-
 function planView() {
   const steps = current?.plan?.steps ?? [];
   if (!steps.length) {
@@ -6361,22 +6125,6 @@ function subagentView() {
   return view;
 }
 
-function scheduleView() {
-  const view = el('div', 'schedule-task-view');
-  const card = el('div', 'right-empty schedule-task-empty');
-  card.append(
-    iconNode('clock', { size: 24 }),
-    el('h3', undefined, '定时任务由运行时管理'),
-    el('p', undefined, '自动化任务页提供筛选、创建、编辑、运行记录、无人值守授权和后台唤醒管理。关闭页面不会删除或停止任何任务。'),
-  );
-  const open = el('button', 'button secondary', '打开自动化任务');
-  open.type = 'button';
-  open.addEventListener('click', () => openPage('automation'));
-  card.append(open);
-  view.append(card);
-  return view;
-}
-
 /* ----------------------------------------------------------------- layout */
 
 function layout() {
@@ -6436,16 +6184,6 @@ function settingRow(label, desc, control, extra = null) {
   return row;
 }
 
-// Disabled controls keep the reference layout; the tooltip states why the
-// capability is unavailable without adding a badge to every row.
-function unavailableControl(control, reason) {
-  const wrap = el('span', 'setting-unavailable');
-  wrap.title = reason;
-  control.title = reason;
-  wrap.append(control);
-  return wrap;
-}
-
 function menuControl(value, options, onChange, { disabled = false, label = '' } = {}) {
   const button = el('button', 'select-button');
   button.type = 'button';
@@ -6479,7 +6217,7 @@ function settingsNav() {
   nav.replaceChildren();
   for (const [id, label, icon] of [
     ['general', '通用设置', 'settings'], ['models', '模型', 'layers'],
-    ['plugins', '内置插件', 'plugins'], ['presets', 'Agent 模式', 'bot'],
+    ['presets', 'Agent 与技能', 'bot'],
   ]) {
     const button = el('button');
     button.type = 'button';
@@ -6499,7 +6237,6 @@ function renderSettings() {
   content.dataset.section = settingsSection;
   if (settingsSection === 'general') renderGeneralSettings(content);
   else if (settingsSection === 'models') renderModelSettings(content);
-  else if (settingsSection === 'plugins') renderPluginSettings(content);
   else renderPresetSettings(content);
   content.scrollTop = sameSection ? priorScroll : 0;
 }
@@ -6633,7 +6370,6 @@ function renderGeneralSettings(content) {
   group.append(settingRow('权限', '选择新会话的默认权限模式', menuControl(settings.defaultPermission, PERMISSION_MODES.map(([value, label]) => ({ value, label })), value => {
     settings.defaultPermission = value; saveSettings(); toast('默认权限已更新', { tone: 'success', holdMs: 1600 });
   }, { label: '权限' })));
-  group.append(settingRow('语言', '当前仅提供中文；语言切换未接入', menuControl('zh-CN', [{ value: 'zh-CN', label: '中文' }], () => {}, { label: '语言' })));
   const themeRow = el('div', 'setting-row appearance-row');
   const themeCopy = el('div', 'setting-copy');
   themeCopy.append(el('div', 'setting-label', '外观'));
@@ -6659,10 +6395,6 @@ function renderGeneralSettings(content) {
       settings.terminalFontSize = value; saveSettings(); applyContentFont(); renderSettings();
     })));
   }
-  const viewRow = settingRow('显示代码工作视图', '开启后，显示轨迹、本轮代码差异，可选择完整的 Agent 模式切换',
-    unavailableControl(switchControl(settings.codingView, () => {}, { disabled: true }), '当前版本不可用：没有本轮代码差异视图，无法完整切换'));
-  viewRow.classList.add('setting-row-compact');
-  group.append(viewRow);
   const shortcuts = el('button', 'settings-shortcut-button', '查看快捷键');
   shortcuts.type = 'button';
   shortcuts.addEventListener('click', () => showShortcuts());
@@ -6676,10 +6408,6 @@ function renderGeneralSettings(content) {
   group.append(settingRow('性能与用量', '选择性能与用量信息展示的详细程度', menuControl(settings.performance, [
     { value: 'detailed', label: '详细' }, { value: 'compact', label: '简洁' },
   ], value => { settings.performance = value; saveSettings(); renderConversation(); renderContextMeter(); }, { label: '性能与用量' })));
-  const sessionLogRow = settingRow('上传 Session 日志', '帮助改进 CodeLeveler 的工具与体验',
-    unavailableControl(switchControl(false, () => {}, { disabled: true }), '当前版本不可用：未接入 Session 日志上传接口'));
-  sessionLogRow.classList.add('setting-row-compact');
-  group.append(sessionLogRow);
   const updateRow = settingRow('Runtime 更新', '仅检查命令行运行时；leveler update 不会更新桌面客户端', updateControl());
   updateRow.classList.add('setting-row-compact');
   group.append(updateRow);
@@ -6706,8 +6434,14 @@ function showShortcuts() {
       { label: '新建会话', shortcut: '⌘ N', disabled: true },
       { label: '打开设置', shortcut: '⌘ ,', disabled: true },
       { label: '搜索当前对话', shortcut: '⌘ F', disabled: true },
+      { label: '快捷键列表', shortcut: '⌘ /', disabled: true },
       { label: '切换右侧边栏', shortcut: '⌥ ⌘ B', disabled: true },
+      { label: '切换侧边栏', shortcut: '⌘ B', disabled: true },
+      { label: '工作区文件', shortcut: '⌘ P', disabled: true },
+      { label: '新建终端', shortcut: '⌃ `', disabled: true },
       { label: '新建浏览器标签', shortcut: '⌘ T', disabled: true },
+      { label: '关闭标签页', shortcut: '⌘ W', disabled: true },
+      { label: '用本地应用打开', shortcut: '⌥ ⌘ O', disabled: true },
       { heading: '输入' },
       { label: '发送', shortcut: 'Enter', disabled: true },
       { label: '换行', shortcut: 'Shift Enter', disabled: true },
@@ -6765,31 +6499,9 @@ function renderModelSettings(content) {
 
 }
 
-function renderPluginSettings(content) {
-  content.append(el('h2', 'settings-title-large', '内置插件'));
-  const toolbar = el('div', 'plugin-toolbar');
-  const search = el('input', 'settings-input plugin-search');
-  search.type = 'search';
-  search.placeholder = '搜索插件';
-  search.disabled = true;
-  search.title = '当前 Runtime 未提供插件目录';
-  search.setAttribute('aria-label', '搜索插件');
-  const filter = el('button', 'button ghost small', '全部');
-  filter.type = 'button';
-  filter.disabled = true;
-  filter.title = '当前 Runtime 未提供插件分类';
-  toolbar.append(search, filter);
-  content.append(toolbar);
-  const card = el('div', 'settings-card');
-  card.append(el('h3', undefined, '当前 Runtime 未提供插件目录'));
-  card.append(el('p', undefined, 'CodeLeveler 的工具与能力由 Runtime 内置，桌面桥接层没有可读取的插件清单或启停接口。这里不会展示伪造的插件开关。'));
-  card.append(unconnected());
-  content.append(card);
-}
-
 function renderPresetSettings(content) {
-  content.append(el('h2', 'settings-title-large', 'Agent 模式'));
-  content.append(el('p', 'settings-note', '当前会话使用 Runtime 的默认模式；模式切换接口尚未接入桌面。'));
+  content.append(el('h2', 'settings-title-large', 'Agent 与技能'));
+  content.append(el('p', 'settings-note', '当前会话使用 Runtime 的默认模式；模式切换接口尚未接入桌面。每个 Agent 定义自带技能列表，可在“查看配置”中确认。'));
   const standard = el('div', 'preset-card');
   const head = el('div', 'preset-head');
   head.append(el('span', 'preset-name', '默认模式'), el('span', 'preset-tag', '当前'));
@@ -6819,20 +6531,11 @@ function renderPresetSettings(content) {
     const usage = el('button', 'button ghost small', '如何使用');
     usage.type = 'button';
     usage.addEventListener('click', () => openPresetDialog(agent, 'usage'));
-    const makeDefault = el('button', 'button ghost small', '设为默认');
-    makeDefault.type = 'button';
-    makeDefault.disabled = true;
-    makeDefault.title = 'Runtime 未提供模式默认切换接口';
-    tags.append(view, usage, makeDefault);
+    tags.append(view, usage);
     card.append(tags);
     content.append(card);
   }
   for (const problem of agentsRead.data?.problems ?? []) content.append(el('div', 'settings-note', `${problem.source}: ${problem.error}`));
-  const create = el('button', 'button secondary', '让 Agent 帮我创建模式');
-  create.type = 'button';
-  create.disabled = true;
-  create.title = '当前桌面桥接未提供模式写入接口';
-  content.append(create);
 }
 
 function openPresetDialog(agent, mode) {
@@ -6888,41 +6591,7 @@ function renderEntryPage() {
   host.hidden = false;
   for (const button of document.querySelectorAll('.panel-row')) button.setAttribute('aria-current', button.dataset.panel === entryPage ? 'page' : 'false');
   const page = el('div', 'entry-inner');
-  const head = el('div', 'entry-head');
-  const copy = el('div');
-  if (entryPage === 'plugins') {
-    copy.append(el('h1', undefined, '插件'), el('p', undefined, '扩展 CodeLeveler 的工具与界面。'));
-    const action = el('button', 'button secondary', '安装插件');
-    action.type = 'button'; action.disabled = true; action.title = '当前版本未接入插件安装';
-    const caret = el('button', 'button secondary entry-split-caret');
-    caret.type = 'button'; caret.disabled = true; caret.title = '当前版本未接入插件安装';
-    caret.setAttribute('aria-label', '插件安装选项');
-    caret.append(iconNode('chevronDown', { size: 12 }));
-    const split = el('div', 'entry-split'); split.append(action, caret);
-    const wrap = el('div', 'settings-actions'); wrap.append(split);
-    head.append(copy, wrap);
-    page.append(head);
-    const search = el('div', 'entry-search');
-    search.append(iconNode('search', { size: 15 }));
-    const input = el('input');
-    input.placeholder = '搜索插件';
-    input.setAttribute('aria-label', '搜索插件');
-    search.append(input);
-    page.append(search);
-    const tabs = el('div', 'entry-tabs');
-    for (const [label, selected] of [['内置', true], ['插件市场', false], ['设置', false]]) {
-      const tab = el('button', 'entry-tab', label);
-      tab.type = 'button';
-      tab.setAttribute('aria-selected', String(selected));
-      tabs.append(tab);
-    }
-    page.append(tabs);
-    const card = el('div', 'entry-card');
-    card.append(el('h2', undefined, '当前 Runtime 未提供插件目录'), el('p', undefined, '桌面桥接层没有可读取的插件清单、启停或安装接口。这里不会伪造插件列表或开关。'));
-    page.append(card);
-  } else {
-    renderAutomationPage(page);
-  }
+  renderAutomationPage(page);
   host.replaceChildren(page);
 }
 
@@ -8175,12 +7844,11 @@ function boot() {
   $('leading-toggle').append(iconNode('panel', { size: 16 }));
   $('leading-new').append(iconNode('plus', { size: 16 }));
   $('new-session').querySelector('.new-session-content').append(iconNode('plus', { size: 14 }), el('span', undefined, '新会话'));
-  $('nav-plugins').append(iconNode('plugins', { size: 16 }), el('span', undefined, '插件'));
   $('nav-automation').append(iconNode('automation', { size: 16 }), el('span', undefined, '自动化任务'));
   $('session-search').append(iconNode('search', { size: 14 }));
   $('view-options').append(iconNode('sliders', { size: 14 }));
   $('add-workspace').append(iconNode('folderPlus', { size: 14 }));
-  $('account-menu').querySelector('.account-icon').append(iconNode('more', { size: 16 }));
+  $('account-menu').querySelector('.account-icon').append(iconNode('settings', { size: 16 }));
   $('floating-right-toggle').append(iconNode('panel', { size: 16 }));
   $('header-right-toggle').append(iconNode('panel', { size: 16 }));
   $('find-bar').querySelector('.find-icon').append(iconNode('search', { size: 14 }));
@@ -8195,7 +7863,10 @@ function boot() {
   ensureHeaderActions();
   applyTheme();
   applyContentFont();
-  api.appInfo?.().then(info => { $('brand-version').textContent = `v${info.version}`; }).catch(() => {});
+  api.appInfo?.().then(info => {
+    $('brand-version').textContent = `v${info.version} · 桌面`;
+    $('brand-version').title = '桌面客户端版本；Runtime 版本见设置';
+  }).catch(() => {});
   api.connectionStatus?.().then(applyConnection).catch(() => {});
   api.onBrowserState(data => {
     browserData = data;
@@ -8237,17 +7908,14 @@ function boot() {
   $('leading-new').addEventListener('click', newSession);
   $('sidebar-toggle').addEventListener('click', toggleSidebar);
   $('leading-toggle').addEventListener('click', toggleSidebar);
-  $('nav-plugins').addEventListener('click', () => openPage('plugins'));
   $('nav-automation').addEventListener('click', () => openPage('automation'));
   $('session-search').addEventListener('click', openSidebarSearch);
   $('view-options').addEventListener('click', event => openViewOptions(event.currentTarget));
   $('add-workspace').addEventListener('click', () => openDirectoryPicker());
   $('account-menu').addEventListener('click', event => openAccountMenu(event.currentTarget));
   $('workspace-picker').addEventListener('click', event => openWorkspaceMenu(event.currentTarget));
-  $('preset-picker').addEventListener('click', event => openPresetMenu(event.currentTarget));
   $('model-picker').addEventListener('click', event => openModelMenu(event.currentTarget));
   $('permission-picker').addEventListener('click', event => openPermissionMenu(event.currentTarget));
-  $('plan-mode').addEventListener('click', () => toast('计划模式切换尚未接入', { tone: 'info', holdMs: 2400 }));
   $('attachment-add').addEventListener('click', () => {
     if (document.querySelector('#command-popover')) closeComposerPopovers();
     else openCommandMenu();
@@ -8376,6 +8044,7 @@ function boot() {
     }
     if ((event.metaKey || event.ctrlKey) && event.key === ',') { event.preventDefault(); openSettings('general'); }
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'f' && current) { event.preventDefault(); openFind(); }
+    if ((event.metaKey || event.ctrlKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === 'p' && current) { event.preventDefault(); openRightbarTab('files'); }
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 't' && !event.altKey) { event.preventDefault(); openRightbarTab('browser'); }
     if ((event.metaKey || event.ctrlKey) && event.altKey && event.key.toLowerCase() === 'b') { event.preventDefault(); rightbarOpen ? closeRightbar() : openRightbar(); }
     if ((event.metaKey || event.ctrlKey) && !event.altKey && event.key.toLowerCase() === 'b') { event.preventDefault(); toggleSidebar(); }
