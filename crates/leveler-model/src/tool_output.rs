@@ -42,6 +42,15 @@ fn is_elision_marker_line(line: &str) -> bool {
     line.starts_with("… [") && line.ends_with("] …") && line.contains(TOOL_OUTPUT_ELIDED_MARKER)
 }
 
+/// Whether `content` carries the registry's whole-line elision marker.
+///
+/// A true answer means the result was reduced and its elided bytes are NOT
+/// recoverable from the result itself. A stored-reference line is a different
+/// shape and is not reported here.
+pub fn has_elision_marker(content: &str) -> bool {
+    content.lines().any(is_elision_marker_line)
+}
+
 /// Reduce an already-externalized tool result to what remains recoverable.
 ///
 /// Returns `None` for a result that carries no externalization marker: its

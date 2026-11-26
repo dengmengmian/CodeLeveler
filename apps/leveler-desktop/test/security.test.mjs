@@ -93,6 +93,30 @@ test('diff query accepts only selected-session optional bounded query identity',
  for(const fields of [{session_id:'s2'},{session_id:''},{query_id:''},{query_id:' '},{query_id:null},{query_id:42},{query_id:'a'.repeat(257)},{path:'/private'},{include_all:true}])assert.throws(()=>security.validateEnvelope(envelope({type:'request_diff',session_id:'s1',...fields})));
 });
 
+test('tool output queries carry only a call id, a bounded part and a byte window',()=>{
+ const base={type:'query_tool_output',session_id:'s1',query_id:'q1',call_id:'call_abc-123',offset:0,max_bytes:65536};
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope(base)));
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope({...base,index:0,offset:1024,max_bytes:262144})));
+ for(const bad of [
+   {...base,session_id:'s2'},
+   {...base,call_id:''},
+   {...base,call_id:'a'.repeat(257)},
+   {...base,call_id:'../../etc/passwd'},
+   {...base,call_id:'a b'},
+   {...base,offset:-1},
+   {...base,offset:1.5},
+   {...base,offset:1073741825},
+   {...base,max_bytes:0},
+   {...base,max_bytes:262145},
+   {...base,max_bytes:'65536'},
+   {...base,index:-1},
+   {...base,index:1025},
+   {...base,index:1.5},
+   {...base,path:'/etc/passwd'},
+   {...base,query_id:null},
+ ])assert.throws(()=>security.validateEnvelope(envelope(bad)));
+});
+
 test('existing settings reads require exact scoped correlated query fields',()=>{
  const simple=['list_agents','query_context'];
  const queries=[...simple.map(type=>({type,session_id:'s1',query_id:'q1'})),{type:'get_agent',session_id:'s1',query_id:'q1',name:'reviewer'},{type:'query_observability',session_id:'s1',query_id:'q1',center_seq:null,before:0,after:100}];

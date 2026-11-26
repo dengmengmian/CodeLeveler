@@ -91,6 +91,18 @@ fn validate_command(session: &SessionId, command: &ClientCommand) -> anyhow::Res
         ClientCommand::ManageSchedule {
             query_id, request, ..
         } if valid_desktop_command_id(query_id) && valid_desktop_schedule_request(request) => {}
+        ClientCommand::QueryToolOutput {
+            query_id,
+            call_id,
+            index,
+            offset,
+            max_bytes,
+            ..
+        } if valid_desktop_command_id(query_id)
+            && valid_desktop_tool_call_id(call_id)
+            && index.is_none_or(|index| index <= 1024)
+            && *offset <= 1024 * 1024 * 1024
+            && (1..=leveler_client_protocol::TOOL_OUTPUT_PAGE_MAX_BYTES).contains(max_bytes) => {}
         ClientCommand::ResumeTask { content, .. }
             if !content.is_empty() && content.chars().count() <= 100_000 => {}
         ClientCommand::CancelBackgroundTask { task_id, .. }
@@ -177,6 +189,17 @@ fn validate_command(session: &SessionId, command: &ClientCommand) -> anyhow::Res
 
 fn valid_desktop_query_id(id: &Option<leveler_core::CommandId>) -> bool {
     id.as_ref().is_some_and(valid_desktop_command_id)
+}
+
+/// A tool-call identity is a provider/host token, not free prose: the query
+/// only ever looks it up, but bounding it keeps an answer from being built
+/// around a meaningless key.
+fn valid_desktop_tool_call_id(call_id: &str) -> bool {
+    !call_id.trim().is_empty()
+        && call_id.len() <= 256
+        && call_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
 }
 
 fn valid_desktop_command_id(id: &leveler_core::CommandId) -> bool {
@@ -977,6 +1000,39 @@ fn requested_collaboration(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_output_queries_are_bounded_and_session_scoped() {
+        let session = SessionId::new("desktop-session");
+        let command = |call_id: &str, index: Option<u32>, offset: u64, max_bytes: u32| {
+            ClientCommand::QueryToolOutput {
+                session_id: session.clone(),
+                query_id: leveler_core::CommandId::new("q1"),
+                call_id: call_id.to_string(),
+                index,
+                offset,
+                max_bytes,
+            }
+        };
+        assert!(validate_command(&session, &command("call_abc-1", None, 0, 65_536)).is_ok());
+        assert!(validate_command(&session, &command("call_abc-1", Some(3), 1024, 262_144)).is_ok());
+        for bad in [
+            command("", None, 0, 1024),
+            command("a b", None, 0, 1024),
+            command("../../etc/passwd", None, 0, 1024),
+            command("call", None, 0, 0),
+            command("call", None, 0, 262_145),
+            command("call", Some(1025), 0, 1024),
+            command("call", None, 1024 * 1024 * 1024 + 1, 1024),
+        ] {
+            assert!(validate_command(&session, &bad).is_err(), "{bad:?}");
+        }
+        let mut other_session = command("call", None, 0, 1024);
+        if let ClientCommand::QueryToolOutput { session_id, .. } = &mut other_session {
+            *session_id = SessionId::new("another");
+        }
+        assert!(validate_command(&session, &other_session).is_err());
+    }
 
     #[test]
     fn desktop_existing_task_commands_validate_scope_and_resume_content() {

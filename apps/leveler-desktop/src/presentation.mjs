@@ -196,6 +196,55 @@ export const failureReason = shared.failureLine;
 export const displayPreview = shared.displayPreview;
 export const isCommandTool = shared.isCommandTool;
 
+// ── Full tool output ─────────────────────────────────────────────────────
+// The tool card shows the runtime's bounded preview. The full recorded result
+// lives in the session transcript; only ask for it when the preview itself
+// proves it is not the whole story. A short complete result gets no button.
+/** @param {{preview?:string|null}} tool */
+export function outputMayBeTruncated(tool){
+ const preview=String(displayPreview(/** @type {any} */ (tool))??'');
+ if(!preview)return false;
+ if(preview.endsWith('…'))return true;
+ if(preview.includes('[tool output saved:'))return true;
+ if(/\[(?:stdout|stderr) full output: [^\]\n]+\]/.test(preview))return true;
+ return preview.includes('elided to fit the context');
+}
+/** A terminal-state tool can have a recorded result; a running one cannot yet.
+ *  @param {{status?:string}} tool */
+export function canViewFullOutput(tool){
+ return !['running','run'].includes(String(tool?.status??''))
+  && !['cancelled','unknown'].includes(contractToolStatus(tool?.status??''));
+}
+/** Strip terminal control sequences for display and copy. The bytes stay the
+ *  runtime's; this is a presentation projection, not a rewrite of the record.
+ *  @param {string} text */
+export function sanitizeOutputText(text){
+ return String(text??'')
+  .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g,'')
+  .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g,'')
+  .replace(/\r\n/g,'\n')
+  .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g,' ');
+}
+/** The typed reason a recorded result cannot be served.
+ *  @param {string|null|undefined} reason */
+export function toolOutputUnavailableLabel(reason){
+ switch(reason){
+  case 'not_saved':return 'Runtime 没有保存这次调用的完整结果（可能仍在运行、历史已被压缩，或来自不保存工具结果的旧版本）。';
+  case 'artifact_missing':return '这次调用引用的完整输出文件已不存在（可能被存储配额清理）；模型当时看到的预览仍然保留。';
+  case 'unknown_part':return '请求的输出片段不存在。';
+  case 'read_failed':return '读取已保存的输出失败，请重试。';
+  default:return '完整输出当前不可用。';
+ }
+}
+/** The complete-artifact chip label for one reference.
+ *  @param {{label?:string,size_bytes?:number,available?:boolean}} reference */
+export function toolOutputReferenceLabel(reference){
+ const label=reference?.label??'完整输出';
+ const size=Number(reference?.size_bytes??0);
+ const sizeText=size>0?(size>=1024*1024?` · ${(size/1024/1024).toFixed(1)} MB`:` · ${(size/1024).toFixed(1)} KB`):'';
+ return reference?.available===false?`${label} · 已不可用`:`${label}${sizeText}`;
+}
+
 /** Conversation presentation rules, from the same shared module. */
 export const groupExploration = shared.groupExploration;
 export const explorationLabel = shared.explorationLabel;

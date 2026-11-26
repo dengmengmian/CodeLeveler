@@ -1211,6 +1211,13 @@ pub enum RuntimeEvent {
         #[serde(default)]
         omitted_turns: u32,
     },
+    /// Result of [`crate::ClientCommand::QueryToolOutput`]: one page of a tool
+    /// call's full recorded result, or the typed reason it cannot be served.
+    ToolOutputLoaded {
+        query_id: CommandId,
+        session_id: leveler_core::SessionId,
+        output: crate::UiToolOutput,
+    },
 }
 
 /// The current contents and controls of an undelivered input.
@@ -1649,6 +1656,42 @@ mod tests {
                 label: "thinking".to_string(),
             },
             "agent_activity",
+        );
+    }
+
+    #[test]
+    fn goal_continuation_stopped_roundtrips() {
+        roundtrip(
+            RuntimeEvent::GoalContinuationStopped {
+                consecutive_windows_without_work: 2,
+            },
+            "goal_continuation_stopped",
+        );
+    }
+
+    #[test]
+    fn tool_output_loaded_roundtrips() {
+        roundtrip(
+            RuntimeEvent::ToolOutputLoaded {
+                query_id: CommandId::new("q1"),
+                session_id: leveler_core::SessionId::new("s1"),
+                output: crate::UiToolOutput {
+                    call_id: "c1".into(),
+                    state: crate::UiToolOutputState::Available,
+                    unavailable: None,
+                    part: crate::UiToolOutputPart::Result,
+                    label: "模型所见结果".into(),
+                    text: "exit: 0".into(),
+                    total_bytes: 8,
+                    offset: 0,
+                    next_offset: 8,
+                    has_more: false,
+                    model_result_reduced: false,
+                    full_output_lost: false,
+                    references: Vec::new(),
+                },
+            },
+            "tool_output_loaded",
         );
     }
 

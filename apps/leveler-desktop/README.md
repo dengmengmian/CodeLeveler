@@ -30,7 +30,7 @@ npm start
 ## 当前限制
 
 - 会话引用尚未接入；插件系统未开放。反馈会复制到剪贴板并打开 GitHub Issues，由用户自行提交，不会自动上传日志。
-- 文件预览暂不支持 PDF 和 Office；工具卡片中的长输出会截断，桌面端暂无完整输出入口。
+- 文件预览暂不支持 PDF 和 Office。工具卡的长输出预览可打开 Runtime 记录的完整结果；大输出与命令流按页读取，引用文件被清理或历史被压缩时明确显示不可用，不会把截断预览当成全文。
 - 内置终端按当前系统用户权限运行，不受 Agent 权限模式的写入和网络限制，也不会请求审批。Windows 暂不支持内置终端。
 - 切换会话期间的后台输出不会补回，任务状态仍会保留。
 - 子 Agent 状态可查看，子会话打开和输入暂未接入。
@@ -40,6 +40,6 @@ npm start
 
 ## 开发检查
 
-运行 `npm run build`、`npm run typecheck`、`npm run lint` 和 `npm test`。构建本地 Runtime 后，使用 `npm run test:smoke` 验证会话恢复、归档恢复、图片附件、自动化运行、定时任务工具卡、定义信任审批和凭据接管。冒烟使用隔离配置、临时工作区和测试专用模型服务，不访问现有会话或外部模型。`npm run test:model-picker` 按真实 HOME/profile 验收模型选择器生命周期，仅创建新的测试会话。`npm run test:modes` 在隔离 HOME 中验收对话/计划/目标三种执行模式（真实 Electron、Runtime 与会话行）；`node scripts/r2b-dogfood.mjs` 在真实 HOME/profile 上跑三种模式与运行中追加指令，仅创建并归档测试会话，需显式设置 `LEVELER_BINARY`。验收脚本通过 `LEVELER_BINARY` 指向当前工作树的独立构建。
+运行 `npm run build`、`npm run typecheck`、`npm run lint` 和 `npm test`。构建本地 Runtime 后，使用 `npm run test:smoke` 验证会话恢复、归档恢复、图片附件、自动化运行、定时任务工具卡、定义信任审批和凭据接管。冒烟使用隔离配置、临时工作区和测试专用模型服务，不访问现有会话或外部模型。`npm run test:model-picker` 按真实 HOME/profile 验收模型选择器生命周期，仅创建新的测试会话；`npm run test:modes` 在隔离 HOME 中验收对话/计划/目标三种执行模式（真实 Electron、Runtime 与会话行）；`npm run test:r2c` 验收完整工具输出读取与 Goal 自动续跑边界；`node scripts/r2b-dogfood.mjs` 在真实 HOME/profile 上跑三种模式与运行中追加指令，仅创建并归档测试会话，需显式设置 `LEVELER_BINARY`。验收脚本通过 `LEVELER_BINARY` 指向当前工作树的独立构建。
 
 自动化的“立即运行”通过调度工具使用 `leveler schedule dispatch --occurrence <id> --follow`：只执行该 run-now 槽位并跟随到终态；不会开启系统后台唤醒，也不会继续派发未来的定时任务。桌面设置中的 Runtime 更新只针对命令行运行时，不更新桌面客户端。

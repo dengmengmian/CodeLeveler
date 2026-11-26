@@ -12,6 +12,10 @@ import {
 } from './presentation.mjs';
 import {goalContinuationStopLabel} from './presentation.mjs';
 import {
+  outputMayBeTruncated, canViewFullOutput, sanitizeOutputText, toolOutputUnavailableLabel,
+  toolOutputReferenceLabel,
+} from './presentation.mjs';
+import {
   projectSnapshot, applySessionMetadata, applyEvent, commandEnvelope, terminalEvents,
   approvalDecisions, clarificationAnswer, uploadDraft, applyUploadEvent, reconcileUploadReply,
   workspaceDraftText, attachmentSubmissionError, permissionCommand, permissionConfirmed,
@@ -53,6 +57,7 @@ const LABELS = {
 const TAB_ICON = {
   start: 'compass', files: 'folder', preview: 'file', terminal: 'terminal',
   browser: 'globe', changes: 'diff', plan: 'list', subagent: 'bot',
+  'tool-output': 'terminal',
 };
 const PERMISSION_MODES = [
   ['full_access', '完全权限'],
@@ -2607,6 +2612,21 @@ function renderToolDetails(row, id) {
   if (output && kind === 'command') {
     detail.append(el('div', 'settings-note', tool.status === 'running' ? '实时输出尾部' : '输出预览，长输出可能被截断'));
   }
+  if (canViewFullOutput(tool) && outputMayBeTruncated(tool)) {
+    // The card's own text is the runtime's bounded preview. Only a preview
+    // that proves it is partial earns the full-output entry; the actual
+    // availability is answered by the Runtime, never assumed here.
+    const bar = el('div', 'tool-output-action');
+    const full = el('button', 'button secondary small', '查看完整结果');
+    full.type = 'button';
+    full.addEventListener('click', event => {
+      event.preventDefault();
+      event.stopPropagation();
+      openToolOutput(tool);
+    });
+    bar.append(full, el('span', 'tool-output-hint', '从 Runtime 的调用记录读取'));
+    detail.append(bar);
+  }
   detail.append(card);
   const raw = el('details', 'tool-raw');
   raw.append(el('summary', undefined, '技术详情'), el('pre', undefined, `工具：${tool.name}\n调用：${tool.id}\n参数：${argsRaw ?? ''}${tool.exit_code !== undefined ? `\n退出码：${tool.exit_code}` : ''}`));
@@ -5121,7 +5141,7 @@ function changesTabTitle() {
 
 const TAB_TITLES = {
   start: '开始', files: '文件', terminal: '终端', browser: '浏览器', changes: '变更',
-  preview: '预览', plan: '计划', subagent: '子智能体',
+  preview: '预览', plan: '计划', subagent: '子智能体', 'tool-output': '完整输出',
 };
 
 function tabTitle(kind, extra = {}) {
@@ -5148,8 +5168,10 @@ function openRightbarTab(kind, extra = {}) {
   // instead of consuming it.
   const reusable = kind === 'preview'
     ? Object.values(rightbarTabs).find(tab => tab.kind === 'preview' && tab.path === extra.path && !rightbarFloats.some(float => float.tabId === tab.id))
-    : ['files', 'changes', 'plan', 'subagent'].includes(kind)
-      ? Object.values(rightbarTabs).find(tab => tab.kind === kind && !rightbarFloats.some(float => float.tabId === tab.id)) : null;
+    : kind === 'tool-output'
+      ? Object.values(rightbarTabs).find(tab => tab.kind === 'tool-output' && tab.callId === extra.callId && !rightbarFloats.some(float => float.tabId === tab.id))
+      : ['files', 'changes', 'plan', 'subagent'].includes(kind)
+        ? Object.values(rightbarTabs).find(tab => tab.kind === kind && !rightbarFloats.some(float => float.tabId === tab.id)) : null;
   const tab = reusable ?? newTabRecord(kind, extra);
   if (kind === 'changes') {
     const previous = { source: tab.source ?? 'workspace', toolIds: JSON.stringify(tab.toolIds ?? []) };
@@ -5216,6 +5238,9 @@ async function closeTab(pane, tabId) {
   closeNativeBrowserTab(closing);
   pane.tabs.splice(index, 1);
   delete rightbarTabs[tabId];
+  // The loaded pages are per-tab memory; closing the tab releases them. An
+  // in-flight answer for the closed tab is ignored by the tab-id check.
+  toolOutputViews.delete(tabId);
   if (pane.activeId === tabId) pane.activeId = pane.tabs[Math.max(0, index - 1)] ?? pane.tabs[0] ?? null;
   if (!pane.tabs.length) {
     if (rightbarPanes.length > 1) {
@@ -5595,6 +5620,7 @@ function renderTabView(tab, pane) {
   if (tab.kind === 'browser') return browserView(tab, pane);
   if (tab.kind === 'changes') return changesView(tab);
   if (tab.kind === 'preview') return previewView(tab);
+  if (tab.kind === 'tool-output') return toolOutputView(tab);
   if (tab.kind === 'plan') return planView();
   if (tab.kind === 'subagent') return subagentView();
   return startView();
@@ -6495,6 +6521,244 @@ function previewUnavailable(label, path) {
   empty.append(openHost);
   renderOpenInAppInto(openHost, path, 'file');
   return empty;
+}
+
+/* ------------------------------------------------------- full tool output */
+// The card preview is the runtime's bounded projection. The full recorded
+// result is read on demand from the session transcript; complete artifacts are
+// served by the runtime from its own store. The renderer never names a path,
+// and no page is loaded until the person opens or scrolls the viewer.
+const toolOutputRequests = new Map(); // query_id -> {resolve, timer}
+const toolOutputViews = new Map();    // "tabN" -> {active, parts: Map<key, part>}
+const TOOL_OUTPUT_PAGE_BYTES = 64 * 1024;
+const TOOL_OUTPUT_COPY_LIMIT = 8 * 1024 * 1024;
+
+function toolOutputViewFor(tab) {
+  let view = toolOutputViews.get(tab.id);
+  if (!view) {
+    view = { active: 'result', parts: new Map() };
+    toolOutputViews.set(tab.id, view);
+  }
+  return view;
+}
+
+function toolOutputPartFor(view, key) {
+  let part = view.parts.get(key);
+  if (!part) {
+    part = {
+      key, text: '', total: 0, next: 0, hasMore: false, loading: false,
+      started: false, error: null, unavailable: null, references: [], reduced: false,
+      lost: false, label: '', generation: 0,
+    };
+    view.parts.set(key, part);
+  }
+  return part;
+}
+
+function toolOutputIndexFor(key) {
+  return key === 'result' ? null : Number(key.slice('artifact:'.length));
+}
+
+function queryToolOutput(callId, index, offset, maxBytes = TOOL_OUTPUT_PAGE_BYTES) {
+  const sessionId = current?.session?.id;
+  if (!sessionId) return Promise.reject(new Error('没有选中的会话'));
+  const queryId = crypto.randomUUID();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      toolOutputRequests.delete(queryId);
+      reject(new Error('15 秒内没有收到 Runtime 结果'));
+    }, 15000);
+    toolOutputRequests.set(queryId, { resolve, timer });
+    deliver({
+      type: 'query_tool_output',
+      session_id: sessionId,
+      query_id: queryId,
+      call_id: callId,
+      ...(index === null ? {} : { index }),
+      offset,
+      max_bytes: maxBytes,
+    }, undefined).catch(error => {
+      const pending = toolOutputRequests.get(queryId);
+      if (pending) { clearTimeout(pending.timer); toolOutputRequests.delete(queryId); }
+      reject(error);
+    });
+  });
+}
+
+function openToolOutput(tool) {
+  const tab = openRightbarTab('tool-output', {
+    callId: tool.id, toolId: tool.id, title: `完整输出 · ${toolLabel(tool)}`,
+  });
+  if (!tab) return;
+  const view = toolOutputViewFor(tab);
+  if (!view.parts.has('result')) view.active = 'result';
+  void loadToolOutput(tab, view.active === 'result' ? null : toolOutputIndexFor(view.active));
+}
+
+async function loadToolOutput(tab, index, { append = false } = {}) {
+  if (!tab || tab.kind !== 'tool-output') return;
+  const view = toolOutputViewFor(tab);
+  const key = index === null ? 'result' : `artifact:${index}`;
+  const part = toolOutputPartFor(view, key);
+  if (part.loading) return;
+  const generation = ++part.generation;
+  part.loading = true;
+  part.error = null;
+  part.unavailable = null;
+  part.started = true;
+  if (!append) { part.text = ''; part.next = 0; part.hasMore = false; part.total = 0; }
+  if (rightbarOpen) renderRightbar();
+  try {
+    const output = await queryToolOutput(tab.callId, index, append ? part.next : 0);
+    if (part.generation !== generation) return;
+    part.references = output.references ?? part.references;
+    part.reduced = output.model_result_reduced === true;
+    part.lost = output.full_output_lost === true;
+    if (output.state === 'unavailable') {
+      part.unavailable = output.unavailable ?? 'read_failed';
+      part.error = toolOutputUnavailableLabel(part.unavailable);
+      return;
+    }
+    part.label = output.label ?? part.label;
+    part.text = append ? part.text + output.text : output.text;
+    part.total = Number(output.total_bytes ?? 0);
+    part.next = Number(output.next_offset ?? 0);
+    part.hasMore = output.has_more === true;
+  } catch (error) {
+    if (part.generation === generation) part.error = error?.message ?? '读取完整输出失败';
+  } finally {
+    if (part.generation === generation) {
+      part.loading = false;
+      if (rightbarOpen) renderRightbar();
+    }
+  }
+}
+
+async function copyAllToolOutput(tab, index) {
+  const view = toolOutputViewFor(tab);
+  const key = index === null ? 'result' : `artifact:${index}`;
+  const part = toolOutputPartFor(view, key);
+  if (part.total > TOOL_OUTPUT_COPY_LIMIT) {
+    toast('输出超过 8 MB；请分页查看后复制所需部分', { tone: 'warning', holdMs: 4000 });
+    return;
+  }
+  let text = part.text;
+  let offset = part.next;
+  let more = part.hasMore;
+  try {
+    while (more) {
+      const output = await queryToolOutput(tab.callId, index, offset);
+      if (output.state !== 'available') throw new Error(toolOutputUnavailableLabel(output.unavailable));
+      text += output.text;
+      offset = output.next_offset;
+      more = output.has_more === true;
+    }
+  } catch (error) {
+    toast(`无法读取完整输出：${error.message}`, { tone: 'error', holdMs: 5000 });
+    return;
+  }
+  const ok = await copyText(api, sanitizeOutputText(text), { quiet: true, showFailure: true });
+  toast(ok ? '已复制完整输出' : '复制失败', { tone: ok ? 'success' : 'error', holdMs: 1600 });
+}
+
+function toolOutputView(tab) {
+  const tabView = toolOutputViewFor(tab);
+  const key = tabView.active;
+  const index = toolOutputIndexFor(key);
+  const part = toolOutputPartFor(tabView, key);
+  if (!part.started && !part.loading) {
+    // First paint of a reopened tab: ask for page 0, never load the world.
+    setTimeout(() => {
+      if (rightbarTabs[tab.id] === tab) void loadToolOutput(tab, index);
+    }, 0);
+  }
+  const wrap = el('div', 'tool-output-view');
+  const head = el('div', 'tool-output-head');
+  const partPicker = el('button', 'preview-renderer', part.label || (index === null ? '模型所见结果' : '完整输出'));
+  partPicker.type = 'button';
+  partPicker.setAttribute('aria-label', '选择输出片段');
+  const referenceItems = part.references.map(reference => ({
+    key: `artifact:${reference.index}`,
+    label: toolOutputReferenceLabel(reference),
+    checked: key === `artifact:${reference.index}`,
+    onSelect: () => { tabView.active = `artifact:${reference.index}`; renderRightbar(); void loadToolOutput(tab, reference.index); },
+  }));
+  partPicker.addEventListener('click', () => openMenu({
+    anchor: partPicker, width: 320,
+    items: [
+      { key: 'result', label: '模型所见结果', checked: key === 'result', onSelect: () => { tabView.active = 'result'; renderRightbar(); void loadToolOutput(tab, null); } },
+      ...referenceItems,
+    ].map(item => ({ label: item.label, checked: item.checked, onSelect: item.onSelect })),
+  }));
+  const copy = iconButton('copy', '复制已加载内容', { size: 15, tooltip: part.hasMore ? '复制已加载内容（未加载全部）' : '复制完整内容' });
+  copy.disabled = !part.text;
+  copy.addEventListener('click', async () => {
+    const ok = await copyText(api, sanitizeOutputText(part.text), { quiet: true, showFailure: true });
+    toast(ok ? (part.hasMore ? '已复制已加载内容' : '已复制完整内容') : '复制失败', { tone: ok ? 'success' : 'error', holdMs: 1600 });
+  });
+  const copyAll = iconButton('archive', '复制全部', { size: 15, tooltip: '读取并复制全部内容' });
+  copyAll.disabled = !part.hasMore && !part.text;
+  copyAll.addEventListener('click', () => void copyAllToolOutput(tab, index));
+  const reload = iconButton('refresh', '重新读取', { size: 15, tooltip: '重新读取' });
+  reload.disabled = part.loading;
+  reload.addEventListener('click', () => void loadToolOutput(tab, index));
+  head.append(partPicker, copy, copyAll, reload);
+  wrap.append(head);
+
+  if (part.reduced && index === null) {
+    wrap.append(el('div', 'tool-output-banner', '模型所见结果已被截断；完整输出在下方引用中。'));
+  } else if (part.reduced && index !== null) {
+    wrap.append(el('div', 'tool-output-banner', '这是 Runtime 保存的完整输出片段。'));
+  }
+  if (part.lost) {
+    wrap.append(el('div', 'tool-output-banner lost', '原始输出没有保存完整，被省略的部分无法恢复。'));
+  }
+  const body = el('div', 'tool-output-body');
+  if (part.loading && !part.text) body.append(el('div', 'review-status', '正在读取完整输出…'));
+  else if (part.unavailable || (part.error && !part.text)) {
+    const status = el('div', 'review-status error');
+    status.append(el('span', undefined, part.error ?? '完整输出当前不可用。'));
+    const retry = el('button', 'button secondary small', '重试');
+    retry.type = 'button';
+    retry.addEventListener('click', () => void loadToolOutput(tab, index));
+    status.append(retry);
+    body.append(status);
+  } else {
+    const pre = el('pre', 'tool-output-pre');
+    pre.textContent = sanitizeOutputText(part.text) || '（无输出）';
+    body.append(pre);
+    if (part.text && part.hasMore) {
+      const more = el('div', 'tool-output-footer');
+      more.append(el('span', 'tool-output-meta', `已加载 ${Math.ceil(part.text.length / 1024)} KB / 共 ${Math.ceil(part.total / 1024)} KB`));
+      const load = el('button', 'button secondary small', '加载更多');
+      load.type = 'button';
+      load.disabled = part.loading;
+      load.addEventListener('click', () => void loadToolOutput(tab, index, { append: true }));
+      more.append(load);
+      body.append(more);
+    } else if (part.total > 0) {
+      body.append(el('div', 'tool-output-meta', `共 ${Math.ceil(part.total / 1024)} KB`));
+    }
+  }
+  wrap.append(body);
+  if (part.references.length) {
+    const refs = el('div', 'tool-output-references');
+    refs.append(el('span', 'tool-output-refs-title', '完整输出引用'));
+    for (const reference of part.references) {
+      const chip = el('button', 'tool-output-ref');
+      chip.type = 'button';
+      chip.disabled = reference.available === false;
+      chip.append(iconNode('terminal', { size: 13 }), el('span', undefined, toolOutputReferenceLabel(reference)));
+      chip.addEventListener('click', () => {
+        tabView.active = `artifact:${reference.index}`;
+        renderRightbar();
+        void loadToolOutput(tab, reference.index);
+      });
+      refs.append(chip);
+    }
+    wrap.append(refs);
+  }
+  return wrap;
 }
 
 async function referenceWorkspaceFile(path) {
@@ -8919,6 +9183,17 @@ api.onEvent(frame => {
   }
   if (frame.event !== 'runtime') return;
   const event = frame.data;
+  if (event.type === 'tool_output_loaded') {
+    // A read answer, not conversation state: it resolves the query that asked
+    // for it and never enters the transcript, trajectory or seq watermark.
+    const pending = toolOutputRequests.get(event.query_id);
+    if (pending) {
+      clearTimeout(pending.timer);
+      toolOutputRequests.delete(event.query_id);
+      pending.resolve(event.output);
+    }
+    return;
+  }
   recordLiveTrajectory(event);
   if (typeof event.seq === 'number') lastEventSeq = Math.max(lastEventSeq, event.seq);
   if (event.type === 'session_history_loaded') {

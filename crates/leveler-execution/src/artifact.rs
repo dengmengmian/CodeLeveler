@@ -3,7 +3,9 @@
 //! deduplicating pattern: identical content hashes to the same file, so a
 //! preview shown to the model can always point at the full, retrievable output.
 
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
@@ -31,6 +33,201 @@ pub struct ArtifactStore {
 /// 512 MiB. Large enough for a long session's paged command output, small
 /// enough that it cannot silently consume a disk.
 pub const DEFAULT_ARTIFACT_QUOTA_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Why a stored artifact could not be served to a reader.
+#[derive(Debug)]
+pub enum ArtifactReadError {
+    /// The path is not a direct child of this store, or is not a
+    /// content-addressed `<sha256>.txt` file. The reader refuses to touch
+    /// anything else, so a forged reference can never become an arbitrary
+    /// local file read.
+    NotArtifact,
+    /// The file no longer exists (swept by the quota, or deleted).
+    Missing,
+    /// The requested offset is beyond the end of the file.
+    OffsetOutOfRange { total_bytes: u64 },
+    /// The file exists but could not be read.
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for ArtifactReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotArtifact => write!(f, "not an artifact in this store"),
+            Self::Missing => write!(f, "artifact file is missing"),
+            Self::OffsetOutOfRange { total_bytes } => {
+                write!(f, "offset is beyond the artifact ({total_bytes} bytes)")
+            }
+            Self::Io(error) => write!(f, "artifact read failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ArtifactReadError {}
+
+/// One page of an artifact's text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactPage {
+    pub text: String,
+    pub offset: u64,
+    pub next_offset: u64,
+    pub total_bytes: u64,
+    pub has_more: bool,
+}
+
+impl ArtifactStore {
+    /// The directory this store owns. Callers may compare it for display, but
+    /// a read path must still resolve through [`Self::resolve`].
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Resolve `path` to a regular file this store wrote.
+    ///
+    /// The name must be a 64-hex-digit content hash plus `.txt` and the parent
+    /// must be this store's canonical root. Symlinks are refused on Unix via
+    /// `O_NOFOLLOW` at open time and by the metadata check here, so a link
+    /// planted inside the store cannot redirect the read.
+    pub fn resolve(&self, path: &Path) -> Result<PathBuf, ArtifactReadError> {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            return Err(ArtifactReadError::NotArtifact);
+        };
+        if !is_content_addressed_name(name) {
+            return Err(ArtifactReadError::NotArtifact);
+        }
+        let root = self.root.canonicalize().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ArtifactReadError::Missing
+            } else {
+                ArtifactReadError::Io(error)
+            }
+        })?;
+        let parent = path
+            .parent()
+            .ok_or(ArtifactReadError::NotArtifact)?
+            .canonicalize()
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    ArtifactReadError::Missing
+                } else {
+                    ArtifactReadError::Io(error)
+                }
+            })?;
+        if parent != root {
+            return Err(ArtifactReadError::NotArtifact);
+        }
+        let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ArtifactReadError::Missing
+            } else {
+                ArtifactReadError::Io(error)
+            }
+        })?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(ArtifactReadError::NotArtifact);
+        }
+        Ok(path.to_path_buf())
+    }
+
+    /// Size of a resolvable artifact.
+    pub fn size_of(&self, path: &Path) -> Result<u64, ArtifactReadError> {
+        let resolved = self.resolve(path)?;
+        std::fs::metadata(&resolved)
+            .map(|metadata| metadata.len())
+            .map_err(ArtifactReadError::Io)
+    }
+
+    /// Read at most `max_bytes` from `offset`, never splitting a UTF-8
+    /// character. The returned `next_offset` is the exact continuation point,
+    /// so a client can page the whole file without loss.
+    pub fn read_page(
+        &self,
+        path: &Path,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<ArtifactPage, ArtifactReadError> {
+        let resolved = self.resolve(path)?;
+        let mut file = open_no_follow(&resolved).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ArtifactReadError::Missing
+            } else {
+                ArtifactReadError::Io(error)
+            }
+        })?;
+        let total_bytes = file
+            .metadata()
+            .map_err(ArtifactReadError::Io)?
+            .len();
+        if offset > total_bytes {
+            return Err(ArtifactReadError::OffsetOutOfRange { total_bytes });
+        }
+        if max_bytes == 0 {
+            return Ok(ArtifactPage {
+                text: String::new(),
+                offset,
+                next_offset: offset,
+                total_bytes,
+                has_more: offset < total_bytes,
+            });
+        }
+        file.seek(SeekFrom::Start(offset))
+            .map_err(ArtifactReadError::Io)?;
+        // One extra char's worth so a cut landing mid-character can still be
+        // completed by the next page.
+        let want = max_bytes.saturating_add(4);
+        let mut buf = vec![0u8; want];
+        let mut read = 0usize;
+        while read < buf.len() {
+            match file.read(&mut buf[read..]) {
+                Ok(0) => break,
+                Ok(n) => read += n,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(ArtifactReadError::Io(error)),
+            }
+        }
+        buf.truncate(read);
+        // Cut at a character boundary. Our own writes are always valid UTF-8,
+        // so a split can only happen at the page edge; anything else is a
+        // corrupted file and is served lossily rather than failing the read.
+        let valid = match std::str::from_utf8(&buf) {
+            Ok(_) => buf.len(),
+            Err(error) => error.valid_up_to().max(1).min(buf.len()),
+        };
+        let text = String::from_utf8_lossy(&buf[..valid]).into_owned();
+        let next_offset = offset.saturating_add(valid as u64);
+        Ok(ArtifactPage {
+            text,
+            offset,
+            next_offset,
+            total_bytes,
+            has_more: next_offset < total_bytes,
+        })
+    }
+}
+
+/// `<sha256>.txt`, lowercase hex only. Nothing else can be an artifact name.
+fn is_content_addressed_name(name: &str) -> bool {
+    let Some(hash) = name.strip_suffix(".txt") else {
+        return false;
+    };
+    hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+#[cfg(unix)]
+fn open_no_follow(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_no_follow(path: &Path) -> std::io::Result<File> {
+    // Windows has no O_NOFOLLOW, and the file type check above (not a symlink)
+    // is the boundary there.
+    File::open(path)
+}
 
 impl ArtifactStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
@@ -232,5 +429,101 @@ mod tests {
         let c = store.write_text("different").unwrap();
         assert_ne!(c.path, a.path);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn paging_returns_the_exact_text_and_never_splits_chinese_characters() {
+        let root = tmp();
+        let store = ArtifactStore::new(&root);
+        let content = "中文输出\n".repeat(500);
+        let art = store.write_text(&content).unwrap();
+
+        let mut joined = String::new();
+        let mut offset = 0u64;
+        loop {
+            let page = store.read_page(&art.path, offset, 7).unwrap();
+            assert_eq!(page.offset, offset);
+            assert_eq!(page.total_bytes, content.len() as u64);
+            assert!(page.text.is_char_boundary(0));
+            joined.push_str(&page.text);
+            if !page.has_more {
+                assert_eq!(page.next_offset, page.total_bytes, "the last page ends the file");
+                break;
+            }
+            assert!(page.next_offset > offset, "a page must make progress");
+            offset = page.next_offset;
+        }
+        assert_eq!(joined, content, "paged reads must be lossless");
+        assert_eq!(store.size_of(&art.path).unwrap(), content.len() as u64);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_path_outside_the_store_or_with_a_foreign_name_is_never_read() {
+        let root = tmp();
+        let store = ArtifactStore::new(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = root.with_extension("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let name = "a".repeat(64);
+        let foreign = outside.join(format!("{name}.txt"));
+        std::fs::write(&foreign, "not yours").unwrap();
+
+        assert!(matches!(
+            store.read_page(&foreign, 0, 1024),
+            Err(ArtifactReadError::NotArtifact)
+        ));
+        // A real file inside the store with a non-artifact name is refused too.
+        let art = store.write_text("inside").unwrap();
+        let renamed = art.path.with_file_name("notes.txt");
+        std::fs::write(&renamed, "inside").unwrap();
+        assert!(matches!(
+            store.read_page(&renamed, 0, 1024),
+            Err(ArtifactReadError::NotArtifact)
+        ));
+        assert!(matches!(
+            store.read_page(&art.path, art.size_bytes as u64 + 1, 1024),
+            Err(ArtifactReadError::OffsetOutOfRange { .. })
+        ));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[test]
+    fn a_swept_artifact_is_reported_missing_not_served_as_empty() {
+        let root = tmp();
+        let store = ArtifactStore::new(&root).with_max_bytes(1);
+        let art = store.write_text("will be swept by the next write").unwrap();
+        // A second write exceeds the 1-byte quota and sweeps the first file.
+        let keep = store.write_text("survivor").unwrap();
+        assert!(keep.path.is_file());
+        assert!(
+            !art.path.exists(),
+            "the test needs a swept artifact to prove the missing state"
+        );
+        assert!(matches!(
+            store.read_page(&art.path, 0, 1024),
+            Err(ArtifactReadError::Missing)
+        ));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_named_like_an_artifact_is_refused() {
+        let root = tmp();
+        let store = ArtifactStore::new(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = root.with_extension("symlink-target");
+        std::fs::write(&outside, "secret").unwrap();
+        let name = "b".repeat(64);
+        let link = root.join(format!("{name}.txt"));
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert!(matches!(
+            store.read_page(&link, 0, 1024),
+            Err(ArtifactReadError::NotArtifact)
+        ));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_file(&outside).ok();
     }
 }

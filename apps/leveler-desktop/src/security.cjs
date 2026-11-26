@@ -1,5 +1,5 @@
 const {SNAPSHOT_VERSIONED_COMMANDS}=require('./command-policy.gen.cjs');
-const allowed=new Set(['submit_message','submit_user_input','steer_current_turn','steer_user_input','cancel_current_turn','cancel_task','resume_task','approval_decision','answer_clarification','definition_trust_decision','capture_secret','revoke_secret','query_session_history','request_diff','list_agents','get_agent','query_context','query_observability','select_model','set_permission_profile','set_product_axes','rename_session','archive_session','unarchive_session','fork_session','compact_context','cancel_background_task','manage_schedule']);
+const allowed=new Set(['submit_message','submit_user_input','steer_current_turn','steer_user_input','cancel_current_turn','cancel_task','resume_task','approval_decision','answer_clarification','definition_trust_decision','capture_secret','revoke_secret','query_session_history','query_tool_output','request_diff','list_agents','get_agent','query_context','query_observability','select_model','set_permission_profile','set_product_axes','rename_session','archive_session','unarchive_session','fork_session','compact_context','cancel_background_task','manage_schedule']);
 const decisions=new Set(['approve_once','approve_session','approve_always','deny']);
 const {validRef}=require('./attachment-ingress.cjs');
 function string(value,max=256){return typeof value==='string'&&value.length>0&&value.length<=max;}
@@ -80,6 +80,15 @@ function validateEnvelope(envelope,authorizeAttachment){
   }
   if(command.type==='answer_clarification'&&(!string(command.request_id)||typeof command.answer!=='string'||command.answer.length>100000))throw new Error('Invalid clarification');
   if(command.type==='query_session_history'&&command.session_id!==envelope.session_id)throw new Error('Invalid history query');
+  if(command.type==='query_tool_output'){
+    // The renderer names a call, a part index and a byte window — never a
+    // path. The Runtime resolves the stored result and serves only its own
+    // artifact store, so this boundary only has to keep the request well
+    // formed and bounded.
+    const keys=['type','session_id','query_id','call_id','offset','max_bytes',...(Object.hasOwn(command,'index')?['index']:[])];
+    if(!exactKeys(command,keys)||!nonblank(command.session_id)||command.session_id!==envelope.session_id||!string(command.query_id,256)||!nonblank(command.call_id)||command.call_id.length>256||!/^[A-Za-z0-9_.:-]+$/.test(command.call_id)||!Number.isSafeInteger(command.offset)||command.offset<0||command.offset>1073741824||!Number.isInteger(command.max_bytes)||command.max_bytes<1||command.max_bytes>262144)throw new Error('Invalid tool output query');
+    if(Object.hasOwn(command,'index')&&(!Number.isInteger(command.index)||command.index<0||command.index>1024))throw new Error('Invalid tool output part');
+  }
   if(['list_agents','get_agent','query_context','query_observability'].includes(command.type)){
     const keys=['type','session_id','query_id',...(command.type==='get_agent'?['name']:[]),...(command.type==='query_observability'?['center_seq','before','after']:[])];
     if(!exactKeys(command,keys)||!nonblank(command.session_id)||command.session_id!==envelope.session_id||!nonblank(command.query_id))throw new Error('Invalid settings query');

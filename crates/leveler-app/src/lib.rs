@@ -46,6 +46,7 @@ pub mod session_projection;
 pub mod settings_service;
 mod side_question;
 pub mod skills;
+mod tool_output;
 pub mod usage;
 mod user_shell;
 mod vcs;

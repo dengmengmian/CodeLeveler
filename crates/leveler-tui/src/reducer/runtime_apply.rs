@@ -194,6 +194,9 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 message,
             });
         }
+        // The full-output query is a Desktop read surface. The terminal has no
+        // such view; the answer is a normal event it can safely ignore.
+        RuntimeEvent::ToolOutputLoaded { .. } => {}
         RuntimeEvent::SessionHistoryLoaded {
             query_id,
             session_id,

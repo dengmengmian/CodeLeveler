@@ -9271,6 +9271,44 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 }
                 Ok(())
             }
+            ClientCommand::QueryToolOutput {
+                session_id,
+                query_id,
+                call_id,
+                index,
+                offset,
+                max_bytes,
+            } => {
+                // The transcript is the authority for what the model actually
+                // received. A result the runtime never persisted has no full
+                // text to serve, and the answer says so instead of inventing
+                // an empty one.
+                let db = self
+                    .app
+                    .open_database()
+                    .await
+                    .map_err(|error| ClientError::Runtime(error.to_string()))?;
+                let stored = crate::tool_output::stored_result(&db, &session_id, &call_id)
+                    .await
+                    .map_err(|error| ClientError::Runtime(error.to_string()))?;
+                let store = crate::tool_output::artifact_store(&self.app);
+                let output = crate::tool_output::project(
+                    &call_id,
+                    stored.as_ref(),
+                    index,
+                    offset,
+                    max_bytes,
+                    &store,
+                );
+                let _ = self
+                    .events_for(&session_id)
+                    .send(RuntimeEvent::ToolOutputLoaded {
+                        query_id,
+                        session_id: session_id.clone(),
+                        output,
+                    });
+                Ok(())
+            }
             ClientCommand::ListAgents {
                 session_id,
                 query_id,
