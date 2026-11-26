@@ -97,12 +97,7 @@ function gitStatus() {
 
 async function openNewSession() {
   await page.locator('#new-session').click();
-  await page.waitForFunction(
-    () => document.querySelector('.session-row[aria-selected="true"]') &&
-      document.querySelector('#conversation-status').textContent !== '连接 Runtime…',
-    null,
-    { timeout: 60000 },
-  );
+  await page.waitForTimeout(500);
   await app.evaluate(({ dialog }, folder) => {
     dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [folder] });
   }, workspace);
@@ -150,14 +145,8 @@ try {
   await page.waitForFunction(() => window.desktop && document.querySelector('#new-session'));
   await openNewSession();
   check('a real configured model is selected', await selectModel(), 'deepseek/deepseek-v4.1-flash-1017');
-  // Selecting the model on the attached workspace creates this run's session.
-  const selected = page.locator('.session-row[aria-selected="true"]');
-  await selected.waitFor({ state: 'visible', timeout: 60000 });
-  const sessionId = await selected.getAttribute('data-session-id');
   const pickerText = await page.locator('#workspace-picker').innerText().catch(() => '');
   check('the real workspace is attached to the tested session', pickerText.includes(workspace.split('/').pop()), pickerText);
-  check('a new Desktop session reaches the runtime', !!sessionId, String(sessionId));
-  evidence.session = sessionId;
 
   // ---- Running append / Enter steer -------------------------------------
   const before = await page.locator('.message.assistant .markdown').count();
@@ -185,6 +174,11 @@ try {
   const steerAnswer = await page.locator('.message.assistant .markdown').last().innerText();
   check('the real model received and answered the running append',
     /R5-BUSY-OK/.test(steerAnswer) && /R5-STEER-OK/.test(steerAnswer), steerAnswer.slice(0, 160));
+  const selected = page.locator('.session-row[aria-selected="true"]');
+  await selected.waitFor({ state: 'visible', timeout: 60000 });
+  const sessionId = await selected.getAttribute('data-session-id');
+  check('a new Desktop session reaches the runtime', !!sessionId, String(sessionId));
+  evidence.session = sessionId;
   await shot('10-steer');
 
   // ---- Goal + Plan -------------------------------------------------------
@@ -254,15 +248,20 @@ try {
     check('the real blocked session opens with its history', false, 'session row not found');
   }
 
-  // ---- Plaintext credential refusal -------------------------------------
+  // ---- A plaintext credential must be reviewed, never silently sent ------
   await selectSession(sessionId);
   const usersBefore = await page.locator('.message.user').count();
-  await page.locator('#message').fill('请使用 DEMO_API_KEY=sk-' + 'A'.repeat(40) + ' 调用服务。');
-  await page.locator('#send').click();
-  await page.waitForTimeout(800);
-  const refusal = await page.locator('#composer-error').innerText().catch(() => '');
+  const canary = 'sk-' + 'A'.repeat(40);
+  await page.locator('#message').fill(`请使用 DEMO_API_KEY=${canary} 调用服务。`);
+  await page.evaluate(() => document.querySelector('#send').click());
+  const review = page.locator('.secret-review-modal');
+  const reviewed = await review.waitFor({ state: 'visible', timeout: 30000 }).then(() => true).catch(() => false);
+  const reviewText = reviewed ? await review.innerText() : '';
+  check('a plaintext credential opens the review instead of being sent', reviewed && !reviewText.includes(canary), reviewText.slice(0, 160));
+  if (reviewed) await page.getByRole('button', { name: '返回' }).click();
+  await page.waitForTimeout(500);
   const usersAfter = await page.locator('.message.user').count();
-  check('a plaintext credential is explicitly refused, not sent', /凭据明文授权/.test(refusal) && usersAfter === usersBefore, refusal.slice(0, 160));
+  check('backing out of the review sends nothing', usersAfter === usersBefore, `${usersBefore} -> ${usersAfter}`);
   await shot('50-refusal');
 
   // ---- Resume after restart --------------------------------------------

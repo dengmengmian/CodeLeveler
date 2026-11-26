@@ -4,7 +4,8 @@
 import { _electron as electron } from '../node_modules/playwright/index.mjs';
 import { writeFile, mkdir } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { readdirSync, statSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -25,13 +26,15 @@ const check = (name, ok, detail = '') => {
 };
 
 function sessionDb(sessionId) {
-  const projects = path.join(os.homedir(), '.leveler', 'state', 'projects');
-  for (const name of readdirSync(projects)) {
-    const db = path.join(projects, name, 'sessions.db');
+  const state = path.join(os.homedir(), '.leveler', 'state');
+  const candidates = [path.join(state, 'no-workspace', 'sessions.db')];
+  const projects = path.join(state, 'projects');
+  for (const name of readdirSync(projects)) candidates.push(path.join(projects, name, 'sessions.db'));
+  for (const db of candidates) {
     try {
       if (!statSync(db).isFile()) continue;
-      const bytes = readFileSync(db);
-      if (bytes.includes(Buffer.from(sessionId))) return db;
+      const found = execFileSync('sqlite3', [db, `select count(*) from sessions where id='${sessionId}'`], { encoding: 'utf8' }).trim();
+      if (found === '1') return db;
     } catch { /* next */ }
   }
   return null;
