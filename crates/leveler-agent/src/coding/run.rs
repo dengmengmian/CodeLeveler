@@ -132,6 +132,10 @@ pub struct CodingRuntime {
     /// terminal time so a cooperative stop is recorded as `cancelled` rather
     /// than resumable `interrupted`.
     pub task_cancel: Arc<AtomicBool>,
+    /// Set while the user has asked to interrupt THIS turn. The task stays
+    /// resumable; the flag only lets the terminal distinguish a person's stop
+    /// from an unclean process exit, which both end as `interrupted`.
+    pub turn_cancel: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Copy)]
@@ -458,6 +462,10 @@ pub(crate) fn terminal_status_for(report: &TaskReport) -> (SessionStatus, AgentS
             (SessionStatus::Incomplete, AgentState::Execute)
         }
         S::Blocked => (SessionStatus::Blocked, AgentState::Execute),
+        // A report never carries a user interrupt (that path ends as
+        // `Interrupted` before the report exists); if one ever did, the work
+        // is not finished and stays resumable.
+        S::Cancelled => (SessionStatus::Interrupted, AgentState::Execute),
     }
 }
 
@@ -1862,6 +1870,16 @@ impl CodingRuntime {
         self
     }
 
+    /// Attach the explicit-turn-interruption flag this turn runs under.
+    ///
+    /// Created with the same admission slot as [`Self::task_cancel`] and set
+    /// when the user stops the running turn without ending the task. Read
+    /// once, at terminal time, so the durable terminal can say who stopped it.
+    pub fn with_turn_cancel(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.turn_cancel = flag;
+        self
+    }
+
     /// Attach the host's human approval surface for untrusted definition
     /// content. Headless runs leave it unset, which makes the safe refusal
     /// final.
@@ -2015,7 +2033,13 @@ impl CodingRuntime {
                 outcome: TaskOutcome::Interrupted,
                 reason: None,
                 failure: None,
-                stop: None,
+                // A user-requested stop keeps the terminal resumable but
+                // records who stopped it; a runtime/process interruption
+                // carries no such stop and stays an unclean interruption.
+                stop: self
+                    .turn_cancel
+                    .load(Ordering::SeqCst)
+                    .then_some(StopReason::Cancelled),
                 status: SessionStatus::Interrupted,
                 state: AgentState::Execute,
                 goal: goal_update,
@@ -2146,7 +2170,10 @@ impl CodingRuntime {
         if cancelled_at_commit && !explicit_task_cancel {
             terminal.outcome = TaskOutcome::Interrupted;
             terminal.reason = None;
-            terminal.stop = None;
+            terminal.stop = self
+                .turn_cancel
+                .load(Ordering::SeqCst)
+                .then_some(StopReason::Cancelled);
             terminal.status = SessionStatus::Interrupted;
             terminal.state = AgentState::Execute;
             terminal.warnings.clear();
@@ -5259,6 +5286,8 @@ pub(crate) fn direct_non_success_outcome(stop: crate::StopReason) -> Option<Task
         S::Yielded => Some(TaskOutcome::Yielded),
         // A stalled work window leaves its goal owed and explicitly resumable.
         S::Stalled => Some(TaskOutcome::Interrupted),
+        // A person stopped this window; the work is unfinished and resumable.
+        S::Cancelled => Some(TaskOutcome::Interrupted),
         S::Incomplete => Some(TaskOutcome::Failed),
     }
 }

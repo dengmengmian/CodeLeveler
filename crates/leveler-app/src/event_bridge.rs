@@ -357,6 +357,9 @@ pub fn turn_end_event(stop: StopReason, stop_detail: Option<String>) -> RuntimeE
         StopReason::Stalled => RuntimeEvent::TurnIncomplete {
             reason: detail.unwrap_or_else(|| "goal 未确认完成".into()),
         },
+        // A person stopped this turn. The task stays resumable, but the
+        // terminal is theirs, not an unclean exit's.
+        StopReason::Cancelled => RuntimeEvent::TurnCancelled,
     }
 }
 
@@ -2812,6 +2815,25 @@ mod bridge_tests {
                 false,
             ),
             RuntimeEvent::TurnInterrupted
+        );
+    }
+
+    #[test]
+    fn a_user_turn_cancel_stays_a_cancel_in_replay() {
+        // The turn outcome is resumable `interrupted`, but the durable stop
+        // records that a person stopped it. Replay must reach the same
+        // terminal the live client saw.
+        assert_eq!(
+            task_finished_event(
+                leveler_lifecycle::TaskOutcome::Interrupted,
+                None,
+                None,
+                Some(leveler_lifecycle::StopReason::Cancelled),
+                Vec::new(),
+                None,
+                false,
+            ),
+            RuntimeEvent::TurnCancelled
         );
     }
 

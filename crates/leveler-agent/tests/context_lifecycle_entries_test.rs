@@ -261,6 +261,7 @@ async fn harness(responses: Vec<ModelResponse>, summary: Summary) -> Harness {
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
         task_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        turn_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     Harness {
         engine,

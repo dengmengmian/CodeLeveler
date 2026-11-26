@@ -990,6 +990,8 @@ impl Application {
             steering,
             // Headless: nobody is at a keyboard to explicitly cancel a task.
             Arc::new(AtomicBool::new(false)),
+            // Headless: nobody is at a keyboard to interrupt this turn.
+            Arc::new(AtomicBool::new(false)),
             // Legacy AgentEvent observer (headless CLI renderer): adapt from
             // the canonical stream one-way.
             &mut |event| forward_engine_event(event, observer),
@@ -1021,6 +1023,9 @@ impl Application {
         steering: Option<Arc<dyn leveler_agent::SteeringSource>>,
         // Set when the user cancels the logical task rather than interrupting.
         task_cancel: Arc<AtomicBool>,
+        // Set when the user interrupts this turn only. The task stays
+        // resumable; the terminal records who stopped it.
+        turn_cancel: Arc<AtomicBool>,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<AgentOutcome, AppError> {
@@ -1034,6 +1039,7 @@ impl Application {
             sandbox,
             steering,
             task_cancel,
+            turn_cancel,
             observer,
             cancellation,
             leveler_agent::ContinuationPolicy::UntilTerminal,
@@ -1073,6 +1079,8 @@ impl Application {
             steering,
             // Eval runs never carry an interactive task cancel.
             Arc::new(AtomicBool::new(false)),
+            // Eval runs never carry an interactive turn interrupt.
+            Arc::new(AtomicBool::new(false)),
             // Legacy AgentEvent observer (eval collectors): adapt one-way.
             &mut |event| forward_engine_event(event, observer),
             cancellation,
@@ -1110,6 +1118,7 @@ impl Application {
         sandbox: bool,
         steering: Option<Arc<dyn leveler_agent::SteeringSource>>,
         task_cancel: Arc<AtomicBool>,
+        turn_cancel: Arc<AtomicBool>,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
         continuation: leveler_agent::ContinuationPolicy,
@@ -1138,7 +1147,8 @@ impl Application {
             )
             .await?
             .with_steering(steering)
-            .with_task_cancel(task_cancel);
+            .with_task_cancel(task_cancel)
+            .with_turn_cancel(turn_cancel);
         let engine = match definition_trust_authorizer {
             Some(authorizer) => engine.with_definition_trust_authorizer(authorizer),
             None => engine,
@@ -1205,6 +1215,7 @@ impl Application {
         // nor a "stop this child" can reach the running turn.
         steering: Option<Arc<dyn leveler_agent::SteeringSource>>,
         task_cancel: Arc<AtomicBool>,
+        turn_cancel: Arc<AtomicBool>,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
         definition_trust_authorizer: Option<Arc<dyn leveler_tools::DefinitionTrustAuthorizer>>,
@@ -1226,7 +1237,8 @@ impl Application {
             )
             .await?
             .with_steering(steering)
-            .with_task_cancel(task_cancel);
+            .with_task_cancel(task_cancel)
+            .with_turn_cancel(turn_cancel);
         let engine = match definition_trust_authorizer {
             Some(authorizer) => engine.with_definition_trust_authorizer(authorizer),
             None => engine,
@@ -1420,6 +1432,7 @@ impl Application {
                 approver,
                 Arc::new(AutoClarify),
                 Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
                 None,
             )
             .await?;
@@ -1457,6 +1470,7 @@ impl Application {
         clarifier: Arc<dyn Clarifier>,
         steering: Option<Arc<dyn leveler_agent::SteeringSource>>,
         task_cancel: Arc<AtomicBool>,
+        turn_cancel: Arc<AtomicBool>,
         observer: &mut (dyn FnMut(leveler_engine::EngineEvent) + Send),
         cancellation: CancellationToken,
         definition_trust_authorizer: Option<Arc<dyn leveler_tools::DefinitionTrustAuthorizer>>,
@@ -1468,6 +1482,7 @@ impl Application {
                 approver,
                 clarifier,
                 task_cancel,
+                turn_cancel,
                 definition_trust_authorizer,
             )
             .await?;
@@ -1503,6 +1518,7 @@ impl Application {
         clarifier: Arc<dyn Clarifier>,
         steering: Option<Arc<dyn leveler_agent::SteeringSource>>,
         task_cancel: Arc<AtomicBool>,
+        turn_cancel: Arc<AtomicBool>,
         recovery: Option<leveler_agent::coding::GoalRecoveryContext>,
         observer: &mut (dyn FnMut(leveler_engine::EngineEvent) + Send),
         cancellation: CancellationToken,
@@ -1515,6 +1531,7 @@ impl Application {
                 approver,
                 clarifier,
                 task_cancel,
+                turn_cancel,
                 definition_trust_authorizer,
             )
             .await?;
@@ -1539,6 +1556,7 @@ impl Application {
         approver: Arc<dyn Approver>,
         clarifier: Arc<dyn Clarifier>,
         task_cancel: Arc<AtomicBool>,
+        turn_cancel: Arc<AtomicBool>,
         definition_trust_authorizer: Option<Arc<dyn leveler_tools::DefinitionTrustAuthorizer>>,
     ) -> Result<(leveler_agent::coding::CodingRuntime, TaskSpec, ModelRef), AppError> {
         let db = self.open_database().await?;
@@ -1576,7 +1594,8 @@ impl Application {
                 Some(session_id.as_str()),
             )
             .await?
-            .with_task_cancel(task_cancel);
+            .with_task_cancel(task_cancel)
+            .with_turn_cancel(turn_cancel);
         let engine = match definition_trust_authorizer {
             Some(authorizer) => engine.with_definition_trust_authorizer(authorizer),
             None => engine,

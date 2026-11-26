@@ -102,6 +102,7 @@ fn stop_reason_wording(reason: StopReason, exhaustion: Option<&BudgetExhaustion>
         StopReason::Blocked => "it declared the task blocked",
         StopReason::Yielded => "it ended its work window with work still owed",
         StopReason::Stalled => "it went quiet without resolving the task",
+        StopReason::Cancelled => "it was cancelled",
         StopReason::Incomplete => "it stopped without finishing",
         StopReason::Completed | StopReason::Answered => "",
     }
@@ -118,6 +119,7 @@ fn child_stop(reason: StopReason) -> leveler_lifecycle::ChildStop {
         | StopReason::Stalled
         | StopReason::Incomplete
         | StopReason::Yielded => ChildStop::Incomplete,
+        StopReason::Cancelled => ChildStop::Cancelled,
     }
 }
 

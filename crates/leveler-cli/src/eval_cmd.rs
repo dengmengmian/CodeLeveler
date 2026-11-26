@@ -746,7 +746,9 @@ fn termination_from_stop_reason(reason: StopReason) -> leveler_eval::Termination
         // A headless evaluation run is one window: a yielded window did not
         // finish the task, and no continuation is evaluated here.
         StopReason::Yielded => leveler_eval::TerminationClass::Incomplete,
-        StopReason::Incomplete | StopReason::Stalled => leveler_eval::TerminationClass::Incomplete,
+        StopReason::Incomplete | StopReason::Stalled | StopReason::Cancelled => {
+            leveler_eval::TerminationClass::Incomplete
+        }
     }
 }
 

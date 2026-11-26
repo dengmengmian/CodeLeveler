@@ -203,6 +203,7 @@ async fn fixture() -> Fixture {
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
         task_cancel: Arc::new(AtomicBool::new(false)),
+        turn_cancel: Arc::new(AtomicBool::new(false)),
     };
     Fixture {
         runtime,

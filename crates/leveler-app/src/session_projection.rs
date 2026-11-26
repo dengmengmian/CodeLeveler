@@ -138,6 +138,9 @@ pub fn project_task(
                         | StopReason::TurnLimitReached
                         | StopReason::Stalled,
                     ) => UiTaskStatus::Incomplete,
+                    // A user interrupt contradicts a completed outcome. The
+                    // projection does not invent a verdict for it.
+                    Some(StopReason::Cancelled) => UiTaskStatus::Unknown,
                     // Legacy TaskFinished remains canonical terminal evidence;
                     // absent stop remains absent rather than inventing a declaration.
                     None => UiTaskStatus::Completed,
@@ -156,6 +159,7 @@ pub fn project_task(
                         StopReason::Blocked => "blocked",
                         StopReason::Yielded => "yielded",
                         StopReason::Stalled => "stalled",
+                        StopReason::Cancelled => "cancelled",
                     }
                     .into()
                 }),
