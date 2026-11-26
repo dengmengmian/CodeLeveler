@@ -671,9 +671,10 @@ async fn yielded_windows_without_work_stop_automatic_continuation() {
         leveler_agent::CollaborationMode::Goal,
     )
     .await;
-    let mut rx = client(&f).subscribe();
+    let runtime = client(&f);
+    let mut rx = runtime.subscribe();
 
-    client(&f)
+    runtime
         .send(ClientCommand::SubmitMessage {
             session_id: f.session.clone(),
             content: OBJECTIVE.to_string(),

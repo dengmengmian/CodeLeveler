@@ -81,21 +81,40 @@ fn finish_frame(reason: &str) -> String {
     .to_string()
 }
 
-fn write_config(dir: &std::path::Path, base_url: &str) {
-    let config = format!(
-        "default_model = \"mock/m\"\n\
-         [providers.mock]\n\
-         protocol = \"openai_chat\"\n\
-         base_url = \"{base_url}\"\n\
-         api_key = \"test-only\"\n\
-         [models.m]\n\
-         provider = \"mock\"\n\
-         model_id = \"mock-model\"\n\
-         context_window = 131072\n\
-         parallel_tool_calls = false\n\
-         vision = false\n"
-    );
-    std::fs::write(dir.join("config.toml"), config).unwrap();
+fn write_config(root: &std::path::Path, base_url: &str) {
+    std::fs::create_dir_all(root.join("configs/providers")).unwrap();
+    std::fs::create_dir_all(root.join("configs/models")).unwrap();
+    std::fs::write(
+        root.join("configs/providers/mock.yaml"),
+        format!("id: mock\nprotocol: openai_chat\nbase_url: {base_url}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("configs/models/m.yaml"),
+        r#"
+id: m
+provider: mock
+model_id: mock-model
+protocol: openai_chat
+capabilities:
+  streaming: true
+  tool_calling: true
+  parallel_tool_calls: false
+  structured_output: true
+  reasoning: false
+  vision: false
+limits:
+  context_window: 131072
+  reliable_context: 65536
+  max_output_tokens: 1024
+  max_tool_schema_bytes: 8192
+  max_parallel_tool_calls: 1
+compatibility:
+  synthesize_tool_call_ids: true
+  drop_unsupported_fields: true
+"#,
+    )
+    .unwrap();
 }
 
 struct Fixture {
