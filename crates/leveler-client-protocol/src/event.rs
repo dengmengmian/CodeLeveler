@@ -462,6 +462,18 @@ pub enum RuntimeEvent {
     /// only outcome a client states. `attempt` is 1-based within the logical
     /// turn's recovery budget.
     GoalRecovery { attempt: u32, max_attempts: u32 },
+    /// The runtime stopped continuing a Goal automatically because consecutive
+    /// yielded work windows executed no work at all.
+    ///
+    /// This is a policy stop, not a task outcome: the goal still owes its work,
+    /// the last window's own terminal (`turn_yielded`) is the durable record of
+    /// that window, and the user can continue the goal with a message. Clients
+    /// must not paint this as completion, failure, or budget exhaustion.
+    GoalContinuationStopped {
+        /// Consecutive windows, ending with the last one, that executed no tool
+        /// other than `update_goal`.
+        consecutive_windows_without_work: u32,
+    },
     /// Project behavior constraints loaded for this turn. Sources are
     /// workspace-relative paths; instruction contents never enter UI chrome.
     ProjectRulesLoaded { sources: Vec<String> },

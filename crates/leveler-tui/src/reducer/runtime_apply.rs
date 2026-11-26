@@ -578,6 +578,23 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             );
             state.activity_elapsed_secs = None;
         }
+        RuntimeEvent::GoalContinuationStopped {
+            consecutive_windows_without_work,
+        } => {
+            // The last window's own yielded terminal already closed that
+            // window; this event only says the runtime will not open another
+            // empty one. The goal still owes its work, so this is a warning,
+            // never a completion or a failure card.
+            state.activity = None;
+            state.activity_elapsed_secs = None;
+            let t = state.t();
+            state.notification = Some(Notification {
+                level: NotificationLevel::Warning,
+                message: t
+                    .goal_continuation_stopped
+                    .replacen("{}", &consecutive_windows_without_work.to_string(), 1),
+            });
+        }
         RuntimeEvent::ProjectRulesLoaded { sources } => {
             mark_turn_busy(state);
             state.project_rule_sources = sources;

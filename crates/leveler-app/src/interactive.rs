@@ -322,7 +322,7 @@ use crate::prompt_bridge::{
     ChannelApprover, ChannelClarifier, PendingApprovals, PendingClarifications, resolve_approval,
     resolve_clarification, supersede_pending_approvals, validate_pending_session,
 };
-use crate::session::MAX_GOAL_RECOVERY_ATTEMPTS;
+use crate::session::{MAX_GOAL_RECOVERY_ATTEMPTS, MAX_GOAL_WINDOWS_WITHOUT_WORK};
 use crate::workspace_view::{compute_diff, detect_branch_label};
 
 fn spawn_auxiliary_assist(
@@ -5381,6 +5381,12 @@ impl InProcessRuntimeClient {
                 // count is also durable, so this is a presentation-side view.
                 let mut recovery_context: Option<leveler_agent::coding::GoalRecoveryContext> = None;
                 let mut recovery_attempts: u32 = 0;
+                // Consecutive yielded windows that executed no work at all. A
+                // window that acts (any tool other than the goal-resolution
+                // declaration) proves the continuation is buying something;
+                // an empty window does not, and two in a row end the automatic
+                // loop instead of letting a model that always yields spin it.
+                let mut windows_without_work: u32 = 0;
                 loop {
                     // Each window owns its bridge: the terminal publisher is
                     // single-use. The terminal event is held in the slot so
@@ -5401,8 +5407,20 @@ impl InProcessRuntimeClient {
                             }
                         });
                     let observer_acceptance = accepted_tx.clone();
+                    // Whether THIS window executed anything that can justify
+                    // opening another one. A continuation that only declares
+                    // `update_goal(yield)` again has nothing new to carry.
+                    let mut window_executed_work = false;
                     let result = {
                         let mut observer = |event: leveler_engine::EngineEvent| {
+                            if let leveler_engine::EngineEvent::ToolCallStarted {
+                                name, agent_id, ..
+                            } = &event
+                                && agent_id.is_none()
+                                && name != leveler_agent::UPDATE_GOAL_TOOL
+                            {
+                                window_executed_work = true;
+                            }
                             steering.note_window(&event);
                             if matches!(event, leveler_engine::EngineEvent::TurnStarted { .. })
                                 && let Some(tx) = observer_acceptance
@@ -5519,6 +5537,28 @@ impl InProcessRuntimeClient {
                             // yielded. Nothing more is owed to publish: the
                             // goal keeps its resumable truth.
                             user_cancelled = true;
+                            active.finish(&admission);
+                            break;
+                        }
+                        // An automatic continuation is only worth spending
+                        // when the window it follows actually did something.
+                        // A window that executed no tool other than its own
+                        // `update_goal(yield)` declaration carries the same
+                        // objective and no new facts into the next one; enough
+                        // of those in a row is a model↔runtime loop, not work.
+                        // The last window's yielded terminal is already
+                        // published, so the person sees the truth: the window
+                        // ended, the goal still owes its work, and automatic
+                        // continuation stopped here.
+                        if window_executed_work {
+                            windows_without_work = 0;
+                        } else {
+                            windows_without_work = windows_without_work.saturating_add(1);
+                        }
+                        if windows_without_work >= MAX_GOAL_WINDOWS_WITHOUT_WORK {
+                            let _ = events.send(RuntimeEvent::GoalContinuationStopped {
+                                consecutive_windows_without_work: windows_without_work,
+                            });
                             active.finish(&admission);
                             break;
                         }

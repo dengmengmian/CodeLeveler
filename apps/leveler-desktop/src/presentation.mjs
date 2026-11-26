@@ -52,6 +52,10 @@ export function collaborationCommand(sessionId,mode){if(!sessionId||!validCollab
  *  @param {{session?:{id?:string,collaboration?:string|undefined}}|null} state
  *  @param {string} sessionId @param {string} mode */
 export function collaborationConfirmed(state,sessionId,mode){return state?.session?.id===sessionId&&(state.session.collaboration??'chat')===mode;}
+/** The runtime stopped opening empty Goal windows. This is not completion,
+ *  failure or budget exhaustion: the goal still owes its work. The count is
+ *  the runtime's own structured fact. @param {number} windows */
+export function goalContinuationStopLabel(windows){const n=Number.isFinite(windows)&&windows>0?windows:0;return `自动续跑已停止 · 连续 ${n} 个窗口没有执行工作 · 目标仍未完成，可发送消息继续`;}
 
 /** @param {{primary_workspace?:string|null}[]} tasks @param {string} [query] */
 export function recentWorkspaces(tasks,query=''){

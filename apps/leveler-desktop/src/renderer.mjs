@@ -10,6 +10,7 @@ import {
   mergeExecutionViews, collaborationLabel, validCollaboration, collaborationCommand, collaborationConfirmed,
   planActiveSteps,
 } from './presentation.mjs';
+import {goalContinuationStopLabel} from './presentation.mjs';
 import {
   projectSnapshot, applySessionMetadata, applyEvent, commandEnvelope, terminalEvents,
   approvalDecisions, clarificationAnswer, uploadDraft, applyUploadEvent, reconcileUploadReply,
@@ -255,6 +256,10 @@ let collaborationSwitch = null;
 // it. A probe that arrives too early is bounded and retried on a later tool of
 // the same turn, never on a timer.
 const goalDockProbes = new Map();
+// Session id -> the runtime's structured "automatic continuation stopped"
+// fact. Transient chrome keyed by the session it belongs to: it must survive a
+// snapshot refresh but never a new user instruction or a real terminal.
+const goalStops = new Map();
 const GOAL_DOCK_PROBE_LIMIT = 3;
 // A submit that the Runtime acknowledged but whose first status event has not
 // reached the page yet is still work that a quit would interrupt.
@@ -1736,9 +1741,23 @@ function renderComposerDocks() {
   // An owed goal is runtime state, not transcript: a paused or continued goal
   // keeps its dock even when the screen would otherwise look idle.
   const execution = current?.session?.execution_task ?? null;
-  if (!current || (isHome() && !hasPlan && !execution)) { host.hidden = true; queuedMessages = queuedMessages.filter(item => item.sessionId === current?.session.id); return; }
+  const goalStop = current ? goalStops.get(current.session.id) ?? null : null;
+  if (!current || (isHome() && !hasPlan && !execution && !goalStop)) { host.hidden = true; queuedMessages = queuedMessages.filter(item => item.sessionId === current?.session.id); return; }
   queuedMessages = queuedMessages.filter(item => item.sessionId === current.session.id);
   host.hidden = false;
+  // The runtime stopped opening empty Goal windows. This is a policy stop,
+  // not completion: the goal still owes its work, and the row stays until the
+  // person sends the next instruction (or a real terminal replaces the state).
+  if (goalStop) {
+    const dock = el('div', 'composer-dock goal-dock goal-stop-dock');
+    const head = el('div', 'composer-dock-head');
+    head.append(iconNode('alert', { size: 16 }), el('span', 'todo-title', '目标 · 自动续跑已停止'));
+    dock.append(head);
+    const row = el('div', 'composer-dock-row');
+    row.append(el('span', 'composer-dock-text', goalContinuationStopLabel(goalStop.windows)));
+    dock.append(row);
+    host.append(dock);
+  }
   if (queuedMessages.length) {
     const dock = el('div', 'composer-dock queue-dock');
     const head = el('div', 'composer-dock-head');
@@ -8998,7 +9017,9 @@ api.onEvent(frame => {
   modelRetry = event.type === 'model_retrying' ? { attempt: event.attempt ?? 0, max: event.max_attempts ?? 0 } : null;
   if (terminalEvents.has(event.type)) { pendingSubmit = false; setTimeout(flushQueuedMessage, 0); }
   if (terminalEvents.has(event.type) && current?.session?.id) goalDockProbes.delete(current.session.id);
+  if (terminalEvents.has(event.type) && current?.session?.id) goalStops.delete(current.session.id);
   if (event.type === 'user_message_added' && current?.session?.id) goalDockProbes.delete(current.session.id);
+  if (event.type === 'user_message_added' && current?.session?.id) goalStops.delete(current.session.id);
   if (event.type === 'tool_call_started' && current?.session?.id
     && (current.session.collaboration ?? 'chat') === 'goal'
     && !current.session.execution_task
@@ -9008,6 +9029,16 @@ api.onEvent(frame => {
     // most three times) instead of leaving the dock absent or polling.
     goalDockProbes.set(current.session.id, (goalDockProbes.get(current.session.id) ?? 0) + 1);
     void refreshMetadata().then(() => renderComposerDocks()).catch(() => {});
+  }
+  if (event.type === 'goal_continuation_stopped' && current?.session?.id) {
+    // The last window's yielded terminal already closed that window; the
+    // runtime only refused to open another empty one. The goal still owes
+    // work, so this is a warning — never a completion or failure receipt.
+    const windows = event.consecutive_windows_without_work ?? 0;
+    goalStops.set(current.session.id, { windows });
+    toast(goalContinuationStopLabel(windows), { tone: 'warning', holdMs: 6000 });
+    renderComposerDocks();
+    return;
   }
   if (event.type === 'turn_yielded') {
     // A goal window closed with work still owed; the runtime continues the
