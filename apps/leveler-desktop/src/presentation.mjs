@@ -536,6 +536,58 @@ export function receiptStats(terminal) {
   ].filter(Boolean);
 }
 
+/** The tool rows that belong to the newest turn.
+ *
+ * A turn starts at the newest user line in the conversation. Tool rows carry
+ * the runtime's own arrival order (`seq`); a row without one cannot be placed
+ * and is kept rather than silently dropped from the delivery view.
+ * @param {ProjectionMessage[]} messages @param {ExecutionToolRow[]} tools */
+export function latestTurnToolIds(messages, tools) {
+  let start = null;
+  for (let index = (messages?.length ?? 0) - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (messageKind(message) !== 'user') continue;
+    start = typeof message.seq === 'number' ? message.seq : index;
+    break;
+  }
+  return (tools ?? [])
+    .filter(tool => start === null || typeof tool.seq !== 'number' || tool.seq >= start)
+    .map(tool => tool.id);
+}
+
+/**
+ * The newest turn's real delivery facts, from Runtime data only:
+ * - the turn terminal (or null when it has not ended),
+ * - files a tool confirmed it changed (`applied_diff`),
+ * - commands that actually ran and their exit codes,
+ * - the requirements the Runtime itself reported as unverified.
+ *
+ * It deliberately carries no success judgement: a status label comes from the
+ * terminal, and an exit code is an exit code, not a verification verdict.
+ * @param {{messages?:ProjectionMessage[],tools?:ExecutionToolRow[],turnTerminals?:Array<{status?:string,detail?:string|null,requirements?:string[]}>}} state
+ */
+export function turnDelivery(state) {
+  const messages = state?.messages ?? [];
+  const tools = state?.tools ?? [];
+  const ids = latestTurnToolIds(messages, tools);
+  const wanted = new Set(ids);
+  const scoped = tools.filter(tool => wanted.has(tool.id));
+  const terminal = (state?.turnTerminals ?? []).at(-1) ?? null;
+  return {
+    terminal,
+    changed: confirmedChangeFiles(ids, tools),
+    confirmedToolIds: scoped.filter(tool => confirmedDiffOf(/** @type {any} */ (tool))).map(tool => tool.id),
+    commands: scoped.filter(tool => isCommandTool(tool.name)).map(tool => ({
+      id: tool.id,
+      label: toolTarget(/** @type {any} */ (tool)) || tool.name || '命令',
+      status: contractToolStatus(tool.status),
+      exit_code: Number.isInteger(tool.exit_code) ? tool.exit_code : null,
+    })),
+    requirements: Array.isArray(terminal?.requirements) ? terminal.requirements : [],
+    toolCalls: scoped.length,
+  };
+}
+
 /** @param {ExecutionToolRow[]} tools @param {string} id */
 function toolOfId(tools, id) { return tools.find(tool => tool.id === id); }
 

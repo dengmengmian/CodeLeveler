@@ -323,6 +323,11 @@ export function applyEvent(state,event) {
       endedHm:new Date().toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit',hour12:false}),
       elapsedMs:Number.isFinite(next.turnStartedAt)?Math.max(0,Date.now()-next.turnStartedAt):null,
       detail,
+      // The runtime's own list of requirements it could not verify. The
+      // delivery view shows them; a shortened title in `detail` must never be
+      // the only record of what remains unverified.
+      requirements: status==='completed_partially_unverified' && Array.isArray(event.requirements)
+        ? event.requirements.slice(0, 50) : [],
     }];
     next.turnStartedAt=null;
     // A segment the runtime never completed is INTERRUPTED: kept and folded,

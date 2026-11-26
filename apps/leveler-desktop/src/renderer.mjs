@@ -15,6 +15,7 @@ import {
   outputMayBeTruncated, canViewFullOutput, sanitizeOutputText, toolOutputUnavailableLabel,
   toolOutputReferenceLabel,
 } from './presentation.mjs';
+import {turnDelivery, receiptMarker} from './presentation.mjs';
 import {
   projectSnapshot, applySessionMetadata, applyEvent, commandEnvelope, terminalEvents,
   approvalDecisions, clarificationAnswer, uploadDraft, applyUploadEvent, reconcileUploadReply,
@@ -2964,19 +2965,88 @@ function presentedFilesCard() {
   return wrap;
 }
 
-function deliveredCard() {
-  const report = current?.session?.completion_report ?? current?.completionReport;
-  if (!report) return null;
-  const card = el('button', 'plan-card-row');
-  card.type = 'button';
-  card.dataset.key = 'delivered-card';
-  const icon = el('span', 'plan-card-icon');
-  icon.append(iconNode('archive', { size: 20 }));
-  const copy = el('span', 'plan-card-copy');
-  copy.append(el('span', 'plan-card-title', '本轮交付'), el('span', 'plan-card-desc', `${report.files_changed ?? 0} 个文件变更 · +${report.added ?? 0} −${report.removed ?? 0}`));
-  card.append(icon, copy, el('span', 'plan-card-open', '查看变更'));
-  card.addEventListener('click', () => openRightbarTab('changes'));
-  return card;
+function turnDeliveryPanel() {
+  if (!current) return null;
+  const delivery = turnDelivery(current);
+  const report = current?.session?.completion_report ?? current?.completionReport ?? null;
+  if (!delivery.terminal && !delivery.changed.length && !delivery.commands.length && !report) return null;
+  const panel = el('div', 'turn-delivery');
+  const head = el('div', 'turn-delivery-head');
+  head.append(el('span', 'turn-delivery-title', '本轮执行'));
+  if (delivery.terminal) {
+    const marker = receiptMarker(delivery.terminal.status);
+    const badge = el('span', 'turn-delivery-status');
+    badge.dataset.tone = marker.tone;
+    badge.textContent = `${marker.glyph} ${marker.label}`;
+    head.append(badge);
+  } else {
+    head.append(el('span', 'turn-delivery-status', '尚未结束'));
+  }
+  panel.append(head);
+  if (delivery.terminal?.detail) panel.append(el('div', 'turn-delivery-detail', delivery.terminal.detail));
+  if (delivery.requirements.length) {
+    const section = el('div', 'turn-delivery-section');
+    section.append(el('div', 'turn-delivery-label', 'Runtime 报告未验证的要求'));
+    const list = el('ul', 'turn-delivery-list');
+    for (const item of delivery.requirements.slice(0, 8)) list.append(el('li', undefined, String(item)));
+    section.append(list);
+    panel.append(section);
+  }
+  if (delivery.changed.length) {
+    const section = el('div', 'turn-delivery-section');
+    section.append(el('div', 'turn-delivery-label', `本轮确认修改 ${delivery.changed.length} 个文件`));
+    for (const file of delivery.changed.slice(0, 8)) {
+      const row = el('button', 'turn-delivery-file');
+      row.type = 'button';
+      row.append(
+        el('span', 'turn-delivery-path', file.path),
+        el('span', 'tool-diffstat add', `+${file.added}`),
+        el('span', 'tool-diffstat del', `−${file.removed}`),
+      );
+      row.addEventListener('click', () => {
+        // Select the file in the confirmed-changes view when the workspace
+        // diff no longer has it (the turn's applied_diff is the evidence), or
+        // in the live workspace diff when that same path is still there.
+        const live = (current?.diff?.files ?? []).some(item => item.path === file.path);
+        const changes = openRightbarTab('changes', live ? {} : { source: 'confirmed', toolIds: delivery.confirmedToolIds, title: '本次修改' });
+        if (!changes) return;
+        changes.selected = file.path;
+        persistRightbar();
+        renderRightbar();
+      });
+      section.append(row);
+    }
+    section.append(el('div', 'turn-delivery-note', '来自工具确认的 applied_diff，是修改发生时的证据。'));
+    panel.append(section);
+  }
+  if (delivery.commands.length) {
+    const section = el('div', 'turn-delivery-section');
+    section.append(el('div', 'turn-delivery-label', `本轮命令 ${delivery.commands.length} 条`));
+    for (const command of delivery.commands.slice(0, 10)) {
+      const row = el('button', 'turn-delivery-command');
+      row.type = 'button';
+      row.title = '查看这次调用记录的完整结果';
+      row.addEventListener('click', () => {
+        const tool = current?.tools.find(item => item.id === command.id);
+        if (tool) openToolOutput(tool);
+      });
+      const exit = command.exit_code !== null ? `退出码 ${command.exit_code}`
+        : command.status === 'running' ? '执行中'
+          : command.status === 'cancelled' ? '已停止'
+            : command.status === 'unknown' ? '结果未知' : '';
+      row.append(el('span', 'turn-delivery-cmd', command.label), el('span', 'turn-delivery-exit', exit));
+      section.append(row);
+    }
+    section.append(el('div', 'turn-delivery-note', '退出码来自真实执行；单条命令通过不代表项目验收通过。'));
+    panel.append(section);
+  }
+  if (report) {
+    // A legacy SessionCompleted report, when some runtime did produce one.
+    // The live delivery facts above are the authority; this line never poses
+    // as a second, conflicting verdict.
+    panel.append(el('div', 'turn-delivery-note', `Runtime 完成报告（旧版事件）：${report.files_changed ?? 0} 个文件变更 · +${report.added ?? 0} −${report.removed ?? 0}`));
+  }
+  return panel;
 }
 
 function renderConversation() {
@@ -3064,7 +3134,6 @@ function renderConversation() {
   if (!running && runClockTimer) { clearInterval(runClockTimer); runClockTimer = null; runStartedAt = null; }
   for (const shell of current.session.user_shells ?? []) nodes.push(userShellNode(shell));
   const plan = planCard(); if (plan) nodes.push(plan);
-  const delivered = deliveredCard(); if (delivered) nodes.push(delivered);
   const presented = presentedFilesCard(); if (presented) nodes.push(presented);
   // The live analysis is the turn's latest activity: it sits above the running
   // line, never above the answer it belongs to.
@@ -6194,21 +6263,8 @@ function changesView(tab) {
   if (!confirmed && hasWorkspace() && !current.diff && !current.diffError && current.diffQuery?.status !== 'pending') setTimeout(requestDiff, 0);
   const view = el('div');
   view.style.display = 'flex'; view.style.flexDirection = 'column'; view.style.flex = '1'; view.style.minHeight = '0';
-  const report = current?.session?.completion_report ?? current?.completionReport;
-  if (report) {
-    const delivery = el('div', 'review-delivery');
-    const summary = el('div', 'deliverable-summary-card');
-    const icon = el('span', 'delivered-icon');
-    icon.append(iconNode('archive', { size: 20 }));
-    const copy = el('span', 'delivered-copy');
-    copy.append(
-      el('span', 'delivered-name', '本轮交付'),
-      el('span', 'delivered-meta', `${report.files_changed ?? 0} 个文件变更 · +${report.added ?? 0} −${report.removed ?? 0}`),
-    );
-    summary.append(icon, copy);
-    delivery.append(summary, el('div', 'deliverable-note', '交付统计来自 Runtime 的完成报告；下方是当前工作区的 Git 变更。'));
-    view.append(delivery);
-  }
+  const deliveryPanel = turnDeliveryPanel();
+  if (deliveryPanel) view.append(deliveryPanel);
   const files = confirmed ? confirmedChangeFiles(tab.toolIds ?? [], current?.tools ?? []) : current?.diff?.files ?? [];
   if (!tab.selected || !files.some(file => file.path === tab.selected)) tab.selected = files[0]?.path ?? null;
   const selected = files.find(file => file.path === tab.selected);
@@ -9203,6 +9259,7 @@ api.onEvent(frame => {
     current = retainInterruptedThoughts(mergeRestoredConversation(replayed, current), current);
     current.plan = replayed.plan ?? current.plan;
     renderConversation();
+    if (rightbarOpen) renderRightbar();
     if (activeView === 'trajectory') renderTrajectory();
     return;
   }
@@ -9359,6 +9416,7 @@ api.onEvent(frame => {
   if (['approval_requested', 'approval_resolved', 'clarification_requested', 'clarification_resolved', 'definition_trust_requested', 'definition_trust_resolved'].includes(event.type)) renderInteractions();
   if ($('settings-dialog').open && settingsSection === 'presets') renderSettings();
   if (terminalEvents.has(event.type)) action(async () => { await refreshSnapshot(); await loadHistory(); await refreshTasks(); });
+  if (terminalEvents.has(event.type) && rightbarOpen) renderRightbar();
   if (event.type === 'turn_failed') showError(event.failure?.message || event.error || 'Runtime 执行失败');
 });
 
