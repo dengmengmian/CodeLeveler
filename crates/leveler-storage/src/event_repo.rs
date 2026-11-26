@@ -1132,4 +1132,40 @@ mod tests {
         assert!(!record.payload.contains("event-secret-value"), "{record:?}");
         assert!(record.payload.contains("[REDACTED]"), "{record:?}");
     }
+
+    /// Tool arguments are stored as a JSON-encoded string. The script's line
+    /// breaks therefore arrive as the two bytes `\n`; the redaction pass must
+    /// still see the key at the logical line start.
+    #[tokio::test]
+    async fn append_redacts_a_secret_after_a_json_escaped_newline() {
+        let (db, session) = db_with_session().await;
+        let canary = "canary-7f3a9c2e5b8d4f6a1c0e8b7d";
+        let arguments = serde_json::json!({
+            "cmd": format!("cat > run.py <<'PY'\nTOKEN='{canary}'\nPY")
+        })
+        .to_string();
+        let payload = serde_json::json!({
+            "payload": {
+                "arguments": arguments,
+                "call_id": "call-canary",
+                "name": "shell_command"
+            },
+            "type": "tool_call_started"
+        })
+        .to_string();
+        let record = EventRepository::new(&db)
+            .append(
+                &session,
+                None,
+                "tool_call_started",
+                &payload,
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        assert!(!record.payload.contains(canary), "{record:?}");
+        assert!(record.payload.contains("[REDACTED]"), "{record:?}");
+        let value: serde_json::Value = serde_json::from_str(&record.payload).unwrap();
+        assert!(value["payload"]["arguments"].is_string());
+    }
 }

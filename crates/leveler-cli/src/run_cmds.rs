@@ -63,6 +63,7 @@ pub(crate) async fn cmd_run(
         .map_err(anyhow::Error::msg)?;
     let mut app = Application::assemble(layout)?
         .with_collaboration(collaboration)
+        .with_plaintext_seed_ack(allow_plaintext_secrets)
         .with_model_step_ceiling(max_model_steps);
     let execution = CollaborationExecution::of(collaboration);
     if let Some(overrides) = eval_env_overrides()? {
@@ -173,6 +174,7 @@ pub(crate) async fn cmd_run_parallel(
     // resolved collaboration for both the parent session and every child.
     let app = Application::assemble(layout)?
         .with_collaboration(collaboration)
+        .with_plaintext_seed_ack(allow_plaintext_secrets)
         .with_model_step_ceiling(max_model_steps);
     let model_ref = resolve_model(&app, model)?;
     let execution_mode = resolve_mode(mode, project_default_mode(&app.layout));
@@ -1899,6 +1901,15 @@ pub(crate) async fn cmd_run_resume(
     allow_plaintext_secrets: bool,
 ) -> anyhow::Result<std::process::ExitCode> {
     if let Some(instruction) = &instruction {
+        // A resume instruction is appended to an existing transcript and has
+        // no per-command plaintext permit channel. Refuse instead of silently
+        // downgrading an explicit `--allow-plaintext-secrets` to `[REDACTED]`.
+        if allow_plaintext_secrets && !leveler_core::detect_secrets(instruction).is_empty() {
+            anyhow::bail!(
+                "恢复指令不支持明文凭据；请使用 TUI 的安全接管或 /secret，\
+                 或在新的 `leveler run --allow-plaintext-secrets` 任务中提供"
+            );
+        }
         leveler_app::secret_input::admit_uninteractive_input(instruction, allow_plaintext_secrets)
             .map_err(anyhow::Error::msg)?;
     }

@@ -631,31 +631,39 @@ pub async fn run(
     // Persist (or clear) the composer draft for next launch (spec §24).
     if let Some(path) = state.draft_path() {
         let draft = state.composer.canonical_text();
-        // A draft the detector calls a high-confidence credential is not
+        // A draft the detector calls a high-confidence credential, or that
+        // contains a value already registered for this session, is not
         // persisted. Losing an unsubmitted draft is recoverable; writing a
         // plaintext credential to `~/.leveler` is not.
         let unsafe_draft = leveler_core::detect_secrets(&draft)
             .iter()
-            .any(|finding| finding.level == leveler_core::SecretLevel::HighConfidence);
+            .any(|finding| finding.level == leveler_core::SecretLevel::HighConfidence)
+            || leveler_core::scrub_registered_secrets(state.session_id.as_str(), &draft) != draft;
         if draft.trim().is_empty() || unsafe_draft {
             let _ = std::fs::remove_file(path);
         } else if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
-            let _ = std::fs::write(path, draft);
+            write_private_state_file(path, &draft);
         }
     }
     // Persist the input history (last HISTORY_CAP entries) for ↑ recall. The
-    // same rule applies: a high-confidence value is masked, so recall cannot
-    // replay a credential from disk.
+    // same rule applies: a high-confidence value is masked and a registered
+    // session secret is scrubbed, so recall cannot replay a credential from
+    // disk.
     if let Some(path) = state.history_path() {
         let history = state.composer.history();
         let tail: Vec<String> = history[history.len().saturating_sub(HISTORY_CAP)..]
             .iter()
-            .map(|entry| mask_high_confidence(entry))
+            .map(|entry| {
+                let masked = mask_high_confidence(entry);
+                leveler_core::scrub_registered_secrets(state.session_id.as_str(), &masked)
+            })
             .collect();
-        if let (Ok(json), Some(parent)) = (serde_json::to_string(&tail), path.parent()) {
-            let _ = std::fs::create_dir_all(parent);
-            let _ = std::fs::write(path, json);
+        if let Ok(json) = serde_json::to_string(&tail) {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            write_private_state_file(path, &json);
         }
     }
 
@@ -1784,6 +1792,15 @@ fn spawn_termination_forwarder(tx: mpsc::UnboundedSender<()>) {
     let _ = tx;
 }
 
+/// Write a state file and make it owner-only. The draft and history can carry
+/// restored user text; they must not be readable by another local account.
+/// Windows inherits the user-profile ACL, so the Unix mode is a no-op there.
+fn write_private_state_file(path: &std::path::Path, contents: &str) {
+    if std::fs::write(path, contents).is_ok() {
+        let _ = leveler_core::private_fs::restrict_file(path);
+    }
+}
+
 /// Replace every high-confidence value in a history entry with its mask. The
 /// entry stays recognizable without becoming a credential store.
 fn mask_high_confidence(text: &str) -> String {
@@ -2591,7 +2608,7 @@ mod tests {
 
 #[cfg(test)]
 mod secret_persistence_tests {
-    use super::mask_high_confidence;
+    use super::{mask_high_confidence, write_private_state_file};
 
     #[test]
     fn history_entries_never_persist_a_high_confidence_value() {
@@ -2603,5 +2620,31 @@ mod secret_persistence_tests {
         // Ordinary text is byte-identical.
         let ordinary = "let password = config.password;";
         assert_eq!(mask_high_confidence(ordinary), ordinary);
+    }
+
+    #[test]
+    fn a_bare_key_handoff_is_masked() {
+        let raw = "然后这是key:mgzk1gr8k7bfm6z6t8ft6tdxd8ydmm5t 要用search api 再测试一次";
+        let masked = mask_high_confidence(raw);
+        assert!(
+            !masked.contains("mgzk1gr8k7bfm6z6t8ft6tdxd8ydmm5t"),
+            "{masked}"
+        );
+        assert!(masked.contains("key:"), "{masked}");
+        assert!(masked.contains("••••"), "{masked}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_files_are_written_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("input_history.json");
+        write_private_state_file(&path, "[]");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }

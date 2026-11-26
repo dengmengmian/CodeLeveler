@@ -32,6 +32,7 @@ mod mcp_service;
 pub mod memory;
 pub mod observability;
 mod parallel;
+mod plaintext_disclosure;
 mod prompt_assist;
 mod prompt_bridge;
 mod review_live;
@@ -934,6 +935,12 @@ pub struct Application {
     execution_overrides: Option<leveler_agent::coding::ExecutionOverrides>,
     /// Collaboration mode (chat / plan / goal).
     collaboration: CollaborationMode,
+    /// True only for a headless invocation that passed
+    /// `--allow-plaintext-secrets`. The one headless turn then installs a
+    /// one-shot steering source carrying the task text as the person's
+    /// explicit per-command plaintext decision. Never persisted and never
+    /// reused for another command.
+    plaintext_seed_ack: bool,
     /// Model-step safety ceiling for this application's top-level runs, from
     /// the CLI's `--max-model-steps` (alias `--max-rounds`). `None` pins no
     /// ceiling; the CLI resolves "flag absent" to
@@ -1023,6 +1030,10 @@ pub struct Application {
     /// command admission path and every tool context of this runtime, so one
     /// authority answers "is this reference usable in this session".
     secret_vault: std::sync::Arc<leveler_execution::secret_vault::SecretVault>,
+    /// Per-input explicit plaintext decisions. Memory-only and bounded; a
+    /// permit widens exactly one input's model projection and never becomes a
+    /// session-wide switch. Durable stores still receive the redacted text.
+    plaintext_disclosures: std::sync::Arc<plaintext_disclosure::PlaintextDisclosures>,
     /// A startup fact this process learned while resolving the default model and
     /// that the next created session's client must be told: today, the persisted
     /// default was not resolvable here and a configured model was used instead.
@@ -1370,6 +1381,7 @@ impl Application {
             // that resolved an explicit axis (`--collaboration`, the transport
             // request) override it via `with_collaboration` or the create path.
             collaboration: CollaborationMode::default(),
+            plaintext_seed_ack: false,
             model_step_ceiling: None,
             environment,
             background_tasks,
@@ -1383,6 +1395,9 @@ impl Application {
             review_live: Default::default(),
             memory,
             secret_vault: std::sync::Arc::new(leveler_execution::secret_vault::SecretVault::new()),
+            plaintext_disclosures: std::sync::Arc::new(
+                plaintext_disclosure::PlaintextDisclosures::new(),
+            ),
             default_model_notice: std::sync::Mutex::new(None),
             permission_profiles: std::sync::Mutex::new(std::collections::HashMap::new()),
             definition_trust_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1393,6 +1408,13 @@ impl Application {
     /// The runtime's credential custody.
     pub fn secret_vault(&self) -> &std::sync::Arc<leveler_execution::secret_vault::SecretVault> {
         &self.secret_vault
+    }
+
+    /// Per-input plaintext decisions recorded by the admission path.
+    pub(crate) fn plaintext_disclosures(
+        &self,
+    ) -> &std::sync::Arc<plaintext_disclosure::PlaintextDisclosures> {
+        &self.plaintext_disclosures
     }
 
     /// The configuration generation in force right now.
@@ -1553,6 +1575,14 @@ impl Application {
     /// Set collaboration mode for subsequent session creates.
     pub fn with_collaboration(mut self, mode: CollaborationMode) -> Self {
         self.collaboration = mode;
+        self
+    }
+
+    /// The headless CLI's explicit `--allow-plaintext-secrets` choice. It
+    /// applies to exactly this process's one task text; the durable stores
+    /// still receive the sanitized projection.
+    pub fn with_plaintext_seed_ack(mut self, ack: bool) -> Self {
+        self.plaintext_seed_ack = ack;
         self
     }
 

@@ -69,12 +69,73 @@ pub struct RawTranscript {
     offset: u64,
 }
 
+/// Project persisted history before it becomes model context.
+///
+/// Rows written before the credential boundary were stored as typed; this
+/// read boundary keeps an older session from re-sending such a value to a
+/// provider when it is resumed or continued by a newer build. Values found
+/// are registered for the session, so later writes and paraphrases are
+/// scrubbed too. Current rows are already redacted; the pass is a no-op for
+/// them.
+fn project_persisted_history(
+    session_id: &SessionId,
+    mut messages: Vec<leveler_model::Message>,
+) -> Vec<leveler_model::Message> {
+    use leveler_model::ContentPart;
+    let session = session_id.as_str();
+    for message in &mut messages {
+        let mut projected = Vec::with_capacity(message.content.len());
+        for mut part in message.content.drain(..) {
+            match &mut part {
+                ContentPart::Text { text } | ContentPart::Reasoning { text } => {
+                    let (clean, found) = leveler_core::sanitize_model_visible(text);
+                    if !found.is_empty() {
+                        leveler_core::register_session_secrets(session, &found);
+                    }
+                    *text = leveler_core::scrub_registered_secrets(session, &clean);
+                }
+                ContentPart::ToolResult { result } => {
+                    let (clean, found) = leveler_core::sanitize_model_visible(&result.content);
+                    if !found.is_empty() {
+                        leveler_core::register_session_secrets(session, &found);
+                    }
+                    result.content = leveler_core::scrub_registered_secrets(session, &clean);
+                }
+                ContentPart::ToolCall { call } => {
+                    if let Ok(encoded) = serde_json::to_string(&call.arguments)
+                        && let Ok(clean) =
+                            leveler_core::redact_secrets_json_for_session(&encoded, Some(session))
+                        && let Ok(decoded) = serde_json::from_str(&clean)
+                    {
+                        call.arguments = decoded;
+                    }
+                }
+                ContentPart::SignedReasoning { text, .. } => {
+                    // A provider-authenticated thought cannot be rewritten
+                    // without invalidating its signature. If an old row carries
+                    // a credential shape, drop the part rather than replay it.
+                    let (_, found) = leveler_core::sanitize_model_visible(text);
+                    if !found.is_empty() {
+                        leveler_core::register_session_secrets(session, &found);
+                        continue;
+                    }
+                }
+                // Images and opaque redacted reasoning carry no text channel
+                // this boundary can project.
+                _ => {}
+            }
+            projected.push(part);
+        }
+        message.content = projected;
+    }
+    messages
+}
+
 impl RawTranscript {
     /// The ordinal `messages[0]` sits at.
     pub fn offset(&self) -> u64 {
         self.offset
     }
-
     /// Total transcript length in ordinals, including rows not loaded.
     pub fn stored_len(&self) -> u64 {
         self.offset + self.messages.len() as u64
@@ -117,7 +178,7 @@ impl RawTranscript {
             .collect::<Result<Vec<leveler_model::Message>, _>>()
             .map_err(|error| EngineError::Corrupt(format!("unreplayable {what}: {error}")))?;
         Ok(Self {
-            messages,
+            messages: project_persisted_history(session_id, messages),
             offset: 0,
         })
     }
@@ -134,7 +195,7 @@ impl RawTranscript {
             .filter_map(|p| serde_json::from_str(p).ok())
             .collect();
         Ok(Self {
-            messages,
+            messages: project_persisted_history(session_id, messages),
             offset: 0,
         })
     }
@@ -189,7 +250,10 @@ impl RawTranscript {
                 .filter_map(|p| serde_json::from_str(p).ok())
                 .collect(),
         };
-        Ok(Self { messages, offset })
+        Ok(Self {
+            messages: project_persisted_history(session_id, messages),
+            offset,
+        })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -962,5 +1026,54 @@ mod fold_semantics_tests {
                 message.text_content()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod history_projection_tests {
+    use super::project_persisted_history;
+    use leveler_model::{ContentPart, Message, Role};
+
+    /// A row persisted by a build that predates the credential boundary is
+    /// projected when a newer build reads it. This is the resume/continue
+    /// path for an older session, not a rewrite of the stored row.
+    #[test]
+    fn a_persisted_legacy_row_is_projected_on_read() {
+        let session = leveler_core::SessionId::new("legacy-history-projection");
+        leveler_core::clear_session_secrets(session.as_str());
+        let canary = "mgzk1gr8k7bfm6z6t8ft6tdxd8ydmm5t";
+        let messages = vec![
+            Message::from_parts(
+                Role::User,
+                vec![ContentPart::Text {
+                    text: format!("key:{canary}"),
+                }],
+                None,
+            ),
+            Message::from_parts(
+                Role::Tool,
+                vec![ContentPart::ToolResult {
+                    result: leveler_model::ToolResultContent {
+                        call_id: leveler_core::ToolCallId::new("call-legacy"),
+                        content: format!("TOKEN={canary}"),
+                        is_error: false,
+                    },
+                }],
+                None,
+            ),
+        ];
+        let projected = project_persisted_history(&session, messages);
+        let text = format!("{projected:?}");
+        assert!(!text.contains(canary), "{text}");
+        assert!(text.contains("[REDACTED]"), "{text}");
+        // The value is now registered, so a later paraphrase is caught too.
+        assert_ne!(
+            leveler_core::scrub_registered_secrets(
+                session.as_str(),
+                &format!("the token was {canary}")
+            ),
+            format!("the token was {canary}")
+        );
+        leveler_core::clear_session_secrets(session.as_str());
     }
 }

@@ -321,6 +321,89 @@ async fn a_steer_during_the_last_answer_is_consumed_in_the_original_turn() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_steer_with_a_registered_secret_is_delivered_redacted() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let harness = harness(vec![
+        MockResponse::GatedSse {
+            first: "data: {\"choices\":[{\"delta\":{\"content\":\"initial answer\"}}]}\n\n".into(),
+            tail: "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+                .into(),
+            release: release.clone(),
+        },
+        text("revised answer"),
+    ])
+    .await;
+    let mut events = harness.client.subscribe();
+    harness
+        .client
+        .send(ClientCommand::SubmitMessage {
+            session_id: harness.session.clone(),
+            content: "ordinary question".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !matches!(
+            events.recv().await.unwrap(),
+            RuntimeEvent::AssistantTextDelta { .. }
+        ) {}
+    })
+    .await
+    .expect("the final answer started streaming");
+
+    let canary = "canary-7f3a9c2e5b8d4f6a1c0e8b7d";
+    leveler_core::register_session_secrets(
+        harness.session.as_str(),
+        &[leveler_core::DetectedSecret {
+            value: canary.to_string(),
+            key: "token".to_string(),
+        }],
+    );
+    let id = MessageId::new("steer-with-registered-secret");
+    harness
+        .client
+        .send(ClientCommand::SteerCurrentTurn {
+            session_id: harness.session.clone(),
+            content: format!("请继续，并使用 {canary}"),
+            message_id: Some(id.clone()),
+        })
+        .await
+        .unwrap();
+    release.notify_one();
+    settle_event(&mut events, &id, UiInputState::Delivered).await;
+    wait_for_terminal(&mut events).await;
+
+    let requests = harness._server.request_bodies().await;
+    assert!(
+        requests.iter().all(|body| !body.contains(canary)),
+        "a registered secret must not reach the provider: {requests:#?}"
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|body| body.contains("[REDACTED]") || body.contains("请继续")),
+        "the steer itself must reach the provider: {requests:#?}"
+    );
+    let db = harness.app.open_database().await.unwrap();
+    let input = leveler_storage::SessionInputRepository::new(&db)
+        .load(&harness.session, id.as_str())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(input.state, leveler_storage::SessionInputState::Consumed);
+    let messages = leveler_storage::MessageRepository::new(&db)
+        .load(&harness.session)
+        .await
+        .unwrap();
+    assert!(
+        messages.iter().all(|payload| !payload.contains(canary)),
+        "the transcript must not persist the secret: {messages:#?}"
+    );
+    leveler_core::clear_session_secrets(harness.session.as_str());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_new_turn_does_not_consume_a_steer_bound_to_another_turn() {
     let harness = harness(vec![text("first answer"), text("second answer")]).await;
     let mut events = harness.client.subscribe();

@@ -604,6 +604,11 @@ async fn run_capture_worker(
             extract_range(runtime, config, db, session_id, model, &lease.job, &cancel).await;
         match outcome {
             Ok(outcome) => {
+                // The extraction model reads the persisted transcript, which
+                // is already redacted. This second pass keeps a model-authored
+                // paraphrase of a registered value (or a value it read from a
+                // historical row) out of the long-lived observation store.
+                let outcome = sanitize_capture_outcome(session_id.as_str(), outcome);
                 let is_observations = matches!(outcome, CaptureOutcomeDraft::Observations(_));
                 let observations = match &outcome {
                     CaptureOutcomeDraft::Observations(values) => values.len(),
@@ -931,9 +936,78 @@ async fn release_cancelled(store: &CaptureStore, lease: &leveler_memory::Capture
     }
 }
 
+/// Project a model-authored observation through the session's secret
+/// boundary before it becomes a long-lived memory file. The persisted
+/// transcript is already redacted; this covers paraphrases the extractor
+/// produced from an older/historical row or from a value it learned in the
+/// same window.
+fn sanitize_capture_outcome(session: &str, outcome: CaptureOutcomeDraft) -> CaptureOutcomeDraft {
+    fn project(session: &str, text: &str) -> String {
+        let (text, found) = leveler_core::sanitize_model_visible(text);
+        if !found.is_empty() {
+            leveler_core::register_session_secrets(session, &found);
+        }
+        leveler_core::scrub_registered_secrets(session, &text)
+    }
+    match outcome {
+        CaptureOutcomeDraft::Observations(observations) => CaptureOutcomeDraft::Observations(
+            observations
+                .into_iter()
+                .map(|mut observation| {
+                    observation.statement = project(session, &observation.statement);
+                    observation.topic_hint = observation
+                        .topic_hint
+                        .as_deref()
+                        .map(|value| project(session, value));
+                    observation.body = observation
+                        .body
+                        .as_deref()
+                        .map(|value| project(session, value));
+                    observation.keywords = observation
+                        .keywords
+                        .iter()
+                        .map(|value| project(session, value))
+                        .collect();
+                    observation.aliases = observation
+                        .aliases
+                        .iter()
+                        .map(|value| project(session, value))
+                        .collect();
+                    observation
+                })
+                .collect(),
+        ),
+        CaptureOutcomeDraft::Noop => CaptureOutcomeDraft::Noop,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::turn_finished_during_process;
+    use super::{sanitize_capture_outcome, turn_finished_during_process};
+    use leveler_memory::{CaptureOutcomeDraft, ObservationDraft, ObservationType};
+
+    #[test]
+    fn capture_outcomes_do_not_persist_a_bare_key_handoff() {
+        let session = "capture-secret-session";
+        let canary = "mgzk1gr8k7bfm6z6t8ft6tdxd8ydmm5t";
+        leveler_core::clear_session_secrets(session);
+        let outcome = CaptureOutcomeDraft::Observations(vec![ObservationDraft {
+            observation_type: ObservationType::User,
+            topic_hint: Some(format!("key:{canary}")),
+            statement: format!("用户给了 key:{canary}"),
+            keywords: vec![format!("key:{canary}")],
+            aliases: Vec::new(),
+            extraction_model: "test-model".into(),
+            prompt_version: "v1".into(),
+            created_at: 0,
+            body: Some(format!("key:{canary}")),
+        }]);
+        let projected = sanitize_capture_outcome(session, outcome);
+        let text = format!("{projected:?}");
+        assert!(!text.contains(canary), "{text}");
+        assert!(text.contains("[REDACTED]"), "{text}");
+        leveler_core::clear_session_secrets(session);
+    }
 
     fn at(rfc3339: &str) -> leveler_core::Timestamp {
         chrono::DateTime::parse_from_rfc3339(rfc3339)

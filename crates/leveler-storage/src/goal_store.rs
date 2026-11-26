@@ -352,8 +352,16 @@ impl GoalStore for Database {
             )))
         })?;
         let id = GoalId::new(leveler_core::new_uuid_string());
+        let session = token.task_id.as_str();
+        let (objective, found) = leveler_core::sanitize_model_visible(objective);
+        if !found.is_empty() {
+            leveler_core::register_session_secrets(session, &found);
+        }
         let acceptance = serde_json::to_string(acceptance)
             .map_err(|e| StorageError::InvalidData(format!("unencodable acceptance: {e}")))?;
+        let acceptance =
+            crate::redact_json_payload_for_session("goal acceptance", &acceptance, Some(session))
+                .map_err(OwnershipError::Storage)?;
         let mut tx = self
             .pool()
             .begin_with("BEGIN IMMEDIATE")
@@ -369,7 +377,7 @@ impl GoalStore for Database {
         .bind(token.task_id.as_str())
         .bind(token.runtime_id.as_str())
         .bind(token.owner_epoch.get() as i64)
-        .bind(objective)
+        .bind(&objective)
         .bind(GoalState::Running.as_str())
         .bind(now.to_rfc3339())
         .bind(acceptance)
@@ -381,8 +389,16 @@ impl GoalStore for Database {
             return Err(crate::ownership_store::sqlite_stale_error(self, token).await);
         }
         for (offset, event) in initial.events.iter().enumerate() {
-            insert_requirement_event(&mut tx, id.as_str(), offset as i64 + 1, "", event, now)
-                .await?;
+            insert_requirement_event(
+                &mut tx,
+                id.as_str(),
+                offset as i64 + 1,
+                "",
+                session,
+                event,
+                now,
+            )
+            .await?;
         }
         tx.commit().await.map_err(StorageError::from)?;
         Ok(id)
@@ -751,8 +767,16 @@ impl GoalStore for Database {
         let mut seq = records.last().map(|record| record.seq).unwrap_or(0) as i64;
         for event in &projection.events {
             seq += 1;
-            insert_requirement_event(&mut tx, goal_id.as_str(), seq, turn_id.as_str(), event, now)
-                .await?;
+            insert_requirement_event(
+                &mut tx,
+                goal_id.as_str(),
+                seq,
+                turn_id.as_str(),
+                token.task_id.as_str(),
+                event,
+                now,
+            )
+            .await?;
         }
         tx.commit().await.map_err(StorageError::from)?;
         Ok(projection)
@@ -927,6 +951,7 @@ async fn insert_requirement_event(
     goal_id: &str,
     seq: i64,
     turn_id: &str,
+    session: &str,
     event: &AppliedRequirementEvent,
     now: Timestamp,
 ) -> Result<(), StorageError> {
@@ -938,6 +963,18 @@ async fn insert_requirement_event(
         .map_err(|error| {
             StorageError::InvalidData(format!("invalid verification for goal {goal_id}: {error}"))
         })?;
+    let verification = verification
+        .as_deref()
+        .map(|payload| {
+            crate::redact_json_payload_for_session("goal verification", payload, Some(session))
+        })
+        .transpose()?;
+    let text = sanitize_goal_field(event.text.as_deref(), session)?;
+    let target = sanitize_goal_field(event.target.as_deref(), session)?;
+    let source_quote =
+        sanitize_goal_field(Some(event.source_quote.as_str()), session)?.unwrap_or_default();
+    let check = sanitize_goal_field(event.check.as_deref(), session)?;
+    let reason = sanitize_goal_field(event.reason.as_deref(), session)?;
     sqlx::query(
         "INSERT INTO goal_requirement_events \
          (goal_id, seq, turn_id, operation, requirement_id, supersedes, kind, text, target, \
@@ -951,17 +988,31 @@ async fn insert_requirement_event(
     .bind(&event.requirement_id)
     .bind(event.supersedes.as_deref())
     .bind(event.kind.map(|kind| kind.as_str()))
-    .bind(event.text.as_deref())
-    .bind(event.target.as_deref())
-    .bind(&event.source_quote)
-    .bind(event.check.as_deref())
+    .bind(text.as_deref())
+    .bind(target.as_deref())
+    .bind(&source_quote)
+    .bind(check.as_deref())
     .bind(verification.as_deref())
-    .bind(event.reason.as_deref())
+    .bind(reason.as_deref())
     .bind(now.to_rfc3339())
     .execute(&mut **tx)
     .await
     .map_err(StorageError::from)?;
     Ok(())
+}
+
+/// Goal text is user-authored and can carry the same credential shapes as the
+/// transcript. Redact at the storage boundary and remember the value so later
+/// goal, checkpoint and transcript writes use the same projection.
+fn sanitize_goal_field(value: Option<&str>, session: &str) -> Result<Option<String>, StorageError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let (text, found) = leveler_core::sanitize_model_visible(value);
+    if !found.is_empty() {
+        leveler_core::register_session_secrets(session, &found);
+    }
+    Ok(Some(text))
 }
 
 async fn requirement_rows(
@@ -2055,6 +2106,52 @@ mod tests {
         let db = Database::connect_in_memory().await.unwrap();
         let (_, token) = seeded_task(&db).await;
         assert_goal_scope_contract(&db, &token).await;
+    }
+
+    /// The objective and the requirement grounding quote are user-authored
+    /// copies of the request. They are durable stores too, not just display
+    /// text, so a bare credential hand-off must be projected exactly like the
+    /// transcript.
+    #[tokio::test]
+    async fn sqlite_goal_writes_redact_a_bare_key_handoff() {
+        use leveler_lifecycle::{RequirementKind, RequirementSeed};
+
+        let db = Database::connect_in_memory().await.unwrap();
+        let (_, token) = seeded_task(&db).await;
+        let canary = "mgzk1gr8k7bfm6z6t8ft6tdxd8ydmm5t";
+        let goal = db
+            .open_scoped(
+                &token,
+                &format!("任务：key:{canary} 继续"),
+                &[format!("验收 key:{canary}")],
+                &[RequirementSeed {
+                    kind: RequirementKind::Named,
+                    text: "R1".into(),
+                    target: None,
+                    source_quote: format!("key:{canary}"),
+                    check: None,
+                    verification: None,
+                }],
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        let (objective, acceptance): (String, String) =
+            sqlx::query_as("SELECT objective, acceptance FROM goals WHERE id = ?1")
+                .bind(goal.as_str())
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert!(!objective.contains(canary), "{objective}");
+        assert!(!acceptance.contains(canary), "{acceptance}");
+        let quote: String = sqlx::query_scalar(
+            "SELECT source_quote FROM goal_requirement_events WHERE goal_id = ?1 LIMIT 1",
+        )
+        .bind(goal.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(!quote.contains(canary), "{quote}");
     }
 
     /// Requirement identity, transition legality and event order are one

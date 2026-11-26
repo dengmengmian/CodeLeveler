@@ -1123,6 +1123,14 @@ impl CodingRuntime {
         let objective = match pending {
             Some(pending) => pending,
             None => {
+                // Goal identity is compared with the durable (projected)
+                // objective. A raw declaration carrying a credential shape
+                // must not open a second identity beside the sanitized row.
+                let (clean, found) = leveler_core::sanitize_model_visible(fallback_objective);
+                if !found.is_empty() {
+                    leveler_core::register_session_secrets(session_id.as_str(), &found);
+                }
+                let durable = leveler_core::scrub_registered_secrets(session_id.as_str(), &clean);
                 // Durable BEFORE the goal row. A Goal turn can start from a
                 // plain message while the session already runs in Goal mode
                 // (no `/goal` command re-declares it); without this, a crash
@@ -1135,17 +1143,17 @@ impl CodingRuntime {
                     .engine
                     .stores
                     .sessions
-                    .set_pending_goal_if_absent(session_id, fallback_objective, leveler_core::now())
+                    .set_pending_goal_if_absent(session_id, &durable, leveler_core::now())
                     .await?
                 {
-                    fallback_objective.to_string()
+                    durable
                 } else {
                     self.engine
                         .stores
                         .sessions
                         .pending_goal(session_id)
                         .await?
-                        .unwrap_or_else(|| fallback_objective.to_string())
+                        .unwrap_or(durable)
                 }
             }
         };

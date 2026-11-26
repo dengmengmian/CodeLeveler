@@ -50,6 +50,15 @@ impl<'a> SessionRecapRepository<'a> {
         text: &str,
         now: Timestamp,
     ) -> Result<String, StorageError> {
+        // The review is model-authored from the turn and is client-visible
+        // durable text. Project it through the same session boundary as the
+        // transcript; a recap must not become the one sink that keeps a
+        // credential the rest of the turn redacted.
+        let (text, found) = leveler_core::sanitize_model_visible(text);
+        if !found.is_empty() {
+            leveler_core::register_session_secrets(session_id.as_str(), &found);
+        }
+        let text = leveler_core::scrub_registered_secrets(session_id.as_str(), &text);
         let stored = sqlx::query_scalar(
             "INSERT INTO session_recaps (session_id, turn_id, text, created_at) \
              VALUES (?1, ?2, ?3, ?4) \
@@ -58,7 +67,7 @@ impl<'a> SessionRecapRepository<'a> {
         )
         .bind(session_id.as_str())
         .bind(turn_id)
-        .bind(text)
+        .bind(&text)
         .bind(now.to_rfc3339())
         .fetch_one(self.db.pool())
         .await?;
@@ -149,6 +158,26 @@ mod tests {
         let rows = repo.load_for_session(&session).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].text, "first");
+    }
+
+    #[tokio::test]
+    async fn a_review_does_not_persist_a_bare_key_handoff() {
+        let (db, session, turn) = db_with_turn().await;
+        let repo = SessionRecapRepository::new(&db);
+        let canary = "mgzk1gr8k7bfm6z6t8ft6tdxd8ydmm5t";
+        let stored = repo
+            .record(
+                &session,
+                &turn,
+                &format!("本轮 key:{canary} 仍未完成"),
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        assert!(!stored.contains(canary), "{stored}");
+        assert!(stored.contains("[REDACTED]"), "{stored}");
+        let rows = repo.load_for_session(&session).await.unwrap();
+        assert!(!rows[0].text.contains(canary), "{:?}", rows[0].text);
     }
 
     #[tokio::test]

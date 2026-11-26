@@ -13,7 +13,9 @@ use std::time::Duration;
 
 use leveler_app::{Application, InProcessRuntimeClient};
 use leveler_client_protocol::secret::{SecretCapture, SecretValue};
-use leveler_client_protocol::{ClientCommand, InteractiveRuntimeClient, RuntimeEvent};
+use leveler_client_protocol::{
+    ClientCommand, InteractiveRuntimeClient, MessageId, RuntimeEvent, SteerAction,
+};
 use leveler_core::{CommandId, SessionId};
 use leveler_execution::PermissionProfile;
 use leveler_model::ModelRef;
@@ -205,6 +207,19 @@ fn assert_canary_absent_except(root: &std::path::Path, allowed: &[&str]) {
         let text = String::from_utf8_lossy(&bytes);
         assert!(
             !text.contains(CANARY),
+            "the canary reached {}",
+            path.display()
+        );
+    }
+}
+
+/// Assert no file under `root` contains `value`. Used by scenarios that
+/// choose their own synthetic canary instead of the file-scope `CANARY`.
+fn assert_value_absent_from_disk(root: &std::path::Path, value: &str) {
+    for (path, bytes) in all_files(root) {
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !text.contains(value),
             "the canary reached {}",
             path.display()
         );
@@ -537,6 +552,514 @@ fn revoking_a_reference_stops_it_from_resolving() {
             ));
             assert_eq!(f.app.secret_vault().available_count(f.session.as_str()), 0);
             assert_canary_absent_from_disk(f._tmp.path());
+        },
+    );
+}
+
+/// A gated stream: the opening delta lets the test wait for the turn to be
+/// genuinely running, then release the tail and settle.
+fn gated_response(text: &str, release: Arc<tokio::sync::Notify>) -> MockResponse {
+    MockResponse::GatedSse {
+        first: format!("data: {{\"choices\":[{{\"delta\":{{\"content\":{text:?}}}}}]}}\n\n"),
+        tail: "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+               data: [DONE]\n\n"
+            .into(),
+        release,
+    }
+}
+
+async fn wait_for_stream_start(rx: &mut tokio::sync::broadcast::Receiver<RuntimeEvent>) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !matches!(
+            rx.recv().await.expect("event stream"),
+            RuntimeEvent::AssistantTextDelta { .. }
+        ) {}
+    })
+    .await
+    .expect("the final answer started streaming");
+}
+
+/// The documented plaintext choice is per command and real: an admitted steer
+/// the person explicitly disclosed reaches the provider, while the journal,
+/// the transcript and every file on disk keep the redacted projection. Once the
+/// input is consumed, a later turn does not inherit the decision.
+#[test]
+fn an_acknowledged_plaintext_steer_is_delivered_once_and_never_persisted() {
+    leveler_test_support::bounded_test(
+        "an_acknowledged_plaintext_steer_is_delivered_once_and_never_persisted",
+        Duration::from_secs(90),
+        || async {
+            let release = Arc::new(tokio::sync::Notify::new());
+            let f = fixture(vec![
+                gated_response("first answer", release.clone()),
+                text_response("turn done"),
+                text_response("follow up done"),
+            ])
+            .await;
+            let mut rx = f.client.subscribe();
+            f.client
+                .send(ClientCommand::SubmitUserInput {
+                    session_id: f.session.clone(),
+                    content: "先做一个普通任务".to_string(),
+                    attachments: Vec::new(),
+                    secret_captures: Vec::new(),
+                    plaintext_secret_ack: false,
+                })
+                .await
+                .unwrap();
+            wait_for_stream_start(&mut rx).await;
+
+            // A value registered earlier (for example from a tool result) is
+            // exactly what the acknowledgement must be able to override for
+            // this one input.
+            leveler_core::register_session_secrets(
+                f.session.as_str(),
+                &[leveler_core::DetectedSecret {
+                    value: CANARY.to_string(),
+                    key: "key".to_string(),
+                }],
+            );
+            let id = MessageId::new("steer-plaintext-ack");
+            f.client
+                .send(ClientCommand::SteerUserInput {
+                    session_id: f.session.clone(),
+                    content: format!("请继续，并使用 key:{CANARY} 再测一次"),
+                    secret_captures: Vec::new(),
+                    plaintext_secret_ack: true,
+                    message_id: Some(id.clone()),
+                })
+                .await
+                .expect("the explicit plaintext steer is admitted");
+            release.notify_one();
+            f.wait_for_turn_end(&mut rx).await;
+
+            let bodies = f.server.request_bodies().await;
+            assert!(
+                bodies.iter().any(|body| body.contains(CANARY)),
+                "the acknowledged plaintext must reach the provider: {bodies:#?}"
+            );
+            assert!(
+                bodies
+                    .iter()
+                    .any(|body| body.contains("请继续") || body.contains("再测一次")),
+                "the steer itself must reach the provider: {bodies:#?}"
+            );
+            let db = f.app.open_database().await.unwrap();
+            let input = leveler_storage::SessionInputRepository::new(&db)
+                .load(&f.session, id.as_str())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(input.state, leveler_storage::SessionInputState::Consumed);
+            assert!(
+                !input.content.contains(CANARY),
+                "the journal stores the redacted projection: {}",
+                input.content
+            );
+            let messages = leveler_storage::MessageRepository::new(&db)
+                .load(&f.session)
+                .await
+                .unwrap();
+            assert!(
+                messages.iter().all(|payload| !payload.contains(CANARY)),
+                "the transcript must not persist the disclosed value: {messages:#?}"
+            );
+
+            // A later, unacknowledged turn starts from the durable transcript
+            // and must not inherit the permit.
+            let before = bodies.len();
+            f.client
+                .send(ClientCommand::SubmitUserInput {
+                    session_id: f.session.clone(),
+                    content: "继续普通工作".to_string(),
+                    attachments: Vec::new(),
+                    secret_captures: Vec::new(),
+                    plaintext_secret_ack: false,
+                })
+                .await
+                .unwrap();
+            f.wait_for_turn_end(&mut rx).await;
+            let after = f.server.request_bodies().await;
+            assert!(
+                after[before..].iter().all(|body| !body.contains(CANARY)),
+                "a later turn inherited the plaintext decision: {after:#?}"
+            );
+            assert_canary_absent_from_disk(f._tmp.path());
+            leveler_core::clear_session_secrets(f.session.as_str());
+        },
+    );
+}
+
+/// A seed explicitly acknowledged as plaintext reaches the provider even when
+/// the same value was already registered (the ordinary projection would scrub
+/// it), and the durable stores still keep it out.
+#[test]
+fn an_acknowledged_seed_overrides_a_registered_value_only_for_that_command() {
+    leveler_test_support::bounded_test(
+        "an_acknowledged_seed_overrides_a_registered_value_only_for_that_command",
+        Duration::from_secs(60),
+        || async {
+            let f = fixture(vec![text_response("acknowledged seed")]).await;
+            let mut rx = f.client.subscribe();
+            leveler_core::register_session_secrets(
+                f.session.as_str(),
+                &[leveler_core::DetectedSecret {
+                    value: CANARY.to_string(),
+                    key: "key".to_string(),
+                }],
+            );
+            f.client
+                .send(ClientCommand::SubmitUserInput {
+                    session_id: f.session.clone(),
+                    content: format!("配置 key:{CANARY}，这次按明文发送"),
+                    attachments: Vec::new(),
+                    secret_captures: Vec::new(),
+                    plaintext_secret_ack: true,
+                })
+                .await
+                .expect("the explicit plaintext seed is admitted");
+            f.wait_for_turn_end(&mut rx).await;
+            let bodies = f.server.request_bodies().await;
+            assert!(
+                bodies.iter().any(|body| body.contains(CANARY)),
+                "the explicit seed disclosure reaches the provider: {bodies:#?}"
+            );
+            assert_canary_absent_from_disk(f._tmp.path());
+
+            // The acknowledgement belonged to that command. A later ordinary
+            // command carrying the same shape is refused before any request.
+            let requests = bodies.len();
+            let error = f
+                .client
+                .send(ClientCommand::SubmitMessage {
+                    session_id: f.session.clone(),
+                    content: format!("再发一次 key:{CANARY}"),
+                    attachments: Vec::new(),
+                })
+                .await
+                .expect_err("plaintext is not a reusable permission");
+            assert!(!error.to_string().contains(CANARY), "{error}");
+            assert_eq!(
+                f.server.request_bodies().await.len(),
+                requests,
+                "the refused command started no provider request"
+            );
+            leveler_core::clear_session_secrets(f.session.as_str());
+        },
+    );
+}
+
+/// Withdrawing a pending steer settles its row as cancelled; the plaintext
+/// decision dies with it and no provider request carries the value.
+#[test]
+fn a_withdrawn_plaintext_steer_never_reaches_the_provider() {
+    leveler_test_support::bounded_test(
+        "a_withdrawn_plaintext_steer_never_reaches_the_provider",
+        Duration::from_secs(90),
+        || async {
+            let release = Arc::new(tokio::sync::Notify::new());
+            let f = fixture(vec![
+                gated_response("first answer", release.clone()),
+                text_response("turn done"),
+            ])
+            .await;
+            let mut rx = f.client.subscribe();
+            f.client
+                .send(ClientCommand::SubmitUserInput {
+                    session_id: f.session.clone(),
+                    content: "先做一个普通任务".to_string(),
+                    attachments: Vec::new(),
+                    secret_captures: Vec::new(),
+                    plaintext_secret_ack: false,
+                })
+                .await
+                .unwrap();
+            wait_for_stream_start(&mut rx).await;
+            let id = MessageId::new("steer-plaintext-withdraw");
+            f.client
+                .send(ClientCommand::SteerUserInput {
+                    session_id: f.session.clone(),
+                    content: format!("请使用 key:{CANARY}"),
+                    secret_captures: Vec::new(),
+                    plaintext_secret_ack: true,
+                    message_id: Some(id.clone()),
+                })
+                .await
+                .unwrap();
+            f.client
+                .send(ClientCommand::ManageSteer {
+                    session_id: f.session.clone(),
+                    action: SteerAction::Withdraw {
+                        message_id: id.clone(),
+                        revision: 0,
+                    },
+                })
+                .await
+                .expect("the pending steer is withdrawn");
+            release.notify_one();
+            f.wait_for_turn_end(&mut rx).await;
+            assert!(
+                f.server
+                    .request_bodies()
+                    .await
+                    .iter()
+                    .all(|body| !body.contains(CANARY)),
+                "a withdrawn input was delivered"
+            );
+            let db = f.app.open_database().await.unwrap();
+            let input = leveler_storage::SessionInputRepository::new(&db)
+                .load(&f.session, id.as_str())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(input.state, leveler_storage::SessionInputState::Cancelled);
+            assert_canary_absent_from_disk(f._tmp.path());
+            leveler_core::clear_session_secrets(f.session.as_str());
+        },
+    );
+}
+
+/// Editing a pending steer changes the text and its revision. The old
+/// plaintext decision is not applied to the new text, and the edited text is
+/// delivered normally.
+#[test]
+fn an_edited_plaintext_steer_does_not_reuse_the_old_decision() {
+    leveler_test_support::bounded_test(
+        "an_edited_plaintext_steer_does_not_reuse_the_old_decision",
+        Duration::from_secs(90),
+        || async {
+            let release = Arc::new(tokio::sync::Notify::new());
+            let f = fixture(vec![
+                gated_response("first answer", release.clone()),
+                text_response("turn done"),
+            ])
+            .await;
+            let mut rx = f.client.subscribe();
+            f.client
+                .send(ClientCommand::SubmitUserInput {
+                    session_id: f.session.clone(),
+                    content: "先做一个普通任务".to_string(),
+                    attachments: Vec::new(),
+                    secret_captures: Vec::new(),
+                    plaintext_secret_ack: false,
+                })
+                .await
+                .unwrap();
+            wait_for_stream_start(&mut rx).await;
+            let id = MessageId::new("steer-plaintext-edit");
+            f.client
+                .send(ClientCommand::SteerUserInput {
+                    session_id: f.session.clone(),
+                    content: format!("请使用 key:{CANARY}"),
+                    secret_captures: Vec::new(),
+                    plaintext_secret_ack: true,
+                    message_id: Some(id.clone()),
+                })
+                .await
+                .unwrap();
+            f.client
+                .send(ClientCommand::ManageSteer {
+                    session_id: f.session.clone(),
+                    action: SteerAction::BeginEdit {
+                        message_id: id.clone(),
+                        revision: 0,
+                        lease_id: "00000000-0000-0000-0000-000000000001".to_string(),
+                    },
+                })
+                .await
+                .expect("the edit lease opens");
+            f.client
+                .send(ClientCommand::ManageSteer {
+                    session_id: f.session.clone(),
+                    action: SteerAction::SaveEdit {
+                        message_id: id.clone(),
+                        revision: 1,
+                        lease_id: "00000000-0000-0000-0000-000000000001".to_string(),
+                        content: "改为先跑单元测试".to_string(),
+                    },
+                })
+                .await
+                .expect("the edit is saved");
+            release.notify_one();
+            f.wait_for_turn_end(&mut rx).await;
+            let bodies = f.server.request_bodies().await;
+            assert!(
+                bodies.iter().any(|body| body.contains("改为先跑单元测试")),
+                "the edited text must be delivered: {bodies:#?}"
+            );
+            assert!(
+                bodies.iter().all(|body| !body.contains(CANARY)),
+                "the edited input reused the old plaintext decision: {bodies:#?}"
+            );
+            assert_canary_absent_from_disk(f._tmp.path());
+            leveler_core::clear_session_secrets(f.session.as_str());
+        },
+    );
+}
+
+/// Prioritize changes only the scheduling priority, not the text or its
+/// revision, so the person's explicit decision still applies to that delivery.
+#[test]
+fn a_prioritized_plaintext_steer_keeps_its_decision() {
+    leveler_test_support::bounded_test(
+        "a_prioritized_plaintext_steer_keeps_its_decision",
+        Duration::from_secs(90),
+        || async {
+            let release = Arc::new(tokio::sync::Notify::new());
+            let f = fixture(vec![
+                gated_response("first answer", release.clone()),
+                text_response("turn done"),
+            ])
+            .await;
+            let mut rx = f.client.subscribe();
+            f.client
+                .send(ClientCommand::SubmitUserInput {
+                    session_id: f.session.clone(),
+                    content: "先做一个普通任务".to_string(),
+                    attachments: Vec::new(),
+                    secret_captures: Vec::new(),
+                    plaintext_secret_ack: false,
+                })
+                .await
+                .unwrap();
+            wait_for_stream_start(&mut rx).await;
+            let id = MessageId::new("steer-plaintext-prioritize");
+            f.client
+                .send(ClientCommand::SteerUserInput {
+                    session_id: f.session.clone(),
+                    content: format!("请立即改用 key:{CANARY}"),
+                    secret_captures: Vec::new(),
+                    plaintext_secret_ack: true,
+                    message_id: Some(id.clone()),
+                })
+                .await
+                .unwrap();
+            f.client
+                .send(ClientCommand::ManageSteer {
+                    session_id: f.session.clone(),
+                    action: SteerAction::Prioritize {
+                        message_id: id.clone(),
+                        revision: 0,
+                    },
+                })
+                .await
+                .expect("the steer is prioritized");
+            release.notify_one();
+            f.wait_for_turn_end(&mut rx).await;
+            assert!(
+                f.server
+                    .request_bodies()
+                    .await
+                    .iter()
+                    .any(|body| body.contains(CANARY)),
+                "prioritize changed neither the text nor the decision"
+            );
+            assert_canary_absent_from_disk(f._tmp.path());
+            leveler_core::clear_session_secrets(f.session.as_str());
+        },
+    );
+}
+
+/// Regression #1: an ordinary seed repeating a value the session already
+/// registered is projected without it, even though the value has no detectable
+/// shape left (a hash-like token in prose). The person did not acknowledge
+/// anything here.
+#[test]
+fn a_registered_value_is_scrubbed_from_an_ordinary_seed() {
+    leveler_test_support::bounded_test(
+        "a_registered_value_is_scrubbed_from_an_ordinary_seed",
+        Duration::from_secs(60),
+        || async {
+            let f = fixture(vec![text_response("ok")]).await;
+            let mut rx = f.client.subscribe();
+            // A hash-like value: no key/value shape and recognised as a hash,
+            // so only the session registry can catch it.
+            let value = "7f3a9c2e5b8d4f6a1c0e8b7d4e5f60718293a4b5";
+            leveler_core::register_session_secrets(
+                f.session.as_str(),
+                &[leveler_core::DetectedSecret {
+                    value: value.to_string(),
+                    key: "token".to_string(),
+                }],
+            );
+            f.client
+                .send(ClientCommand::SubmitUserInput {
+                    session_id: f.session.clone(),
+                    content: format!("请继续任务，使用 {value} 这个值"),
+                    attachments: Vec::new(),
+                    secret_captures: Vec::new(),
+                    plaintext_secret_ack: false,
+                })
+                .await
+                .expect("an ordinary message without a detectable shape is admitted");
+            f.wait_for_turn_end(&mut rx).await;
+            let bodies = f.server.request_bodies().await;
+            assert!(
+                bodies.iter().all(|body| !body.contains(value)),
+                "a registered value reached the provider: {bodies:#?}"
+            );
+            assert!(
+                bodies.iter().any(|body| body.contains("[REDACTED]")),
+                "the model request kept the scrubbed projection: {bodies:#?}"
+            );
+            let db = f.app.open_database().await.unwrap();
+            let messages = leveler_storage::MessageRepository::new(&db)
+                .load(&f.session)
+                .await
+                .unwrap();
+            assert!(messages.iter().all(|payload| !payload.contains(value)));
+            assert_canary_absent_from_disk(f._tmp.path());
+            leveler_core::clear_session_secrets(f.session.as_str());
+        },
+    );
+}
+
+/// The headless entry's explicit `--allow-plaintext-secrets` is a one-command
+/// disclosure: the provider sees the bytes, the durable session stores keep
+/// the redacted projection. This is the `leveler run` path, not a mock.
+#[test]
+fn a_headless_plaintext_choice_reaches_the_provider_and_not_the_stores() {
+    leveler_test_support::bounded_test(
+        "a_headless_plaintext_choice_reaches_the_provider_and_not_the_stores",
+        Duration::from_secs(60),
+        || async {
+            let canary = "mgzk1gr8k7bfm6z6t8ft6tdxd8ydmm5t";
+            let server = MockServer::start(vec![text_response("ok")]).await;
+            let tmp = tempfile::tempdir().unwrap();
+            write_config(tmp.path(), &server.base_url());
+            let layout = Layout::from_parts(
+                tmp.path().to_path_buf(),
+                tmp.path().join("configs"),
+                tmp.path().join("state"),
+            );
+            let app = Arc::new(
+                Application::assemble(layout)
+                    .unwrap()
+                    .with_collaboration(leveler_lifecycle::CollaborationMode::Chat)
+                    .with_plaintext_seed_ack(true),
+            );
+            let model = ModelRef::new("mock", "m");
+            let task = format!("请配置 key:{canary}，然后回答 ok");
+            let session = app.create_session(&model, &task).await.unwrap();
+            app.run_in_session(
+                &session,
+                &model,
+                PermissionProfile::Assisted,
+                &task,
+                Arc::new(leveler_execution::AutoApprove),
+                false,
+                &mut |_| {},
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let bodies = server.request_bodies().await;
+            assert!(
+                bodies.iter().any(|body| body.contains(canary)),
+                "the explicit headless choice reaches the provider: {bodies:#?}"
+            );
+            assert_value_absent_from_disk(tmp.path(), canary);
+            leveler_core::clear_session_secrets(session.as_str());
         },
     );
 }

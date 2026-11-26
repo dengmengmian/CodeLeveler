@@ -1140,21 +1140,46 @@ impl leveler_agent::SteeringSource for SessionSteering {
             Ok(rows
                 .into_iter()
                 .take_while(|row| !row.editing_at(now))
-                .map(|row| leveler_agent::PendingUserInput {
-                    id: Some(row.id),
-                    text: row.content,
+                .map(|row| {
+                    let model_text = self.app.plaintext_disclosures().input_text(
+                        self.session_id.as_str(),
+                        &row.id,
+                        row.revision,
+                    );
+                    leveler_agent::PendingUserInput {
+                        id: Some(row.id),
+                        text: row.content,
+                        model_text,
+                    }
                 })
                 .collect())
         })
     }
 
     fn input_consumed(&self, id: &str, ordinal: Option<u64>) {
+        // The admission decision is spent once this exact input reached the
+        // transcript. A later round or turn cannot inherit it.
+        self.app
+            .plaintext_disclosures()
+            .remove_input(self.session_id.as_str(), id);
         let _ = self.events.send(RuntimeEvent::InputSettled {
             message_id: MessageId::new(id),
             state: UiInputState::Delivered,
             reason: String::new(),
             ordinal,
         });
+    }
+
+    fn take_seed_model_text(&self, seed_input_id: Option<&str>) -> Option<String> {
+        self.app
+            .plaintext_disclosures()
+            .take_seed(self.session_id.as_str(), seed_input_id)
+    }
+
+    fn goal_declaration_model_text(&self, declaration: &str) -> Option<String> {
+        self.app
+            .plaintext_disclosures()
+            .take_goal_if_matches(self.session_id.as_str(), declaration)
     }
 
     fn model_attempt_interrupt(&self) -> Option<CancellationToken> {
@@ -4172,6 +4197,27 @@ impl InProcessRuntimeClient {
         answer: String,
         session_id: Option<SessionId>,
     ) -> Result<(), ClientError> {
+        // The answer reaches the model as the clarifier's result. The
+        // clarification surface has no credential review, so a detected value
+        // is projected here; the redacted answer is also what a retry is
+        // compared against, keeping the decision deterministic.
+        let answer_session = session_id.clone().or_else(|| {
+            self.pending_clarify
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&request_id)
+                .map(|pending| pending.binding.session_id.clone())
+        });
+        let answer = match answer_session {
+            Some(session) => {
+                let (text, found) = leveler_core::sanitize_model_visible(&answer);
+                if !found.is_empty() {
+                    leveler_core::register_session_secrets(session.as_str(), &found);
+                }
+                leveler_core::scrub_registered_secrets(session.as_str(), &text)
+            }
+            None => answer,
+        };
         if resolve_clarification(&self.pending_clarify, &request_id, answer.clone()).is_ok() {
             return Ok(());
         }
@@ -4322,6 +4368,58 @@ impl InProcessRuntimeClient {
         )
     }
 
+    /// Whether the ordinary projection would change `text`: a credential
+    /// shape the sanitizer redacts, or a value this session already had
+    /// registered. Shape findings are registered here, so the same value is
+    /// scrubbed from later durable writes even though this one input was
+    /// explicitly disclosed.
+    fn plaintext_projection_differs(&self, session_id: &SessionId, text: &str) -> bool {
+        let (sanitized, found) = leveler_core::sanitize_model_visible(text);
+        if !found.is_empty() {
+            leveler_core::register_session_secrets(session_id.as_str(), &found);
+        }
+        sanitized != text
+            || leveler_core::scrub_registered_secrets(session_id.as_str(), text) != text
+    }
+
+    /// The opening message of the turn being started. Only the explicitly
+    /// acknowledged input gets a permit; the store is one-shot and cleared
+    /// when the next turn is admitted.
+    fn grant_seed_plaintext(&self, session_id: &SessionId, text: &str) {
+        if self.plaintext_projection_differs(session_id, text) {
+            self.app
+                .plaintext_disclosures()
+                .grant_seed(session_id.as_str(), text);
+        }
+    }
+
+    /// A `/goal` declaration delivered to a running turn.
+    fn grant_goal_plaintext(&self, session_id: &SessionId, text: &str) {
+        if self.plaintext_projection_differs(session_id, text) {
+            self.app
+                .plaintext_disclosures()
+                .grant_goal(session_id.as_str(), text);
+        }
+    }
+
+    /// A journaled steer, bound to the revision it was admitted at.
+    fn grant_input_plaintext(
+        &self,
+        session_id: &SessionId,
+        input_id: &str,
+        revision: i64,
+        text: &str,
+    ) {
+        if self.plaintext_projection_differs(session_id, text) {
+            self.app.plaintext_disclosures().grant_input(
+                session_id.as_str(),
+                input_id,
+                revision,
+                text,
+            );
+        }
+    }
+
     /// Revoke one capture by reference. The vault is the authority; a forged
     /// or foreign reference is simply "not found".
     async fn handle_revoke_secret(
@@ -4406,6 +4504,13 @@ impl InProcessRuntimeClient {
                 .admit(session_id)
                 .map_err(|error| ClientError::Runtime(error.to_string()))?
         };
+        // One session has one live turn. A seed or goal permit that the
+        // previous turn never consumed must not reach this one; pending input
+        // permits stay because they belong to journal rows this turn may
+        // deliver.
+        self.app
+            .plaintext_disclosures()
+            .clear_turn_slots(session_id.as_str());
         self.auxiliary_assists.cancel(session_id);
         if retitle {
             self.retitle_placeholder_session(session_id, text).await;
@@ -4499,10 +4604,16 @@ impl InProcessRuntimeClient {
             .open_database()
             .await
             .map_err(|error| ClientError::Runtime(error.to_string()))?;
-        SessionInputRepository::new(&db)
+        let settled = SessionInputRepository::new(&db)
             .cancel(session_id, id, reason, leveler_core::now())
             .await
-            .map_err(|error| ClientError::Runtime(error.to_string()))
+            .map_err(|error| ClientError::Runtime(error.to_string()))?;
+        if settled.is_some() {
+            self.app
+                .plaintext_disclosures()
+                .remove_input(session_id.as_str(), id);
+        }
+        Ok(settled)
     }
 
     /// Close live admission and settle the cancelled lineage's pending rows.
@@ -4539,6 +4650,9 @@ impl InProcessRuntimeClient {
         match settled {
             Ok(rows) => {
                 for row in rows {
+                    self.app
+                        .plaintext_disclosures()
+                        .remove_input(session_id.as_str(), &row.id);
                     self.emit_input_settled(
                         session_id,
                         &row.id,
@@ -4800,6 +4914,11 @@ impl InProcessRuntimeClient {
             if rows[index].revision != revision {
                 return Err(ClientError::SteerConflict(SteerConflict::StaleRevision));
             }
+            // Only prioritization keeps the exact text the person authorized.
+            // A withdraw, an edit lease or a saved edit changes what would be
+            // delivered, so the old plaintext decision stops here even before
+            // the row is read again.
+            let keeps_disclosure = matches!(mutation, SessionInputMutation::Prioritize);
             let updated = match journal
                 .mutate(&session_id, id.as_str(), revision, mutation, now)
                 .await
@@ -4826,6 +4945,11 @@ impl InProcessRuntimeClient {
                     return Err(ClientError::SteerConflict(reason));
                 }
             };
+            if !keeps_disclosure {
+                self.app
+                    .plaintext_disclosures()
+                    .remove_input(session_id.as_str(), id.as_str());
+            }
             if updated.state == SessionInputState::Cancelled {
                 rows.remove(index);
                 self.emit_input_settled(
@@ -5130,6 +5254,13 @@ impl InProcessRuntimeClient {
         let Some(title) = title_from_first_message(content) else {
             return;
         };
+        // The display title is a durable, list-visible copy of the first
+        // message. It is never a place to keep a credential.
+        let (title, found) = leveler_core::sanitize_model_visible(&title);
+        if !found.is_empty() {
+            leveler_core::register_session_secrets(session_id.as_str(), &found);
+        }
+        let title = leveler_core::scrub_registered_secrets(session_id.as_str(), &title);
         let Ok(db) = self.app.open_database().await else {
             return;
         };
@@ -5677,6 +5808,9 @@ impl InProcessRuntimeClient {
         let cancel = self
             .stage_turn(&session_id, &content, true, 0, None, None)
             .await?;
+        if plaintext_secret_ack {
+            self.grant_seed_plaintext(&session_id, &content);
+        }
         let accepted = self.spawn_goal_turn(session_id, content, cancel, config, model);
         await_turn_acceptance(accepted).await
     }
@@ -5707,6 +5841,9 @@ impl InProcessRuntimeClient {
         // objective are still one consistent pair on disk, and the next Goal
         // turn adopts it.
         self.persist_goal_declaration(&session_id, &task).await?;
+        if plaintext_secret_ack {
+            self.grant_goal_plaintext(&session_id, &task);
+        }
         {
             let goal = self.goal_state_for(&session_id);
             let mut goal = goal
@@ -5869,6 +6006,9 @@ impl InProcessRuntimeClient {
                 seed_input_id,
             )
             .await?;
+        if plaintext_secret_ack && !promoted {
+            self.grant_seed_plaintext(&session_id, &content);
+        }
         // CollaborationMode is the single source of turn profile:
         // goal → goal_mode / update_goal path; chat|plan → content turn.
         // Plan read_only is applied inside engine from session.collaboration.
@@ -6563,6 +6703,19 @@ impl InProcessRuntimeClient {
                         };
                         crate::side_question::render(&ctx)
                     };
+                    // The live tails come from the process streams, not from a
+                    // tool result that already passed the host sanitizer. This
+                    // is a model request boundary of its own, so project it
+                    // through the same session secret boundary.
+                    let (runtime_context, found) =
+                        leveler_core::sanitize_model_visible(&runtime_context);
+                    if !found.is_empty() {
+                        leveler_core::register_session_secrets(session_id.as_str(), &found);
+                    }
+                    let runtime_context = leveler_core::scrub_registered_secrets(
+                        session_id.as_str(),
+                        &runtime_context,
+                    );
                     let question_message = side_question_message(&question, &runtime_context);
                     // The read-only tool surface the side question may use.
                     // Composed from the same owner as a normal turn, narrowed to
@@ -7612,6 +7765,12 @@ impl InProcessRuntimeClient {
             .admit_input(&session_id, &id, &content, window.as_ref())
             .await?;
         let text = row.content.clone();
+        // Only a still-pending row can be delivered, and only that delivery
+        // may see the person's explicit plaintext choice. A retry that finds
+        // the row already consumed grants nothing.
+        if plaintext_secret_ack && row.state == SessionInputState::Pending {
+            self.grant_input_plaintext(&session_id, &id, row.revision, &content);
+        }
         match row.state {
             SessionInputState::Consumed => {
                 self.emit_input_admitted(&session_id, &id, &text);
@@ -8607,6 +8766,12 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             } => {
                 let config = self.runtime_config(&session_id).await?;
                 let model = require_model(&config, &session_id)?;
+                // A side question has no credential review surface, so it
+                // follows the same rule as every other unreviewed command: a
+                // detected credential is refused before it reaches a provider.
+                let question = self.prepare_secrets(&session_id, &question, &[], false)?;
+                let question =
+                    leveler_core::scrub_registered_secrets(session_id.as_str(), &question);
                 self.spawn_btw(session_id, question, config, model);
                 Ok(())
             }

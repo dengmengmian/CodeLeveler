@@ -252,6 +252,30 @@ mod tests {
     }
 
     #[test]
+    fn a_bare_key_handoff_requires_a_decision() {
+        let vault = SecretVault::new();
+        let token = "mgzk1gr8k7bfm6z6t8ft6tdxd8ydmm5t";
+        let content = format!("请用 key:{token} 继续跑测试");
+        let error = prepare_secret_input(&vault, &session(), &content, &[], false)
+            .expect_err("an unadmitted key hand-off must be refused");
+        let text = format!("{error}");
+        assert!(text.contains("疑似凭据"), "{text}");
+        let acknowledged = prepare_secret_input(&vault, &session(), &content, &[], true)
+            .expect("the explicit plaintext choice admits it unchanged");
+        assert_eq!(acknowledged, content);
+    }
+
+    #[test]
+    fn documentation_placeholders_are_not_refused() {
+        let vault = SecretVault::new();
+        let content =
+            "Authorization: Bearer <YOUR_API_TOKEN>\n请将 <YOUR_API_TOKEN> 替换为实际 Token";
+        let prepared = prepare_secret_input(&vault, &session(), content, &[], false)
+            .expect("a placeholder is a shape, not a credential");
+        assert_eq!(prepared, content);
+    }
+
+    #[test]
     fn a_message_that_names_a_target_and_field_bounds_the_capture() {
         let vault = SecretVault::new();
         let prepared = prepare_secret_input(

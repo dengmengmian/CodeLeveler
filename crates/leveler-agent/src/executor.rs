@@ -1415,6 +1415,13 @@ impl SubAgentExecutionPolicies {
 pub struct PendingUserInput {
     pub id: Option<String>,
     pub text: String,
+    /// The host's exact model-visible text for this one input, when the person
+    /// explicitly chose to disclose it as plaintext. `None` means the ordinary
+    /// session projection: the text is scrubbed of registered credentials
+    /// before it reaches the model. A value here is vouched for by the host's
+    /// admission path and is used only for this input's model message; it is
+    /// never written to any durable store.
+    pub model_text: Option<String>,
 }
 
 /// Where mid-turn user input comes from.
@@ -1436,7 +1443,11 @@ pub trait SteeringSource: Send + Sync {
     fn take_pending_inputs(&self) -> Vec<PendingUserInput> {
         self.take_pending()
             .into_iter()
-            .map(|text| PendingUserInput { id: None, text })
+            .map(|text| PendingUserInput {
+                id: None,
+                text,
+                model_text: None,
+            })
             .collect()
     }
 
@@ -1475,6 +1486,24 @@ pub trait SteeringSource: Send + Sync {
     /// row and the journal settlement commit together and a crash between them
     /// cannot leave a delivered-looking row with nothing in the model context.
     fn seed_input_id(&self) -> Option<String> {
+        None
+    }
+
+    /// The host's exact model-visible text for this turn's opening message,
+    /// when the person explicitly authorized plaintext for that one input.
+    ///
+    /// The seed content the executor was given is the journal projection
+    /// (redacted). This override exists only for the input the person saw and
+    /// acknowledged; it is one-shot, memory-only, and the host remains the
+    /// authority that granted it.
+    fn take_seed_model_text(&self, _seed_input_id: Option<&str>) -> Option<String> {
+        None
+    }
+
+    /// The host's exact model-visible text for a `/goal` declaration, when the
+    /// declaration itself came from an explicitly acknowledged plaintext
+    /// command. `None` means the ordinary projection.
+    fn goal_declaration_model_text(&self, _declaration: &str) -> Option<String> {
         None
     }
 
@@ -1521,6 +1550,40 @@ pub trait SteeringSource: Send + Sync {
 
     /// The call finished executing; its cancellation handle is spent.
     fn tool_call_ended(&self, _id: &str) {}
+}
+
+/// Project one user-authored text for the model. The explicit plaintext
+/// decision, when present, protects the exact admitted request while every
+/// other registered value is still scrubbed; without it every registered
+/// value is scrubbed.
+fn project_user_text(
+    session: &str,
+    text: &str,
+    raw_request: &str,
+    disclosure: Option<&str>,
+) -> String {
+    match disclosure {
+        Some(_) if !raw_request.is_empty() && text.contains(raw_request) => {
+            // Protect the authorized input, scrub everything else. The
+            // sentinel is NUL-delimited so ordinary text cannot collide with
+            // it.
+            const SENTINEL: &str = "\u{0}leveler-plaintext\u{0}";
+            let marked = text.replace(raw_request, SENTINEL);
+            let (clean, found) = leveler_core::sanitize_model_visible(&marked);
+            if !found.is_empty() {
+                leveler_core::register_session_secrets(session, &found);
+            }
+            let scrubbed = leveler_core::scrub_registered_secrets(session, &clean);
+            scrubbed.replace(SENTINEL, raw_request)
+        }
+        _ => {
+            let (clean, found) = leveler_core::sanitize_model_visible(text);
+            if !found.is_empty() {
+                leveler_core::register_session_secrets(session, &found);
+            }
+            leveler_core::scrub_registered_secrets(session, &clean)
+        }
+    }
 }
 
 /// How one turn runs.
@@ -3502,6 +3565,106 @@ impl Executor {
         .await
     }
 
+    /// The person's explicit plaintext decision for this turn's opening
+    /// message, if any. One-shot and depth-0 only; subagent text is model text.
+    fn take_seed_disclosure(&self) -> Option<String> {
+        if self.depth != 0 {
+            return None;
+        }
+        self.steering
+            .as_ref()
+            .and_then(|source| source.take_seed_model_text(self.seed_input_id.as_deref()))
+    }
+
+    /// Build the model-visible copy of the opening content. `None` means the
+    /// content is unchanged: with no disclosure, no registered value and no
+    /// detectable shape appears, the raw content is already the projection.
+    fn project_seed_content(
+        &self,
+        content: &[ContentPart],
+        disclosure: Option<&str>,
+    ) -> Option<Vec<ContentPart>> {
+        let session = self.tool_context.session_scope();
+        let text_parts = content
+            .iter()
+            .filter(|part| matches!(part, ContentPart::Text { .. }))
+            .count();
+        let mut projected = content.to_vec();
+        if let Some(permitted) = disclosure.filter(|_| text_parts == 1) {
+            for part in &mut projected {
+                if let ContentPart::Text { text } = part {
+                    *text = permitted.to_string();
+                }
+            }
+            return Some(projected);
+        }
+        let mut changed = false;
+        for part in &mut projected {
+            if let ContentPart::Text { text } = part {
+                let (clean, found) = leveler_core::sanitize_model_visible(text);
+                if !found.is_empty() {
+                    leveler_core::register_session_secrets(session, &found);
+                }
+                let scrubbed = leveler_core::scrub_registered_secrets(session, &clean);
+                if scrubbed != *text {
+                    *text = scrubbed;
+                    changed = true;
+                }
+            }
+        }
+        changed.then_some(projected)
+    }
+
+    /// Project the objective anchor. The objective is user-authored text that
+    /// is re-injected into every request, so it is a real model channel. An
+    /// explicitly disclosed input keeps its bytes; every other registered
+    /// value is scrubbed, including one that arrived in a later message.
+    fn project_objective(
+        &self,
+        objective: ObjectiveAnchor,
+        raw_request: &str,
+        disclosure: Option<&str>,
+    ) -> ObjectiveAnchor {
+        let session = self.tool_context.session_scope();
+        let project = |text: &str| project_user_text(session, text, raw_request, disclosure);
+        let mut objective = objective;
+        objective.text = project(&objective.text);
+        objective.primary = objective.primary.as_deref().map(project);
+        for amendment in &mut objective.amendments {
+            *amendment = project(amendment);
+        }
+        objective
+    }
+
+    /// The engine may pin the active objective into the prior transcript
+    /// before the executor runs (`compact_messages` re-injects it). That pin is
+    /// built from the raw objective, so it goes through the same projection as
+    /// the objective anchor itself. Only host pins are touched: persisted
+    /// user/assistant rows were already projected at their write boundary.
+    fn project_objective_pins(
+        &self,
+        prior: &mut [Message],
+        raw_request: &str,
+        disclosure: Option<&str>,
+    ) {
+        let session = self.tool_context.session_scope();
+        for message in prior {
+            if !matches!(
+                message.origin,
+                Some(TranscriptOrigin::RuntimeNotice {
+                    notice: RuntimeNoticeKind::ObjectivePin
+                })
+            ) {
+                continue;
+            }
+            for part in &mut message.content {
+                if let ContentPart::Text { text } = part {
+                    *text = project_user_text(session, text, raw_request, disclosure);
+                }
+            }
+        }
+    }
+
     /// Write the turn's opening user message.
     ///
     /// A promoted append has a journal row already: the atomic append is the
@@ -3553,12 +3716,32 @@ impl Executor {
             }
         };
         let seed = vec![Message::from_parts(Role::User, content, Some(origin))];
+        // Take the host's decision before the journal append settles the row:
+        // settlement ends the input permit.
+        let disclosure = self.take_seed_disclosure();
         self.append_seed(sink, &seed[0]).await?;
+        // The journal row is the admitted text; the model sees the same text
+        // projected through the session secret registry. A value registered
+        // from an earlier tool result must not become model-visible because a
+        // later turn repeats it.
+        //
+        // The one exception is a person's explicit plaintext choice for THIS
+        // input. The host carries that typed decision; it is one-shot and
+        // memory-only. It cannot be inferred from the text, and it does not
+        // exempt any other input or any durable write. The objective anchor is
+        // projected by the same rule: it is re-injected into every request.
+        let objective = self.project_objective(objective, &request, disclosure.as_deref());
+        let mut model_seed = seed.clone();
+        if let Some(projected) = self.project_seed_content(&seed[0].content, disclosure.as_deref())
+            && let Some(message) = model_seed.first_mut()
+        {
+            message.content = projected;
+        }
         observer(AgentEvent::RuleDelivery { audit: rule_audit });
         observer(AgentEvent::SkillDelivery { audit: skill_audit });
         let mut facts = AbortedFacts::default();
         self.drive(
-            seed,
+            model_seed,
             control,
             objective,
             observer,
@@ -3815,7 +3998,12 @@ impl Executor {
         cancellation: CancellationToken,
     ) -> Result<AgentOutcome, DriveAborted> {
         let request = text_of(&content);
+        // Take the host's explicit plaintext decision before the journal
+        // append settles a promoted input and ends its permit.
+        let disclosure = self.take_seed_disclosure();
         // Active objective is THIS message — never the first user in `prior`.
+        // The objective is re-injected into every request, so it goes through
+        // the same secret projection as the message itself.
         let objective = self.seeded_objective.clone().unwrap_or_else(|| {
             if self.goal_mode() {
                 ObjectiveAnchor::from_session_goal(&request)
@@ -3823,16 +4011,25 @@ impl Executor {
                 ObjectiveAnchor::from_user_message(&request)
             }
         });
+        let objective = self.project_objective(objective, &request, disclosure.as_deref());
         let user = Message::from_parts(Role::User, content, Some(origin));
         // Persist only the new user message; prior + system are not re-stored.
         self.append_seed(sink, &user).await?;
+        let mut model_user = user.clone();
+        if let Some(projected) = self.project_seed_content(&user.content, disclosure.as_deref()) {
+            model_user.content = projected;
+        }
 
         let (control, rule_audit, skill_audit, references) =
             self.turn_control_context_with_rules(&request, &request, false);
         observer(AgentEvent::RuleDelivery { audit: rule_audit });
         observer(AgentEvent::SkillDelivery { audit: skill_audit });
         let mut seed = prior;
-        seed.push(user);
+        // The engine may have pinned the raw objective into the prior
+        // transcript before this executor existed. That pin is a model-visible
+        // copy of the same user text, so it gets the same projection.
+        self.project_objective_pins(&mut seed, &request, disclosure.as_deref());
+        seed.push(model_user);
         let mut facts = AbortedFacts::default();
         self.drive(
             seed,
@@ -3890,10 +4087,32 @@ impl Executor {
             .clone()
             .unwrap_or_else(|| ObjectiveAnchor::from_user_message(first_user_text(&prior)));
         let mut facts = AbortedFacts::default();
+        // A resume has no client plaintext channel: the protocol carries only
+        // the instruction text, and the person did not acknowledge it here.
+        // The caller appends the instruction to `prior` before this call, so
+        // it and any host objective pin are projected like every other model
+        // channel. Persisted rows were already projected at their write
+        // boundary.
+        let session = self.tool_context.session_scope();
+        let objective = self.project_objective(objective, instruction.unwrap_or_default(), None);
         let request = instruction
             .filter(|text| !text.trim().is_empty())
             .or_else(|| objective.amendments.last().map(String::as_str))
             .unwrap_or(&objective.text);
+        let mut prior = prior;
+        self.project_objective_pins(&mut prior, request, None);
+        if let Some(instruction) = instruction {
+            for message in &mut prior {
+                if message.role != Role::User || message.text_content() != instruction {
+                    continue;
+                }
+                for part in &mut message.content {
+                    if let ContentPart::Text { text } = part {
+                        *text = project_user_text(session, text, instruction, None);
+                    }
+                }
+            }
+        }
         let procedure_request = format!("{}\n{request}", objective.text);
         let (control, rule_audit, skill_audit, references) =
             self.turn_control_context_with_rules(request, &procedure_request, true);

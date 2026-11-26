@@ -21,6 +21,38 @@ use leveler_storage::SessionRepository;
 
 use crate::{AppError, Application, CollaborationExecution};
 
+/// A headless command's one-shot plaintext decision.
+///
+/// The CLI has no input journal and no review overlay, so the explicit
+/// `--allow-plaintext-secrets` choice is carried as the same typed
+/// [`leveler_agent::SteeringSource::take_seed_model_text`] permit the
+/// interactive path uses. It is consumed by the one seed it belongs to; the
+/// source produces no mid-turn input.
+struct HeadlessPlaintextSeed {
+    text: std::sync::Mutex<Option<String>>,
+}
+
+impl HeadlessPlaintextSeed {
+    fn new(text: String) -> Self {
+        Self {
+            text: std::sync::Mutex::new(Some(text)),
+        }
+    }
+}
+
+impl leveler_agent::SteeringSource for HeadlessPlaintextSeed {
+    fn take_pending(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn take_seed_model_text(&self, _seed_input_id: Option<&str>) -> Option<String> {
+        self.text
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+    }
+}
+
 fn goal_from_content(content: &[ContentPart]) -> String {
     content
         .iter()
@@ -925,6 +957,13 @@ impl Application {
         // watching a headless run to Ctrl+C a stuck task. Interactive UIs go
         // through [`Self::run_in_session_with_clarifier`], which stays
         // until-terminal. Config `limits.max_duration_seconds` overrides.
+        // Headless has no input journal; the explicit plaintext choice (when
+        // the CLI passed the opt-in) is a one-shot seed permit.
+        let steering: Option<Arc<dyn leveler_agent::SteeringSource>> =
+            self.plaintext_seed_ack.then(|| {
+                Arc::new(HeadlessPlaintextSeed::new(goal.to_string()))
+                    as Arc<dyn leveler_agent::SteeringSource>
+            });
         self.run_in_session_with_policy(
             session_id,
             model,
@@ -933,8 +972,9 @@ impl Application {
             approver,
             Arc::new(AutoClarify),
             sandbox,
-            // Headless: nobody is at a keyboard to steer.
-            None,
+            // Headless: nobody is at a keyboard to steer; this slot only
+            // carries the explicit plaintext decision.
+            steering,
             // Headless: nobody is at a keyboard to explicitly cancel a task.
             Arc::new(AtomicBool::new(false)),
             // Legacy AgentEvent observer (headless CLI renderer): adapt from
