@@ -95,6 +95,14 @@ fn validate_command(session: &SessionId, command: &ClientCommand) -> anyhow::Res
             if !content.is_empty() && content.chars().count() <= 100_000 => {}
         ClientCommand::CancelBackgroundTask { task_id, .. }
             if !task_id.trim().is_empty() && task_id.len() <= 256 => {}
+        // A trust answer must name the session that owns the waiter and a
+        // bounded request identity. The runtime still refuses a request it no
+        // longer holds; the bridge refuses an unroutable answer earlier.
+        ClientCommand::DefinitionTrustDecision {
+            request_id,
+            session_id: Some(_),
+            ..
+        } if !request_id.as_str().trim().is_empty() && request_id.as_str().len() <= 256 => {}
         ClientCommand::SteerCurrentTurn { .. }
         | ClientCommand::CancelCurrentTurn { .. }
         | ClientCommand::CancelTask { .. }
@@ -778,6 +786,39 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn definition_trust_decisions_are_scoped_to_the_selected_session() {
+        let session = SessionId::new("desktop-session");
+        let decision = || leveler_client_protocol::DefinitionTrustDecision::AllowOnce;
+        for (id, expected) in [
+            (session.clone(), true),
+            (SessionId::new("other-session"), false),
+        ] {
+            let command = ClientCommand::DefinitionTrustDecision {
+                request_id: leveler_core::DefinitionTrustRequestId::new("trust-1"),
+                decision: decision(),
+                session_id: Some(id),
+            };
+            assert_eq!(validate_command(&session, &command).is_ok(), expected);
+        }
+        // The runtime refuses a decision that does not name its session; the
+        // bridge refuses it earlier instead of forwarding an unroutable answer.
+        for session_id in [None, Some(SessionId::new(" "))] {
+            let command = ClientCommand::DefinitionTrustDecision {
+                request_id: leveler_core::DefinitionTrustRequestId::new("trust-1"),
+                decision: decision(),
+                session_id,
+            };
+            assert!(validate_command(&session, &command).is_err());
+        }
+        let empty = ClientCommand::DefinitionTrustDecision {
+            request_id: leveler_core::DefinitionTrustRequestId::new(""),
+            decision: decision(),
+            session_id: Some(session.clone()),
+        };
+        assert!(validate_command(&session, &empty).is_err());
     }
 
     #[test]

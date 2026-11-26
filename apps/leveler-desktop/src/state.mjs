@@ -10,7 +10,7 @@ import {
 } from './presentation.mjs';
 
 export function projectSnapshot(snapshot, history = []) {
-  let state = {session:snapshot, messages:[], nextSeq:0, status:snapshot.task_status ?? snapshot.status ?? 'unknown', tools:[], thoughts:[], reasoning:'', reasoningSuperseded:false, approvals:[], clarifications:[], activity:'', activityElapsedMs:null, plan:snapshot.plan??null,diff:snapshot.diff??null,diffError:null,streamingMessageId:null,lastTerminal:null,turnErrors:[],turnTerminals:[],turnStartedAt:null};
+  let state = {session:snapshot, messages:[], nextSeq:0, status:snapshot.task_status ?? snapshot.status ?? 'unknown', tools:[], thoughts:[], reasoning:'', reasoningSuperseded:false, approvals:[], clarifications:[], definitionTrust:[], activity:'', activityElapsedMs:null, plan:snapshot.plan??null,diff:snapshot.diff??null,diffError:null,streamingMessageId:null,lastTerminal:null,turnErrors:[],turnTerminals:[],turnStartedAt:null};
   if (history.length > 0) {
     // The durable log is the conversation; the snapshot's `messages` are the
     // ACTIVE MODEL CONTEXT (`/compact` leaves one summary row there). Replaying
@@ -66,6 +66,10 @@ export function projectSnapshot(snapshot, history = []) {
 
   state.approvals = (snapshot.pending_interactions ?? []).filter(i=>i.type==='approval').map(i=>i.request);
   state.clarifications = (snapshot.pending_interactions ?? []).filter(i=>i.type==='clarification').map(i=>i.request);
+  // Definition trust is a third live waiter, not an approval: it answers
+  // "may this exact instruction content enter control context". A snapshot
+  // only carries requests whose runtime waiter is still alive.
+  state.definitionTrust = (snapshot.pending_interactions ?? []).filter(i=>i.type==='definition_trust').map(i=>i.request);
   return state;
 }
 /** The message a process row belongs to: the newest one when the row began. */
@@ -247,6 +251,12 @@ export function applyEvent(state,event) {
   if (event.type==='approval_resolved') next.approvals=state.approvals.filter(a=>a.id!==event.id);
   if (event.type==='clarification_requested') next.clarifications=[...state.clarifications.filter(a=>a.id!==event.request.id),event.request];
   if (event.type==='clarification_resolved') next.clarifications=state.clarifications.filter(a=>a.id!==event.id);
+  if (event.type==='definition_trust_requested') {
+    next.definitionTrust=[...(state.definitionTrust??[]).filter(r=>r.id!==event.request.id),event.request];
+  }
+  if (event.type==='definition_trust_resolved') {
+    next.definitionTrust=(state.definitionTrust??[]).filter(r=>r.id!==event.id);
+  }
   if (event.type==='agent_activity' || event.type==='command_progress') {
     next.activity=event.label;
     next.activityElapsedMs=event.type==='command_progress'&&Number.isFinite(event.elapsed_ms)?event.elapsed_ms:null;

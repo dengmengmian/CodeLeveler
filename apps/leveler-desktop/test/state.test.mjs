@@ -10,6 +10,28 @@ test('snapshot restores transcript and only live waiter approvals', () => {
   const restored = projectSnapshot(snapshot, [{event:{type:'approval_requested',request:{id:'stale'}}}]);
   assert.deepEqual(restored.approvals,[]);
 });
+test('definition trust waiters survive the snapshot and live events', () => {
+  const request = {
+    id:'d1', session_id:'session-1', call_id:'c1', identity:'skill:.leveler/skills/x',
+    display:'.leveler/skills/x', kind:'skill', scope:'project', source:'Agent Skills',
+    location:'/workspace/.leveler/skills/x', state:'unapproved',
+    current_digest:'sha256:new', current_content:'--- SKILL.md ---\nbody\n',
+  };
+  const state = projectSnapshot({...snapshot,pending_interactions:[
+    {type:'approval',request:{id:'a1',summary:'run'}},
+    {type:'definition_trust',request},
+  ]});
+  assert.deepEqual(state.approvals.map(a=>a.id),['a1']);
+  assert.deepEqual(state.definitionTrust.map(d=>d.id),['d1']);
+  assert.equal(state.definitionTrust[0].current_content,'--- SKILL.md ---\nbody\n');
+  const resolved = applyEvent(state,{type:'definition_trust_resolved',id:'d1'});
+  assert.deepEqual(resolved.definitionTrust,[]);
+  const requested = applyEvent(state,{type:'definition_trust_requested',request:{...request,id:'d2'}});
+  assert.deepEqual(requested.definitionTrust.map(d=>d.id),['d1','d2']);
+  const duplicate = applyEvent(requested,{type:'definition_trust_requested',request:{...request,id:'d2',state:'changed'}});
+  assert.deepEqual(duplicate.definitionTrust.map(d=>d.id),['d1','d2']);
+  assert.equal(duplicate.definitionTrust[1].state,'changed');
+});
 test('assistant stream does not invent completion or duplicate canonical messages', () => {
   let state = projectSnapshot(snapshot);
   state = applyEvent(state,{type:'assistant_message_started',message_id:'a1'});

@@ -15,6 +15,13 @@ test('desktop rejects cross-session submission but accepts scoped text and live 
  assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'submit_message',session_id:'s1',content:'hi'})));
  assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'approval_decision',request_id:'a1',decision:'approve_once'})));
 });
+test('definition trust decisions are scoped, enumerated, and exact',()=>{
+ for(const decision of ['allow_once','trust_current_version','deny'])assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'definition_trust_decision',request_id:'d1',decision,session_id:'s1'})));
+ for(const session_id of ['s2','',null,undefined,' '])assert.throws(()=>security.validateEnvelope(envelope({type:'definition_trust_decision',request_id:'d1',decision:'allow_once',session_id})));
+ for(const decision of ['allow','trust','deny_all','ALLOW_ONCE','',null,undefined,{}])assert.throws(()=>security.validateEnvelope(envelope({type:'definition_trust_decision',request_id:'d1',decision,session_id:'s1'})));
+ for(const request_id of ['',null,undefined,'   ','a'.repeat(257)])assert.throws(()=>security.validateEnvelope(envelope({type:'definition_trust_decision',request_id,decision:'deny',session_id:'s1'})));
+ assert.throws(()=>security.validateEnvelope(envelope({type:'definition_trust_decision',request_id:'d1',decision:'deny',session_id:'s1',content:'x'})));
+});
 test('desktop accepts current-session model, title, and archive commands using existing contracts',()=>{
  for(const command of [{type:'select_model',session_id:'s1',model:{provider:'openai',model:'gpt-4o'}},{type:'rename_session',session_id:'s1',name:'新名称'},{type:'archive_session',session_id:'s1'},{type:'unarchive_session',session_id:'s1'}])assert.doesNotThrow(()=>security.validateEnvelope(envelope(command)));
 });

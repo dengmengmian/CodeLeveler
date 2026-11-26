@@ -37,6 +37,6 @@ npm start
 
 ## 开发检查
 
-运行 `npm run build`、`npm run typecheck`、`npm run lint` 和 `npm test`。构建本地 Runtime 后，使用 `npm run test:smoke` 验证会话恢复、归档恢复、图片附件、自动化运行和定时任务工具卡。冒烟使用隔离配置、临时工作区和测试专用模型服务，不访问现有会话或外部模型。
+运行 `npm run build`、`npm run typecheck`、`npm run lint` 和 `npm test`。构建本地 Runtime 后，使用 `npm run test:smoke` 验证会话恢复、归档恢复、图片附件、自动化运行、定时任务工具卡和定义信任审批。冒烟使用隔离配置、临时工作区和测试专用模型服务，不访问现有会话或外部模型。
 
 自动化的“立即运行”通过调度工具使用 `leveler schedule dispatch --occurrence <id> --follow`：只执行该 run-now 槽位并跟随到终态；不会开启系统后台唤醒，也不会继续派发未来的定时任务。桌面设置中的 Runtime 更新只针对命令行运行时，不更新桌面客户端。

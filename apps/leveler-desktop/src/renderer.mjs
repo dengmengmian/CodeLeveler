@@ -251,7 +251,7 @@ function controls() {
   }
   for (const button of document.querySelectorAll('.takeover button')) button.disabled = loading || !!uncertain;
   $('conversation-status').textContent = loading ? '连接 Runtime…'
-    : current ? (current.approvals.length || current.clarifications.length
+    : current ? (current.approvals.length || current.clarifications.length || (current.definitionTrust?.length ?? 0)
       ? '等待你处理' : current.activity || LABELS[current.status] || current.status) : '';
 }
 
@@ -3649,6 +3649,12 @@ function renderTrajectory() {
 
 /* ----------------------------------------------------------- interactions */
 
+function shortDigest(value) {
+  const text = String(value ?? '');
+  const body = text.startsWith('sha256:') ? text.slice(7) : text;
+  return body.length > 12 ? `${body.slice(0, 12)}…` : body;
+}
+
 function renderInteractions() {
   const host = $('takeover');
   const cards = [];
@@ -3695,6 +3701,63 @@ function renderInteractions() {
       }));
       actions.append(button);
     }
+    card.append(actions);
+    cards.push(card);
+  }
+  for (const request of current?.definitionTrust ?? []) {
+    const card = el('div', 'interaction-card definition-trust-card');
+    card.dataset.requestId = request.id;
+    card.append(el('h3', undefined, '需要信任一个定义'));
+    card.append(el('p', undefined, '运行时已暂停一个工具调用，直到你决定是否允许下面的定义内容进入执行上下文。'));
+    const meta = el('dl', 'definition-trust-meta');
+    const stateLabels = { unapproved: '未批准', changed: '内容已变更', store_unavailable: '信任存储不可用', other: '其他状态' };
+    for (const [label, value] of [
+      ['定义', request.display],
+      ['类型', request.kind],
+      ['范围', request.scope],
+      ['来源', request.source],
+      ['位置', request.location],
+      ['状态', stateLabels[request.state] ?? request.state],
+    ]) if (value) meta.append(el('dt', undefined, label), el('dd', undefined, String(value)));
+    card.append(meta);
+    const digests = [];
+    if (request.current_digest) digests.push(`当前 ${shortDigest(request.current_digest)}`);
+    if (request.approved_digest) digests.push(`已批准 ${shortDigest(request.approved_digest)}`);
+    if (digests.length) {
+      const line = el('p', 'definition-trust-digest', digests.join(' · '));
+      line.title = `当前 ${request.current_digest ?? ''}${request.approved_digest ? `\n已批准 ${request.approved_digest}` : ''}`;
+      card.append(line);
+    }
+    const content = el('details', 'interaction-details definition-trust-content');
+    content.append(el('summary', undefined, '查看当前内容'), el('pre', undefined, request.current_content ?? ''));
+    card.append(content);
+    if (typeof request.approved_content === 'string') {
+      const approved = el('details', 'interaction-details definition-trust-content');
+      approved.append(el('summary', undefined, '查看已批准的版本'), el('pre', undefined, request.approved_content));
+      card.append(approved);
+    }
+    if (request.content_truncated) card.append(el('p', 'definition-trust-note', '内容预览已被截断；决定只针对运行时的当前完整内容。'));
+    card.append(el('p', 'definition-trust-note', '允许本次使用只影响本会话；信任当前版本会为这份精确内容写入持久批准；拒绝不会写入信任。'));
+    const actions = el('div', 'interaction-actions');
+    const buttons = [];
+    for (const [decision, label, title] of [
+      ['allow_once', '允许本次使用', '仅本次会话使用这份精确内容'],
+      ['trust_current_version', '信任当前版本', '持久批准这份精确内容'],
+      ['deny', '拒绝', '不使用这份定义'],
+    ]) {
+      const button = el('button', `button ${decision === 'deny' ? 'secondary' : 'primary'}`, label);
+      button.type = 'button';
+      button.title = title;
+      button.addEventListener('click', () => action(async () => {
+        // The card is not removed optimistically: it disappears only when the
+        // Runtime resolves the waiter and the next snapshot (or event) says so.
+        for (const item of buttons) item.disabled = true;
+        await deliver({ type: 'definition_trust_decision', request_id: request.id, decision, session_id: current.session.id });
+        await refreshMetadata();
+      }));
+      buttons.push(button);
+    }
+    actions.append(...buttons);
     card.append(actions);
     cards.push(card);
   }
@@ -7616,6 +7679,7 @@ api.onEvent(frame => {
     current.plan = replayed.plan ?? current.plan;
     current.approvals = replayed.approvals;
     current.clarifications = replayed.clarifications;
+    current.definitionTrust = replayed.definitionTrust;
     current.settledBackgroundTasks = settledBackgroundTasks;
     const reconciled = reconcileBackgroundJobs({
       active: (frame.data.active_background_tasks ?? []).map(job => activeJobRecord(job, priorBackgroundTasks)),
@@ -7746,7 +7810,7 @@ api.onEvent(frame => {
       && current.tools.some(tool => tool.id === event.id && browserActivity(tool)))) {
     renderRightbar();
   }
-  if (['approval_requested', 'approval_resolved', 'clarification_requested', 'clarification_resolved'].includes(event.type)) renderInteractions();
+  if (['approval_requested', 'approval_resolved', 'clarification_requested', 'clarification_resolved', 'definition_trust_requested', 'definition_trust_resolved'].includes(event.type)) renderInteractions();
   if ($('settings-dialog').open && settingsSection === 'presets') renderSettings();
   if (terminalEvents.has(event.type)) action(async () => { await refreshSnapshot(); await loadHistory(); await refreshTasks(); });
   if (event.type === 'turn_failed') showError(event.failure?.message || event.error || 'Runtime 执行失败');
