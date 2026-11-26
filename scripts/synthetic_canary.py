@@ -28,7 +28,6 @@ import secrets
 import uuid
 
 _ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-_PREFIX_RE = re.compile(r"^CLTEST-([0-9a-f]{8})-[a-z0-9-]+-[A-Za-z0-9]{32,}$")
 
 
 class UntrustedCanary(ValueError):
@@ -44,12 +43,23 @@ class SyntheticCanaryRun:
         self._issued: dict[str, str] = {}
         self._labels: dict[str, str] = {}
 
-    def issue(self, label: str) -> str:
-        """Generate one fresh synthetic value for `label`."""
+    def issue(self, label: str, shape: str = "plain") -> str:
+        """Generate one fresh synthetic value for `label`.
+
+        `shape="plain"` carries this run's id visibly. `shape="sk"` matches the
+        provider-key detector's prefix so a test can exercise automatic
+        detection; its provenance is still this run's issued-digest set, not
+        the spelling.
+        """
         if not re.fullmatch(r"[a-z0-9-]{1,32}", label):
             raise ValueError("canary label must be short lowercase ascii")
         token = "".join(secrets.choice(_ALPHABET) for _ in range(40))
-        value = f"CLTEST-{self.run_id}-{label}-{token}"
+        if shape == "plain":
+            value = f"CLTEST-{self.run_id}-{label}-{token}"
+        elif shape == "sk":
+            value = f"sk-{token}"
+        else:
+            raise ValueError("unsupported synthetic canary shape")
         digest = self.digest(value)
         if digest in self._issued:
             # Astronomically unlikely; a collision must never merge two labels.
@@ -59,11 +69,13 @@ class SyntheticCanaryRun:
         return value
 
     def accepts(self, value: str) -> bool:
-        """Whether `value` was issued by this run and nothing else."""
+        """Whether `value` was issued by this run and nothing else.
+
+        Membership, not appearance, is the authority. A shaped value never
+        embeds the run id; an unissued string that merely looks like a key is
+        refused.
+        """
         if not isinstance(value, str):
-            return False
-        match = _PREFIX_RE.fullmatch(value)
-        if not match or match.group(1) != self.run_id:
             return False
         return self._issued.get(self.digest(value)) is not None
 
@@ -105,6 +117,20 @@ class SyntheticCanaryRun:
         if not placeholder.startswith("<SYNTHETIC-"):
             raise ValueError("redaction placeholders must be visibly synthetic")
         return text.replace(value, placeholder)
+
+    def scrub_loose(self, text: str, value: str, placeholder: str) -> str:
+        """Redact a value a terminal may have wrapped across lines.
+
+        A PTY inserts line breaks inside a long token; an exact replacement
+        then misses it and the value lands in evidence. This matches the value
+        with optional whitespace between characters, so the wrapped rendering
+        is redacted too.
+        """
+        self.require(value)
+        if not placeholder.startswith("<SYNTHETIC-"):
+            raise ValueError("redaction placeholders must be visibly synthetic")
+        pattern = re.compile(r"\s*".join(re.escape(char) for char in value))
+        return pattern.sub(placeholder, text)
 
 
 # A process-wide run for scripts that issue once. Tests that need isolation

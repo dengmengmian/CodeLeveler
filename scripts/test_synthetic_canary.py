@@ -55,6 +55,28 @@ class SyntheticCanaryContract(unittest.TestCase):
         forged = value.replace(run.run_id, "deadbeef", 1)
         self.assertFalse(run.accepts(forged))
 
+    def test_a_shaped_value_is_accepted_only_when_this_run_issued_it(self):
+        run = SyntheticCanaryRun("unit")
+        issued = run.issue("seed", shape="sk")
+        looking_alike = "sk-" + "A" * 40
+        self.assertTrue(issued.startswith("sk-"))
+        self.assertTrue(run.accepts(issued))
+        self.assertFalse(run.accepts(looking_alike))
+
+    def test_scripts_do_not_freeze_canary_literals(self):
+        import pathlib
+        import re as _re
+        root = pathlib.Path(__file__).resolve().parent
+        literal = _re.compile(r"CANARY[A-Z_]*\s*=\s*[\"'][^\"']+[\"']")
+        offenders = []
+        for path in root.glob("*.py"):
+            if path.name in {"synthetic_canary.py", "test_synthetic_canary.py"}:
+                continue
+            for number, line in enumerate(path.read_text(errors="ignore").splitlines(), 1):
+                if literal.search(line):
+                    offenders.append(f"{path.name}:{number}")
+        self.assertEqual(offenders, [], "security tests must issue canaries per run")
+
     def test_reports_carry_digests_not_values(self):
         run = SyntheticCanaryRun("unit")
         value = run.issue("seed")
