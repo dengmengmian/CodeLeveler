@@ -272,3 +272,122 @@ fn a_foreign_unknown_revoked_or_expired_capture_cannot_gain_a_use_scope() {
         Err(VaultError::Expired)
     ));
 }
+
+#[test]
+fn a_denial_is_sticky_and_a_new_capture_is_the_way_back() {
+    let vault = vault();
+    let reference = vault
+        .capture("s", "hunter2-abc123".to_string(), None)
+        .unwrap();
+    assert!(vault.authorize_declaration(
+        "s",
+        &reference,
+        &leveler_core::DotenvUseDeclaration {
+            targets: vec![".env".to_string()],
+            fields: vec!["KEY".to_string()],
+            denied_targets: vec![".env.production".to_string()],
+            ..Default::default()
+        }
+    ));
+    let scope = vault.use_scope("s", &reference).unwrap();
+    assert_eq!(scope.targets, vec![".env".to_string()]);
+    assert_eq!(scope.denied_targets, vec![".env.production".to_string()]);
+
+    // A later bare mention is not an explicit override. The prohibition stays
+    // attached to this capture.
+    assert!(vault.authorize_use("s", &reference, &[".env.production".to_string()], &[]));
+    let scope = vault.use_scope("s", &reference).unwrap();
+    assert_eq!(scope.denied_targets, vec![".env.production".to_string()]);
+    assert!(!scope.targets.contains(&".env.production".to_string()));
+
+    // A new capture is a new decision and starts without the old prohibition.
+    let fresh = vault
+        .capture("s", "hunter2-abc123".to_string(), None)
+        .unwrap();
+    assert!(vault.authorize_use("s", &fresh, &[".env.production".to_string()], &[]));
+    let scope = vault.use_scope("s", &fresh).unwrap();
+    assert!(scope.denied_targets.is_empty());
+    assert_eq!(scope.targets, vec![".env.production".to_string()]);
+}
+
+#[test]
+fn an_exact_approval_and_denial_bind_to_one_reference_and_use() {
+    let vault = vault();
+    let first = vault
+        .capture("s", "first-secret-abc123".to_string(), None)
+        .unwrap();
+    let second = vault
+        .capture("s", "second-secret-abc123".to_string(), None)
+        .unwrap();
+    assert!(vault.record_exact_approval("s", &first, ".env", "A_KEY"));
+    assert!(vault.record_exact_denial("s", &second, ".env", "B_KEY"));
+
+    let scope = vault.use_scope("s", &first).unwrap();
+    assert_eq!(scope.approved_uses.len(), 1);
+    assert_eq!(scope.approved_uses[0].target, ".env");
+    assert_eq!(scope.approved_uses[0].field, "A_KEY");
+    assert!(scope.denied_uses.is_empty());
+
+    let scope = vault.use_scope("s", &second).unwrap();
+    assert_eq!(scope.denied_uses.len(), 1);
+    assert_eq!(scope.denied_uses[0].field, "B_KEY");
+    assert!(scope.approved_uses.is_empty());
+
+    // The other session cannot record or learn a decision.
+    assert!(!vault.record_exact_approval("other", &first, ".env", "A_KEY"));
+
+    // A fresh approval lifts the exact refusal; a fresh refusal lifts the
+    // approval. The two sets never contain the same use.
+    assert!(vault.record_exact_approval("s", &second, ".env", "B_KEY"));
+    let scope = vault.use_scope("s", &second).unwrap();
+    assert!(scope.denied_uses.is_empty(), "{scope:?}");
+    assert_eq!(scope.approved_uses.len(), 1);
+
+    assert!(vault.record_exact_denial("s", &second, ".env", "B_KEY"));
+    let scope = vault.use_scope("s", &second).unwrap();
+    assert!(scope.approved_uses.is_empty(), "{scope:?}");
+    assert_eq!(scope.denied_uses.len(), 1);
+}
+
+#[test]
+fn revoked_and_foreign_captures_cannot_gain_or_record_a_decision() {
+    let vault = vault();
+    let reference = vault
+        .capture("s", "hunter2-abc123".to_string(), None)
+        .unwrap();
+    assert!(!vault.record_exact_approval("other", &reference, ".env", "KEY"));
+    vault.revoke("s", &reference);
+    assert!(!vault.record_exact_approval("s", &reference, ".env", "KEY"));
+    assert!(!vault.record_exact_denial("s", &reference, ".env", "KEY"));
+    assert!(matches!(
+        vault.use_scope("s", &reference),
+        Err(VaultError::Revoked)
+    ));
+}
+
+#[test]
+fn an_ambiguous_declaration_is_sticky_and_carries_no_positive_grant() {
+    let vault = vault();
+    let reference = vault
+        .capture("s", "hunter2-abc123".to_string(), None)
+        .unwrap();
+    assert!(vault.authorize_declaration(
+        "s",
+        &reference,
+        &leveler_core::DotenvUseDeclaration {
+            ambiguous: true,
+            ..Default::default()
+        }
+    ));
+    let scope = vault.use_scope("s", &reference).unwrap();
+    assert!(scope.ambiguous);
+    assert!(scope.targets.is_empty());
+    assert!(scope.fields.is_empty());
+
+    // A later explicit use is a positive grant, but the earlier mention was
+    // never resolved; the flag stays for the dimensions it still covers.
+    assert!(vault.authorize_use("s", &reference, &[".env".to_string()], &[]));
+    let scope = vault.use_scope("s", &reference).unwrap();
+    assert!(scope.ambiguous);
+    assert_eq!(scope.targets, vec![".env".to_string()]);
+}

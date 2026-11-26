@@ -35,10 +35,12 @@ pub use ids::{
 };
 pub use ownership::{BootLiveness, BootLivenessProbe, OwnerEpoch, OwnershipToken};
 pub use secret::{
-    DetectedSecret, SECRET_PLACEHOLDER, SecretEvidence, SecretFinding, SecretKind, SecretLevel,
-    clear_session_secrets, detect_secrets, dotenv_fields_in, dotenv_targets_in, masked_secret,
-    normalize_dotenv_target, parse_secret_reference_token, register_session_secrets,
-    sanitize_model_visible, scrub_registered_secrets, secret_reference_token,
+    DetectedSecret, DotenvMention, DotenvUseDeclaration, SECRET_PLACEHOLDER, SecretEvidence,
+    SecretFinding, SecretKind, SecretLevel, clear_session_secrets, detect_secrets,
+    dotenv_field_mentions, dotenv_fields_in, dotenv_target_mentions, dotenv_targets_in,
+    dotenv_use_declarations, masked_secret, normalize_dotenv_target, parse_secret_reference_token,
+    register_session_secrets, sanitize_model_visible, scrub_registered_secrets,
+    secret_reference_token,
 };
 pub use text::{
     ceil_char_boundary, floor_char_boundary, redact_secrets, redact_secrets_json,

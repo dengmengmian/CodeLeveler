@@ -509,8 +509,32 @@ impl Executor {
                 },
             );
             match outcome {
-                AskOutcome::Allowed(evidence) => return Ok(pending.allowed(evidence)),
-                AskOutcome::DeniedByUser => return Err("denied by user".to_string()),
+                AskOutcome::Allowed(evidence) => {
+                    // An approval of `secret_apply` authorizes one exact
+                    // `(reference, target, field)` use. Record it in the vault
+                    // so the tool can distinguish a confirmed unbound use from
+                    // a guess, and so a denied use stays denied.
+                    leveler_tools::record_secret_call_decision(
+                        ctx,
+                        &call.name,
+                        &call.arguments,
+                        true,
+                    );
+                    return Ok(pending.allowed(evidence));
+                }
+                AskOutcome::DeniedByUser => {
+                    // A refusal binds to the exact call the person saw. The
+                    // broker will refuse that use even if the model retries or
+                    // the profile later becomes Full; only an explicit new
+                    // statement or approval lifts it.
+                    leveler_tools::record_secret_call_decision(
+                        ctx,
+                        &call.name,
+                        &call.arguments,
+                        false,
+                    );
+                    return Err("denied by user".to_string());
+                }
                 AskOutcome::DeniedUnattended(reason) => return Err(reason),
                 AskOutcome::Cancelled => return Err("cancelled".to_string()),
                 // The profile changed while the question waited. Loop and let
@@ -5167,5 +5191,60 @@ mod authorize_tests {
             )
             .await;
         assert!(read.is_ok(), "an investigation still reads");
+    }
+
+    #[tokio::test]
+    async fn a_secret_apply_approval_records_the_exact_credential_use() {
+        use leveler_execution::secret_vault::SecretVault;
+
+        for decision in [ApprovalDecision::ApproveOnce, ApprovalDecision::Deny] {
+            let dir = tempfile::tempdir().unwrap();
+            let vault = Arc::new(SecretVault::new());
+            let reference = vault
+                .capture("s", "sk-2f8a1c9e4b7d6a5f3e2c1b0a".into(), None)
+                .unwrap();
+            let approver = Arc::new(FixedApprover::new(decision));
+            let mut exec = executor_at(dir.path(), PermissionProfile::Assisted, approver.clone());
+            exec.tool_context = exec
+                .tool_context
+                .clone()
+                .with_session_scope("s")
+                .with_secret_vault(vault.clone());
+            let request = call(
+                "secret_apply",
+                serde_json::json!({
+                    "secret_ref": reference.as_str(),
+                    "field": "DEMO_API_KEY",
+                    "target": ".env",
+                }),
+            );
+            let result = exec.authorize(&request, &mut HashSet::new()).await;
+            assert_eq!(approver.asks(), 1, "the unbound use is a question");
+            let scope = vault.use_scope("s", &reference).unwrap();
+            match decision {
+                ApprovalDecision::ApproveOnce => {
+                    assert!(result.is_ok(), "{result:?}");
+                    assert!(
+                        scope
+                            .approved_uses
+                            .iter()
+                            .any(|use_| { use_.target == ".env" && use_.field == "DEMO_API_KEY" }),
+                        "the approval must bind to the exact use: {scope:?}"
+                    );
+                    assert!(scope.denied_uses.is_empty());
+                }
+                _ => {
+                    assert!(result.is_err(), "a refusal must not authorize");
+                    assert!(
+                        scope
+                            .denied_uses
+                            .iter()
+                            .any(|use_| { use_.target == ".env" && use_.field == "DEMO_API_KEY" }),
+                        "the refusal must bind to the exact use: {scope:?}"
+                    );
+                    assert!(scope.approved_uses.is_empty());
+                }
+            }
+        }
     }
 }

@@ -1279,6 +1279,12 @@ pub async fn reconcile_runtime_generation(
                 #[cfg(not(unix))]
                 let requested = false;
                 if !ui.waits_for_legacy_exit() {
+                    // Cooperative retirement of a pre-token runtime is a
+                    // Unix-only compatibility path. The Windows endpoint has
+                    // no pre-token generation to retire; keep the branch out
+                    // of the Windows build instead of referencing Unix-only
+                    // helpers that do not exist there.
+                    #[cfg(unix)]
                     if requested {
                         if wait_for_endpoint_release_bounded(
                             &observed,
@@ -1320,6 +1326,10 @@ pub async fn reconcile_runtime_generation(
                         .as_ref()
                         .is_some_and(|observed| observed.info.health.shutting_down)
                     {
+                        // The bounded release wait uses the Unix-only legacy
+                        // handoff helpers; Windows has no pre-token generation
+                        // to retire and reports the pending transition instead.
+                        #[cfg(unix)]
                         if wait_for_endpoint_release_bounded(
                             &observed,
                             LEGACY_RETIREMENT_RELEASE_TIMEOUT,

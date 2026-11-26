@@ -117,19 +117,36 @@ impl Tool for SecretApplyTool {
         let session = context.session_scope.as_deref()?;
         let vault = context.execution.secret_vault.as_ref()?;
         let scope = vault.use_scope(session, &reference).ok()?;
-        if scope_refusal(&scope, &target, field).is_some() {
+        if hard_scope_refusal(&scope, &target, field).is_some() {
+            return None;
+        }
+        // The person already approved this exact use. A second identical call
+        // is the same authorized operation, not a new question.
+        if scope
+            .approved_uses
+            .iter()
+            .any(|approved| approved.target == target && approved.field == field)
+        {
             return None;
         }
         // No prompt only when the person's own message named BOTH dimensions.
         // A target without a field (or a field without a target) leaves the
         // other half to the model, which is exactly the sensitive credential
         // use Auto asks about.
-        let missing = match (scope.targets.is_empty(), scope.fields.is_empty()) {
-            (false, false) => return None,
+        let unbound_dimensions = match (scope.targets.is_empty(), scope.fields.is_empty()) {
+            (false, false) => "",
             (true, true) => "目标与字段都未在用户消息中声明",
             (true, false) => "目标未在用户消息中声明",
             (false, true) => "字段未在用户消息中声明",
         };
+        // An unattributed mention is not a missing dimension the model may
+        // fill in: the user said something that could name this dimension, but
+        // the message did not bind it to this reference. Guess and the write
+        // may land somewhere the user did not authorize.
+        let unattributed = scope.ambiguous && (scope.targets.is_empty() || scope.fields.is_empty());
+        if unbound_dimensions.is_empty() && !unattributed {
+            return None;
+        }
         // Do not prompt for a write the execution layer would refuse.
         if context.write_path_denied(&target).is_some() {
             return None;
@@ -139,10 +156,19 @@ impl Tool for SecretApplyTool {
             .ok()?
             .resolve_for_secret_write(&target, &context.write_scope())
             .ok()?;
-        Some(format!(
-            "使用已接管凭据（{}）写入 {target} 的 {field}。{missing}，请确认。",
-            short_reference(&reference)
-        ))
+        let reason = if unattributed {
+            format!(
+                "用户消息提到了一个无法唯一归属到该凭据的 .env 目标或字段。\
+                 使用已接管凭据（{}）写入 {target} 的 {field} 需要你确认这次精确使用。",
+                short_reference(&reference)
+            )
+        } else {
+            format!(
+                "使用已接管凭据（{}）写入 {target} 的 {field}。{unbound_dimensions}，请确认。",
+                short_reference(&reference)
+            )
+        };
+        Some(reason)
     }
 
     async fn execute(
@@ -452,15 +478,35 @@ fn validate_env_target(target: &str) -> Result<String, String> {
     })
 }
 
-/// Why the model's requested use is outside what the person's own message
-/// authorized. An empty scope is not a refusal: the person may still approve
-/// the use at admission, or the capture may have arrived through `/secret`
-/// without a target.
-fn scope_refusal(
+/// A refusal that no approval can lift: an explicit prohibition, an exact use
+/// the person refused, or a use outside a non-empty declared dimension.
+fn hard_scope_refusal(
     scope: &leveler_execution::secret_vault::SecretUseScope,
     target: &str,
     field: &str,
 ) -> Option<String> {
+    if scope
+        .denied_uses
+        .iter()
+        .any(|denied| denied.target == target && denied.field == field)
+    {
+        return Some(format!(
+            "the user refused this exact use of the captured secret ({target}, {field}). \
+             Do not retry it; ask the user whether a different use is intended."
+        ));
+    }
+    if scope.denied_targets.iter().any(|denied| denied == target) {
+        return Some(format!(
+            "the user explicitly prohibited writing this captured secret to {target}. \
+             Do not use that target; ask the user which target they authorize."
+        ));
+    }
+    if scope.denied_fields.iter().any(|denied| denied == field) {
+        return Some(format!(
+            "the user explicitly prohibited writing this captured secret to field {field}. \
+             Do not use that field; ask the user which field they authorize."
+        ));
+    }
     if !scope.targets.is_empty() && !scope.targets.iter().any(|allowed| allowed == target) {
         return Some(format!(
             "this captured secret is authorized only for {}; the user's message did not \
@@ -478,6 +524,92 @@ fn scope_refusal(
         ));
     }
     None
+}
+
+/// Whether the exact use is outside what the person's own message authorized.
+///
+/// The authorization unit is the exact `(reference, target, field)` use. A
+/// denial is absolute: an explicit prohibition and an exact use the person
+/// refused are both enforced in every permission mode, including Full. An
+/// empty dimension is not a refusal by itself — the person may still approve
+/// that use — but a dimension the message mentioned without binding it to this
+/// reference must never be guessed.
+fn scope_refusal(
+    scope: &leveler_execution::secret_vault::SecretUseScope,
+    target: &str,
+    field: &str,
+) -> Option<String> {
+    if let Some(reason) = hard_scope_refusal(scope, target, field) {
+        return Some(reason);
+    }
+    // A mention exists that could not be attributed to this reference. With an
+    // empty dimension there is nothing to check the model's choice against, so
+    // only an exact approval recorded through the ordinary consent surface can
+    // make this use concrete. This also holds in Full: the mode removes
+    // permission friction, not the user's authority over their own credential.
+    if scope.ambiguous
+        && (scope.targets.is_empty() || scope.fields.is_empty())
+        && !scope
+            .approved_uses
+            .iter()
+            .any(|approved| approved.target == target && approved.field == field)
+    {
+        return Some(format!(
+            "the user's message named a .env target or field it did not bind to this \
+             captured secret. Writing {field} to {target} would guess; ask the user to \
+             state the exact target and field for this reference."
+        ));
+    }
+    None
+}
+
+/// Record a person's exact-call decision for a credential write.
+///
+/// The approval unit is `(reference, target, field)`, never the tool or the
+/// reference alone. Returns whether the decision applied to a live capture in
+/// this session; `false` means the call was not a credential write or the
+/// reference was already unavailable.
+pub fn record_secret_call_decision(
+    context: &ToolContext,
+    tool: &str,
+    input: &serde_json::Value,
+    approved: bool,
+) -> bool {
+    if tool != "secret_apply" {
+        return false;
+    }
+    let Some(session) = context.session_scope.as_deref() else {
+        return false;
+    };
+    let Some(vault) = context.execution.secret_vault.as_deref() else {
+        return false;
+    };
+    let Some(reference) = input
+        .get("secret_ref")
+        .and_then(|value| value.as_str())
+        .and_then(|value| SecretRef::parse(value).ok())
+    else {
+        return false;
+    };
+    let Some(target) = leveler_core::normalize_dotenv_target(
+        input
+            .get("target")
+            .and_then(|value| value.as_str())
+            .unwrap_or(".env"),
+    ) else {
+        return false;
+    };
+    let Some(field) = input.get("field").and_then(|value| value.as_str()) else {
+        return false;
+    };
+    if !is_env_field(field) {
+        return false;
+    }
+    if approved {
+        vault.record_exact_approval(session, &reference, &target, field)
+    } else {
+        vault.record_exact_denial(session, &reference, &target, field)
+    }
 }
 
 /// A reference suffix safe to show in an approval prompt: the model already
@@ -781,6 +913,63 @@ mod tests {
         assert_eq!(output.metadata["changed"], false);
         leveler_win_confine::verify_private_state_file(&path)
             .expect("an idempotent retry must still protect the credential file");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_new_dotenv_in_a_broad_directory_is_private_from_the_start() {
+        let (context, dir, _vault, reference) = broker_ctx(&[]);
+        let status = std::process::Command::new("icacls")
+            .arg(&dir)
+            .args(["/grant", "*S-1-1-0:(OI)(CI)R"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let output = apply(&context, &reference, "DEMO_API_KEY", ".env").await;
+        assert!(!output.is_error, "{}", output.content);
+        let path = dir.join(".env");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "DEMO_API_KEY=sk-2f8a1c9e4b7d6a5f3e2c1b0a\n"
+        );
+        leveler_win_confine::verify_private_state_file(&path)
+            .expect("a new credential file must not inherit the directory's broad DACL");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_changed_write_tightens_a_broad_existing_dotenv_without_leaving_a_stage() {
+        let (context, dir, _vault, reference) = broker_ctx(&[]);
+        let path = dir.join(".env");
+        std::fs::write(&path, "API_KEY=old-value-1\nOTHER=visible\n").unwrap();
+        let status = std::process::Command::new("icacls")
+            .arg(&path)
+            .args(["/grant", "*S-1-1-0:R"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        leveler_win_confine::verify_private_state_file(&path)
+            .expect_err("the probe file must start broad");
+
+        let output = apply(&context, &reference, "API_KEY", ".env").await;
+        assert!(!output.is_error, "{}", output.content);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "API_KEY=sk-2f8a1c9e4b7d6a5f3e2c1b0a\nOTHER=visible\n"
+        );
+        leveler_win_confine::verify_private_state_file(&path)
+            .expect("a changed credential write must leave a private file");
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".leveler-tmp")
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
     #[tokio::test]
@@ -1107,5 +1296,285 @@ mod tests {
             None,
             "Full mode never asks"
         );
+    }
+
+    #[tokio::test]
+    async fn a_prohibited_target_is_refused_in_every_mode() {
+        for mode in [
+            PermissionProfile::Assisted,
+            PermissionProfile::FullAccess,
+            PermissionProfile::RequestApproval,
+        ] {
+            let (context, dir, vault, reference) = broker_ctx(&[]);
+            assert!(vault.authorize_declaration(
+                "s",
+                &reference,
+                &leveler_core::DotenvUseDeclaration {
+                    targets: vec![".env".to_string()],
+                    fields: vec!["DEMO_API_KEY".to_string()],
+                    denied_targets: vec![".env.production".to_string()],
+                    ..Default::default()
+                }
+            ));
+            let context = context
+                .with_permission_profile(leveler_execution::SharedPermissionProfile::new(mode));
+            let denied = apply(&context, &reference, "DEMO_API_KEY", ".env.production").await;
+            assert!(denied.is_error, "{mode:?}: {}", denied.content);
+            assert!(denied.content.contains("prohibited"), "{}", denied.content);
+            assert!(
+                !dir.join(".env.production").exists(),
+                "{mode:?}: a prohibited target writes nothing"
+            );
+
+            let allowed = apply(&context, &reference, "DEMO_API_KEY", ".env").await;
+            assert!(!allowed.is_error, "{mode:?}: {}", allowed.content);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_unbound_use_is_not_guessed() {
+        for mode in [
+            PermissionProfile::Assisted,
+            PermissionProfile::FullAccess,
+            PermissionProfile::RequestApproval,
+        ] {
+            let (context, dir, vault, reference) = broker_ctx(&[]);
+            assert!(vault.authorize_declaration(
+                "s",
+                &reference,
+                &leveler_core::DotenvUseDeclaration {
+                    ambiguous: true,
+                    ..Default::default()
+                }
+            ));
+            let context = context
+                .with_permission_profile(leveler_execution::SharedPermissionProfile::new(mode));
+            let input = serde_json::json!({
+                "secret_ref": reference.as_str(),
+                "field": "DEMO_API_KEY",
+                "target": ".env",
+            });
+            let reason = SecretApplyTool.approval_reason(&input, &context);
+            if mode == PermissionProfile::FullAccess {
+                assert_eq!(reason, None, "Full mode never asks");
+            } else {
+                let reason = reason.expect("an unattributed dimension is a question");
+                assert!(reason.contains("无法唯一归属"), "{reason}");
+            }
+            let output = apply(&context, &reference, "DEMO_API_KEY", ".env").await;
+            assert!(output.is_error, "{mode:?}: {}", output.content);
+            assert!(
+                output.content.contains("did not bind"),
+                "{}",
+                output.content
+            );
+            assert!(!dir.join(".env").exists(), "{mode:?}: nothing was written");
+
+            // The ordinary consent surface records this exact use; the same
+            // call then becomes concrete and is allowed.
+            assert!(record_secret_call_decision(
+                &context,
+                "secret_apply",
+                &input,
+                true
+            ));
+            let output = apply(&context, &reference, "DEMO_API_KEY", ".env").await;
+            assert!(!output.is_error, "{mode:?}: {}", output.content);
+            assert!(dir.join(".env").exists(), "{mode:?}");
+
+            // The approval binds to the exact use only.
+            let other = apply(&context, &reference, "OTHER_KEY", ".env").await;
+            assert!(other.is_error, "{mode:?}: a new field is a new question");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_approved_exact_use_is_not_asked_again() {
+        let (context, _dir, vault, reference) = broker_ctx(&[]);
+        assert!(vault.authorize_declaration(
+            "s",
+            &reference,
+            &leveler_core::DotenvUseDeclaration {
+                ambiguous: true,
+                ..Default::default()
+            }
+        ));
+        let input = serde_json::json!({
+            "secret_ref": reference.as_str(),
+            "field": "DEMO_API_KEY",
+            "target": ".env",
+        });
+        assert!(
+            SecretApplyTool.approval_reason(&input, &context).is_some(),
+            "an unbound use is a question"
+        );
+        assert!(record_secret_call_decision(
+            &context,
+            "secret_apply",
+            &input,
+            true
+        ));
+        assert_eq!(
+            SecretApplyTool.approval_reason(&input, &context),
+            None,
+            "the person already approved this exact use"
+        );
+        let output = apply(&context, &reference, "DEMO_API_KEY", ".env").await;
+        assert!(!output.is_error, "{}", output.content);
+    }
+
+    #[tokio::test]
+    async fn a_refused_exact_use_stays_refused_after_the_mode_changes() {
+        let (context, dir, vault, reference) = broker_ctx(&[]);
+        // The person named the target and field, so the first call needs no
+        // broker question under Assisted.
+        assert!(vault.authorize_use(
+            "s",
+            &reference,
+            &[".env".to_string()],
+            &["DEMO_API_KEY".to_string()]
+        ));
+        let input = serde_json::json!({
+            "secret_ref": reference.as_str(),
+            "field": "DEMO_API_KEY",
+            "target": ".env",
+        });
+        assert_eq!(SecretApplyTool.approval_reason(&input, &context), None);
+        assert!(record_secret_call_decision(
+            &context,
+            "secret_apply",
+            &input,
+            false
+        ));
+
+        let full = context.clone().with_permission_profile(
+            leveler_execution::SharedPermissionProfile::new(PermissionProfile::FullAccess),
+        );
+        assert_eq!(
+            SecretApplyTool.approval_reason(&input, &full),
+            None,
+            "a denied exact use is refused, not asked again"
+        );
+        let output = apply(&full, &reference, "DEMO_API_KEY", ".env").await;
+        assert!(output.is_error, "{}", output.content);
+        assert!(output.content.contains("refused"), "{}", output.content);
+        assert!(!dir.join(".env").exists(), "a refusal writes nothing");
+
+        // A later bare mention does NOT lift the refusal. Only a new capture
+        // (or a fresh approval through the consent surface) is a new decision.
+        assert!(vault.authorize_use(
+            "s",
+            &reference,
+            &[".env".to_string()],
+            &["DEMO_API_KEY".to_string()]
+        ));
+        let output = apply(&full, &reference, "DEMO_API_KEY", ".env").await;
+        assert!(output.is_error, "{}", output.content);
+        assert!(
+            !dir.join(".env").exists(),
+            "a refused use stays refused without a new decision"
+        );
+
+        let fresh = vault
+            .capture("s", "sk-2f8a1c9e4b7d6a5f3e2c1b0a".into(), None)
+            .unwrap();
+        assert!(vault.authorize_use(
+            "s",
+            &fresh,
+            &[".env".to_string()],
+            &["DEMO_API_KEY".to_string()]
+        ));
+        let output = apply(&full, &fresh, "DEMO_API_KEY", ".env").await;
+        assert!(!output.is_error, "{}", output.content);
+        assert!(dir.join(".env").exists());
+    }
+
+    #[tokio::test]
+    async fn two_references_do_not_share_a_target_grant() {
+        let (context, dir, vault, _reference) = broker_ctx(&[]);
+        let first = vault
+            .capture("s", "sk-first-2f8a1c9e4b7d6a5f".into(), None)
+            .unwrap();
+        let second = vault
+            .capture("s", "sk-second-2f8a1c9e4b7d6a5f".into(), None)
+            .unwrap();
+        assert!(vault.authorize_use("s", &first, &[".env".to_string()], &["A_KEY".to_string()]));
+        assert!(vault.authorize_use(
+            "s",
+            &second,
+            &[".env.production".to_string()],
+            &["B_KEY".to_string()]
+        ));
+        let cross = apply(&context, &first, "B_KEY", ".env.production").await;
+        assert!(cross.is_error, "{}", cross.content);
+        assert!(!dir.join(".env.production").exists());
+
+        let own = apply(&context, &second, "B_KEY", ".env.production").await;
+        assert!(!own.is_error, "{}", own.content);
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".env.production")).unwrap(),
+            "B_KEY=sk-second-2f8a1c9e4b7d6a5f\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_concurrent_writes_leave_one_complete_dotenv() {
+        let (context, dir, vault, reference) = broker_ctx(&[]);
+        assert!(vault.authorize_use(
+            "s",
+            &reference,
+            &[".env".to_string()],
+            &["A_KEY".to_string(), "B_KEY".to_string()]
+        ));
+        let first = apply(&context, &reference, "A_KEY", ".env");
+        let second = apply(&context, &reference, "B_KEY", ".env");
+        let (first, second) = tokio::join!(first, second);
+        assert!(
+            !first.is_error || !second.is_error,
+            "at least one serialized write must commit: {:?} / {:?}",
+            first.content,
+            second.content
+        );
+        let written = std::fs::read_to_string(dir.join(".env")).unwrap();
+        for line in written.lines() {
+            assert!(
+                line.starts_with("A_KEY=") || line.starts_with("B_KEY="),
+                "a torn line was committed: {written}"
+            );
+        }
+        assert!(written.contains("sk-2f8a1c9e"), "{written}");
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".leveler-tmp")
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    fn recording_a_decision_ignores_calls_that_are_not_credential_writes() {
+        let (context, _dir, _vault, reference) = broker_ctx(&[]);
+        let input = serde_json::json!({
+            "secret_ref": reference.as_str(),
+            "field": "DEMO_API_KEY",
+            "target": ".env",
+        });
+        assert!(!record_secret_call_decision(
+            &context,
+            "write_file",
+            &input,
+            true
+        ));
+        assert!(!record_secret_call_decision(
+            &context,
+            "secret_apply",
+            &serde_json::json!({ "secret_ref": "not-a-ref", "field": "X", "target": ".env" }),
+            true
+        ));
     }
 }
