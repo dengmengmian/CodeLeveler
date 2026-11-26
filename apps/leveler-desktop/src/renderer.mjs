@@ -224,6 +224,9 @@ async function migrateLegacyDrafts() {
 function clearDraft() { drafts.delete(draftKey()); cleanDrafts.delete(draftKey()); draftScan = { key: null, text: '', status: 'idle', findings: [], useTargets: [], useFields: [], error: null }; saveDrafts(); }
 loadDrafts();
 let queuedMessages = [];
+// Chosen before a session exists. It becomes a session fact only through the
+// create command; opening or browsing the picker never creates one.
+let pendingModel = null;
 // A submit that the Runtime acknowledged but whose first status event has not
 // reached the page yet is still work that a quit would interrupt.
 let pendingSubmit = false;
@@ -1788,14 +1791,16 @@ function renderComposerMeta() {
   const permissionText = mode ? permissionLabel(mode) : '工作区内修改';
   permission.dataset.tooltip = `访问模式：${permissionText}（仅影响 Agent，用户终端按系统用户权限运行）`;
   permission.setAttribute('aria-label', `访问模式，当前：${permissionText}`);
-  const model = current?.session.model;
+  const model = current ? current.session.model : pendingModel;
   const modelText = modelLabel(model) || '请选择模型';
   $('model-picker').replaceChildren(
     el('span', 'trigger-label', modelText),
     iconNode('chevronDown', { size: 12, className: 'trigger-chevron' }),
   );
-  $('model-picker').dataset.tooltip = model ? `模型：${modelText} · 提供商：${model.provider}` : '选择模型';
-  $('model-picker').setAttribute('aria-label', `选择模型，当前：${modelText}`);
+  $('model-picker').dataset.tooltip = model
+    ? `模型：${modelText} · 提供商：${model.provider}${current ? '' : '（新会话使用）'}`
+    : '选择模型';
+  $('model-picker').setAttribute('aria-label', current ? `选择模型，当前：${modelText}` : `选择新会话模型，当前：${modelText}`);
   $('send').replaceChildren(iconNode('arrowUp', { size: 16, stroke: 1.8 }));
   // The running button shows a solid stop block, not an outlined icon glyph.
   $('stop').replaceChildren(el('span', 'stop-glyph'));
@@ -4180,9 +4185,8 @@ function selectWorkspace(folder) {
 }
 
 function openModelMenu(anchor) {
-  action(async () => {
-    if (!current) await createTask();
-    const models = current?.session.available_models ?? [];
+  if (current) {
+    const models = current.session.available_models ?? [];
     const items = [];
     if (!models.length) {
       items.push({ heading: '暂无可用模型' });
@@ -4204,7 +4208,41 @@ function openModelMenu(anchor) {
       }
     }
     openMenu({ anchor, items, width: 280, side: 'top', align: 'end' });
-  });
+    return;
+  }
+  // No session: read the configured models from the host. Selecting one is a
+  // pending choice; the session is created only when the person actually
+  // sends (or explicitly starts a new session).
+  void (async () => {
+    let models;
+    try {
+      models = (await api.listModels(selection?.id ?? null))?.models ?? [];
+    } catch (error) {
+      toast(`无法读取模型配置：${error?.message ?? '未知错误'}`, { tone: 'error', holdMs: 4200 });
+      return;
+    }
+    const items = [];
+    if (!models.length) {
+      items.push({ heading: '暂无可用模型' });
+      items.push({ label: '打开模型设置', icon: 'settings', onSelect: () => openSettings('models') });
+    } else {
+      items.push({ heading: '模型（新会话使用）' });
+      for (const model of models) {
+        items.push({
+          label: model.model,
+          badge: model.provider,
+          checked: pendingModel?.provider === model.provider && pendingModel?.model === model.model,
+          onSelect: () => {
+            pendingModel = { provider: model.provider, model: model.model };
+            renderComposerMeta();
+            controls();
+            toast(`新会话将使用 ${model.model}`, { tone: 'info', holdMs: 1800 });
+          },
+        });
+      }
+    }
+    openMenu({ anchor, items, width: 280, side: 'top', align: 'end' });
+  })();
 }
 
 function openPermissionMenu(anchor) {
@@ -4379,8 +4417,10 @@ async function createTask() {
   const draftText = $('message').value;
   const key = selection?.id ?? null;
   if (!pendingCreation || pendingCreation.key !== key) pendingCreation = { key, id: crypto.randomUUID() };
-  const result = await api.createTask(key, pendingCreation.id);
+  const pinned = pendingModel;
+  const result = await api.createTask(key, pendingCreation.id, pinned ?? undefined);
   pendingCreation = null;
+  if (pinned) pendingModel = null;
   pendingCreation = null;
   history = [];
   uncertain = null;

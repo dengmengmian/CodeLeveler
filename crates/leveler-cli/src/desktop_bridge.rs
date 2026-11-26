@@ -386,6 +386,15 @@ fn valid_desktop_secret_ref(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+/// The configured model refs, read through the same config authority the
+/// runtime uses. No session and no runtime process are created.
+fn model_list_payload(layout: Layout) -> anyhow::Result<Value> {
+    let config = leveler_app::ConfigManager::load(layout)?;
+    let mut models = config.snapshot().registry.model_refs();
+    models.sort_by_key(|model| model.to_string());
+    Ok(json!({ "models": models }))
+}
+
 /// The host-side credential scan the Desktop UI uses for its review. It reuses
 /// the exact detector the TUI and the runtime admission use, and returns only
 /// masks, names and spans — never the value.
@@ -598,6 +607,13 @@ impl Bridge {
                     "content exceeds the message limit"
                 );
                 Ok(secret_scan_payload(content))
+            }
+            // A session-less read of the configured models for the composer's
+            // picker. The list is the same registry the snapshot advertises;
+            // selecting one only becomes a fact when a session is created.
+            "models" => {
+                let workspace = workspace_param(&params)?;
+                model_list_payload(self.layout_for(workspace)?)
             }
             "list_tasks" => Ok(serde_json::to_value(
                 leveler_app::global_task_index::query_global_tasks(
@@ -1059,6 +1075,48 @@ mod tests {
             secret_ref: "not-a-reference".into(),
         };
         assert!(validate_command(&session, &bad_ref).is_err());
+    }
+
+    #[test]
+    fn model_list_reads_configured_models_without_a_session() {
+        let dir =
+            std::env::temp_dir().join(format!("leveler-desktop-models-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config_dir = dir.join("configs");
+        std::fs::create_dir_all(config_dir.join("providers")).unwrap();
+        std::fs::create_dir_all(config_dir.join("models")).unwrap();
+        std::fs::write(
+            config_dir.join("providers/mock.yaml"),
+            "id: mock\nprotocol: openai_chat\nbase_url: http://127.0.0.1:9\n",
+        )
+        .unwrap();
+        std::fs::write(
+            config_dir.join("models/m.yaml"),
+            r#"
+id: m
+provider: mock
+model_id: mock-model
+protocol: openai_chat
+capabilities: { streaming: true, tool_calling: true, parallel_tool_calls: false, structured_output: true, reasoning: false, vision: false }
+limits: { context_window: 131072, reliable_context: 65536, max_output_tokens: 1024, max_tool_schema_bytes: 8192, max_parallel_tool_calls: 1 }
+compatibility: { synthesize_tool_call_ids: true, drop_unsupported_fields: true }
+"#,
+        )
+        .unwrap();
+        let layout = Layout::no_workspace(
+            leveler_core::LevelerHome::from_root(dir.join("home")),
+            Some(config_dir),
+        );
+        let payload = model_list_payload(layout).unwrap();
+        assert!(
+            payload["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|model| model["provider"] == "mock" && model["model"] == "m"),
+            "the configured model must be listed: {payload}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
