@@ -168,9 +168,16 @@ try {
   assert.equal(await page.locator('.rightbar-float').count(), 0);
   cases.cross_pane_drag = true;
 
-  // 6. A draft survives a real Desktop restart.
+  // 6. A draft survives a real Desktop restart. Only a scanned-clean draft is
+  // persisted (the scan is asynchronous); wait for that real product state
+  // instead of racing the quit against it.
   const draftSession = await selectedId();
   await page.locator('#message').fill('DRAFT-SURVIVES-RESTART');
+  await page.waitForFunction(() => {
+    const id = document.querySelector('.session-row[aria-selected="true"]')?.dataset.sessionId;
+    try { return JSON.parse(localStorage.getItem('codeleveler.drafts.v1') || '{}')[id] === 'DRAFT-SURVIVES-RESTART'; }
+    catch { return false; }
+  }, null, { timeout: 15000 });
   await app.evaluate(({ app }) => app.exit(0));
   await new Promise(resolve => setTimeout(resolve, 1200));
   await launch();

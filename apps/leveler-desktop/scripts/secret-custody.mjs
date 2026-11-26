@@ -80,15 +80,21 @@ const okCount = () => page.evaluate(() => [...document.querySelectorAll('.messag
 const waitOk = async (previous, timeout = 60000) => {
   // The durable session status is the authority; the header text can lag or be
   // empty while a takeover owns the composer.
-  await page.waitForFunction(async previous => {
-    const replies = [...document.querySelectorAll('.message.assistant .markdown')]
-      .filter(node => node.textContent.includes('SECRET_OK')).length;
-    if (!(replies > previous)) return false;
-    const id = document.querySelector('.session-row[aria-selected="true"]')?.dataset.sessionId;
-    if (!id) return false;
-    const snapshot = await window.desktop.snapshot(id);
-    return !['running', 'waiting_user'].includes(snapshot.task_status);
-  }, previous, { timeout });
+  const deadline = Date.now() + timeout;
+  let last = null;
+  while (Date.now() < deadline) {
+    last = await page.evaluate(async () => {
+      const rows = [...document.querySelectorAll('.message.assistant .markdown')]
+        .filter(node => node.textContent.includes('SECRET_OK'));
+      const id = document.querySelector('.session-row[aria-selected="true"]')?.dataset.sessionId;
+      let status = null;
+      try { status = id ? (await window.desktop.snapshot(id)).task_status : null; } catch { status = 'snapshot_failed'; }
+      return { replies: rows.length, status, texts: rows.map(row => row.textContent.slice(0, 80)) };
+    });
+    if (last.replies > previous && last.status && !['running', 'waiting_user'].includes(last.status)) return;
+    await page.waitForTimeout(50);
+  }
+  throw new Error(`waitOk timeout: ${JSON.stringify(last)}`);
 };
 
 try {
@@ -135,6 +141,7 @@ try {
   // row; the reference must be visible before it is read.
   await page.waitForFunction(() => document.querySelector('#conversation')?.innerText.includes('[secret:sec_'), null, { timeout: 30000 });
   const captureRequest = requestText();
+  evidence.capture_request = { requests: requests.length, bytes: captureRequest.length, keys: requests.map(body => Object.keys(body)) };
   assert.doesNotMatch(captureRequest, new RegExp(CAPTURE_KEY), 'the capture path must not send the value to the provider');
   assert.match(captureRequest, /\[secret:sec_[0-9a-f]{32}\]/);
   assert.match(await page.locator('#conversation').innerText(), /\[secret:sec_[0-9a-f]{32}\]/);
