@@ -15,6 +15,13 @@ test('desktop rejects cross-session submission but accepts scoped text and live 
  assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'submit_message',session_id:'s1',content:'hi'})));
  assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'approval_decision',request_id:'a1',decision:'approve_once'})));
 });
+test('desktop refuses plaintext credentials it cannot review or authorize',()=>{
+ const key='sk-'+'A'.repeat(40);
+ for(const type of ['submit_message','steer_current_turn','resume_task'])assert.throws(()=>security.validateEnvelope(envelope({type,session_id:'s1',content:`请使用 ${key} 调用服务`})),/凭据明文授权/);
+ assert.throws(()=>security.validateEnvelope(envelope({type:'submit_message',session_id:'s1',content:'AWS AKIA'+'B'.repeat(16)})),/凭据明文授权/);
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'submit_message',session_id:'s1',content:'sk- 是常见的 key 前缀，这里只是讨论格式'})));
+});
+
 test('desktop accepts current-session model, title, and archive commands using existing contracts',()=>{
  for(const command of [{type:'select_model',session_id:'s1',model:{provider:'openai',model:'gpt-4o'}},{type:'rename_session',session_id:'s1',name:'新名称'},{type:'archive_session',session_id:'s1'},{type:'unarchive_session',session_id:'s1'}])assert.doesNotThrow(()=>security.validateEnvelope(envelope(command)));
 });

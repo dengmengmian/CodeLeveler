@@ -5,6 +5,12 @@ const {validRef}=require('./attachment-ingress.cjs');
 function string(value,max=256){return typeof value==='string'&&value.length>0&&value.length<=max;}
 function exactKeys(value,keys){return !!value&&typeof value==='object'&&!Array.isArray(value)&&Object.keys(value).length===keys.length&&keys.every(key=>Object.hasOwn(value,key));}
 function nonblank(value){return string(value)&&value.trim().length>0;}
+// Desktop has no credential-review or per-input plaintext decision. Forwarding
+// a value that looks like a provider key would silently send it in cleartext;
+// fail closed and point at the TUI's /secret path instead. Conservative shapes
+// only: a false positive is a rejected message, never a leaked credential.
+const PLAINTEXT_SECRET=/\b(?:sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{30,}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{30,})\b/;
+function refusesPlaintextCredential(content){return typeof content==='string'&&PLAINTEXT_SECRET.test(content);}
 function validateEnvelope(envelope,authorizeAttachment){
   if(!envelope||!string(envelope.command_id)||!string(envelope.session_id)||typeof envelope.issued_at!=='string'||!Number.isFinite(Date.parse(envelope.issued_at)))throw new Error('Invalid command envelope');
   const command=envelope.command;
@@ -12,6 +18,7 @@ function validateEnvelope(envelope,authorizeAttachment){
   if(SNAPSHOT_VERSIONED_COMMANDS.includes(command.type)?(!Number.isSafeInteger(envelope.expected_version)||envelope.expected_version<0):envelope.expected_version!==null)throw new Error('Invalid snapshot version');
   if(command.session_id && command.session_id!==envelope.session_id)throw new Error('Session mismatch');
   if(['submit_message','steer_current_turn'].includes(command.type)&&((!string(command.content,100000)&&!(command.type==='submit_message'&&command.content===''&&Array.isArray(command.attachments)&&command.attachments.length>0))||command.session_id!==envelope.session_id))throw new Error('Invalid message');
+  if(['submit_message','steer_current_turn','resume_task'].includes(command.type)&&refusesPlaintextCredential(command.content))throw new Error('Desktop 尚未支持凭据明文授权；请改用 TUI 的 /secret 安全接管，或移除明文凭据后重试');
   if(command.type==='submit_message'&&Object.keys(command).some(key=>!['type','session_id','content','attachments'].includes(key)))throw new Error('Invalid message fields');
   if(command.type==='submit_message'&&command.attachments!==undefined){
     if(Array.isArray(command.attachments)&&command.attachments.some(ref=>ref?.kind!=='image'))throw new Error('普通文件已上传，但当前 Runtime 不支持将其内容发送给模型；请移除附件后发送文字');
@@ -50,4 +57,4 @@ function validateEnvelope(envelope,authorizeAttachment){
     if(command.type==='select_model'&&(!exactKeys(command.model,['provider','model'])||!nonblank(command.model.provider)||!nonblank(command.model.model)))throw new Error('Invalid model selection');
   }
 }
-module.exports={validateEnvelope};
+module.exports={validateEnvelope,refusesPlaintextCredential};
