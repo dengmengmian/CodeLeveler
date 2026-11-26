@@ -227,8 +227,6 @@ fn assert_canary_absent_except(root: &std::path::Path, allowed: &[&str]) {
     }
 }
 
-/// The reference the runtime announced for the captured value.
-
 fn assert_value_absent_from_disk(root: &std::path::Path, value: &str) {
     for (path, bytes) in all_files(root) {
         let text = String::from_utf8_lossy(&bytes);
