@@ -91,7 +91,7 @@ impl FromStr for SessionStatus {
 
 /// A task's terminal status: how the run ended. It says nothing about whether
 /// the user's intent was met, which no runtime can mechanically establish.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskOutcome {
     /// The model declared the goal complete (or a conversational turn ended
@@ -139,12 +139,32 @@ impl TaskOutcome {
     }
 }
 
+/// Decode through the same compatibility mapping as [`TaskOutcome::from_str`].
+///
+/// Terminal rows are durable evidence; a legacy spelling must not make a whole
+/// session unreadable. Serialization stays the derived canonical spelling.
+impl<'de> Deserialize<'de> for TaskOutcome {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        TaskOutcome::from_str(&raw).map_err(serde::de::Error::custom)
+    }
+}
+
 impl FromStr for TaskOutcome {
     type Err = UnknownVariant;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s {
             "completed" => TaskOutcome::Completed,
+            // Rows written before the host-owned verification gate was removed
+            // stored the old verdict as the terminal outcome. Replay must read
+            // them as completed: rejecting them makes whole sessions and every
+            // index that projects them unreadable. The legacy spelling is
+            // read-only — it is never written again.
+            "verified" | "completed_unverified" => TaskOutcome::Completed,
             "blocked" => TaskOutcome::Blocked,
             "yielded" => TaskOutcome::Yielded,
             "budget_limited" => TaskOutcome::BudgetLimited,
@@ -475,6 +495,29 @@ mod tests {
         assert_eq!(err.kind, "session status");
         assert_eq!(err.value, "bogus");
         assert!(TaskOutcome::from_str("done").is_err());
+    }
+
+    /// Rows written before the host-owned verification gate was removed carry
+    /// `verified` / `completed_unverified` as the terminal wire value. Replay
+    /// must still read them as `Completed`; rejecting them makes whole
+    /// sessions, and every index that projects them, unreadable.
+    #[test]
+    fn legacy_verified_wire_values_read_as_completed() {
+        for legacy in ["verified", "completed_unverified"] {
+            assert_eq!(
+                TaskOutcome::from_str(legacy).unwrap(),
+                TaskOutcome::Completed,
+                "{legacy} must read as completed"
+            );
+            let decoded: TaskOutcome = serde_json::from_value(serde_json::json!(legacy))
+                .unwrap_or_else(|error| panic!("{legacy} must decode: {error}"));
+            assert_eq!(decoded, TaskOutcome::Completed);
+        }
+        // The legacy spelling is read-only: it is never written again.
+        assert_eq!(
+            serde_json::to_value(TaskOutcome::Completed).unwrap(),
+            serde_json::json!("completed")
+        );
     }
 
     /// The child's short task title is part of the durable spawn record, so a
