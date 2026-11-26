@@ -23,6 +23,7 @@
 
 ## Reference and project resources
 
+- [Credential custody contract](SECRET-BROKER.md)
 - [Permissions, privacy, and security reporting](../SECURITY.md)
 - [Release notes](RELEASE.md) · [Full changelog](../CHANGELOG.md) · [Release downloads](https://github.com/dengmengmian/CodeLeveler/releases)
 - [Contributing guide](../CONTRIBUTING.md) · [Coding agent instructions](../AGENTS.md)

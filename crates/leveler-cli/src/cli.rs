@@ -340,6 +340,15 @@ pub enum Command {
         /// review the integrated result before shipping it explicitly.
         #[arg(long, default_value_t = 1)]
         parallel: usize,
+        /// Send a task that contains a detected credential as visible
+        /// plaintext.
+        ///
+        /// Without this flag `leveler run` refuses the task before any model
+        /// call: the headless path has no credential review, so there is no
+        /// way to record a decision to capture it. Use the TUI's secure
+        /// capture or `/secret` when the broker should hold the value.
+        #[arg(long)]
+        allow_plaintext_secrets: bool,
     },
 
     /// Run the evaluation harness.

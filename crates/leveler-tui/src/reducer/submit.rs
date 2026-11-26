@@ -66,6 +66,41 @@ pub(super) fn submit(state: &mut AppState) -> Vec<Effect> {
     // no longer the last word about this input. Its durable transcript record
     // stays.
     super::clear_command_notice(state);
+    // Credential review. It runs before slash dispatch so `/goal <key>` is
+    // covered too: a captured `/goal` text still starts with the command and
+    // the runtime parses it after the value has become a reference.
+    //
+    // A local command that merely stores its argument (for example
+    // `/remember`) has no custody lane; refusing it is the only honest
+    // outcome, because running it would persist the plaintext outside the
+    // vault.
+    let detection_text = state.composer.canonical_text();
+    let findings = leveler_core::detect_secrets(&detection_text);
+    if !findings.is_empty() {
+        let slash_name = detection_text
+            .trim()
+            .strip_prefix('/')
+            .and_then(|rest| rest.lines().next())
+            .and_then(|line| line.split_whitespace().next())
+            .unwrap_or("");
+        if slash_name == "secret" {
+            // The secure-paste field is the custody lane for this command.
+        } else if !slash_name.is_empty()
+            && crate::screen::is_known_slash_token(slash_name)
+            && slash_name != "goal"
+        {
+            state.notification = Some(Notification {
+                level: NotificationLevel::Warning,
+                message: state.t().secret.local_command_refused.to_string(),
+            });
+            return Vec::new();
+        } else {
+            state.overlay = Some(crate::overlay::Overlay::SecretReview(Box::new(
+                crate::overlay::SecretReviewOverlay::new(detection_text, findings),
+            )));
+            return Vec::new();
+        }
+    }
     // A FIRST LINE starting with a KNOWN `/command` is a local slash command,
     // parsed locally and never sent to the model — its argument may span
     // multiple lines (a small pasted goal below the chip threshold must not
@@ -280,6 +315,153 @@ fn skill_refusal_copy(
         .invoke_refused
         .replace("{token}", &format!("/{}", token.trim_start_matches('/')))
         .replace("{reason}", &reason)
+}
+
+/// `/secret` — open the masked secure-paste field.
+fn open_secure_paste(state: &mut AppState, argument: &str) -> Vec<Effect> {
+    if !argument.trim().is_empty() {
+        state.notification = Some(Notification {
+            level: NotificationLevel::Warning,
+            message: state.t().secret.paste_secret_usage.to_string(),
+        });
+        return Vec::new();
+    }
+    state.overlay = Some(crate::overlay::Overlay::SecurePaste(Box::new(
+        crate::overlay::SecurePasteOverlay::new(),
+    )));
+    Vec::new()
+}
+
+/// Apply the person's decision from the credential review.
+pub(super) fn submit_secret_review(
+    state: &mut AppState,
+    review: crate::overlay::SecretReviewOverlay,
+    choice: crate::overlay::SecretReviewChoice,
+) -> Vec<Effect> {
+    use crate::overlay::SecretReviewChoice;
+    // The same blockers the ordinary submit path applies before it consumes
+    // the draft. Returning now leaves the composer untouched.
+    if turn_input_held(state) {
+        return Vec::new();
+    }
+    if state.is_busy() && !state.pending_attachments.is_empty() {
+        state.notification = Some(Notification {
+            level: NotificationLevel::Warning,
+            message: state.t().steer_attachments_unsupported.to_string(),
+        });
+        return Vec::new();
+    }
+    if !state.is_busy() && !state.pending_attachments.is_empty() && !state.vision {
+        open_unsupported_media(state);
+        return Vec::new();
+    }
+    if let Some(request) = crate::skills::mid_turn_skill_request(state, &review.draft)
+        && state.is_busy()
+    {
+        state.notification = Some(Notification {
+            level: NotificationLevel::Warning,
+            message: state
+                .t()
+                .skills
+                .invoke_mid_turn
+                .replace("{request}", &request),
+        });
+        return Vec::new();
+    }
+    match choice {
+        SecretReviewChoice::Back => Vec::new(),
+        SecretReviewChoice::Plaintext => {
+            let masked = masked_text(&review.draft, &review.findings);
+            let text = state.composer.take_recording(Some(&masked));
+            deliver_secret_input(state, text, Vec::new(), true, masked)
+        }
+        SecretReviewChoice::Capture => {
+            let mut captures = Vec::new();
+            let mut content = review.draft.clone();
+            for finding in review.findings.iter().rev() {
+                let value = review.draft[finding.start..finding.end].to_string();
+                let placeholder =
+                    format!("{{{{secret-capture:{}}}}}", leveler_core::new_uuid_string());
+                content.replace_range(finding.start..finding.end, &placeholder);
+                captures.push(
+                    leveler_client_protocol::secret::SecretCapture::new(placeholder, value)
+                        .with_key_hint(finding.key.clone()),
+                );
+            }
+            let masked = masked_text(&review.draft, &review.findings);
+            let _ = state.composer.take_recording(Some(&masked));
+            deliver_secret_input(state, content, captures, false, masked)
+        }
+    }
+}
+
+/// A display/history form with each value replaced by its length mask.
+fn masked_text(text: &str, findings: &[leveler_core::SecretFinding]) -> String {
+    let mut out = text.to_string();
+    for finding in findings.iter().rev() {
+        out.replace_range(
+            finding.start..finding.end,
+            &leveler_core::masked_secret(finding.value(text)),
+        );
+    }
+    out
+}
+
+/// Send one reviewed input through the ordinary turn-input delivery, choosing
+/// idle vs steer exactly like the normal submit path.
+fn deliver_secret_input(
+    state: &mut AppState,
+    content: String,
+    captures: Vec<leveler_client_protocol::secret::SecretCapture>,
+    plaintext_ack: bool,
+    display: String,
+) -> Vec<Effect> {
+    if turn_input_held(state) {
+        return Vec::new();
+    }
+    if state.is_busy() {
+        if !state.pending_attachments.is_empty() {
+            state.notification = Some(Notification {
+                level: NotificationLevel::Warning,
+                message: state.t().steer_attachments_unsupported.to_string(),
+            });
+            return Vec::new();
+        }
+        let message_id = MessageId::new(leveler_core::new_uuid_string());
+        state
+            .transcript
+            .push_input(message_id.clone(), display, InputDelivery::Sending);
+        let command = ClientCommand::SteerUserInput {
+            session_id: state.session_id.clone(),
+            content,
+            secret_captures: captures,
+            plaintext_secret_ack: plaintext_ack,
+            message_id: Some(message_id),
+        };
+        return submit_turn_input(state, command);
+    }
+    if !state.pending_attachments.is_empty() && !state.vision {
+        open_unsupported_media(state);
+        return Vec::new();
+    }
+    let attachments = std::mem::take(&mut state.pending_attachments);
+    state.staged_goal = Some(crate::active_goal::StagedGoal {
+        title: crate::active_goal::short_title(&display),
+        objective: Some(display.clone()),
+        continuation: attachments.is_empty() && resumes_goal(state),
+    });
+    start_turn(state);
+    super::clear_command_notice(state);
+    state.goal_mode_active =
+        state.collaboration.eq_ignore_ascii_case("goal") && attachments.is_empty();
+    let command = ClientCommand::SubmitUserInput {
+        session_id: state.session_id.clone(),
+        content,
+        attachments,
+        secret_captures: captures,
+        plaintext_secret_ack: plaintext_ack,
+    };
+    submit_turn_input(state, command)
 }
 
 /// Build and send the current composer message with its attachments, clearing
@@ -685,6 +867,27 @@ pub(super) fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
         // Same page, other section: one implementation, two entry points.
         "usage" => open_stats(state, crate::screen::StatsSection::Usage),
         "clean" => open_clean(state),
+        "secret" => {
+            let argument = command.strip_prefix("secret").unwrap_or("").trim();
+            if let Some(reference) = argument.strip_prefix("revoke") {
+                let reference = reference
+                    .trim()
+                    .trim_start_matches("[secret:")
+                    .trim_end_matches(']');
+                if reference.is_empty() {
+                    state.notification = Some(Notification {
+                        level: NotificationLevel::Warning,
+                        message: state.t().secret.paste_secret_usage.to_string(),
+                    });
+                    return Vec::new();
+                }
+                return vec![Effect::Send(ClientCommand::RevokeSecret {
+                    session_id: state.session_id.clone(),
+                    secret_ref: reference.to_string(),
+                })];
+            }
+            open_secure_paste(state, argument)
+        }
         "trust" => crate::trust::open(state),
         "schedules" => crate::schedules::open(state),
         "memory" => crate::memory::open(state),

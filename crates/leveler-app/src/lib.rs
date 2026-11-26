@@ -38,6 +38,7 @@ mod review_live;
 pub mod runtime_boot;
 mod runtime_identity;
 mod schedule_tools;
+pub mod secret_input;
 mod session;
 pub mod session_history;
 pub mod session_projection;
@@ -1018,6 +1019,10 @@ pub struct Application {
     capability_activations: std::sync::Mutex<
         std::collections::HashMap<String, leveler_agent::capability::SharedCapabilityActivation>,
     >,
+    /// Process-local custody for credentials the user captured. Shared by the
+    /// command admission path and every tool context of this runtime, so one
+    /// authority answers "is this reference usable in this session".
+    secret_vault: std::sync::Arc<leveler_execution::secret_vault::SecretVault>,
     /// A startup fact this process learned while resolving the default model and
     /// that the next created session's client must be told: today, the persisted
     /// default was not resolvable here and a configured model was used instead.
@@ -1377,11 +1382,17 @@ impl Application {
             in_flight_commands: Default::default(),
             review_live: Default::default(),
             memory,
+            secret_vault: std::sync::Arc::new(leveler_execution::secret_vault::SecretVault::new()),
             default_model_notice: std::sync::Mutex::new(None),
             permission_profiles: std::sync::Mutex::new(std::collections::HashMap::new()),
             definition_trust_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
             capability_activations: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
+    }
+
+    /// The runtime's credential custody.
+    pub fn secret_vault(&self) -> &std::sync::Arc<leveler_execution::secret_vault::SecretVault> {
+        &self.secret_vault
     }
 
     /// The configuration generation in force right now.
@@ -1896,6 +1907,7 @@ impl Application {
             None => ToolContext::without_workspace_with_environment(mode, self.environment.clone()),
         }
         .with_policy_limits(max_files)
+        .with_secret_vault(self.secret_vault.clone())
         .with_sandbox(sandbox)
         .with_deny_env(provider_secret_env_names(
             &snapshot.loaded.providers,

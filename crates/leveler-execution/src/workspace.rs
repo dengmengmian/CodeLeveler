@@ -18,6 +18,21 @@ use crate::WriteScope;
 enum PathAccess {
     Read,
     Write,
+    /// A write made by the host's secret broker: the credential-file family
+    /// (`.env`, `*.pem`, `credentials.json`, …) is the target by design.
+    /// Every other protection — workspace bound, symlink identity, trust
+    /// stores, `.git`/`.ssh`/`.aws`, agent and skill definitions — still
+    /// applies. Only [`Workspace::resolve_for_secret_write`] uses it.
+    SecretWrite,
+    /// A read made by the host's secret broker to verify a target. Same
+    /// narrow exception, same remaining protections.
+    SecretRead,
+}
+
+impl PathAccess {
+    fn writes(self) -> bool {
+        matches!(self, Self::Write | Self::SecretWrite)
+    }
 }
 
 /// Errors from workspace path validation.
@@ -28,6 +43,10 @@ pub enum WorkspaceError {
     OutsideWorkspace(String),
     #[error("path `{0}` is denied (sensitive file)")]
     Denied(String),
+    /// The secret broker writes dotenv files only. This is not a general
+    /// credential-file write authority.
+    #[error("path `{0}` is not a dotenv target; the secret broker writes only .env files")]
+    NotSecretTarget(String),
     /// An agent definition, which only the agent store writes.
     #[error(
         "path `{0}` is an agent definition; tools do not edit it. Change agents \
@@ -517,7 +536,48 @@ impl Workspace {
             input.as_ref(),
             scope,
             leveler_core::Capability::FilesystemWrite,
+            PathAccess::Write,
         )
+    }
+
+    /// Resolve the destination of a host-brokered credential write.
+    ///
+    /// Like [`Self::resolve_for_write`], except the credential-file name
+    /// denylist does not apply for **dotenv files only**: writing `.env` is
+    /// the broker's purpose. A key file, a credential store or any other
+    /// sensitive name stays denied even on this path. Every other protection
+    /// (workspace bound, symlink identity, trust stores, `.git`/`.ssh`/`.aws`,
+    /// agent and skill definitions) still applies.
+    pub fn resolve_for_secret_write(
+        &self,
+        input: impl AsRef<Path>,
+        scope: &WriteScope,
+    ) -> Result<PathBuf, WorkspaceError> {
+        let input = input.as_ref();
+        if !is_dotenv_target_path(input) {
+            return Err(WorkspaceError::NotSecretTarget(input.display().to_string()));
+        }
+        self.resolve_for_mutation(
+            input,
+            scope,
+            leveler_core::Capability::FilesystemWrite,
+            PathAccess::SecretWrite,
+        )
+    }
+
+    /// Resolve a dotenv file for the broker's own verification read. Only a
+    /// dotenv name qualifies; the trust-store, `.git`/`.ssh`/`.aws`,
+    /// agent/skill and workspace-bound checks all still apply.
+    pub fn resolve_for_secret_read(
+        &self,
+        input: impl AsRef<Path>,
+    ) -> Result<PathBuf, WorkspaceError> {
+        let input = input.as_ref();
+        if !is_dotenv_target_path(input) {
+            return Err(WorkspaceError::NotSecretTarget(input.display().to_string()));
+        }
+        let bound = self.root.as_path();
+        self.resolve_bounded(input, Some(bound), PathAccess::SecretRead)
     }
 
     /// Resolve a deletion under its independent capability.
@@ -530,6 +590,7 @@ impl Workspace {
             input.as_ref(),
             scope,
             leveler_core::Capability::FilesystemDelete,
+            PathAccess::Write,
         )
     }
 
@@ -538,13 +599,13 @@ impl Workspace {
         input: &Path,
         scope: &WriteScope,
         capability: leveler_core::Capability,
+        access: PathAccess,
     ) -> Result<PathBuf, WorkspaceError> {
         if self.unrestricted_access || self.allows_resource_path(capability, input) {
-            return self.clone().with_unrestricted_access(true).resolve_bounded(
-                input,
-                None,
-                PathAccess::Write,
-            );
+            return self
+                .clone()
+                .with_unrestricted_access(true)
+                .resolve_bounded(input, None, access);
         }
         let bound = match scope {
             WriteScope::None => return Err(WorkspaceError::no_write_scope(input)),
@@ -557,7 +618,7 @@ impl Workspace {
                 allowed,
                 excluded,
             } => {
-                let path = self.resolve_bounded(input, Some(root), PathAccess::Write)?;
+                let path = self.resolve_bounded(input, Some(root), access)?;
                 if !allowed.iter().any(|p| path.starts_with(p))
                     || excluded.iter().any(|p| path.starts_with(p))
                 {
@@ -576,7 +637,7 @@ impl Workspace {
                 return Ok(path);
             }
         };
-        let resolved = self.resolve_bounded(input, bound, PathAccess::Write)?;
+        let resolved = self.resolve_bounded(input, bound, access)?;
         if matches!(scope, WriteScope::Unrestricted) {
             // Descriptor-relative writers open each component with O_NOFOLLOW
             // and compare the target against their (canonical) root. A
@@ -596,7 +657,7 @@ impl Workspace {
                     } else {
                         real_ancestor.join(suffix)
                     };
-                    self.check_sensitive(&real, input, PathAccess::Write)?;
+                    self.check_sensitive(&real, input, access)?;
                     return Ok(real);
                 }
                 let Some(parent) = lexical.parent() else {
@@ -622,6 +683,24 @@ impl Workspace {
         scope: &WriteScope,
     ) -> Result<(), WorkspaceError> {
         let checked = self.resolve_for_write(resolved, scope)?;
+        if checked != resolved {
+            return Err(WorkspaceError::OutsideWorkspace(format!(
+                "path `{}` changed identity before write",
+                resolved.display()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Revalidate the exact deletion resource at the mutation boundary.
+    /// Revalidate the exact destination of a brokered credential write at the
+    /// commit boundary.
+    pub fn revalidate_secret_write_path(
+        &self,
+        resolved: &Path,
+        scope: &WriteScope,
+    ) -> Result<(), WorkspaceError> {
+        let checked = self.resolve_for_secret_write(resolved, scope)?;
         if checked != resolved {
             return Err(WorkspaceError::OutsideWorkspace(format!(
                 "path `{}` changed identity before write",
@@ -742,23 +821,32 @@ impl Workspace {
 
         // Writing these would let the agent pick its own hooks and its own
         // standing permissions, defeating the content-keyed trust gate.
-        if access == PathAccess::Write && self.is_trust_gated_project_file(normalized) {
+        if access.writes() && self.is_trust_gated_project_file(normalized) {
             return Err(denied(original));
         }
         // Agent definitions change what future children may do. They are
         // written through the agent store (validated, confirmed by a person,
         // atomic), so no tool patches them in place.
-        if access == PathAccess::Write && self.is_in_project_agents_dir(normalized) {
+        if access.writes() && self.is_in_project_agents_dir(normalized) {
             return Err(WorkspaceError::AgentDefinition(
                 original.display().to_string(),
             ));
         }
         // Skill definitions are written through the skill store (validated,
         // confirmed by a person, atomic), so no tool patches them in place.
-        if access == PathAccess::Write && self.is_in_project_skills_dir(normalized) {
+        if access.writes() && self.is_in_project_skills_dir(normalized) {
             return Err(WorkspaceError::SkillDefinition(
                 original.display().to_string(),
             ));
+        }
+        // The broker's dotenv exception does not make agent/skill definition
+        // trees readable either: a `.env` inside them is still control-plane
+        // material, not a project configuration file.
+        if matches!(access, PathAccess::SecretRead)
+            && (self.is_in_project_agents_dir(normalized)
+                || self.is_in_project_skills_dir(normalized))
+        {
+            return Err(denied(original));
         }
 
         for comp in normalized.components() {
@@ -774,7 +862,8 @@ impl Workspace {
             }
         }
 
-        if let Some(file) = normalized.file_name().map(|f| f.to_string_lossy())
+        if !matches!(access, PathAccess::SecretWrite | PathAccess::SecretRead)
+            && let Some(file) = normalized.file_name().map(|f| f.to_string_lossy())
             && is_sensitive_file_name(&file)
         {
             return Err(denied(original));
@@ -817,8 +906,15 @@ impl Workspace {
     }
 }
 
-/// File names that commonly hold credentials, denied at the workspace layer
-/// (`read_file`, `apply_patch`, …) and best-effort refused by the shell guard
+/// Whether the path's file name is a dotenv file. This is the complete set of
+/// names the secret broker's narrow authority covers.
+fn is_dotenv_target_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == ".env" || name.starts_with(".env."))
+}
+
+/// File names that commonly hold credentials, denied at the workspace layer/// (`read_file`, `apply_patch`, …) and best-effort refused by the shell guard
 /// so both layers enforce one rule set: `.env*`, key/cert material by
 /// extension, SSH private keys by conventional name, and well-known credential
 /// stores. Public halves (`id_rsa.pub`) stay allowed.
@@ -1642,6 +1738,7 @@ mod resource_path_tests {
 #[cfg(test)]
 mod read_confinement_tests {
     use super::Workspace;
+    use crate::WriteScope;
 
     #[test]
     fn a_read_confined_workspace_keeps_reads_inside_the_review_object() {
@@ -1790,6 +1887,100 @@ mod read_confinement_tests {
                 .iter()
                 .any(|(name, is_dir)| name == "src" && *is_dir)
         );
+    }
+
+    /// The broker's destination authority is the ONLY place the credential
+    /// file-name denylist is lifted. A tool that can write `.env` must not
+    /// thereby reach `.git`, `.ssh`, or the trust-gated project config.
+    #[test]
+    fn secret_write_lifts_only_the_credential_name_denylist() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".ssh")).unwrap();
+        std::fs::write(root.path().join(".ssh/config"), "Host x").unwrap();
+        let workspace = Workspace::new(root.path()).unwrap();
+        let scope = WriteScope::Workspace {
+            root: workspace.root().to_path_buf(),
+        };
+
+        for allowed in [".env", ".env.local", "apps/web/.env"] {
+            assert!(
+                workspace.resolve_for_secret_write(allowed, &scope).is_ok(),
+                "broker must be able to write {allowed}: {:?}",
+                workspace.resolve_for_secret_write(allowed, &scope)
+            );
+            assert!(
+                workspace.resolve_for_write(allowed, &scope).is_err(),
+                "ordinary tools must not write {allowed}"
+            );
+            assert!(
+                workspace.resolve_for_secret_read(allowed).is_ok(),
+                "broker must be able to verify {allowed}"
+            );
+            assert!(
+                workspace.resolve_for_read(allowed).is_err(),
+                "ordinary tools must not read {allowed}"
+            );
+        }
+
+        for denied in [
+            ".ssh/config",
+            ".git/config",
+            ".aws/credentials",
+            "key.pem",
+            "credentials.json",
+            ".leveler/agents/reviewer/.env",
+            ".leveler/skills/deploy/.env",
+        ] {
+            assert!(
+                workspace.resolve_for_secret_write(denied, &scope).is_err(),
+                "broker must not write {denied}"
+            );
+            assert!(
+                workspace.resolve_for_secret_read(denied).is_err(),
+                "broker must not read {denied}"
+            );
+        }
+    }
+
+    #[test]
+    fn secret_write_still_respects_the_workspace_bound() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new(root.path()).unwrap();
+        let scope = WriteScope::Workspace {
+            root: workspace.root().to_path_buf(),
+        };
+        assert!(
+            workspace
+                .resolve_for_secret_write(outside.path().join(".env"), &scope)
+                .is_err()
+        );
+        assert!(
+            workspace
+                .resolve_for_secret_write("../.env", &scope)
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_write_refuses_a_symlink_that_leaves_the_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(
+            outside.path().join("outside.env"),
+            "SECRET=1
+",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(outside.path().join("outside.env"), root.path().join(".env"))
+            .unwrap();
+        let workspace = Workspace::new(root.path()).unwrap();
+        let scope = WriteScope::Workspace {
+            root: workspace.root().to_path_buf(),
+        };
+        assert!(workspace.resolve_for_secret_write(".env", &scope).is_err());
+        assert!(workspace.resolve_for_secret_read(".env").is_err());
     }
 
     /// A legitimate symlink that stays inside the workspace is still readable:

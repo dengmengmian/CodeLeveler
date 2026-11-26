@@ -45,6 +45,7 @@ pub const RESERVED_SLASH_NAMES: &[&str] = &[
     "resume-codex",
     "attach",
     "image",
+    "secret",
     "theme",
     "help",
     "exit",

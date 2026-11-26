@@ -439,7 +439,9 @@ pub(crate) fn status_phase(state: &AppState) -> StatusPhase {
             | crate::overlay::Overlay::ConfirmSchedule(_)
             | crate::overlay::Overlay::ConfirmRecovery(_)
             | crate::overlay::Overlay::ThinkingPicker(_)
-            | crate::overlay::Overlay::ReviewScopePicker(_) => {
+            | crate::overlay::Overlay::ReviewScopePicker(_)
+            | crate::overlay::Overlay::SecretReview(_)
+            | crate::overlay::Overlay::SecurePaste(_) => {
                 return StatusPhase::AwaitingUser;
             }
         }

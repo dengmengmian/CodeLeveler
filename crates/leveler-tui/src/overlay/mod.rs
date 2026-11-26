@@ -12,6 +12,7 @@ pub mod approval;
 pub mod clarification;
 pub mod definition_trust;
 pub mod exit_confirm;
+pub mod secret;
 pub mod selection;
 
 use ratatui::Frame;
@@ -30,6 +31,7 @@ pub use approval::{ApprovalOutcome, ApprovalOverlay};
 pub use clarification::{ClarificationOutcome, ClarificationOverlay};
 pub use definition_trust::{DefinitionTrustOutcome, DefinitionTrustOverlay};
 pub use exit_confirm::ExitConfirmOverlay;
+pub use secret::{SecretReviewChoice, SecretReviewOverlay, SecurePasteOutcome, SecurePasteOverlay};
 pub use selection::{SelectionModel, SelectionOption, SelectionOutcome};
 
 /// An open overlay. Model and mode pickers share the [`SelectionModel`]; the
@@ -80,6 +82,11 @@ pub enum Overlay {
     /// The explicit exit confirmation. Its rows are the runtime's affected
     /// executions, and its default cursor is the safe "stay" choice.
     ConfirmExit(Box<ExitConfirmOverlay>),
+    /// A credential was detected in the composer; the person decides whether
+    /// to capture it, send it as plain text, or keep editing.
+    SecretReview(Box<SecretReviewOverlay>),
+    /// `/secret` — paste a credential of any shape into a masked field.
+    SecurePaste(Box<SecurePasteOverlay>),
 }
 
 /// A short label for the status line while an overlay is open.
@@ -108,6 +115,8 @@ impl Overlay {
             | Overlay::ConfirmRecovery(_)
             | Overlay::ThinkingPicker(_)
             | Overlay::ReviewScopePicker(_)
+            | Overlay::SecretReview(_)
+            | Overlay::SecurePaste(_)
             | Overlay::ConfirmExit(_) => None,
         }
     }
@@ -126,6 +135,11 @@ impl Overlay {
                 ov.insert_text(text);
                 true
             }
+            Overlay::SecurePaste(ov) => {
+                ov.insert_text(text);
+                true
+            }
+            Overlay::SecretReview(_) => false,
             Overlay::ModelPicker(m)
             | Overlay::DefaultModelPicker(m)
             | Overlay::ModePicker(m)
@@ -363,6 +377,8 @@ fn build_content(
         Overlay::Clarification(ov) => clarification_content(ov, theme, width, locale),
         Overlay::ConfirmSchedule(ov) => selection_content(&ov.model, theme, width, locale),
         Overlay::ConfirmExit(ov) => exit_content(ov, theme, width, locale),
+        Overlay::SecretReview(ov) => secret::review_content(ov, theme, width, locale),
+        Overlay::SecurePaste(ov) => secret::paste_content(ov, theme, width, locale),
     }
 }
 

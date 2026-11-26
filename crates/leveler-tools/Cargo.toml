@@ -33,6 +33,7 @@ regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+zeroize = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -57,6 +58,7 @@ rustix = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 cap-std = { workspace = true }
 cap-tempfile = { workspace = true }
+leveler-win-confine = { workspace = true }
 
 [dev-dependencies]
 leveler-definition-trust = { workspace = true, features = ["test-support"] }

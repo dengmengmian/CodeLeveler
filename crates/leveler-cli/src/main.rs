@@ -421,6 +421,7 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
             max_model_steps,
             collaboration,
             parallel,
+            allow_plaintext_secrets,
         } => {
             // `--resume <id>` continues an interrupted non-interactive run
             // (headless event stream); it does not take a fresh task.
@@ -437,6 +438,7 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
                     auto_approve,
                     confirm_recovery,
                     output,
+                    allow_plaintext_secrets,
                 )
                 .await;
             }
@@ -466,6 +468,7 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
                     max_model_steps,
                     output,
                     ship,
+                    allow_plaintext_secrets,
                 )
                 .await
             } else {
@@ -481,6 +484,7 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
                     deny_network,
                     collab,
                     max_model_steps,
+                    allow_plaintext_secrets,
                 )
                 .await
             }

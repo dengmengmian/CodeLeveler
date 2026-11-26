@@ -373,6 +373,25 @@ pub enum RuntimeEvent {
     /// claim a transcript row exists. Every connected client paints the same
     /// row from this event, not from the submitting client's optimism.
     InputAdmitted { message: UiMessage },
+    /// The answer to [`crate::ClientCommand::CaptureSecret`]: the value is in
+    /// the runtime vault and `secret_ref` is the opaque reference a later
+    /// message or tool call may use. `masked` is a length-only description and
+    /// never contains the value.
+    SecretCaptured {
+        session_id: crate::SessionId,
+        request_id: crate::CommandId,
+        secret_ref: String,
+        masked: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key_hint: Option<String>,
+    },
+    /// The answer to [`crate::ClientCommand::CaptureSecret`] when custody could
+    /// not be taken. Nothing was stored.
+    SecretCaptureFailed {
+        session_id: crate::SessionId,
+        request_id: crate::CommandId,
+        error: String,
+    },
     /// A previously admitted input reached a terminal state.
     ///
     /// `Delivered` means its transcript row is durable (and `ordinal` locates

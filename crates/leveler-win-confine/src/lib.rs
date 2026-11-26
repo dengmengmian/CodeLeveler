@@ -158,6 +158,26 @@ pub fn verify_private_state_file(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Apply and verify an owner-only, inheritance-protected DACL on one regular
+/// file.
+///
+/// This is the Windows counterpart of `0600` for a credential file the host
+/// writes outside a private state directory: the file must not be a reparse
+/// point, and after this call only the current user, SYSTEM and the
+/// Administrators group may read or change it. The Unix build reports
+/// `Unsupported`; callers keep their mode-bit path there.
+pub fn secure_private_file(path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        windows::secure_private_file(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Err(unsupported())
+    }
+}
+
 /// Read a process's creation time as its stable start token.
 ///
 /// `ERROR_INVALID_PARAMETER` means no process with that id exists;

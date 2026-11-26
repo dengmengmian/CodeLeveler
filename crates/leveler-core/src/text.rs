@@ -901,6 +901,24 @@ mod tests {
     }
 
     /// The same storage path must still remove a real credential value.
+    /// A custody reference is a protocol token, not a credential: durable
+    /// redaction must leave it byte-identical or resume loses the ability to
+    /// use the captured value.
+    #[test]
+    fn json_redaction_preserves_custody_reference_tokens() {
+        let token = crate::secret::secret_reference_token("sec_0123456789abcdef0123456789abcdef");
+        let payload = serde_json::json!({
+            "role": "user",
+            "content": format!("配置 {token} 到 .env"),
+            "nested": { "field": "DEEPSEEK_API_KEY" },
+        })
+        .to_string();
+        let redacted = redact_secrets_json(&payload).unwrap();
+        assert!(redacted.contains(&token), "{redacted}");
+        let value: serde_json::Value = serde_json::from_str(&redacted).unwrap();
+        assert_eq!(value["role"], "user");
+    }
+
     #[test]
     fn session_json_redaction_still_removes_real_secrets() {
         let session = "sess-json-secret";

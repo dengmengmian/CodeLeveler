@@ -53,6 +53,1048 @@ pub struct DetectedSecret {
     pub key: String,
 }
 
+// ── Structured detection for text a person typed ───────────────────────────
+//
+// The sanitizer above answers "what must not reach the model". This detector
+// answers a different question: "what might be a credential in the user's own
+// words, and how sure are we?" It never rewrites anything. The caller decides
+// whether to capture, ask, or send unchanged, and that decision is a user
+// decision — detection only describes risk.
+
+/// How strongly the evidence says a span is a real credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretLevel {
+    /// A self-identifying format, or several independent signals agreeing.
+    /// This value must not be sent to a model without the person confirming.
+    HighConfidence,
+    /// Credential-shaped, but ordinary code, a hash, or a placeholder cannot
+    /// be ruled out. The user decides.
+    Ambiguous,
+}
+
+impl SecretLevel {
+    /// Stable rank used to resolve overlapping findings.
+    fn rank(self) -> u8 {
+        match self {
+            Self::HighConfidence => 2,
+            Self::Ambiguous => 1,
+        }
+    }
+}
+
+/// What kind of credential position the finding occupies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretKind {
+    /// A complete PEM private-key block.
+    PemPrivateKey,
+    /// A value with a provider-issued, self-identifying prefix (`sk-…`,
+    /// `ghp_…`, `AKIA…`).
+    ProviderKey,
+    /// A JWT (`header.payload.signature`).
+    JsonWebToken,
+    /// Credentials embedded in a URL authority (`scheme://user:pass@host`).
+    UrlCredentials,
+    /// The value of a credential-named key (`PASSWORD=…`,
+    /// `"api_key": "…"`, `--token …`).
+    KeyValue,
+    /// An opaque token next to credential words in prose.
+    ProseCredential,
+}
+
+/// One independent reason the detector classified a span the way it did.
+/// Diagnostics and tests read these; the UI shows a localized summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretEvidence {
+    /// `-----BEGIN … PRIVATE KEY-----`
+    PrivateKeyMarker,
+    /// A known provider token prefix.
+    KnownPrefix,
+    /// The value sits after a credential-named key.
+    CredentialKeyName,
+    /// The value follows a credential scheme word (`Bearer`, `Basic`).
+    CredentialScheme,
+    /// The value is the password field of a URL authority.
+    UrlUserInfo,
+    /// Long value with no whitespace, mixing letters and digits.
+    OpaqueValue,
+    /// The value has high Shannon entropy relative to its length.
+    HighEntropy,
+    /// Credential words appear next to a standalone token in natural prose.
+    ProseCue,
+}
+
+/// A credential candidate in the user's text.
+///
+/// `start..end` is a byte range into the ORIGINAL text and always lands on
+/// UTF-8 character boundaries. Only the span is reported — the value itself is
+/// read from the input by the caller that already holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretFinding {
+    /// Inclusive byte offset of the credential value.
+    pub start: usize,
+    /// Exclusive byte offset of the credential value.
+    pub end: usize,
+    /// How strongly the evidence supports "this is a real credential".
+    pub level: SecretLevel,
+    /// The credential position this span occupies.
+    pub kind: SecretKind,
+    /// The field or header name it was found under, when there is one. Safe
+    /// to log and show: it is a name, never the value.
+    pub key: Option<String>,
+    /// The independent signals behind this classification.
+    pub evidence: Vec<SecretEvidence>,
+}
+
+impl SecretFinding {
+    /// The value this finding covers.
+    pub fn value<'a>(&self, text: &'a str) -> &'a str {
+        &text[self.start..self.end]
+    }
+}
+
+/// A masked description of a credential value, safe for a terminal, a log or
+/// a UI prompt. Reveals only the length — never a prefix that could identify
+/// the credential itself.
+pub fn masked_secret(value: &str) -> String {
+    let chars = value.chars().count();
+    format!("•••••• ({chars} chars)")
+}
+
+/// The transcript token for a captured reference: `[secret:sec_…]`.
+///
+/// One spelling, defined here, because the model reads it in a message, the
+/// client renders it, and the broker tool parses it back.
+pub fn secret_reference_token(reference: &str) -> String {
+    format!("[secret:{reference}]")
+}
+
+/// The reference inside a transcript token, or `None` when the token is not a
+/// well-formed reference. This validates the shape only; the vault decides
+/// whether the reference resolves.
+pub fn parse_secret_reference_token(token: &str) -> Option<&str> {
+    let inner = token.strip_prefix("[secret:")?.strip_suffix(']')?;
+    let hex = inner.strip_prefix("sec_")?;
+    (hex.len() == 32
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+    .then_some(inner)
+}
+
+/// Validate and normalize a workspace-relative dotenv target.
+///
+/// The broker writes dotenv files only. This is the one shape check shared by
+/// the host broker and the capture-time use scope: a relative path whose file
+/// name is `.env` or `.env.<suffix>`. Absolute paths, parent traversal, drive
+/// letters and non-dotenv names are not targets.
+pub fn normalize_dotenv_target(target: &str) -> Option<String> {
+    let trimmed = target.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 1024
+        || trimmed.contains(['\0', '\n', '\r'])
+        || trimmed.starts_with('/')
+        || trimmed.starts_with('\\')
+        || trimmed.contains(':')
+    {
+        return None;
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for part in trimmed.split(['/', '\\']) {
+        match part {
+            "" | "." => continue,
+            ".." => return None,
+            other => parts.push(other),
+        }
+    }
+    let file = *parts.last()?;
+    if file != ".env" && !file.starts_with(".env.") {
+        return None;
+    }
+    Some(parts.join("/"))
+}
+
+/// Bytes that may belong to one path-shaped token. Only ASCII: any non-ASCII
+/// character is prose adjacent to the path, not part of it.
+fn is_target_path_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-' | b'/' | b'\\')
+}
+
+/// Every dotenv target the user's own text names.
+///
+/// This is the authorization source for a captured credential's write target:
+/// a message that says "configure this in `.env`" lets the broker write that
+/// reference to `.env`, and nowhere else. It deliberately does not parse
+/// natural language — it extracts path-shaped tokens whose file name is a
+/// dotenv file. A message that names no target authorizes none.
+pub fn dotenv_targets_in(text: &str) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let bytes = text.as_bytes();
+    let mut targets = std::collections::BTreeSet::new();
+    let mut cursor = 0usize;
+    while let Some(relative) = text[cursor..].find(".env") {
+        let hit = cursor + relative;
+        let mut start = hit;
+        while start > 0 && is_target_path_byte(bytes[start - 1]) {
+            start -= 1;
+        }
+        let mut end = hit + 4;
+        while end < bytes.len() && is_target_path_byte(bytes[end]) {
+            end += 1;
+        }
+        if let Some(target) = normalize_dotenv_target(&text[start..end]) {
+            targets.insert(target);
+        }
+        if targets.len() >= 16 {
+            break;
+        }
+        cursor = end.max(hit + 1);
+    }
+    targets.into_iter().collect()
+}
+
+/// Whether `name` can be a dotenv key.
+fn is_dotenv_field_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 128 {
+        return false;
+    }
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Every dotenv field the user's own text assigns (`NAME=`).
+///
+/// Only explicit assignment syntax counts. A label in prose ("password: …")
+/// is not reliably the environment variable name the user wants, so it is not
+/// turned into a field authorization.
+pub fn dotenv_fields_in(text: &str) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let bytes = text.as_bytes();
+    let mut fields = std::collections::BTreeSet::new();
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte != b'=' {
+            continue;
+        }
+        // `==`, `=>`, `=<` and `=~` are comparisons or arrows, not assignments.
+        if matches!(
+            bytes.get(index + 1),
+            Some(b'=') | Some(b'>') | Some(b'<') | Some(b'~')
+        ) {
+            continue;
+        }
+        let mut end = index;
+        while end > 0 && matches!(bytes[end - 1], b' ' | b'\t') {
+            end -= 1;
+        }
+        let mut start = end;
+        while start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_') {
+            start -= 1;
+        }
+        if start == end {
+            continue;
+        }
+        // A `=` directly before the name means this is another assignment's
+        // value (`A=B=C`), not a field of its own.
+        if start > 0 && matches!(bytes[start - 1], b'=' | b'>' | b'<' | b'!') {
+            continue;
+        }
+        let name = &text[start..end];
+        if is_dotenv_field_name(name) {
+            fields.insert(name.to_string());
+            if fields.len() >= 16 {
+                break;
+            }
+        }
+    }
+    fields.into_iter().collect()
+}
+
+/// Detect credential candidates in text a person typed.
+///
+/// Deterministic and local: no network, no model, no entropy-only guessing.
+/// Findings are non-overlapping and sorted by position. Empty text, ordinary
+/// code, templates and environment references return no findings.
+pub fn detect_secrets(text: &str) -> Vec<SecretFinding> {
+    if text.trim().is_empty() {
+        return Vec::new();
+    }
+    // Our own custody tokens are not credentials. Blank them with spaces of
+    // the same byte length so every later offset still addresses the original
+    // text; the vault, not the detector, decides whether they resolve.
+    let text = &mask_reference_tokens(text);
+    let mut findings = Vec::new();
+    let mut occupied: Vec<(usize, usize)> = Vec::new();
+    scan_private_key_blocks(text, &mut findings, &mut occupied);
+    scan_block_scalars(text, &mut findings);
+
+    let mut line_start = 0usize;
+    for line in text.split_inclusive('\n') {
+        let line_end = line_start + line.len();
+        if !occupied
+            .iter()
+            .any(|(start, end)| line_start < *end && line_end > *start)
+            && !line.trim().is_empty()
+        {
+            let mut line_findings = known_token_findings(line, line_start);
+            line_findings.extend(assignment_findings(line, line_start));
+            line_findings.extend(url_credential_findings(line, line_start));
+            line_findings.extend(prose_credential_findings(line, line_start));
+            findings.extend(line_findings);
+        }
+        line_start = line_end;
+    }
+    resolve_findings(findings)
+}
+
+/// Blank every `[secret:sec_…]` token, preserving byte offsets. Tokens are
+/// ASCII, so the masked copy is valid UTF-8 and the same length.
+fn mask_reference_tokens(text: &str) -> String {
+    let mut out = text.to_string();
+    let mut search = 0usize;
+    while let Some(rel) = out[search..].find("[secret:") {
+        let start = search + rel;
+        let Some(close) = out[start..].find(']') else {
+            break;
+        };
+        let end = start + close + 1;
+        if parse_secret_reference_token(&out[start..end]).is_some() {
+            out.replace_range(start..end, &" ".repeat(end - start));
+        }
+        search = end;
+        if search >= out.len() {
+            break;
+        }
+    }
+    out
+}
+
+/// Byte ranges of complete `[secret:sec_…]` tokens on one line.
+fn reference_token_ranges(line: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut search = 0usize;
+    while let Some(rel) = line[search..].find("[secret:") {
+        let start = search + rel;
+        let Some(close) = line[start..].find(']') else {
+            break;
+        };
+        let end = start + close + 1;
+        if parse_secret_reference_token(&line[start..end]).is_some() {
+            ranges.push((start, end));
+        }
+        search = end;
+        if search >= line.len() {
+            break;
+        }
+    }
+    ranges
+}
+
+fn kind_rank(kind: SecretKind) -> u8 {
+    match kind {
+        SecretKind::ProviderKey | SecretKind::JsonWebToken | SecretKind::PemPrivateKey => 4,
+        SecretKind::UrlCredentials => 3,
+        SecretKind::KeyValue => 2,
+        SecretKind::ProseCredential => 1,
+    }
+}
+
+/// Keep one finding per credential position. Overlaps are resolved by
+/// confidence, then by how specifically the credential position is named —
+/// `Authorization: Bearer sk-…` must yield the token span, not the whole
+/// header value, so a caller can substitute the value without destroying the
+/// syntax around it.
+fn resolve_findings(mut findings: Vec<SecretFinding>) -> Vec<SecretFinding> {
+    findings.sort_by(|a, b| {
+        a.start
+            .cmp(&b.start)
+            .then(a.end.cmp(&b.end))
+            .then(b.level.rank().cmp(&a.level.rank()))
+    });
+    let mut out: Vec<SecretFinding> = Vec::new();
+    for candidate in findings {
+        if let Some(last) = out.last_mut() {
+            if candidate.start == last.start && candidate.end == last.end {
+                if candidate.level.rank() > last.level.rank()
+                    || (candidate.level.rank() == last.level.rank()
+                        && kind_rank(candidate.kind) > kind_rank(last.kind))
+                {
+                    *last = candidate;
+                }
+                continue;
+            }
+            if candidate.start < last.end {
+                let replace = candidate.level.rank() > last.level.rank()
+                    || (candidate.level.rank() == last.level.rank()
+                        && (kind_rank(candidate.kind) > kind_rank(last.kind)
+                            || (kind_rank(candidate.kind) == kind_rank(last.kind)
+                                && (candidate.end - candidate.start) < (last.end - last.start))));
+                if replace {
+                    *last = candidate;
+                }
+                continue;
+            }
+        }
+        out.push(candidate);
+    }
+    out
+}
+
+// ── Multi-line positions ───────────────────────────────────────────────────
+
+/// Complete private-key blocks. A block that starts and never ends is
+/// reported through the end of the text: fail closed, exactly like the
+/// sanitizer's rule.
+fn scan_private_key_blocks(
+    text: &str,
+    findings: &mut Vec<SecretFinding>,
+    occupied: &mut Vec<(usize, usize)>,
+) {
+    let mut line_start = 0usize;
+    let mut begin: Option<usize> = None;
+    for line in text.split_inclusive('\n') {
+        if begin.is_none() && is_private_key_marker(line, true) {
+            let marker = line.to_ascii_lowercase().find("-----begin ");
+            begin = Some(line_start + marker.unwrap_or(0));
+        } else if let Some(start) = begin
+            && is_private_key_marker(line, false)
+        {
+            let content = line.trim_end_matches(['\n', '\r']);
+            let end = line_start + content.len();
+            findings.push(SecretFinding {
+                start,
+                end,
+                level: SecretLevel::HighConfidence,
+                kind: SecretKind::PemPrivateKey,
+                key: None,
+                evidence: vec![SecretEvidence::PrivateKeyMarker],
+            });
+            occupied.push((start, end));
+            begin = None;
+        }
+        line_start += line.len();
+    }
+    if let Some(start) = begin {
+        let end = text.trim_end_matches(['\n', '\r']).len();
+        findings.push(SecretFinding {
+            start,
+            end,
+            level: SecretLevel::HighConfidence,
+            kind: SecretKind::PemPrivateKey,
+            key: None,
+            evidence: vec![SecretEvidence::PrivateKeyMarker],
+        });
+        occupied.push((start, end));
+    }
+}
+
+/// `password: |` followed by indented body lines. One credential, one span.
+fn scan_block_scalars(text: &str, findings: &mut Vec<SecretFinding>) {
+    let mut offset = 0usize;
+    let mut lines = text.split_inclusive('\n').peekable();
+    while let Some(line) = lines.next() {
+        let line_offset = offset;
+        offset += line.len();
+        let Some(indent) = block_scalar_indent(line) else {
+            continue;
+        };
+        let key = next_sensitive_key(line, 0).map(|(start, end)| line[start..end].to_string());
+        let mut start: Option<usize> = None;
+        let mut end = line_offset + line.trim_end_matches(['\n', '\r']).len();
+        let mut body_offset = offset;
+        let mut consumed = 0usize;
+        for body in lines.clone() {
+            let trimmed = body.trim_start_matches([' ', '\t']);
+            let leading = body.len() - trimmed.len();
+            if trimmed.trim_end_matches(['\n', '\r']).is_empty() {
+                body_offset += body.len();
+                consumed += 1;
+                continue;
+            }
+            if leading < indent {
+                break;
+            }
+            let content_start = body_offset + leading;
+            let content_end = body_offset + body.trim_end_matches(['\n', '\r']).len();
+            start.get_or_insert(content_start);
+            end = content_end;
+            body_offset += body.len();
+            consumed += 1;
+        }
+        if let Some(start) = start {
+            let value = &text[start..end];
+            if !value.trim().is_empty() && !is_template_value(value.trim()) {
+                findings.push(SecretFinding {
+                    start,
+                    end,
+                    level: SecretLevel::HighConfidence,
+                    kind: SecretKind::KeyValue,
+                    key,
+                    evidence: vec![
+                        SecretEvidence::CredentialKeyName,
+                        SecretEvidence::OpaqueValue,
+                    ],
+                });
+            }
+        }
+        for _ in 0..consumed {
+            let _ = lines.next();
+        }
+    }
+}
+
+// ── Known provider formats ────────────────────────────────────────────────
+
+fn boundary_before(line: &str, start: usize) -> bool {
+    line[..start]
+        .chars()
+        .next_back()
+        .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'))
+}
+
+fn boundary_after(line: &str, end: usize) -> bool {
+    line[end..]
+        .chars()
+        .next()
+        .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'))
+}
+
+fn take_while_byte(line: &str, mut i: usize, f: impl Fn(u8) -> bool) -> usize {
+    let bytes = line.as_bytes();
+    while let Some(&b) = bytes.get(i) {
+        if !f(b) {
+            break;
+        }
+        i += 1;
+    }
+    i
+}
+
+fn token_body(line: &str, start: usize) -> usize {
+    take_while_byte(line, start, |b| {
+        b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+    })
+}
+
+fn known_token_findings(line: &str, offset: usize) -> Vec<SecretFinding> {
+    let mut out = Vec::new();
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+    while i < line.len() {
+        let rest = &line[i..];
+        let mut matched: Option<(usize, SecretKind)> = None;
+        if rest.starts_with("sk-") {
+            let end = token_body(line, i + 3);
+            if boundary_before(line, i) && boundary_after(line, end) && end - (i + 3) >= 16 {
+                matched = Some((end, SecretKind::ProviderKey));
+            }
+        } else if rest.starts_with("sk_live_") || rest.starts_with("sk_test_") {
+            let prefix = 8;
+            let end = token_body(line, i + prefix);
+            if boundary_before(line, i) && boundary_after(line, end) && end - (i + prefix) >= 12 {
+                matched = Some((end, SecretKind::ProviderKey));
+            }
+        } else if ["ghp_", "gho_", "ghu_", "ghs_", "ghr_"]
+            .iter()
+            .any(|prefix| rest.starts_with(prefix))
+        {
+            let end = token_body(line, i + 4);
+            if boundary_before(line, i) && boundary_after(line, end) && end - (i + 4) >= 16 {
+                matched = Some((end, SecretKind::ProviderKey));
+            }
+        } else if rest.starts_with("github_pat_") {
+            let end = token_body(line, i + "github_pat_".len());
+            if boundary_before(line, i)
+                && boundary_after(line, end)
+                && end - (i + "github_pat_".len()) >= 16
+            {
+                matched = Some((end, SecretKind::ProviderKey));
+            }
+        } else if rest.starts_with("AKIA") {
+            let end = i + 20;
+            if end <= line.len()
+                && bytes[i + 4..end]
+                    .iter()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+                && boundary_before(line, i)
+                && boundary_after(line, end)
+            {
+                matched = Some((end, SecretKind::ProviderKey));
+            }
+        } else if ["xoxb-", "xoxp-", "xoxa-", "xoxr-", "xoxs-"]
+            .iter()
+            .any(|prefix| rest.starts_with(prefix))
+        {
+            let end = token_body(line, i + 5);
+            if boundary_before(line, i) && boundary_after(line, end) && end - (i + 5) >= 10 {
+                matched = Some((end, SecretKind::ProviderKey));
+            }
+        } else if rest.starts_with("AIza") {
+            let end = token_body(line, i + 4);
+            let total = end - i;
+            if boundary_before(line, i) && boundary_after(line, end) && (35..=45).contains(&total) {
+                matched = Some((end, SecretKind::ProviderKey));
+            }
+        } else if rest.starts_with("eyJ")
+            && let Some(end) = jwt_end(line, i)
+        {
+            matched = Some((end, SecretKind::JsonWebToken));
+        }
+        if let Some((end, kind)) = matched {
+            out.push(SecretFinding {
+                start: offset + i,
+                end: offset + end,
+                level: SecretLevel::HighConfidence,
+                kind,
+                key: None,
+                evidence: vec![SecretEvidence::KnownPrefix],
+            });
+            i = end;
+            continue;
+        }
+        i += line[i..].chars().next().map_or(1, char::len_utf8);
+    }
+    out
+}
+
+/// The end of a JWT that starts at `start`, or `None` when the run is not a
+/// three-part JWT. Two dots and a plausible header are the format proof; the
+/// signature is not decoded and the token is never sent anywhere.
+fn jwt_end(line: &str, start: usize) -> Option<usize> {
+    let end = take_while_byte(line, start, |b| {
+        b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')
+    });
+    if end.saturating_sub(start) < 40 || !boundary_after(line, end) {
+        return None;
+    }
+    let token = &line[start..end];
+    let parts: Vec<&str> = token.split('.').collect();
+    (parts.len() == 3
+        && parts.iter().all(|part| !part.is_empty())
+        && parts[0].starts_with("eyJ")
+        && parts.iter().all(|part| {
+            part.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+        }))
+    .then_some(end)
+}
+
+// ── Key/value positions ───────────────────────────────────────────────────
+
+fn assignment_findings(line: &str, offset: usize) -> Vec<SecretFinding> {
+    let code_line = looks_like_code(line);
+    let bytes = line.as_bytes();
+    let mut out = Vec::new();
+    let mut idx = 0usize;
+    let mut guard = 0usize;
+    while idx < line.len() && guard < 64 {
+        guard += 1;
+        let Some((key_start, key_end)) = next_sensitive_key(line, idx) else {
+            break;
+        };
+        let name_start = line[..key_start]
+            .char_indices()
+            .rev()
+            .take_while(|(_, c)| c.is_ascii_alphanumeric() || *c == '_')
+            .last()
+            .map_or(key_start, |(i, _)| i);
+        let key = line[name_start..key_end].to_string();
+        let mut cursor = key_end;
+        if matches!(bytes.get(cursor), Some(b'"') | Some(b'\'') | Some(b'`')) {
+            cursor += 1;
+        }
+        cursor = skip_spaces(bytes, cursor);
+        let before_key = &line[..key_start];
+        let flag_style = before_key.ends_with("--")
+            || (before_key.ends_with('-')
+                && !before_key[..before_key.len() - 1]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_ascii_alphanumeric()));
+        let sep = bytes.get(cursor).copied();
+        let has_sep = matches!(sep, Some(b'=') | Some(b':'));
+        if has_sep {
+            if matches!(bytes.get(cursor + 1), Some(b'=') | Some(b'>') | Some(b':')) {
+                idx = key_end;
+                continue;
+            }
+            cursor += 1;
+        } else if !(flag_style && cursor > key_end) {
+            idx = key_end;
+            continue;
+        }
+        cursor = skip_spaces(bytes, cursor);
+        let mut credential_scheme = false;
+        for scheme in ["bearer ", "basic ", "token "] {
+            if line.len() >= cursor + scheme.len()
+                && line.is_char_boundary(cursor)
+                && line.is_char_boundary(cursor + scheme.len())
+                && line[cursor..cursor + scheme.len()].eq_ignore_ascii_case(scheme)
+            {
+                cursor += scheme.len();
+                cursor = skip_spaces(bytes, cursor);
+                credential_scheme = true;
+                break;
+            }
+        }
+        let Some((value_start, value_end, quoted)) = value_span(line, cursor) else {
+            if cursor <= idx {
+                break;
+            }
+            idx = cursor;
+            continue;
+        };
+        let value = &line[value_start..value_end];
+        if let Some(level) = classify_assignment(&key, value, quoted, code_line, credential_scheme)
+        {
+            let mut evidence = vec![SecretEvidence::CredentialKeyName];
+            if credential_scheme {
+                evidence.push(SecretEvidence::CredentialScheme);
+            }
+            if is_opaque(value) {
+                evidence.push(SecretEvidence::OpaqueValue);
+            }
+            out.push(SecretFinding {
+                start: offset + value_start,
+                end: offset + value_end,
+                level,
+                kind: SecretKind::KeyValue,
+                key: Some(key),
+                evidence,
+            });
+        }
+        idx = value_end.max(idx + 1);
+    }
+    out
+}
+
+fn classify_assignment(
+    key: &str,
+    value: &str,
+    quoted: bool,
+    code_line: bool,
+    credential_scheme: bool,
+) -> Option<SecretLevel> {
+    let value = value.trim();
+    if value.len() < MIN_SECRET_LEN || is_template_value(value) || is_hash_or_uuid(value) {
+        return None;
+    }
+    let lower_key = key.to_ascii_lowercase();
+    let header = lower_key == "authorization" || lower_key.ends_with("authorization");
+    if header || credential_scheme {
+        return (is_opaque(value) && value.len() >= 8).then_some(SecretLevel::HighConfidence);
+    }
+    // A code expression is not a credential literal. Quoted literals stay
+    // eligible because the source really contains that value.
+    if !quoted && is_code_expression(value) {
+        return None;
+    }
+    if code_line && !quoted && is_bare_identifier(value) {
+        return None;
+    }
+    if is_non_secret_prose(value) {
+        return None;
+    }
+    let entropy = shannon_entropy(value);
+    let opaque = is_opaque(value);
+    if opaque
+        && value.len() >= 12
+        && value.chars().any(|c| c.is_ascii_alphabetic())
+        && value.chars().any(|c| c.is_ascii_digit())
+        && entropy >= 3.0
+    {
+        return Some(SecretLevel::HighConfidence);
+    }
+    if opaque && value.len() >= MIN_SECRET_LEN {
+        return Some(SecretLevel::Ambiguous);
+    }
+    if !opaque && value.len() >= 12 && value.split_whitespace().count() >= 2 && entropy >= 3.2 {
+        return Some(SecretLevel::Ambiguous);
+    }
+    None
+}
+
+// ── URLs ──────────────────────────────────────────────────────────────────
+
+fn url_credential_findings(line: &str, offset: usize) -> Vec<SecretFinding> {
+    let mut out = Vec::new();
+    let mut search = 0usize;
+    while let Some(rel) = line[search..].find("://") {
+        let scheme_end = search + rel + 3;
+        let tail = &line[scheme_end..];
+        let authority_end = tail
+            .find(|c: char| {
+                c == '/' || c == '?' || c == '#' || c.is_whitespace() || c == '"' || c == '\''
+            })
+            .unwrap_or(tail.len());
+        let authority = &tail[..authority_end];
+        if let (Some(at), Some(colon)) = (authority.find('@'), authority.find(':'))
+            && colon < at
+        {
+            let value_start = scheme_end + colon + 1;
+            let value_end = scheme_end + at;
+            let value = &line[value_start..value_end];
+            if value.len() >= MIN_SECRET_LEN && !is_template_value(value) {
+                out.push(SecretFinding {
+                    start: offset + value_start,
+                    end: offset + value_end,
+                    level: SecretLevel::HighConfidence,
+                    kind: SecretKind::UrlCredentials,
+                    key: None,
+                    evidence: vec![SecretEvidence::UrlUserInfo, SecretEvidence::OpaqueValue],
+                });
+            }
+        }
+        search = scheme_end + authority_end;
+        if search >= line.len() {
+            break;
+        }
+    }
+    out
+}
+
+// ── Prose mentions ────────────────────────────────────────────────────────
+
+const PROSE_CUES: &[&str] = &[
+    "api key",
+    "api_key",
+    "apikey",
+    "token",
+    "password",
+    "passwd",
+    "secret",
+    "credential",
+    "密钥",
+    "令牌",
+    "密码",
+    "凭据",
+    "这个值",
+    "该值",
+    "配置进去",
+    "配置到",
+    "填入",
+    "填到",
+    "设置为",
+    "this value",
+];
+
+fn prose_credential_findings(line: &str, offset: usize) -> Vec<SecretFinding> {
+    if looks_like_code(line) || is_comment_line(line) {
+        return Vec::new();
+    }
+    let lower = line.to_ascii_lowercase();
+    let mut out = Vec::new();
+    for cue in PROSE_CUES {
+        let mut search = 0usize;
+        while let Some(rel) = lower[search..].find(cue) {
+            let after_cue = search + rel + cue.len();
+            let window_end = (after_cue + 64).min(line.len());
+            let window_start = crate::text::floor_char_boundary(line, after_cue);
+            let window_end = crate::text::ceil_char_boundary(line, window_end);
+            for (start, end) in ascii_token_spans(&line[window_start..window_end]) {
+                let start = window_start + start;
+                let end = window_start + end;
+                let value = &line[start..end];
+                if plausible_unlabelled_credential(value) {
+                    out.push(SecretFinding {
+                        start: offset + start,
+                        end: offset + end,
+                        level: SecretLevel::Ambiguous,
+                        kind: SecretKind::ProseCredential,
+                        key: None,
+                        evidence: vec![SecretEvidence::ProseCue, SecretEvidence::OpaqueValue],
+                    });
+                    break;
+                }
+            }
+            search = after_cue;
+            if search >= lower.len() {
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn ascii_token_spans(text: &str) -> Vec<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut spans = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_alphanumeric() {
+            let start = i;
+            i += 1;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'-'))
+            {
+                i += 1;
+            }
+            spans.push((start, i));
+        } else {
+            i += 1;
+        }
+    }
+    spans
+}
+
+fn plausible_unlabelled_credential(value: &str) -> bool {
+    if value.len() < 8 || value.len() > 120 {
+        return false;
+    }
+    if is_hash_or_uuid(value) || looks_like_encoded_text(value) {
+        return false;
+    }
+    if value.chars().all(|c| c.is_ascii_digit()) {
+        // A long number can be a PIN or password, but it is also a build id.
+        return value.len() >= 8;
+    }
+    let has_mixed = value.chars().any(|c| c.is_ascii_uppercase())
+        && value.chars().any(|c| c.is_ascii_lowercase());
+    let has_digit = value.chars().any(|c| c.is_ascii_digit());
+    let has_separator = value.contains('-') || value.contains('_');
+    has_digit && (has_mixed || has_separator || shannon_entropy(value) >= 3.4)
+}
+
+// ── Value shape helpers ───────────────────────────────────────────────────
+
+fn is_opaque(value: &str) -> bool {
+    !value.chars().any(char::is_whitespace)
+}
+
+fn shannon_entropy(value: &str) -> f64 {
+    if value.is_empty() {
+        return 0.0;
+    }
+    let mut counts = [0usize; 256];
+    for byte in value.bytes() {
+        counts[byte as usize] += 1;
+    }
+    let len = value.len() as f64;
+    counts
+        .iter()
+        .filter(|count| **count > 0)
+        .map(|count| {
+            let probability = *count as f64 / len;
+            -probability * probability.log2()
+        })
+        .sum()
+}
+
+/// Values that occupy a credential position syntactically but are not a
+/// credential: environment indirection, templates, documentation
+/// placeholders and redaction markers.
+fn is_template_value(value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return true;
+    }
+    let lower = value.to_ascii_lowercase();
+    if value.starts_with("${")
+        || value.starts_with("${{")
+        || value.starts_with("{{")
+        || (value.starts_with('<') && value.ends_with('>'))
+        || (value.starts_with('%') && value.ends_with('%'))
+        || value == "[REDACTED]"
+        || value.eq_ignore_ascii_case("[redacted]")
+        || value == "***"
+        || value == "..."
+        || value == "…"
+    {
+        return true;
+    }
+    if value.starts_with('$')
+        && value[1..]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return true;
+    }
+    if value.contains("process.env")
+        || value.contains("os.getenv")
+        || value.contains("os.environ")
+        || value.contains("std::env")
+        || value.contains("env(")
+        || value.contains("${")
+    {
+        return true;
+    }
+    let first_word = lower.split(['-', '_', ' ', '.']).next().unwrap_or("");
+    matches!(
+        first_word,
+        "your"
+            | "example"
+            | "sample"
+            | "dummy"
+            | "placeholder"
+            | "changeme"
+            | "replace"
+            | "insert"
+            | "xxx"
+            | "redacted"
+            | "testkey"
+    ) || matches!(
+        lower.as_str(),
+        "password"
+            | "secret"
+            | "token"
+            | "string"
+            | "boolean"
+            | "number"
+            | "undefined"
+            | "required"
+            | "invalid"
+            | "optional"
+            | "enabled"
+            | "disabled"
+            | "true"
+            | "false"
+            | "none"
+            | "null"
+            | "bearer"
+            | "basic"
+            | "completed"
+            | "pending"
+            | "running"
+            | "failed"
+            | "success"
+            | "valid"
+    )
+}
+
+/// Hashes, commit SHAs and UUIDs are opaque and random-looking, and are
+/// ordinary development material. Demote them: a credential that happens to
+/// be a bare hex digest is indistinguishable from a hash, so claiming high
+/// confidence would be dishonest.
+fn is_hash_or_uuid(value: &str) -> bool {
+    if !value.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return false;
+    }
+    let digits = value.chars().filter(|c| c.is_ascii_hexdigit()).count();
+    let dashes = value.chars().filter(|c| *c == '-').count();
+    if digits == 32 && dashes == 4 && value.len() == 36 {
+        return true;
+    }
+    dashes == 0 && matches!(digits, 32 | 40 | 64 | 128)
+}
+
+/// Base64 of printable text: no digits, standard alphabet, padded. This is
+/// the shape of encoded logs and fixtures, not of a provider credential.
+fn looks_like_encoded_text(value: &str) -> bool {
+    value.len() >= 16
+        && value.len().is_multiple_of(4)
+        && value.ends_with('=')
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+        && !value.bytes().any(|b| b.is_ascii_digit())
+}
+
 /// Sanitize text that is about to become model-visible, returning the text
 /// with secret VALUES replaced and the list of values that were found.
 ///
@@ -251,6 +1293,7 @@ fn redact_url_userinfo(line: &str, found: &mut Vec<DetectedSecret>) -> String {
 fn redact_sensitive_assignments(line: &str, found: &mut Vec<DetectedSecret>) -> String {
     let code_line = looks_like_code(line);
     let bytes = line.as_bytes();
+    let tokens = reference_token_ranges(line);
     let mut out = String::with_capacity(line.len());
     let mut idx = 0usize;
     while idx < line.len() {
@@ -258,6 +1301,18 @@ fn redact_sensitive_assignments(line: &str, found: &mut Vec<DetectedSecret>) -> 
             out.push_str(&line[idx..]);
             return out;
         };
+        // `[secret:sec_…]` is the runtime's own custody token. Its inner word
+        // is a name in a protocol, not a credential assignment; treating it as
+        // one would rewrite the reference and break resume and tool use.
+        if let Some((_start, end)) = tokens
+            .iter()
+            .find(|(start, end)| key_start >= *start && key_start < *end)
+            .copied()
+        {
+            out.push_str(&line[idx..end]);
+            idx = end.max(key_start + 1);
+            continue;
+        }
         // Report the FULL key name (`SERVICE_PASSWORD`, not `PASSWORD`) —
         // it is a name, safe to log, and far more useful in diagnostics.
         let name_start = line[..key_start]
@@ -326,7 +1381,10 @@ fn redact_sensitive_assignments(line: &str, found: &mut Vec<DetectedSecret>) -> 
         };
         let value = &line[value_start..value_end];
         out.push_str(&line[idx..value_start]);
-        if is_credential_value(value, quoted, code_line, credential_scheme) {
+        let value_is_reference = reference_token_ranges(value)
+            .iter()
+            .any(|(start, end)| *start == 0 && *end == value.len());
+        if !value_is_reference && is_credential_value(value, quoted, code_line, credential_scheme) {
             out.push_str(SECRET_PLACEHOLDER);
             found.push(DetectedSecret {
                 value: value.to_string(),
@@ -448,11 +1506,19 @@ fn value_span(line: &str, from: usize) -> Option<(usize, usize, bool)> {
             None
         }
         _ => {
+            // Unquoted values are ASCII tokens. A non-ASCII character is
+            // prose punctuation (Chinese comma, full stop, full-width colon)
+            // or the start of a sentence, never part of a bare credential;
+            // consuming it would both miss the exact span and destroy the
+            // text around the value when it is redacted.
             let end = line[from..]
-                .find(|c: char| {
-                    c.is_whitespace() || matches!(c, ',' | '}' | ')' | ';' | '\'' | '"' | '`')
+                .char_indices()
+                .find(|(_, c)| {
+                    c.is_whitespace()
+                        || !c.is_ascii()
+                        || matches!(c, ',' | '}' | ')' | ';' | '\'' | '"' | '`')
                 })
-                .map(|rel| from + rel)
+                .map(|(rel, _)| from + rel)
                 .unwrap_or(line.len());
             (end > from).then_some((from, end, false))
         }
@@ -663,9 +1729,10 @@ fn is_code_expression(value: &str) -> bool {
     if dotted_identifier {
         return true;
     }
-    // A bare CamelCase type name (`String`, `SecretString`).
+    // A bare CamelCase type name (`String`, `SecretString`). A digit means it
+    // is an opaque token, not a type.
     value.chars().next().is_some_and(|c| c.is_ascii_uppercase())
-        && value.chars().all(|c| c.is_ascii_alphanumeric())
+        && value.chars().all(|c| c.is_ascii_alphabetic())
         && value.chars().any(|c| c.is_ascii_lowercase())
 }
 
@@ -1327,5 +2394,91 @@ mod tests {
         let out = sanitize(dotted);
         assert!(!out.contains("abcdef0123456789"), "{out}");
         assert!(out.contains("Bearer"), "{out}");
+    }
+
+    #[test]
+    fn only_workspace_dotenv_files_are_targets() {
+        for (input, expected) in [
+            (".env", Some(".env")),
+            (".env.local", Some(".env.local")),
+            (".env.production", Some(".env.production")),
+            ("./.env", Some(".env")),
+            ("apps/web/.env", Some("apps/web/.env")),
+            (r"apps\web\.env", Some("apps/web/.env")),
+            ("apps//web/.env", Some("apps/web/.env")),
+            ("配置 目录/.env", Some("配置 目录/.env")),
+        ] {
+            assert_eq!(
+                normalize_dotenv_target(input).as_deref(),
+                expected,
+                "{input}"
+            );
+        }
+        for input in [
+            "",
+            ".envrc",
+            "config.toml",
+            "../.env",
+            "/etc/.env",
+            r"C:\project\.env",
+            "a/../../.env",
+            "dotenv",
+        ] {
+            assert_eq!(normalize_dotenv_target(input), None, "{input}");
+        }
+    }
+
+    #[test]
+    fn the_users_own_text_names_the_targets_a_capture_may_write() {
+        for (text, expected) in [
+            ("请把凭据配置到 .env：", vec![".env"]),
+            ("写到 apps/web/.env.local 里", vec!["apps/web/.env.local"]),
+            (
+                "用 `./.env` 和 .env.production",
+                vec![".env.production", ".env"],
+            ),
+            ("配置到.env中", vec![".env"]),
+            ("see (.env), then continue", vec![".env"]),
+        ] {
+            let mut got = dotenv_targets_in(text);
+            got.sort();
+            let mut expected: Vec<String> = expected.into_iter().map(String::from).collect();
+            expected.sort();
+            assert_eq!(got, expected, "{text}");
+        }
+        for text in [
+            "把 key 配置进去",
+            "README.env is documentation",
+            "my.env is not a dotenv name",
+            "https://example.com/.env",
+            "/etc/.env",
+        ] {
+            assert!(dotenv_targets_in(text).is_empty(), "{text}");
+        }
+    }
+
+    #[test]
+    fn only_explicit_assignments_name_a_field() {
+        for (text, expected) in [
+            ("DEMO_API_KEY=CANARY", vec!["DEMO_API_KEY"]),
+            ("export DB_PASSWORD = x", vec!["DB_PASSWORD"]),
+            ("api_key=\"abc\"", vec!["api_key"]),
+        ] {
+            let mut got = dotenv_fields_in(text);
+            got.sort();
+            let mut expected: Vec<String> = expected.into_iter().map(String::from).collect();
+            expected.sort();
+            assert_eq!(got, expected, "{text}");
+        }
+        for text in [
+            "密码是 password: hunter2",
+            "值在字段 DEMO_API_KEY 里",
+            "if (a == b) {}",
+            "a >= b",
+            "FOO=>bar",
+            "1BAD=value",
+        ] {
+            assert!(dotenv_fields_in(text).is_empty(), "{text}");
+        }
     }
 }

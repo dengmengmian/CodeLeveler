@@ -1123,11 +1123,16 @@ impl Executor {
                 // Typed, tool-declared destructiveness. The decision binds to
                 // this exact argument vector: a different target is a
                 // different irreversible operation and needs its own approval.
-                let exact_call_only = self
-                    .tool(&call.name)
-                    .and_then(|tool| tool.mcp_annotations())
-                    .and_then(|annotations| annotations.destructive_hint)
-                    == Some(true);
+                // A tool can also declare that one approval must never
+                // generalize (the credential broker: its authority is the
+                // captured reference, which a permission rule cannot name).
+                let exact_call_only = self.tool(&call.name).is_some_and(|tool| {
+                    tool.exact_call_consent()
+                        || tool
+                            .mcp_annotations()
+                            .and_then(|annotations| annotations.destructive_hint)
+                            == Some(true)
+                });
                 PolicyResolution::Ask(Box::new(PendingApproval {
                     request: ApprovalRequest {
                         id: ApprovalId::generate(),

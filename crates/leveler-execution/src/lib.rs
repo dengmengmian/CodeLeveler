@@ -37,6 +37,7 @@ pub mod policy;
 mod pty;
 pub mod resource_identity;
 pub mod risk;
+pub mod secret_vault;
 mod shell_ast;
 pub use encoding::decode_output;
 pub use shell_ast::{

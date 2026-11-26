@@ -1546,6 +1546,8 @@ pub struct UiText {
     pub skills: SkillsText,
     /// `/trust` page and the mid-turn definition authorization prompt.
     pub trust: TrustText,
+    /// Credential detection review and the explicit secure-paste field.
+    pub secret: SecretText,
     /// `/schedules` page copy.
     pub schedules: SchedulesText,
     /// `/memory` page copy.
@@ -2435,6 +2437,46 @@ pub struct SlashText {
     pub reload: &'static str,
     /// /review: manual, read-only, evidence-driven review.
     pub review: &'static str,
+    /// `/secret` — secure paste into the host vault.
+    pub secret: &'static str,
+}
+
+/// Credential review and secure-paste copy. No string here ever contains a
+/// value: every one is shown before or after custody, never with the secret.
+#[derive(Debug)]
+pub struct SecretText {
+    pub review_title: &'static str,
+    /// `{}` is the number of findings.
+    pub review_multiple: &'static str,
+    pub review_capture: &'static str,
+    pub review_plaintext: &'static str,
+    pub review_back: &'static str,
+    pub review_hint: &'static str,
+    /// `{}` is the comma-separated list of dotenv targets the message names.
+    pub review_scope_targets: &'static str,
+    /// `{}` is the comma-separated list of dotenv fields the message assigns.
+    pub review_scope_fields: &'static str,
+    pub review_scope_none: &'static str,
+    pub level_high: &'static str,
+    pub level_ambiguous: &'static str,
+    pub kind_provider_key: &'static str,
+    pub kind_jwt: &'static str,
+    pub kind_private_key: &'static str,
+    pub kind_url: &'static str,
+    pub kind_value: &'static str,
+    pub kind_prose: &'static str,
+    pub paste_title: &'static str,
+    pub paste_hint: &'static str,
+    pub paste_scope: &'static str,
+    pub paste_empty: &'static str,
+    /// `{}` is a masked description of the captured value.
+    pub captured: &'static str,
+    /// `{}` is the runtime's error.
+    pub capture_failed: &'static str,
+    /// Refusal for a local slash command that cannot take custody.
+    pub local_command_refused: &'static str,
+    /// `/secret` takes no argument; the value goes into the masked field.
+    pub paste_secret_usage: &'static str,
 }
 
 /// `/memory` page copy. The page is a view over the runtime's memory API, so
@@ -3370,8 +3412,10 @@ static ZH: UiText = UiText {
         update: "升级到最新的稳定版本（会自动重启）",
         reload: "重新读取配置文件并立即应用（无需重启）",
         review: "手动审查：代码、业务、安全、架构、测试、交付或会话；/review report [id] 查看报告",
+        secret: "安全粘贴凭据：值只交给本机 Vault，模型只看到引用（/secret）",
     },
     slash_brief: SlashText {
+        secret: "安全粘贴凭据",
         thinking: "调整模型思考强度",
         model: "切换模型",
         rename: "重命名会话",
@@ -3496,6 +3540,33 @@ static ZH: UiText = UiText {
         overlay_withheld: "批准前不会加载正文",
         overlay_hint: "↑↓ 选择 · Enter 确认 · v 查看内容 · Esc 拒绝",
         full_mode_note: "Full 模式：本会话会采纳创建基线内的项目定义；此处显示持久信任状态。",
+    },
+    secret: SecretText {
+        review_title: "检测到可能的敏感凭据",
+        review_multiple: "检测到 {} 个疑似敏感凭据",
+        review_capture: "安全接管并继续（值不会发送给模型）",
+        review_plaintext: "作为普通文本发送（明文会进入模型与 Provider）",
+        review_back: "返回编辑",
+        review_hint: "↑↓ 选择 · Enter 确认 · Esc 返回编辑；Esc 永远不会发送",
+        review_scope_targets: "写入目标：{}（由本条消息授权）",
+        review_scope_fields: "字段：{}",
+        review_scope_none: "本条消息未声明 .env 目标：该凭据的写入位置不受本条消息约束",
+        level_high: "高置信度",
+        level_ambiguous: "需要确认",
+        kind_provider_key: "Provider Key",
+        kind_jwt: "JWT",
+        kind_private_key: "PEM 私钥",
+        kind_url: "URL 凭据",
+        kind_value: "字段值",
+        kind_prose: "正文中的疑似值",
+        paste_title: "安全粘贴凭据",
+        paste_hint: "粘贴内容不会回显 · Enter 接管 · Esc 取消",
+        paste_scope: "值只进入本机会话 Vault；模型只会收到 [secret:sec_…] 引用。",
+        paste_empty: "（粘贴或输入凭据）",
+        captured: "已安全接管 {}。请继续说明要如何配置。",
+        capture_failed: "安全接管失败：{}",
+        local_command_refused: "该命令无法安全接管凭据；请改用 /secret，或把凭据移出该命令",
+        paste_secret_usage: "用法：/secret 打开掩码输入框；/secret revoke <sec_…> 撤销本会话的凭据",
     },
     schedules: SchedulesText {
         title: "定时任务",
@@ -5285,8 +5356,10 @@ static EN: UiText = UiText {
         update: "install the latest stable release (restarts automatically)",
         reload: "re-read the configuration files and apply them without a restart",
         review: "manual review: code, business, security, architecture, test, delivery or session; /review report [id] opens a report",
+        secret: "securely paste a credential: the value goes only to the local vault and the model sees a reference (/secret)",
     },
     slash_brief: SlashText {
+        secret: "secure paste a credential",
         thinking: "Adjust how hard the model thinks",
         model: "Switch model",
         rename: "rename session",
@@ -5411,6 +5484,33 @@ static EN: UiText = UiText {
         overlay_withheld: "Its instructions are not loaded before approval",
         overlay_hint: "↑↓ Select · Enter Confirm · v View content · Esc Deny",
         full_mode_note: "Full mode: this session adopts definitions from its creation baseline; this page shows persistent trust.",
+    },
+    secret: SecretText {
+        review_title: "Possible credential detected",
+        review_multiple: "{} possible credentials detected",
+        review_capture: "Capture securely and continue (the model never sees the value)",
+        review_plaintext: "Send as plain text (the model and provider will see it)",
+        review_back: "Back to editing",
+        review_hint: "Up/Down choose · Enter confirm · Esc returns to editing; Esc never sends",
+        review_scope_targets: "Write target: {} (authorized by this message)",
+        review_scope_fields: "Field: {}",
+        review_scope_none: "This message names no .env target; the write location is not bound by it",
+        level_high: "high confidence",
+        level_ambiguous: "needs confirmation",
+        kind_provider_key: "provider key",
+        kind_jwt: "JWT",
+        kind_private_key: "PEM private key",
+        kind_url: "URL credential",
+        kind_value: "field value",
+        kind_prose: "prose token",
+        paste_title: "Secure paste",
+        paste_hint: "Pasted text is never echoed · Enter captures · Esc cancels",
+        paste_scope: "The value stays in this session's local vault; the model receives only a [secret:sec_…] reference.",
+        paste_empty: "(paste or type a credential)",
+        captured: "Captured {}. Now say how it should be configured.",
+        capture_failed: "Secure capture failed: {}",
+        local_command_refused: "This command cannot take custody of a credential; use /secret, or remove the credential from it",
+        paste_secret_usage: "usage: /secret opens the masked field; /secret revoke <sec_…> revokes a capture in this session",
     },
     schedules: SchedulesText {
         title: "Scheduled tasks",

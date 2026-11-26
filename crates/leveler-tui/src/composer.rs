@@ -790,7 +790,7 @@ impl Composer {
         self.take_recording(Some(&format!("! {}", text.trim())))
     }
 
-    fn take_recording(&mut self, history_entry: Option<&str>) -> String {
+    pub(crate) fn take_recording(&mut self, history_entry: Option<&str>) -> String {
         let text = self.canonical_text();
         self.clear_edit_history();
         self.buffer.clear();

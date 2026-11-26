@@ -23,6 +23,7 @@ mod read_file;
 mod read_symbol;
 mod rules;
 mod run_command;
+mod secret_apply;
 mod shell_command;
 mod shell_guard;
 pub use shell_guard::refuse_shell_script;
@@ -52,6 +53,7 @@ pub use read_file::ReadFileTool;
 pub use read_symbol::ReadSymbolTool;
 pub use rules::ReadProjectRulesTool;
 pub use run_command::RunCommandTool;
+pub use secret_apply::{SecretApplyTool, SecretInspectTool};
 pub use shell_command::ShellCommandTool;
 pub use skills::{
     DELETE_SKILL_TOOL, DeleteSkillTool, LoadSkillTool, SAVE_SKILL_TOOL, SKILL_AUTHORING_TOOLS,

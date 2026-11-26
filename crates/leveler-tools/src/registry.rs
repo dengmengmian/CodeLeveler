@@ -41,6 +41,7 @@ pub const OBSERVE_CLASS_TOOLS: &[&str] = &[
     "read_file",
     "read_project_rules",
     "read_symbol",
+    "secret_inspect",
     "session_history",
     "update_plan",
     "view_image",
@@ -75,6 +76,8 @@ pub const MODEL_SURFACE_TOOLS: &[&str] = &[
     "read_project_rules",
     "read_symbol",
     "run_command",
+    "secret_apply",
+    "secret_inspect",
     "shell_command",
     "view_image",
     "wait_task",
@@ -639,6 +642,10 @@ pub fn core_surface(capabilities: &Capabilities) -> ToolRegistry {
     // edit / write
     registry.register(Arc::new(tools::ApplyPatchTool));
     registry.register(Arc::new(tools::WriteFileTool));
+    // Credential custody: the model can place a captured value, never read it.
+    // The tools refuse when no vault is attached to the execution.
+    registry.register(Arc::new(tools::SecretApplyTool));
+    registry.register(Arc::new(tools::SecretInspectTool));
     // bash, and the background lifecycle it creates
     registry.register(Arc::new(tools::RunCommandTool::new(commands.clone())));
     registry.register(Arc::new(tools::ShellCommandTool::new(commands)));
@@ -833,6 +840,10 @@ mod tests {
             // edit / write
             "apply_patch",
             "write_file",
+            // credential custody: the model can place a captured value, never
+            // read it
+            "secret_apply",
+            "secret_inspect",
             // bash, and the background lifecycle run_command can create
             "run_command",
             "shell_command",
@@ -950,12 +961,14 @@ mod tests {
         ] {
             assert!(names.iter().any(|n| n == present), "missing {present}");
         }
-        // core 12 + intel 5 + vcs 2 + web 2 + media 1 + skills 1
-        // + browser 3 + computer use 2 + native actions 3 = 31. The harness controls
-        // (`update_plan` and the injected ones) are not in this count: they are
-        // not a capability the host composes, so
+        // core 14 + intel 5 + vcs 2 + web 2 + media 1 + skills 1
+        // + browser 3 + computer use 2 + native actions 3 = 33. The harness
+        // controls (`update_plan` and the injected ones) are not in this
+        // count: they are not a capability the host composes, so
         // `leveler_agent::register_harness_controls` adds them on top.
-        assert_eq!(names.len(), 31);
+        // The broker pair (`secret_apply` / `secret_inspect`) is core because
+        // custody must exist without any optional pack.
+        assert_eq!(names.len(), 33);
     }
 
     /// `MODEL_SURFACE_TOOLS` is what an agent definition's `tools:` field is
@@ -1655,7 +1668,10 @@ mod schema_budget {
     /// The advertised tool schema is a FIXED cost on every model request of a
     /// session — it sits in the cached prefix, so it is cheap per request, but
     /// it is paid uncached once per session and it is pure prefix growth.
-    /// Measured 2026-09-09: core 13.1 KB / 14 tools, full 28.8 KB / 43 tools.
+    /// Measured 2026-09-09: core 13.1 KB / 12 tools, full 28.8 KB / 43 tools.
+    /// The Secret Broker adds two core tools (2026-11-25): the schema is the
+    /// model's only instruction for using a captured value without seeing it,
+    /// so its bytes are bought deliberately, not leaked.
     ///
     /// These bounds are a tripwire, not a target: a tool whose schema doubles
     /// the surface should be a decision, not a surprise.
@@ -1671,12 +1687,12 @@ mod schema_budget {
         let full = super::default_registry();
         let (core_bytes, full_bytes) = (bytes(&core), bytes(&full));
         assert!(
-            core_bytes < 20_000,
+            core_bytes < 25_000,
             "core tool schema grew to {core_bytes} bytes over {} tools",
             core.definitions().len()
         );
         assert!(
-            full_bytes < 40_000,
+            full_bytes < 45_000,
             "full tool schema grew to {full_bytes} bytes over {} tools",
             full.definitions().len()
         );

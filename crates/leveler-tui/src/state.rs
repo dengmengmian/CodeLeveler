@@ -669,6 +669,10 @@ pub struct AppState {
 
     /// The active modal overlay, if any (picker / approval). Captures key input.
     pub overlay: Option<Overlay>,
+    /// The `/secret` capture this client is waiting for. Only the matching
+    /// request id may insert a reference into the composer; an unsolicited
+    /// event from another capture must not.
+    pub pending_secret_paste: Option<CommandId>,
     /// Approval/clarification requests that arrived while another overlay was
     /// open. They wait here (oldest first) and are promoted as the overlay clears,
     /// so a later request never silently drops an earlier, unanswered one.
@@ -1068,6 +1072,7 @@ impl AppState {
             settled_turn_usage: None,
             checkpoints: Vec::new(),
             overlay: None,
+            pending_secret_paste: None,
             pending_interactions: VecDeque::new(),
             interaction_command_ids: HashMap::new(),
             uncertain_interaction_key: None,
