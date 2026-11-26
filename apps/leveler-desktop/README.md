@@ -24,11 +24,12 @@ npm start
 - 从工作区文件预览选择“引用到消息”，把相对路径加入草稿。Agent 按当前权限读取文件。图片可通过输入框的“添加图片”发送给支持视觉的模型。
 - 粘贴疑似凭据时在审查中选择安全接管或明文发送；命令菜单可安全粘贴凭据，消息中的 `[secret:…]` 引用可撤销。接管后的值由 Runtime 会话级保管，桌面不持久化明文。
 - 没有会话时可先选择模型：打开、浏览或关闭选择器不会创建会话；首个会话按所选模型创建。
+- 输入区的执行模式菜单可新建或切换会话的对话 / 计划 / 目标模式。模式由 Runtime 的会话记录确认；切换只影响之后的回合，Goal 结束或取消后 Runtime 可自行回到对话。`/goal <任务>` 在输入框仍按 Runtime 的 Goal 语义执行。
 - 使用文件预览、浏览器和内置终端，调整主题、字号和面板布局。
 
 ## 当前限制
 
-- 计划模式切换和会话引用尚未接入；插件系统未开放。反馈会复制到剪贴板并打开 GitHub Issues，由用户自行提交，不会自动上传日志。
+- 会话引用尚未接入；插件系统未开放。反馈会复制到剪贴板并打开 GitHub Issues，由用户自行提交，不会自动上传日志。
 - 文件预览暂不支持 PDF 和 Office；工具卡片中的长输出会截断，桌面端暂无完整输出入口。
 - 内置终端按当前系统用户权限运行，不受 Agent 权限模式的写入和网络限制，也不会请求审批。Windows 暂不支持内置终端。
 - 切换会话期间的后台输出不会补回，任务状态仍会保留。
@@ -39,6 +40,6 @@ npm start
 
 ## 开发检查
 
-运行 `npm run build`、`npm run typecheck`、`npm run lint` 和 `npm test`。构建本地 Runtime 后，使用 `npm run test:smoke` 验证会话恢复、归档恢复、图片附件、自动化运行、定时任务工具卡、定义信任审批和凭据接管。冒烟使用隔离配置、临时工作区和测试专用模型服务，不访问现有会话或外部模型。`npm run test:model-picker` 按真实 HOME/profile 验收模型选择器生命周期，仅创建新的测试会话。验收脚本通过 `LEVELER_BINARY` 指向当前工作树的独立构建。
+运行 `npm run build`、`npm run typecheck`、`npm run lint` 和 `npm test`。构建本地 Runtime 后，使用 `npm run test:smoke` 验证会话恢复、归档恢复、图片附件、自动化运行、定时任务工具卡、定义信任审批和凭据接管。冒烟使用隔离配置、临时工作区和测试专用模型服务，不访问现有会话或外部模型。`npm run test:model-picker` 按真实 HOME/profile 验收模型选择器生命周期，仅创建新的测试会话。`npm run test:modes` 在隔离 HOME 中验收对话/计划/目标三种执行模式（真实 Electron、Runtime 与会话行）；`node scripts/r2b-dogfood.mjs` 在真实 HOME/profile 上跑三种模式与运行中追加指令，仅创建并归档测试会话，需显式设置 `LEVELER_BINARY`。验收脚本通过 `LEVELER_BINARY` 指向当前工作树的独立构建。
 
 自动化的“立即运行”通过调度工具使用 `leveler schedule dispatch --occurrence <id> --follow`：只执行该 run-now 槽位并跟随到终态；不会开启系统后台唤醒，也不会继续派发未来的定时任务。桌面设置中的 Runtime 更新只针对命令行运行时，不更新桌面客户端。

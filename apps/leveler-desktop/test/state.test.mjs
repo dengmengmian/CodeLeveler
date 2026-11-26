@@ -351,3 +351,53 @@ test('a finished command releases the live activity label', () => {
   state = applyEvent(state, { type: 'tool_call_completed', id: 't1', ok: true, preview: 'done' });
   assert.equal(state.activity, '');
 });
+
+test('the runtime snapshot is the only source of the session collaboration axis', () => {
+  const goal = projectSnapshot({ id: 's', messages: [], task_status: 'running', pending_interactions: [], active_tools: [], collaboration: 'goal' });
+  assert.equal(goal.session.collaboration, 'goal');
+  // An older runtime omits the field; the interactive default is chat.
+  const legacy = projectSnapshot({ id: 's', messages: [], task_status: 'idle', pending_interactions: [], active_tools: [] });
+  assert.equal(legacy.session.collaboration, undefined);
+});
+
+test('paused and blocked goal turns are their own terminal receipts, never completions', () => {
+  const build = (type, reason, seq) => {
+    let state = projectSnapshot({ id: 's', messages: [{ id: 'u1', role: 'user', text: 'goal' }], task_status: 'running', pending_interactions: [], active_tools: [] });
+    state = applyEvent(state, { type: 'assistant_message_started', message_id: 'a1' });
+    state = applyEvent(state, { type: 'assistant_text_delta', message_id: 'a1', delta: 'the window stopped' });
+    state = applyEvent(state, { type, reason, seq });
+    return { state, receipt: conversationItems(state).find(item => item.kind === 'turn_receipt') };
+  };
+  const blocked = build('turn_blocked', '需要外部数据', 5);
+  assert.equal(blocked.state.lastTerminal, 'blocked');
+  assert.equal(blocked.receipt?.terminal.status, 'blocked');
+  assert.equal(blocked.receipt?.terminal.label, '目标受阻');
+  assert.equal(blocked.receipt?.terminal.tone, 'warning');
+  const paused = build('turn_paused', '等待你授权继续', 5);
+  assert.equal(paused.state.lastTerminal, 'paused');
+  assert.equal(paused.receipt?.terminal.status, 'paused');
+  assert.equal(paused.receipt?.terminal.label, '已暂停');
+  assert.equal(paused.receipt?.terminal.tone, 'muted');
+});
+
+test('a yielded goal window is not a terminal and never paints a receipt', () => {
+  let state = projectSnapshot({ id: 's', messages: [{ id: 'u1', role: 'user', text: 'goal' }], task_status: 'running', pending_interactions: [], active_tools: [] });
+  state = applyEvent(state, { type: 'assistant_message_started', message_id: 'a1' });
+  state = applyEvent(state, { type: 'assistant_text_delta', message_id: 'a1', delta: 'window one done' });
+  state = applyEvent(state, { type: 'turn_yielded', reason: '本窗口结束 · 继续同一目标', seq: 5 });
+  assert.equal(state.lastTerminal, null);
+  assert.equal(state.turnTerminals.length, 0);
+  assert.equal(conversationItems(state).some(item => item.kind === 'turn_receipt'), false);
+});
+
+test('an omitted owed goal in a SessionUpdated clears the previous projection', () => {
+  let state = projectSnapshot({ id: 's', messages: [], task_status: 'running', pending_interactions: [], active_tools: [], collaboration: 'goal' });
+  const owed = { goal_id: 'g1', objective: 'ship it', running: true, user_paused: false };
+  state = applySessionMetadata(state, { id: 's', task_status: 'running', collaboration: 'goal', execution_task: owed });
+  assert.equal(state.session.execution_task.objective, 'ship it');
+  // The runtime omits `execution_task` once the goal settles; the old badge
+  // must not survive the merge.
+  const settled = applySessionMetadata(state, { id: 's', task_status: 'completed', collaboration: 'chat' });
+  assert.equal(settled.session.execution_task, undefined);
+  assert.equal(settled.session.collaboration, 'chat');
+});

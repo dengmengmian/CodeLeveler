@@ -33,7 +33,7 @@ contextBridge.exposeInMainWorld('desktop',Object.freeze({
   openConfig:()=>invoke('desktop:open-config'),
   openInAppApps:()=>invoke('desktop:open-in-app-apps'),
   openInApp:request=>invoke('desktop:open-in-app',request),
-  createTask:(selection,requestId,model)=>invoke('desktop:create-identified',{selection,requestId,model}),
+  createTask:(selection,requestId,model,collaboration)=>invoke('desktop:create-identified',{selection,requestId,model,collaboration}),
   listModels:selection=>invoke('desktop:models',selection),
   providers:request=>invoke('desktop:providers',request),
   saveProvider:request=>invoke('desktop:provider-save',request),

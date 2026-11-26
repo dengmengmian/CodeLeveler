@@ -1040,7 +1040,7 @@ body.home .composer-input, body.home .composer-input-wrap { min-height: 52px; }
   min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .model-trigger { font-weight: 400; padding-right: 8px; }
-#permission-picker, #model-picker { flex: 0 1 auto; }
+#mode-picker, #permission-picker, #model-picker { flex: 0 1 auto; }
 /* Default reading; the narrow rules below swap it for the percent. Declared
    here, before the container queries, so source order cannot resurrect the
    hidden variant. */

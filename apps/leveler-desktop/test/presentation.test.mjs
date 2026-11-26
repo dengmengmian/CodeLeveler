@@ -99,7 +99,7 @@ test('history prompts include user intent but exclude runtime notices on the sam
 
 test('plan statuses use the actual Runtime states and retain unknown semantics',async()=>{
  const {planStepLabel}=await import('../src/presentation.mjs');
- assert.deepEqual(['pending','running','done','failed','skipped'].map(planStepLabel),['待执行','进行中','已完成','失败','已跳过']);
+ assert.deepEqual(['pending','running','done','failed','skipped','abandoned'].map(planStepLabel),['待执行','进行中','已完成','失败','已跳过','已弃用']);
  assert.equal(planStepLabel('future_state'),'未知状态：future_state');
 });
 test('Workbench only offers views backed by plan steps, diff evidence or actual read failure',async()=>{
@@ -263,6 +263,8 @@ test('the task dock reports per-status counts in the reference order', async () 
   assert.equal(planProgressLabel([{ status: 'running' }]), '1 进行中');
   assert.equal(planProgressLabel([{ status: 'done' }, { status: 'failed' }, { status: 'skipped' }]),
     '1 已完成 · 1 失败 · 1 已跳过');
+  // An abandoned step is replacement history, never delivered work.
+  assert.equal(planProgressLabel([{ status: 'done' }, { status: 'abandoned' }]), '1 已完成 · 1 已弃用');
   assert.equal(planProgressLabel([]), '');
 });
 
@@ -290,4 +292,21 @@ test('a multi-step tool run collapses to one category sentence, not a count', as
   assert.equal(merged.label, '执行了命令并已读取文件');
   assert.equal(executionStatusLabel(merged), '', 'a settled run carries no trailing success sentence');
   assert.equal(executionStatusLabel({ ...merged, failed: 1 }), '1 项失败');
+});
+
+test('the product collaboration axis names, encodes and confirms only Runtime values', async () => {
+  const { collaborationLabel, validCollaboration, collaborationCommand, collaborationConfirmed } = await import('../src/presentation.mjs');
+  assert.deepEqual(['chat', 'plan', 'goal'].map(collaborationLabel), ['对话', '计划', '目标']);
+  assert.equal(collaborationLabel(undefined), '对话');
+  for (const good of ['chat', 'plan', 'goal']) assert.equal(validCollaboration(good), true);
+  for (const bad of ['Chat', 'auto', '', null, undefined, 'orchestrate']) assert.equal(validCollaboration(bad), false);
+  assert.deepEqual(collaborationCommand('s1', 'goal'), { type: 'set_product_axes', session_id: 's1', work_profile: 'single', collaboration: 'goal' });
+  assert.throws(() => collaborationCommand('', 'goal'));
+  assert.throws(() => collaborationCommand('s1', 'auto'));
+  // Confirmation is the Runtime snapshot's value, never the requested one.
+  assert.equal(collaborationConfirmed({ session: { id: 's1', collaboration: 'plan' } }, 's1', 'plan'), true);
+  assert.equal(collaborationConfirmed({ session: { id: 's1', collaboration: 'chat' } }, 's1', 'plan'), false);
+  assert.equal(collaborationConfirmed({ session: { id: 's2', collaboration: 'plan' } }, 's1', 'plan'), false);
+  // An older runtime omits the field; an interactive session is chat.
+  assert.equal(collaborationConfirmed({ session: { id: 's1' } }, 's1', 'chat'), true);
 });

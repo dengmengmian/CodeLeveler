@@ -142,6 +142,18 @@ fn validate_command(session: &SessionId, command: &ClientCommand) -> anyhow::Res
                 !hint.is_empty() && hint.len() <= MAX_DESKTOP_SECRET_HINT_BYTES
             }) => {}
         ClientCommand::RevokeSecret { secret_ref, .. } if valid_desktop_secret_ref(secret_ref) => {}
+        // The product collaboration axis is the same typed command the
+        // terminal sends. `work_profile` is the deprecated wire field every
+        // current client fills with `single`; it carries no product meaning and
+        // the runtime ignores it. The axis itself is the runtime's to validate
+        // again — the bridge only refuses values that are not representable.
+        ClientCommand::SetProductAxes {
+            work_profile,
+            collaboration,
+            ..
+        } if !work_profile.is_empty()
+            && work_profile.len() <= 64
+            && matches!(collaboration.as_str(), "chat" | "plan" | "goal") => {}
         ClientCommand::SteerCurrentTurn { .. }
         | ClientCommand::CancelCurrentTurn { .. }
         | ClientCommand::CancelTask { .. }
@@ -1384,6 +1396,40 @@ compatibility: { synthesize_tool_call_ids: true, drop_unsupported_fields: true }
                 .is_err()
             );
         }
+    }
+
+    /// R2b: the Desktop's mode picker writes the SAME typed axis command the
+    /// terminal does, bound to the selected session. Values the runtime cannot
+    /// represent are refused here; anything else stays the runtime's decision.
+    #[test]
+    fn desktop_collaboration_switch_is_the_existing_typed_axis_command() {
+        let session = SessionId::new("mode-session");
+        for collaboration in ["chat", "plan", "goal"] {
+            let command = ClientCommand::SetProductAxes {
+                session_id: session.clone(),
+                work_profile: "single".to_string(),
+                collaboration: collaboration.to_string(),
+            };
+            assert!(validate_command(&session, &command).is_ok());
+            assert!(validate_command(&SessionId::new("other"), &command).is_err());
+        }
+        for collaboration in ["Chat", "Goal", "plan ", "", "auto", "orchestrate"] {
+            let command = ClientCommand::SetProductAxes {
+                session_id: session.clone(),
+                work_profile: "single".to_string(),
+                collaboration: collaboration.to_string(),
+            };
+            assert!(
+                validate_command(&session, &command).is_err(),
+                "`{collaboration}` must not be representable as an axis"
+            );
+        }
+        let long_profile = ClientCommand::SetProductAxes {
+            session_id: session.clone(),
+            work_profile: "x".repeat(65),
+            collaboration: "chat".to_string(),
+        };
+        assert!(validate_command(&session, &long_profile).is_err());
     }
 
     /// DESKTOP-SESSION-1: an ordinary Desktop task is a CONVERSATION.

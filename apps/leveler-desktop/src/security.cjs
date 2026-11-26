@@ -1,5 +1,5 @@
 const {SNAPSHOT_VERSIONED_COMMANDS}=require('./command-policy.gen.cjs');
-const allowed=new Set(['submit_message','submit_user_input','steer_current_turn','steer_user_input','cancel_current_turn','cancel_task','resume_task','approval_decision','answer_clarification','definition_trust_decision','capture_secret','revoke_secret','query_session_history','request_diff','list_agents','get_agent','query_context','query_observability','select_model','set_permission_profile','rename_session','archive_session','unarchive_session','fork_session','compact_context','cancel_background_task','manage_schedule']);
+const allowed=new Set(['submit_message','submit_user_input','steer_current_turn','steer_user_input','cancel_current_turn','cancel_task','resume_task','approval_decision','answer_clarification','definition_trust_decision','capture_secret','revoke_secret','query_session_history','request_diff','list_agents','get_agent','query_context','query_observability','select_model','set_permission_profile','set_product_axes','rename_session','archive_session','unarchive_session','fork_session','compact_context','cancel_background_task','manage_schedule']);
 const decisions=new Set(['approve_once','approve_session','approve_always','deny']);
 const {validRef}=require('./attachment-ingress.cjs');
 function string(value,max=256){return typeof value==='string'&&value.length>0&&value.length<=max;}
@@ -91,6 +91,11 @@ function validateEnvelope(envelope,authorizeAttachment){
   }
   if(command.type==='request_diff'&&(!exactKeys(command,Object.hasOwn(command,'query_id')?['type','session_id','query_id']:['type','session_id'])||!nonblank(command.session_id)||command.session_id!==envelope.session_id||(Object.hasOwn(command,'query_id')&&!nonblank(command.query_id))))throw new Error('Invalid diff query');
   if(command.type==='set_permission_profile'&&(!exactKeys(command,['type','session_id','mode'])||!nonblank(command.session_id)||command.session_id!==envelope.session_id||!['full_access','assisted','request_approval'].includes(command.mode)))throw new Error('Invalid permission selection');
+  // The product mode is a durable session fact written by the Runtime. The
+  // renderer never states whether the switch succeeded — only which of the
+  // three representable axes it is asking for. The deprecated `work_profile`
+  // is accepted because the wire command requires it; it carries no authority.
+  if(command.type==='set_product_axes'&&(!exactKeys(command,['type','session_id','work_profile','collaboration'])||!nonblank(command.session_id)||command.session_id!==envelope.session_id||!string(command.work_profile,64)||!['chat','plan','goal'].includes(command.collaboration)))throw new Error('Invalid collaboration selection');
   if(['fork_session','compact_context'].includes(command.type)&&(!exactKeys(command,['type','session_id'])||!nonblank(command.session_id)||command.session_id!==envelope.session_id))throw new Error('Invalid session command');
   if(command.type==='compact_context'&&envelope.expected_version!==null)throw new Error('Invalid compaction envelope');
   if(['select_model','rename_session','archive_session','unarchive_session'].includes(command.type)){

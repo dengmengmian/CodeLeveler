@@ -338,7 +338,7 @@ export function commandEnvelope(sessionId,command,observedVersion) {
   if(versioned&&(!Number.isSafeInteger(observedVersion)||observedVersion<0))throw new Error('snapshot version required');
   return {command_id:crypto.randomUUID(),session_id:sessionId,expected_version:versioned?observedVersion:null,issued_at:new Date().toISOString(),command};
 }
-export const terminalEvents = new Set(['turn_completed','turn_completed_partially_unverified','turn_completed_with_warnings','turn_answered','turn_failed','turn_cancelled','task_cancelled','turn_truncated','turn_incomplete']);
+export const terminalEvents = new Set(['turn_completed','turn_completed_partially_unverified','turn_completed_with_warnings','turn_answered','turn_paused','turn_blocked','turn_failed','turn_cancelled','task_cancelled','turn_truncated','turn_incomplete']);
 export function approvalDecisions(request){return request.requires_human_consent?['approve_once','deny']:['approve_once','approve_session',...(request.always_persists?['approve_always']:[]),'deny'];}
 export function clarificationAnswer(question,{picks=[],text=''}){
   const kind=question.kind??'single';text=text.trim();
@@ -366,6 +366,10 @@ export function applySessionMetadata(state,snapshot,{liveProjection=true}={}){
   // SessionUpdated is metadata-only by the existing client protocol. A command
   // receipt is not a transcript checkpoint; live messages remain event-derived.
   const metadata={...snapshot};delete metadata.messages;
+  // An omitted optional fact is the ABSENCE of that fact, not "unchanged". A
+  // goal that settled arrives without `execution_task`; spreading the old
+  // session must not resurrect the owed-goal badge the Runtime just cleared.
+  if(!Object.hasOwn(metadata,'execution_task'))metadata.execution_task=undefined;
   const next={...state,session:{...state.session,...metadata},status:snapshot.task_status??snapshot.status??state.status};
   // A fetched confirmation snapshot carries no event sequence and may be taken
   // before the turn produces its plan, so it cannot prove the plan or diff were

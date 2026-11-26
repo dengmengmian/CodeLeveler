@@ -7,7 +7,8 @@ import {
   attachmentErrorPresentation, slashIntent, commandCandidates,
   contractToolStatus, failureReason, displayPreview,
   confirmedDiffOf, diffCounts, messageTime, conversationItems, executionStatusLabel, confirmedChangeFiles,
-  mergeExecutionViews,
+  mergeExecutionViews, collaborationLabel, validCollaboration, collaborationCommand, collaborationConfirmed,
+  planActiveSteps,
 } from './presentation.mjs';
 import {
   projectSnapshot, applySessionMetadata, applyEvent, commandEnvelope, terminalEvents,
@@ -241,6 +242,18 @@ let queuedMessages = [];
 // Chosen before a session exists. It becomes a session fact only through the
 // create command; opening or browsing the picker never creates one.
 let pendingModel = null;
+// The collaboration axis for the NEXT session, before one exists. The current
+// session's axis is always read from the Runtime snapshot; this is only the
+// pre-session choice. Switching an existing session is never optimistic: the
+// Runtime's own snapshot confirms it.
+let pendingCollaboration = 'chat';
+// One axis switch in flight: {sessionId, target}. Presentation only.
+let collaborationSwitch = null;
+// Sessions whose goal state was refreshed once for the current turn. The
+// snapshot is the only source of the owed-goal dock; a goal record can appear
+// just after the submit acknowledgement, so the first tool of the turn is the
+// first reliable point to re-read it without polling.
+const goalDockProbed = new Set();
 // A submit that the Runtime acknowledged but whose first status event has not
 // reached the page yet is still work that a quit would interrupt.
 let pendingSubmit = false;
@@ -335,6 +348,7 @@ function controls() {
   $('send').disabled = frozen || !hasContent;
   $('attachment-add').disabled = frozen;
   $('model-picker').disabled = frozen;
+  $('mode-picker').disabled = frozen;
   $('permission-picker').disabled = frozen;
   $('workspace-picker').disabled = frozen;
   $('new-session').disabled = loading || uploads || offline;
@@ -450,7 +464,8 @@ const SIDEBAR_SESSION_LIMIT = 5;
 const groupLimits = new Map();
 const sessionStatusLabels = {
   running: '运行中', waiting_user: '等待你处理', answered: '已回答', idle: '就绪',
-  completed: '已完成', failed: '失败', cancelled: '已取消', unknown: '状态未知',
+  completed: '已完成', failed: '失败', cancelled: '已取消', interrupted: '已中断',
+  blocked: '受阻', incomplete: '未完成', unknown: '状态未知',
 };
 
 function childIsSettled(child) {
@@ -1716,7 +1731,10 @@ function renderComposerDocks() {
   // A plan is real progress even before its first work message commits; the
   // composer dock must not disappear just because the session still looks home.
   const hasPlan = (current?.plan?.steps ?? []).length > 0;
-  if (!current || (isHome() && !hasPlan)) { host.hidden = true; queuedMessages = queuedMessages.filter(item => item.sessionId === current?.session.id); return; }
+  // An owed goal is runtime state, not transcript: a paused or continued goal
+  // keeps its dock even when the screen would otherwise look idle.
+  const execution = current?.session?.execution_task ?? null;
+  if (!current || (isHome() && !hasPlan && !execution)) { host.hidden = true; queuedMessages = queuedMessages.filter(item => item.sessionId === current?.session.id); return; }
   queuedMessages = queuedMessages.filter(item => item.sessionId === current.session.id);
   host.hidden = false;
   if (queuedMessages.length) {
@@ -1737,6 +1755,20 @@ function renderComposerDocks() {
       row.append(remove);
       dock.append(row);
     }
+    host.append(dock);
+  }
+  // The owed goal's own projection: objective and whether a window runs or
+  // the goal waits for the person. Both fields come from the Runtime snapshot.
+  if (execution) {
+    const state = execution.user_paused ? '已暂停 · 等待你的指令'
+      : execution.running ? '执行中' : '待继续';
+    const dock = el('div', 'composer-dock goal-dock');
+    const head = el('div', 'composer-dock-head');
+    head.append(iconNode('compass', { size: 16 }), el('span', 'todo-title', `目标 · ${state}`));
+    dock.append(head);
+    const row = el('div', 'composer-dock-row');
+    row.append(el('span', 'composer-dock-text', execution.objective));
+    dock.append(row);
     host.append(dock);
   }
   // Reference task panel: the list stays readable in every plan state, and the
@@ -1805,6 +1837,28 @@ function renderComposerMeta() {
   const permissionText = mode ? permissionLabel(mode) : '工作区内修改';
   permission.dataset.tooltip = `访问模式：${permissionText}（仅影响 Agent，用户终端按系统用户权限运行）`;
   permission.setAttribute('aria-label', `访问模式，当前：${permissionText}`);
+  // The execution mode is a Runtime fact for an existing session. Before one
+  // exists this is only the pending choice the create request will state.
+  // While a switch is in flight the trigger names the Runtime's value first,
+  // so it never claims the new axis before the snapshot confirms it.
+  const sessionAxis = current ? (current.session.collaboration ?? 'chat') : pendingCollaboration;
+  const switching = !!current && collaborationSwitch?.sessionId === current.session.id
+    && collaborationSwitch.target !== sessionAxis;
+  const modeText = switching
+    ? `${collaborationLabel(sessionAxis)} → ${collaborationLabel(collaborationSwitch.target)}`
+    : collaborationLabel(sessionAxis);
+  const modeTrigger = $('mode-picker');
+  if (modeTrigger) {
+    modeTrigger.replaceChildren(
+      iconNode(collaborationIcon(sessionAxis), { size: 14 }),
+      el('span', 'trigger-label', modeText),
+      iconNode('chevronDown', { size: 12, className: 'trigger-chevron' }),
+    );
+    modeTrigger.dataset.tooltip = current
+      ? `执行模式：${collaborationLabel(sessionAxis)}（由 Runtime 确认${switching ? '，切换中' : ''}；只影响之后的回合）`
+      : `新会话执行模式：${collaborationLabel(pendingCollaboration)}`;
+    modeTrigger.setAttribute('aria-label', current ? `执行模式，当前：${collaborationLabel(sessionAxis)}` : `新会话执行模式，当前：${collaborationLabel(pendingCollaboration)}`);
+  }
   // Before a session exists the composer shows the configured default until
   // the person picks another model; it is the same model the next session
   // will start on, not an invented choice.
@@ -2809,7 +2863,10 @@ function openConfirmedChanges(toolIds, selected = null) {
 function planCard() {
   const steps = current?.plan?.steps ?? [];
   if (!steps.length) return null;
-  const done = steps.filter(step => step.status === 'done').length;
+  // Abandoned steps are replacement history, never delivered work; the ratio
+  // counts the plan's live steps only (the same rule the terminal uses).
+  const active = planActiveSteps(steps);
+  const done = active.filter(step => step.status === 'done').length;
   const card = el('div', 'plan-card-row');
   card.dataset.key = 'plan-card';
   const main = el('button', 'plan-card-main');
@@ -2818,7 +2875,7 @@ function planCard() {
   icon.append(iconNode('list', { size: 20 }));
   const copy = el('span', 'plan-card-copy');
   const planStateLabel = current?.plan?.state === 'completed' ? '（已完成）' : current?.plan?.state === 'interrupted' ? '（已中断）' : '';
-  copy.append(el('span', 'plan-card-title', `执行计划${planStateLabel}`), el('span', 'plan-card-desc', `${done} / ${steps.length} 步骤已完成`));
+  copy.append(el('span', 'plan-card-title', `执行计划${planStateLabel}`), el('span', 'plan-card-desc', `${done} / ${active.length} 步骤已完成`));
   main.append(icon, copy, el('span', 'plan-card-open', '打开'));
   main.addEventListener('click', () => openRightbarTab('plan'));
   card.append(main);
@@ -4286,6 +4343,73 @@ function openPermissionMenu(anchor) {
   });
 }
 
+const COLLABORATION_MODES = [['chat', '对话'], ['plan', '计划'], ['goal', '目标']];
+const COLLABORATION_HINTS = {
+  chat: '对话：普通回合，回答即结束',
+  plan: '计划：只读规划，写入需要审批；回答即结束',
+  goal: '目标：由 Runtime 持续执行到完成或阻塞',
+};
+function collaborationIcon(axis) {
+  return axis === 'goal' ? 'compass' : axis === 'plan' ? 'list' : 'chat';
+}
+
+/**
+ * The execution-mode picker. Browsing is inert: it creates no session, starts
+ * no Goal, clears no plan and does not interrupt a running turn. The choice
+ * becomes a fact only through the create request (no session yet) or the
+ * Runtime's snapshot after `set_product_axes`.
+ */
+function openCollaborationMenu(anchor) {
+  const sessionAxis = current ? (current.session.collaboration ?? 'chat') : pendingCollaboration;
+  const items = COLLABORATION_MODES.map(([axis, label]) => ({
+    label,
+    icon: collaborationIcon(axis),
+    checked: axis === sessionAxis,
+    title: COLLABORATION_HINTS[axis],
+    onSelect: () => {
+      if (!current) {
+        pendingCollaboration = axis;
+        renderComposerMeta();
+        controls();
+        toast(`新会话将使用${label}模式`, { tone: 'info', holdMs: 1800 });
+        return;
+      }
+      if (axis === (current.session.collaboration ?? 'chat')) return;
+      applyCollaboration(axis);
+    },
+  }));
+  items.push({ divider: true });
+  items.push({ label: current ? '切换只影响之后的回合' : '创建会话时生效', disabled: true });
+  openMenu({ anchor, items, width: 260, side: 'top', align: 'start' });
+}
+
+/**
+ * Ask the Runtime to change the session's axis and require its snapshot to
+ * confirm. A refusal keeps the Runtime's value on screen; nothing here is
+ * optimistically applied.
+ */
+function applyCollaboration(axis) {
+  action(async () => {
+    if (!current || !validCollaboration(axis)) return;
+    if (uncertain) throw new Error('上一个操作结果未知，请先刷新确认');
+    const id = current.session.id;
+    const from = current.session.collaboration ?? 'chat';
+    if (from === axis) return;
+    collaborationSwitch = { sessionId: id, target: axis };
+    renderComposerMeta();
+    try {
+      await deliver(collaborationCommand(id, axis));
+      await refreshMetadata();
+      if (!collaborationConfirmed(current, id, axis)) throw new Error('Runtime 尚未确认执行模式切换');
+    } finally {
+      if (collaborationSwitch?.sessionId === id) collaborationSwitch = null;
+      renderComposerMeta();
+      controls();
+    }
+  }, { onError: composerError, clearGlobal: false });
+}
+
+
 function commandCatalog() {
   const frozen = loading || !!uncertain || uploadPending();
   const session = !!current;
@@ -4294,7 +4418,6 @@ function commandCatalog() {
     ['add', 'reference', '引用工作区文件', hasWorkspace(), 'file', null, '请先打开有工作区的会话'],
     ['add', 'secret', '安全粘贴凭据', session, 'shield', null, '请先选择或新建会话'],
     ['commands', 'goal', '目标', true, 'compass', null, null],
-    ['commands', 'plan', '计划', false, 'list', '未接入', '桌面尚未接入计划模式切换'],
     ['commands', 'feedback', '反馈', true, 'feedback', null, null],
     ['commands', 'diff', '工作区变更', !!current?.session.repository, 'diff', null, '当前会话没有工作区'],
     ['commands', 'compact', '压缩', session, 'archive', null, null],
@@ -4446,9 +4569,13 @@ async function createTask() {
   const key = selection?.id ?? null;
   if (!pendingCreation || pendingCreation.key !== key) pendingCreation = { key, id: crypto.randomUUID() };
   const pinned = pendingModel ?? providerState.data?.resolved_default_model ?? null;
-  const result = await api.createTask(key, pendingCreation.id, pinned ?? undefined);
+  const axis = validCollaboration(pendingCollaboration) ? pendingCollaboration : 'chat';
+  const result = await api.createTask(key, pendingCreation.id, pinned ?? undefined, axis);
   pendingCreation = null;
   if (pendingModel) pendingModel = null;
+  // The created session's axis is what the Runtime wrote; the pending choice
+  // only stated the request.
+  if (validCollaboration(result.session?.collaboration)) pendingCollaboration = result.session.collaboration;
   pendingCreation = null;
   history = [];
   uncertain = null;
@@ -6504,7 +6631,7 @@ function planView() {
   for (const step of steps) {
     const row = el('div', 'plan-step-row');
     row.dataset.planStatus = step.status;
-    row.append(el('span', 'step-mark', { pending: '○', running: '●', done: '✓', failed: '✕', skipped: '–' }[step.status] ?? '?'));
+    row.append(el('span', 'step-mark', { pending: '○', running: '●', done: '✓', failed: '✕', skipped: '–', abandoned: '⊘' }[step.status] ?? '?'));
     row.append(el('span', 'step-text', step.description), el('span', 'step-status', planStepLabel(step.status)));
     view.append(row);
   }
@@ -8806,6 +8933,7 @@ api.onEvent(frame => {
     current = attachExtras(applySessionMetadata(current, event.session), event.session);
     renderHeader();
     renderComposerMeta();
+    renderComposerDocks();
     renderSidebar();
     // The status the runtime settles after a turn arrives here, not on the
     // terminal event. The transcript owns the running row and the plan/diff
@@ -8867,6 +8995,26 @@ api.onEvent(frame => {
   if (current.status !== statusBefore || current.activity !== activityBefore) { renderHeader(); renderComposerMeta(); }
   modelRetry = event.type === 'model_retrying' ? { attempt: event.attempt ?? 0, max: event.max_attempts ?? 0 } : null;
   if (terminalEvents.has(event.type)) { pendingSubmit = false; setTimeout(flushQueuedMessage, 0); }
+  if (terminalEvents.has(event.type) && current?.session?.id) goalDockProbed.delete(current.session.id);
+  if (event.type === 'user_message_added' && current?.session?.id) goalDockProbed.delete(current.session.id);
+  if (event.type === 'tool_call_started' && current?.session?.id
+    && (current.session.collaboration ?? 'chat') === 'goal'
+    && !current.session.execution_task
+    && !goalDockProbed.has(current.session.id)) {
+    // The goal record can be committed after the submit acknowledgement, so
+    // the first tool of the turn is where the owed-goal projection becomes
+    // reliably readable. One snapshot read per turn; failures leave the dock
+    // absent rather than inventing a state.
+    goalDockProbed.add(current.session.id);
+    void refreshMetadata().then(() => renderComposerDocks()).catch(() => {});
+  }
+  if (event.type === 'turn_yielded') {
+    // A goal window closed with work still owed; the runtime continues the
+    // same logical turn in a fresh window. This is NOT a completion — no
+    // receipt is painted — and the snapshot is re-read so the goal dock shows
+    // the runtime's own projection rather than a window-local guess.
+    action(async () => { await refreshSnapshot(); });
+  }
   if (terminalEvents.has(event.type) && current?.session?.repository) {
     const attemptDiff = (attempt = 0) => {
       if (attempt > 6 || !current?.session?.repository) return;
@@ -9072,6 +9220,7 @@ function boot() {
   $('account-menu').addEventListener('click', event => openAccountMenu(event.currentTarget));
   $('workspace-picker').addEventListener('click', event => openWorkspaceMenu(event.currentTarget));
   $('model-picker').addEventListener('click', event => openModelMenu(event.currentTarget));
+  $('mode-picker').addEventListener('click', event => openCollaborationMenu(event.currentTarget));
   $('permission-picker').addEventListener('click', event => openPermissionMenu(event.currentTarget));
   $('attachment-add').addEventListener('click', () => {
     if (document.querySelector('#command-popover')) closeComposerPopovers();
