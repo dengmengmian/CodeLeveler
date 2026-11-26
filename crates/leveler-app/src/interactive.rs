@@ -5414,7 +5414,9 @@ impl InProcessRuntimeClient {
                     let result = {
                         let mut observer = |event: leveler_engine::EngineEvent| {
                             if let leveler_engine::EngineEvent::ToolCallStarted {
-                                name, agent_id, ..
+                                name,
+                                agent_id,
+                                ..
                             } = &event
                                 && agent_id.is_none()
                                 && name != leveler_agent::UPDATE_GOAL_TOOL

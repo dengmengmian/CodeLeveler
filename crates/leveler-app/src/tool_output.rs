@@ -86,11 +86,7 @@ pub(crate) fn project(
     store: &ArtifactStore,
 ) -> UiToolOutput {
     let Some(stored) = stored else {
-        return unavailable(
-            call_id,
-            index,
-            UiToolOutputUnavailable::NotSaved,
-        );
+        return unavailable(call_id, index, UiToolOutputUnavailable::NotSaved);
     };
     let references = extract_references(&stored.content);
     let shaped: Vec<UiToolOutputReference> = references
@@ -98,17 +94,15 @@ pub(crate) fn project(
         .enumerate()
         .map(|(position, reference)| {
             let size = store.size_of(&reference.path).unwrap_or(0);
-            let matches_identity = reference
-                .sha256
-                .as_deref()
-                .is_none_or(|hash| {
-                    reference
-                        .path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| name == format!("{hash}.txt"))
-                })
-                && reference.declared_bytes.is_none_or(|declared| declared == size);
+            let matches_identity = reference.sha256.as_deref().is_none_or(|hash| {
+                reference
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name == format!("{hash}.txt"))
+            }) && reference
+                .declared_bytes
+                .is_none_or(|declared| declared == size);
             UiToolOutputReference {
                 index: position as u32,
                 label: reference.label.to_string(),
@@ -156,7 +150,9 @@ pub(crate) fn project(
             .and_then(|name| name.to_str())
             .is_some_and(|name| name == format!("{hash}.txt"))
     }) && reference.declared_bytes.is_none_or(|declared| {
-        store.size_of(&reference.path).is_ok_and(|size| size == declared)
+        store
+            .size_of(&reference.path)
+            .is_ok_and(|size| size == declared)
     });
     if !identity_ok {
         return unavailable_with_references(
@@ -204,11 +200,7 @@ pub(crate) fn project(
     }
 }
 
-fn unavailable(
-    call_id: &str,
-    index: Option<u32>,
-    reason: UiToolOutputUnavailable,
-) -> UiToolOutput {
+fn unavailable(call_id: &str, index: Option<u32>, reason: UiToolOutputUnavailable) -> UiToolOutput {
     let part = match index {
         Some(index) => UiToolOutputPart::Artifact { index },
         None => UiToolOutputPart::Result,
@@ -492,13 +484,13 @@ mod tests {
 
         let missing = project("c1", None, None, 0, 1024, &store);
         assert_eq!(missing.state, UiToolOutputState::Unavailable);
-        assert_eq!(
-            missing.unavailable,
-            Some(UiToolOutputUnavailable::NotSaved)
-        );
+        assert_eq!(missing.unavailable, Some(UiToolOutputUnavailable::NotSaved));
 
         let unknown = project("c1", Some(&stored), Some(3), 0, 1024, &store);
-        assert_eq!(unknown.unavailable, Some(UiToolOutputUnavailable::UnknownPart));
+        assert_eq!(
+            unknown.unavailable,
+            Some(UiToolOutputUnavailable::UnknownPart)
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 }

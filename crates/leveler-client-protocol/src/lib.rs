@@ -78,8 +78,8 @@ mod usage;
 mod version;
 pub use terminal::{TerminalOperation, TerminalRequest, TerminalState};
 pub use tool_output::{
-    TOOL_OUTPUT_PAGE_DEFAULT_BYTES, TOOL_OUTPUT_PAGE_MAX_BYTES, UiToolOutput,
-    UiToolOutputPart, UiToolOutputReference, UiToolOutputState, UiToolOutputUnavailable,
+    TOOL_OUTPUT_PAGE_DEFAULT_BYTES, TOOL_OUTPUT_PAGE_MAX_BYTES, UiToolOutput, UiToolOutputPart,
+    UiToolOutputReference, UiToolOutputState, UiToolOutputUnavailable,
 };
 mod wire_types;
 

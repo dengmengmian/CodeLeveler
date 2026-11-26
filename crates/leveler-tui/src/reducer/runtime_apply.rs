@@ -593,9 +593,11 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             let t = state.t();
             state.notification = Some(Notification {
                 level: NotificationLevel::Warning,
-                message: t
-                    .goal_continuation_stopped
-                    .replacen("{}", &consecutive_windows_without_work.to_string(), 1),
+                message: t.goal_continuation_stopped.replacen(
+                    "{}",
+                    &consecutive_windows_without_work.to_string(),
+                    1,
+                ),
             });
         }
         RuntimeEvent::ProjectRulesLoaded { sources } => {

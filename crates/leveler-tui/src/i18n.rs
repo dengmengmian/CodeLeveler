@@ -4815,8 +4815,7 @@ static EN: UiText = UiText {
     reconnecting: "Model service unavailable · retry {attempt}/{max} · {secs}s",
     reconnected: "Recovered",
     goal_recovery_activity: "Recovering the task · attempt {}/{}",
-    goal_continuation_stopped:
-        "Automatic continuation stopped: {} consecutive windows did no work; the goal is still owed",
+    goal_continuation_stopped: "Automatic continuation stopped: {} consecutive windows did no work; the goal is still owed",
     footer_cache: "cache {}%",
     turn_rounds: "{} rounds",
     turn_tokens: "{} tokens",

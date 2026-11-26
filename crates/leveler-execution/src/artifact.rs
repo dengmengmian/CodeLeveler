@@ -154,10 +154,7 @@ impl ArtifactStore {
                 ArtifactReadError::Io(error)
             }
         })?;
-        let total_bytes = file
-            .metadata()
-            .map_err(ArtifactReadError::Io)?
-            .len();
+        let total_bytes = file.metadata().map_err(ArtifactReadError::Io)?.len();
         if offset > total_bytes {
             return Err(ArtifactReadError::OffsetOutOfRange { total_bytes });
         }
@@ -210,7 +207,10 @@ fn is_content_addressed_name(name: &str) -> bool {
     let Some(hash) = name.strip_suffix(".txt") else {
         return false;
     };
-    hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    hash.len() == 64
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 #[cfg(unix)]
@@ -447,7 +447,10 @@ mod tests {
             assert!(page.text.is_char_boundary(0));
             joined.push_str(&page.text);
             if !page.has_more {
-                assert_eq!(page.next_offset, page.total_bytes, "the last page ends the file");
+                assert_eq!(
+                    page.next_offset, page.total_bytes,
+                    "the last page ends the file"
+                );
                 break;
             }
             assert!(page.next_offset > offset, "a page must make progress");

@@ -235,15 +235,14 @@ async fn the_runtime_serves_the_full_recorded_result_and_its_artifacts() {
         sse(vec![answer_frame("done"), finish_frame("stop")]),
     ])
     .await;
-    let runtime: Arc<dyn InteractiveRuntimeClient> = Arc::new(
-        InProcessRuntimeClient::new_with_options(
+    let runtime: Arc<dyn InteractiveRuntimeClient> =
+        Arc::new(InProcessRuntimeClient::new_with_options(
             f.app.clone(),
             ModelRef::new("mock", "m"),
             PermissionProfile::Assisted,
             false,
             true,
-        ),
-    );
+        ));
     let mut rx = runtime.subscribe();
     runtime
         .send(ClientCommand::SubmitMessage {
@@ -259,9 +258,16 @@ async fn the_runtime_serves_the_full_recorded_result_and_its_artifacts() {
     // and its stream locator names the complete stdout.
     let result = query(&runtime, &mut rx, &f.session, BIG_CALL_ID, None, 0, 65_536).await;
     assert_eq!(result.state, UiToolOutputState::Available, "{result:?}");
-    assert!(result.model_result_reduced, "the result must say it is partial");
+    assert!(
+        result.model_result_reduced,
+        "the result must say it is partial"
+    );
     assert!(!result.full_output_lost, "the stream was saved, not lost");
-    assert!(result.text.contains("stdout full output:"), "{}", result.text);
+    assert!(
+        result.text.contains("stdout full output:"),
+        "{}",
+        result.text
+    );
     assert_eq!(result.references.len(), 1, "{:?}", result.references);
     let reference = &result.references[0];
     assert_eq!(reference.label, "stdout");
@@ -275,9 +281,21 @@ async fn the_runtime_serves_the_full_recorded_result_and_its_artifacts() {
     let mut paged = String::new();
     let mut offset = 0u64;
     loop {
-        let page = query(&runtime, &mut rx, &f.session, BIG_CALL_ID, Some(0), offset, 16_384).await;
+        let page = query(
+            &runtime,
+            &mut rx,
+            &f.session,
+            BIG_CALL_ID,
+            Some(0),
+            offset,
+            16_384,
+        )
+        .await;
         assert_eq!(page.state, UiToolOutputState::Available, "{page:?}");
-        assert_eq!(page.part, leveler_client_protocol::UiToolOutputPart::Artifact { index: 0 });
+        assert_eq!(
+            page.part,
+            leveler_client_protocol::UiToolOutputPart::Artifact { index: 0 }
+        );
         paged.push_str(&page.text);
         if !page.has_more {
             assert_eq!(page.next_offset, page.total_bytes);
@@ -288,10 +306,23 @@ async fn the_runtime_serves_the_full_recorded_result_and_its_artifacts() {
     }
     assert_eq!(paged.lines().count(), 20_000);
     assert!(paged.starts_with("1\n"));
-    assert!(paged.ends_with("20000\n"), "{:?}", &paged[paged.len().saturating_sub(20)..]);
+    assert!(
+        paged.ends_with("20000\n"),
+        "{:?}",
+        &paged[paged.len().saturating_sub(20)..]
+    );
 
     // A small result is served exactly as the model received it.
-    let small = query(&runtime, &mut rx, &f.session, SMALL_CALL_ID, None, 0, 65_536).await;
+    let small = query(
+        &runtime,
+        &mut rx,
+        &f.session,
+        SMALL_CALL_ID,
+        None,
+        0,
+        65_536,
+    )
+    .await;
     assert_eq!(small.state, UiToolOutputState::Available);
     assert!(!small.model_result_reduced);
     assert_eq!(small.text, "     1\talpha\n     2\tbeta\n     3\tgamma\n");
@@ -299,10 +330,7 @@ async fn the_runtime_serves_the_full_recorded_result_and_its_artifacts() {
     // Absence is typed: a fabricated id has no stored result.
     let missing = query(&runtime, &mut rx, &f.session, "never-called", None, 0, 1024).await;
     assert_eq!(missing.state, UiToolOutputState::Unavailable);
-    assert_eq!(
-        missing.unavailable,
-        Some(UiToolOutputUnavailable::NotSaved)
-    );
+    assert_eq!(missing.unavailable, Some(UiToolOutputUnavailable::NotSaved));
 
     // The record is bound to its own session: another session cannot read it.
     let other = f
@@ -322,4 +350,3 @@ async fn the_runtime_serves_the_full_recorded_result_and_its_artifacts() {
     assert_eq!(bounded.text, "     ", "char boundaries stay intact");
     assert!(bounded.has_more);
 }
-

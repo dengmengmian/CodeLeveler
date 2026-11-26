@@ -199,7 +199,13 @@ try {
   await capture('r2c-goal-boundary-failure.png').catch(() => {});
   throw error;
 } finally {
-  await app?.close().catch(() => {});
-  provider.close();
+  // Evidence first: Electron's close can wait on a process under load, and
+  // losing the evidence would turn a real PASS into an unusable run.
   await writeFile(path.join(output, 'r2c-goal-boundary-evidence.json'), JSON.stringify(evidence, null, 2));
+  await Promise.race([
+    app?.close().catch(() => {}),
+    new Promise(resolve => setTimeout(resolve, 8000)),
+  ]);
+  try { app?.process()?.kill('SIGKILL'); } catch { /* already gone */ }
+  provider.close();
 }
