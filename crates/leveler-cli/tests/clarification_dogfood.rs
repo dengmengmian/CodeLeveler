@@ -309,6 +309,7 @@ compatibility:
                 | RuntimeEvent::TurnCompletedWithWarnings { .. }
                 | RuntimeEvent::TurnFailed { .. }
                 | RuntimeEvent::TurnCancelled
+                | RuntimeEvent::TurnInterrupted
         );
         println!("[event] {}", short(&event));
         let clarification_delivered = matches!(

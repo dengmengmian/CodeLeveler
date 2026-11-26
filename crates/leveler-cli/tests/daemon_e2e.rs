@@ -2865,6 +2865,7 @@ async fn smoke_wait_terminal(rx: &mut broadcast::Receiver<RuntimeEvent>) -> Stri
                 | RuntimeEvent::TurnIncomplete { .. } => return "completed".to_string(),
                 RuntimeEvent::TurnFailed { error, .. } => return format!("failed: {error}"),
                 RuntimeEvent::TurnCancelled => return "cancelled".to_string(),
+                RuntimeEvent::TurnInterrupted => return "interrupted".to_string(),
                 _ => continue,
             },
             Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,

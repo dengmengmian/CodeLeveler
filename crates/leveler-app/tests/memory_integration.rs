@@ -515,7 +515,8 @@ async fn wait_for_turn_end(
                 | RuntimeEvent::TurnTruncated { .. }
                 | RuntimeEvent::TurnIncomplete { .. }
                 | RuntimeEvent::TurnFailed { .. }
-                | RuntimeEvent::TurnCancelled => return event,
+                | RuntimeEvent::TurnCancelled
+                | RuntimeEvent::TurnInterrupted => return event,
                 _ => continue,
             },
             Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
@@ -1640,8 +1641,8 @@ async fn an_interrupted_turn_settles_its_capture_range_without_inventing_memory(
         .unwrap();
     let terminal = wait_for_turn_end(&mut rx).await;
     assert!(
-        matches!(terminal, RuntimeEvent::TurnCancelled),
-        "the interrupted turn settles as cancelled: {terminal:?}"
+        matches!(terminal, RuntimeEvent::TurnInterrupted),
+        "the interrupted turn settles as interrupted: {terminal:?}"
     );
 
     let activity = harness

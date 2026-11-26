@@ -204,6 +204,7 @@ async fn run_case(
             | Ok(Ok(RuntimeEvent::TurnCompletedWithWarnings { .. }))
             | Ok(Ok(RuntimeEvent::TurnAnswered))
             | Ok(Ok(RuntimeEvent::TurnCancelled))
+            | Ok(Ok(RuntimeEvent::TurnInterrupted))
             | Ok(Ok(RuntimeEvent::TaskCancelled))
             | Ok(Ok(RuntimeEvent::TurnIncomplete { .. }))
             | Ok(Ok(RuntimeEvent::TurnTruncated { .. })) => observed.terminal = true,

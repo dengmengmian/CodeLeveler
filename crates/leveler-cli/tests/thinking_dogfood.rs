@@ -218,7 +218,8 @@ async fn wait_for_turn_end(rx: &mut tokio::sync::broadcast::Receiver<RuntimeEven
                 | RuntimeEvent::TurnTruncated { .. }
                 | RuntimeEvent::TurnIncomplete { .. }
                 | RuntimeEvent::TurnFailed { .. }
-                | RuntimeEvent::TurnCancelled => return,
+                | RuntimeEvent::TurnCancelled
+                | RuntimeEvent::TurnInterrupted => return,
                 _ => continue,
             },
             Ok(Err(RecvError::Lagged(_))) => continue,
