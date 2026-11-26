@@ -431,6 +431,10 @@ pub enum StopReason {
     /// Unlike [`StopReason::Blocked`] nothing is obstructed, so the runtime
     /// continues the same objective in a fresh window.
     Yielded,
+    /// The user explicitly interrupted the current turn. The logical task
+    /// stays resumable; this only lets the terminal tell a person's stop apart
+    /// from an unclean process exit, which also ends as `interrupted`.
+    Cancelled,
 }
 
 #[cfg(test)]

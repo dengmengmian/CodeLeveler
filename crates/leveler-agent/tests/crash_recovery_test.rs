@@ -227,6 +227,7 @@ async fn harness_captured(
         approver,
         clarifier: Arc::new(AutoClarify),
         task_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        turn_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     (engine, db, dir, requests)
 }

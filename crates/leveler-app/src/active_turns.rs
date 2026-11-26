@@ -31,6 +31,10 @@ pub(crate) struct TurnLease {
     /// interrupt the running turn. The engine reads it at terminal time to
     /// distinguish `cancelled` from `interrupted`.
     task_cancel: Arc<AtomicBool>,
+    /// Set when the user asks to interrupt this turn only. The engine reads it
+    /// at terminal time so the durable terminal can say a person stopped it,
+    /// while an unclean process exit still reads as an interruption.
+    turn_cancel: Arc<AtomicBool>,
     steering: Arc<ActiveSteering>,
 }
 
@@ -44,6 +48,11 @@ impl TurnLease {
         self.task_cancel.clone()
     }
 
+    /// The explicit-turn-interruption flag this turn runs under.
+    pub(crate) fn turn_cancel(&self) -> Arc<AtomicBool> {
+        self.turn_cancel.clone()
+    }
+
     pub(crate) fn steering(&self) -> Arc<ActiveSteering> {
         self.steering.clone()
     }
@@ -53,6 +62,7 @@ struct ActiveTurn {
     generation: u64,
     cancellation: CancellationToken,
     task_cancel: Arc<AtomicBool>,
+    turn_cancel: Arc<AtomicBool>,
     /// When the turn was admitted. Turns the count into an age a handover
     /// wait can show instead of a bare `1`.
     started_at: Instant,
@@ -175,6 +185,7 @@ impl ActiveTurns {
         }
         let token = CancellationToken::new();
         let task_cancel = Arc::new(AtomicBool::new(false));
+        let turn_cancel = Arc::new(AtomicBool::new(false));
         let steering = Arc::new(ActiveSteering::default());
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
         let now = Instant::now();
@@ -184,6 +195,7 @@ impl ActiveTurns {
                 generation,
                 cancellation: token.clone(),
                 task_cancel: task_cancel.clone(),
+                turn_cancel: turn_cancel.clone(),
                 started_at: now,
                 last_activity_at: now,
                 run_model: None,
@@ -196,6 +208,7 @@ impl ActiveTurns {
             generation,
             cancellation: token,
             task_cancel,
+            turn_cancel,
             steering,
         })
     }
@@ -353,6 +366,7 @@ impl ActiveTurns {
 
     pub(crate) fn cancel(&self, session_id: &SessionId) -> bool {
         if let Some(turn) = self.active.lock().unwrap().get(session_id) {
+            turn.turn_cancel.store(true, Ordering::SeqCst);
             turn.cancellation.cancel();
             true
         } else {

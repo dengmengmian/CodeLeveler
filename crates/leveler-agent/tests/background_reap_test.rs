@@ -404,6 +404,7 @@ async fn harness_with(responses: Vec<ModelResponse>, wait_for_background: bool) 
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
         task_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        turn_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     Harness {
         engine,

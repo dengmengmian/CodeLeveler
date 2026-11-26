@@ -1901,6 +1901,7 @@ pub(crate) async fn cmd_run_resume(
                 std::sync::Arc::new(leveler_agent::AutoClarify),
                 None,
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 &mut |event| {
                     leveler_app::forward_engine_event(event, &mut |e| render_event(e, output))
                 },
@@ -2050,7 +2051,8 @@ fn outcome_exit_code(
         | StopReason::BudgetExhausted
         | StopReason::TurnLimitReached
         | StopReason::Blocked
-        | StopReason::Stalled => std::process::ExitCode::from(NOT_COMPLETED_EXIT_CODE),
+        | StopReason::Stalled
+        | StopReason::Cancelled => std::process::ExitCode::from(NOT_COMPLETED_EXIT_CODE),
     }
 }
 
@@ -2143,6 +2145,13 @@ fn finish(
                         Line::warn(&format!(
                             "Stopped: the model went quiet without resolving the goal \
                              after {} model step(s) (not verified).",
+                            outcome.model_steps
+                        ))
+                    ),
+                    StopReason::Cancelled => println!(
+                        "{}",
+                        Line::warn(&format!(
+                            "Cancelled after {} model step(s); the work is not finished.",
                             outcome.model_steps
                         ))
                     ),

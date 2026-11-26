@@ -2449,6 +2449,7 @@ impl Application {
             approver,
             clarifier,
             task_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            turn_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 

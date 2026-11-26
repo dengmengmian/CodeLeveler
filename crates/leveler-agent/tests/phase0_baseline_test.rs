@@ -482,6 +482,7 @@ async fn blocked_goal_is_typed_in_terminal_events_and_session_status() {
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
         task_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        turn_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     let spec = TaskSpec {
         runtime: leveler_agent::coding::RuntimeTaskSpec {
@@ -586,6 +587,7 @@ async fn engine_stamps_running_and_terminal_session_status_itself() {
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
         task_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        turn_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     let spec = TaskSpec {
         runtime: leveler_agent::coding::RuntimeTaskSpec {

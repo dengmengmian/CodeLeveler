@@ -302,6 +302,7 @@ fn coding_runtime(db: &Database, root: &Path, script: Vec<ModelResponse>) -> Cod
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
         task_cancel: Arc::new(AtomicBool::new(false)),
+        turn_cancel: Arc::new(AtomicBool::new(false)),
     }
 }
 

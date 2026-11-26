@@ -411,6 +411,7 @@ async fn fixture_with_clarifier(
         approver: Arc::new(AutoApprove),
         clarifier,
         task_cancel: task_cancel.clone(),
+        turn_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     Fixture {
         runtime,

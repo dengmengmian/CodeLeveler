@@ -395,6 +395,7 @@ async fn harness_with_overrides(
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
         task_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        turn_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     Harness {
         engine,
@@ -1880,6 +1881,7 @@ async fn interrupted_direct_task_resumes_from_the_persisted_transcript() {
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
         task_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        turn_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     let spec2 = TaskSpec {
         runtime: leveler_agent::coding::RuntimeTaskSpec {
@@ -2562,6 +2564,7 @@ async fn unlaunchable_review_leaves_a_persisted_trace() {
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
         task_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        turn_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     let s = TaskSpec {
         runtime: leveler_agent::coding::RuntimeTaskSpec {
@@ -3916,6 +3919,7 @@ async fn the_step_ceiling_is_per_drive_and_resume_continues_task_spend() {
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
         task_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        turn_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     let mut s2 = spec(&h);
     s2.coding.repository = Some(dir2.path().to_path_buf());
@@ -5476,6 +5480,7 @@ async fn a_refused_completion_survives_a_process_restart_and_completes_on_resume
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
         task_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        turn_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
     let report = engine2
