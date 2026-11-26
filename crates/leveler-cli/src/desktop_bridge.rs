@@ -1140,17 +1140,17 @@ mod tests {
         let capture = SecretCapture::new("{{s}}", "sk-x");
         assert!(valid_desktop_secret_captures(
             "use {{s}}",
-            &[capture.clone()],
+            std::slice::from_ref(&capture),
             false
         ));
         assert!(!valid_desktop_secret_captures(
             "no placeholder",
-            &[capture.clone()],
+            std::slice::from_ref(&capture),
             false
         ));
         assert!(!valid_desktop_secret_captures(
             "{{s}} and {{s}}",
-            &[capture.clone()],
+            std::slice::from_ref(&capture),
             false
         ));
         assert!(!valid_desktop_secret_captures(
@@ -1160,7 +1160,7 @@ mod tests {
         ));
         assert!(!valid_desktop_secret_captures(
             "use {{s}}",
-            &[capture.clone()],
+            std::slice::from_ref(&capture),
             true
         ));
         assert!(valid_desktop_secret_ref(
