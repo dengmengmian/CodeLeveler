@@ -2372,6 +2372,28 @@ body.blank-session .view-tabs, body.home .view-tabs { display: none; }
   width: min(460px, calc(100vw - 48px)); padding: 18px 20px 20px; border-radius: 20px;
   background: var(--bg-layer-1); box-shadow: var(--panel-shadow); display: flex; flex-direction: column; gap: 14px;
 }
+.secret-review-modal, .secret-paste-modal { padding: 0; border: 0; background: transparent; }
+.secret-review-card, .secret-paste-card {
+  width: min(560px, calc(100vw - 40px)); max-height: calc(100vh - 80px); overflow: auto;
+  padding: 18px 20px; border-radius: 20px; background: var(--bg-layer-2);
+  box-shadow: var(--panel-shadow); display: flex; flex-direction: column; gap: 10px;
+}
+.secret-review-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.secret-review-head h2 { margin: 0; font-size: 16px; line-height: 24px; font-weight: 510; }
+.secret-review-copy { display: flex; flex-direction: column; gap: 8px; }
+.secret-review-copy p { margin: 0; color: var(--text-secondary); font-size: 13px; line-height: 20px; }
+.secret-review-findings { display: flex; flex-direction: column; gap: 4px; padding: 8px 10px; border-radius: 10px; background: var(--bg-layer-1); font-family: var(--font-code); font-size: 12px; line-height: 18px; }
+.secret-review-scope { color: var(--text-tertiary); font-size: 12px; }
+.secret-review-warning { padding: 8px 10px; border-radius: 10px; background: #fef5e7; color: #dd8629; font-size: 12px; line-height: 18px; }
+:root[data-theme="dark"] .secret-review-warning { background: #27241f; color: #dd8629; }
+.secret-review-error { margin: 0; color: var(--danger); font-size: 12px; line-height: 18px; }
+.secret-review-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.secret-paste-input { height: 38px; padding: 0 12px; border: .5px solid var(--border-l3); border-radius: 10px; background: var(--bg-layer-1); color: var(--text-primary); font-family: var(--font-code); font-size: 13px; }
+.secret-paste-status { margin: 0; color: var(--text-tertiary); font-size: 12px; line-height: 18px; }
+.secret-revoke-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.secret-revoke { height: 24px; padding: 0 8px; border: .5px solid var(--border-l3); border-radius: 8px; background: var(--bg-layer-1); color: var(--text-secondary); font-size: 11px; }
+.secret-revoke:hover { background: var(--hover); }
+.secret-revoke:disabled { opacity: .6; }
 .feedback-head { display: flex; align-items: center; justify-content: space-between; }
 .feedback-head h2 { margin: 0; font-size: 16px; font-weight: 500; }
 .feedback-chips { display: flex; flex-wrap: wrap; gap: 8px; }

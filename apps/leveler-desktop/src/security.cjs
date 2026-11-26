@@ -1,10 +1,38 @@
 const {SNAPSHOT_VERSIONED_COMMANDS}=require('./command-policy.gen.cjs');
-const allowed=new Set(['submit_message','steer_current_turn','cancel_current_turn','cancel_task','resume_task','approval_decision','answer_clarification','definition_trust_decision','query_session_history','request_diff','list_agents','get_agent','query_context','query_observability','select_model','set_permission_profile','rename_session','archive_session','unarchive_session','fork_session','compact_context','cancel_background_task','manage_schedule']);
+const allowed=new Set(['submit_message','submit_user_input','steer_current_turn','steer_user_input','cancel_current_turn','cancel_task','resume_task','approval_decision','answer_clarification','definition_trust_decision','capture_secret','revoke_secret','query_session_history','request_diff','list_agents','get_agent','query_context','query_observability','select_model','set_permission_profile','rename_session','archive_session','unarchive_session','fork_session','compact_context','cancel_background_task','manage_schedule']);
 const decisions=new Set(['approve_once','approve_session','approve_always','deny']);
 const {validRef}=require('./attachment-ingress.cjs');
 function string(value,max=256){return typeof value==='string'&&value.length>0&&value.length<=max;}
 function exactKeys(value,keys){return !!value&&typeof value==='object'&&!Array.isArray(value)&&Object.keys(value).length===keys.length&&keys.every(key=>Object.hasOwn(value,key));}
 function nonblank(value){return string(value)&&value.trim().length>0;}
+const MAX_SECRET_BYTES=64*1024;
+function secretValue(value){return typeof value==='string'&&value.length>0&&value.length<=MAX_SECRET_BYTES;}
+function secretRef(value){return typeof value==='string'&&/^sec_[0-9a-f]{32}$/.test(value);}
+// A capture carries a value and a placeholder that occupies exactly one span
+// of the message. The runtime revalidates and owns custody; this boundary
+// rejects malformed shapes before any value can reach the vault.
+function validCaptures(content,captures,ack){
+  if(typeof ack!=='boolean'||!Array.isArray(captures)||captures.length>16)return false;
+  if(ack&&captures.length)return false;
+  const seen=new Set();
+  for(const capture of captures){
+    if(!capture||typeof capture!=='object'||Array.isArray(capture))return false;
+    const keys=['placeholder','value',...(Object.hasOwn(capture,'key_hint')?['key_hint']:[])];
+    if(!exactKeys(capture,keys)||!string(capture.placeholder,256)||!secretValue(capture.value))return false;
+    if(Object.hasOwn(capture,'key_hint')&&!string(capture.key_hint,128))return false;
+    if(seen.has(capture.placeholder))return false;
+    seen.add(capture.placeholder);
+    if(content.split(capture.placeholder).length-1!==1)return false;
+  }
+  return true;
+}
+function validSecretInput(command){
+  if(typeof command.content!=='string'||command.content.length>100000)return false;
+  const captures=command.secret_captures??[];
+  const ack=command.plaintext_secret_ack??false;
+  if(ack&&!command.content)return false;
+  return validCaptures(command.content,captures,ack);
+}
 function validateEnvelope(envelope,authorizeAttachment){
   if(!envelope||!string(envelope.command_id)||!string(envelope.session_id)||typeof envelope.issued_at!=='string'||!Number.isFinite(Date.parse(envelope.issued_at)))throw new Error('Invalid command envelope');
   const command=envelope.command;
@@ -31,6 +59,24 @@ function validateEnvelope(envelope,authorizeAttachment){
     // it. The Runtime refuses a mismatched answer; the IPC boundary refuses
     // to build one in the first place.
     if(!exactKeys(command,['type','request_id','decision','session_id'])||!nonblank(command.request_id)||command.request_id.length>256||!['allow_once','trust_current_version','deny'].includes(command.decision)||!nonblank(command.session_id)||command.session_id!==envelope.session_id)throw new Error('Invalid definition trust decision');
+  }
+  if(command.type==='submit_user_input'){
+    // Captures ride beside the message; the runtime is the authority that
+    // takes custody and replaces placeholders. A plaintext acknowledgement is
+    // a different decision and never travels with captures.
+    if(!exactKeys(command,['type','session_id','content','attachments','secret_captures','plaintext_secret_ack'])||!nonblank(command.session_id)||command.session_id!==envelope.session_id||!validSecretInput(command))throw new Error('Invalid secret submission');
+    if(!Array.isArray(command.attachments)||command.attachments.length>16||command.attachments.some(ref=>ref?.kind!=='image'||!validRef(ref)||!authorizeAttachment?.(envelope.session_id,ref)))throw new Error('Invalid or unregistered attachment');
+    if(!command.content&&!command.attachments.length)throw new Error('Empty secret submission');
+  }
+  if(command.type==='steer_user_input'){
+    if(!exactKeys(command,['type','session_id','content','secret_captures','plaintext_secret_ack'])||!nonblank(command.session_id)||command.session_id!==envelope.session_id||!command.content||!validSecretInput(command))throw new Error('Invalid secret steer');
+  }
+  if(command.type==='capture_secret'){
+    const keys=['type','session_id','request_id','value',...(Object.hasOwn(command,'key_hint')?['key_hint']:[])];
+    if(!exactKeys(command,keys)||!nonblank(command.session_id)||command.session_id!==envelope.session_id||!string(command.request_id,256)||!secretValue(command.value)||(Object.hasOwn(command,'key_hint')&&!string(command.key_hint,128)))throw new Error('Invalid secret capture');
+  }
+  if(command.type==='revoke_secret'){
+    if(!exactKeys(command,['type','session_id','secret_ref'])||!nonblank(command.session_id)||command.session_id!==envelope.session_id||!secretRef(command.secret_ref))throw new Error('Invalid secret revoke');
   }
   if(command.type==='answer_clarification'&&(!string(command.request_id)||typeof command.answer!=='string'||command.answer.length>100000))throw new Error('Invalid clarification');
   if(command.type==='query_session_history'&&command.session_id!==envelope.session_id)throw new Error('Invalid history query');

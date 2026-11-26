@@ -68,10 +68,11 @@ contract. The detailed design, threat model and acceptance record live in
 - **Drafts and history do not store an undecided candidate.** The composer
   keeps the raw text in memory while the person edits. A draft containing any
   detected candidate — high-confidence or ambiguous — is not written to disk;
-  an old unsafe draft is removed when the TUI opens. History entries are
-  masked for every detected candidate before they are written, and an old
-  history file is sanitized and rewritten on open. Ordinary code, templates
-  and environment references are left byte-identical.
+  an old unsafe draft is removed when the client opens (the Desktop rescans
+  its persisted drafts at startup and rewrites only the clean ones). History
+  entries are masked for every detected candidate before they are written, and
+  an old history file is sanitized and rewritten on open. Ordinary code,
+  templates and environment references are left byte-identical.
 - **The plaintext acknowledgement is a per-command decision.** It is carried
   by that one `SubmitUserInput` / `SteerUserInput`, never stored as custody,
   never combined with captures, and never reused for a later command. It
@@ -88,6 +89,7 @@ contract. The detailed design, threat model and acceptance record live in
 | Resume | the replayed text goes through the same admission | yes when captured before | explicit choice |
 | Older clients (`SubmitMessage`, `SteerCurrentTurn`, …) | no review surface | no | no; any finding is refused |
 | Direct client / IPC | same runtime admission | yes when it sends the new command | per-command ack |
+| Desktop chat / safe paste | host scan review before send | yes | explicit choice in the review |
 | `leveler run` (headless) | no review surface | no | only `--allow-plaintext-secrets` |
 
 A client cannot set `plaintext_secret_ack` on behalf of a tool or a model: the

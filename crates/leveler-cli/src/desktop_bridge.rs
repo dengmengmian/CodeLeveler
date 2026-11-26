@@ -103,6 +103,45 @@ fn validate_command(session: &SessionId, command: &ClientCommand) -> anyhow::Res
             session_id: Some(_),
             ..
         } if !request_id.as_str().trim().is_empty() && request_id.as_str().len() <= 256 => {}
+        // Credentials travel through the one admission transform every client
+        // uses. The bridge checks shape and bounds; the runtime owns custody,
+        // placeholder replacement and the plaintext acknowledgement.
+        ClientCommand::SubmitUserInput {
+            content,
+            attachments,
+            secret_captures,
+            plaintext_secret_ack,
+            ..
+        } if content.chars().count() <= 100_000
+            && attachments.len() <= 16
+            && attachments.iter().all(valid_desktop_image)
+            && valid_desktop_secret_captures(content, secret_captures, *plaintext_secret_ack)
+            && (!content.is_empty() || !attachments.is_empty()) => {}
+        ClientCommand::SteerUserInput {
+            content,
+            secret_captures,
+            plaintext_secret_ack,
+            message_id,
+            ..
+        } if !content.is_empty()
+            && content.chars().count() <= 100_000
+            && valid_desktop_secret_captures(content, secret_captures, *plaintext_secret_ack)
+            && message_id
+                .as_ref()
+                .is_none_or(|id| !id.as_str().trim().is_empty() && id.as_str().len() <= 256) => {}
+        ClientCommand::CaptureSecret {
+            request_id,
+            value,
+            key_hint,
+            ..
+        } if !request_id.as_str().trim().is_empty()
+            && request_id.as_str().len() <= 256
+            && !value.is_empty()
+            && value.len() <= MAX_DESKTOP_SECRET_BYTES
+            && key_hint.as_ref().is_none_or(|hint| {
+                !hint.is_empty() && hint.len() <= MAX_DESKTOP_SECRET_HINT_BYTES
+            }) => {}
+        ClientCommand::RevokeSecret { secret_ref, .. } if valid_desktop_secret_ref(secret_ref) => {}
         ClientCommand::SteerCurrentTurn { .. }
         | ClientCommand::CancelCurrentTurn { .. }
         | ClientCommand::CancelTask { .. }
@@ -293,6 +332,106 @@ fn valid_desktop_image(attachment: &leveler_client_protocol::AttachmentRef) -> b
             .is_some_and(|height| (1..=2048).contains(&height))
 }
 
+/// One message may hand at most this many credentials. A message with more is
+/// a data dump, not a request (mirrors the runtime's admission bound).
+const MAX_DESKTOP_CAPTURES: usize = 16;
+const MAX_DESKTOP_PLACEHOLDER_BYTES: usize = 256;
+const MAX_DESKTOP_SECRET_BYTES: usize = 64 * 1024;
+const MAX_DESKTOP_SECRET_HINT_BYTES: usize = 128;
+
+/// A capture is well-formed only when every placeholder occupies exactly one
+/// span of the message and no two captures share one. The runtime revalidates;
+/// this boundary refuses malformed shapes before they can reach the vault.
+fn valid_desktop_secret_captures(
+    content: &str,
+    captures: &[leveler_client_protocol::secret::SecretCapture],
+    plaintext_ack: bool,
+) -> bool {
+    // Capture and plaintext are different decisions for the same bytes; the
+    // runtime refuses the combination, so the adapter does too.
+    if plaintext_ack && !captures.is_empty() {
+        return false;
+    }
+    if captures.len() > MAX_DESKTOP_CAPTURES {
+        return false;
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for capture in captures {
+        if capture.placeholder.is_empty()
+            || capture.placeholder.len() > MAX_DESKTOP_PLACEHOLDER_BYTES
+            || capture.value.is_empty()
+            || capture.value.len() > MAX_DESKTOP_SECRET_BYTES
+            || capture
+                .key_hint
+                .as_ref()
+                .is_some_and(|hint| hint.is_empty() || hint.len() > MAX_DESKTOP_SECRET_HINT_BYTES)
+            || !seen.insert(capture.placeholder.as_str())
+            || content.matches(capture.placeholder.as_str()).count() != 1
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// `sec_` plus 128 random bits as lowercase hex — the vault's one reference
+/// spelling. Anything else is not a reference this host may ask to revoke.
+fn valid_desktop_secret_ref(value: &str) -> bool {
+    let Some(hex) = value.strip_prefix("sec_") else {
+        return false;
+    };
+    hex.len() == 32
+        && hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// The host-side credential scan the Desktop UI uses for its review. It reuses
+/// the exact detector the TUI and the runtime admission use, and returns only
+/// masks, names and spans — never the value.
+fn secret_scan_payload(content: &str) -> Value {
+    use leveler_core::SecretLevel;
+    let findings = leveler_core::detect_secrets(content);
+    // The value is not an instruction: blank its span before deriving the use
+    // scope, exactly as the runtime does.
+    let mut scope_text = content.to_string();
+    for finding in findings.iter().rev() {
+        if finding.start < finding.end && finding.end <= scope_text.len() {
+            scope_text.replace_range(
+                finding.start..finding.end,
+                &" ".repeat(finding.end - finding.start),
+            );
+        }
+    }
+    let items = findings
+        .iter()
+        .map(|finding| {
+            // Byte offsets are Rust-side; the renderer slices UTF-16. Both are
+            // reported so a client never has to convert one into the other.
+            let start_utf16 = content[..finding.start].encode_utf16().count();
+            let end_utf16 = content[..finding.end].encode_utf16().count();
+            json!({
+                "start": finding.start,
+                "end": finding.end,
+                "start_utf16": start_utf16,
+                "end_utf16": end_utf16,
+                "level": match finding.level {
+                    SecretLevel::HighConfidence => "high_confidence",
+                    SecretLevel::Ambiguous => "ambiguous",
+                },
+                "kind": format!("{:?}", finding.kind),
+                "key": finding.key,
+                "masked": leveler_core::masked_secret(finding.value(content)),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "findings": items,
+        "use_targets": leveler_core::dotenv_targets_in(&scope_text),
+        "use_fields": leveler_core::dotenv_fields_in(&scope_text),
+    })
+}
+
 struct Bridge {
     home: leveler_core::LevelerHome,
     config_dir: Option<PathBuf>,
@@ -450,6 +589,16 @@ impl Bridge {
             // bridge answers before announcing a connection; it touches no
             // runtime, session or durable state.
             "ping" => Ok(json!({"ok": true})),
+            // Read-only credential review for the Desktop composer. It reuses
+            // the runtime's detector and never sends the value back.
+            "secret_scan" => {
+                let content = required_string(&params, "content")?;
+                anyhow::ensure!(
+                    content.chars().count() <= 100_000,
+                    "content exceeds the message limit"
+                );
+                Ok(secret_scan_payload(content))
+            }
             "list_tasks" => Ok(serde_json::to_value(
                 leveler_app::global_task_index::query_global_tasks(
                     &self.home,
@@ -819,6 +968,97 @@ mod tests {
             session_id: Some(session.clone()),
         };
         assert!(validate_command(&session, &empty).is_err());
+    }
+
+    #[test]
+    fn secret_scan_returns_utf16_spans_and_never_the_value() {
+        let text = "请把 .env 的 API_KEY=sk-abcdefghijklmnop1234 写入";
+        let payload = secret_scan_payload(text);
+        let findings = payload["findings"].as_array().unwrap();
+        assert_eq!(findings.len(), 1, "{payload}");
+        let finding = &findings[0];
+        let value = "sk-abcdefghijklmnop1234";
+        let start = finding["start_utf16"].as_u64().unwrap() as usize;
+        let end = finding["end_utf16"].as_u64().unwrap() as usize;
+        let sliced: String = text
+            .encode_utf16()
+            .skip(start)
+            .take(end - start)
+            .map(|unit| char::from_u32(u32::from(unit)).unwrap())
+            .collect();
+        assert_eq!(sliced, value);
+        assert_eq!(
+            finding["masked"].as_str().unwrap(),
+            leveler_core::masked_secret(value)
+        );
+        assert!(!payload.to_string().contains(value));
+        assert!(
+            !payload["use_targets"].as_array().unwrap().is_empty(),
+            "the scan describes the declared dotenv target: {payload}"
+        );
+    }
+
+    #[test]
+    fn desktop_secret_commands_validate_shape_bounds_and_session() {
+        use leveler_client_protocol::secret::{SecretCapture, SecretValue};
+        let capture = SecretCapture::new("{{s}}", "sk-x");
+        assert!(valid_desktop_secret_captures(
+            "use {{s}}",
+            &[capture.clone()],
+            false
+        ));
+        assert!(!valid_desktop_secret_captures(
+            "no placeholder",
+            &[capture.clone()],
+            false
+        ));
+        assert!(!valid_desktop_secret_captures(
+            "{{s}} and {{s}}",
+            &[capture.clone()],
+            false
+        ));
+        assert!(!valid_desktop_secret_captures(
+            "use {{s}}",
+            &[capture.clone(), capture.clone()],
+            false
+        ));
+        assert!(!valid_desktop_secret_captures(
+            "use {{s}}",
+            &[capture.clone()],
+            true
+        ));
+        assert!(valid_desktop_secret_ref(
+            "sec_00000000000000000000000000000000"
+        ));
+        assert!(!valid_desktop_secret_ref("sec_xyz"));
+
+        let session = SessionId::new("desktop-session");
+        let submit = |id: SessionId| ClientCommand::SubmitUserInput {
+            session_id: id,
+            content: "hello".into(),
+            attachments: vec![],
+            secret_captures: vec![],
+            plaintext_secret_ack: false,
+        };
+        assert!(validate_command(&session, &submit(session.clone())).is_ok());
+        assert!(validate_command(&session, &submit(SessionId::new("other"))).is_err());
+        let capture = ClientCommand::CaptureSecret {
+            session_id: session.clone(),
+            request_id: leveler_core::CommandId::new("r1"),
+            value: SecretValue::new("sk-x"),
+            key_hint: None,
+        };
+        assert!(validate_command(&session, &capture).is_ok());
+        let revoke = ClientCommand::RevokeSecret {
+            session_id: session.clone(),
+            secret_ref: "sec_00000000000000000000000000000000".into(),
+        };
+        assert!(validate_command(&session, &revoke).is_ok());
+        let bad_ref = ClientCommand::RevokeSecret {
+            session_id: session.clone(),
+            secret_ref: "not-a-reference".into(),
+        };
+        assert!(validate_command(&session, &bad_ref).is_err());
     }
 
     #[test]

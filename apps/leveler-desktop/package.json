@@ -16,7 +16,7 @@
     "typecheck": "tsc -p tsconfig.json",
     "lint": "eslint src scripts test",
     "test:product": "node scripts/product.mjs",
-    "test:smoke": "node scripts/product.mjs && node scripts/session-actions.mjs && node scripts/composer.mjs && node scripts/schedules.mjs && node scripts/schedule-tool-card.mjs && node scripts/definition-trust.mjs",
+    "test:smoke": "node scripts/product.mjs && node scripts/session-actions.mjs && node scripts/composer.mjs && node scripts/schedules.mjs && node scripts/schedule-tool-card.mjs && node scripts/definition-trust.mjs && node scripts/secret-custody.mjs",
     "test:long-session": "node scripts/long-session.mjs",
     "test:session-actions": "node scripts/session-actions.mjs",
     "test:conversation": "node scripts/conversation.mjs",

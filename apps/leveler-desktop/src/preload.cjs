@@ -20,6 +20,7 @@ contextBridge.exposeInMainWorld('desktop',Object.freeze({
   onQuitInspect:callback=>{const listener=()=>callback();ipcRenderer.on('desktop:quit-inspect',listener);return ()=>ipcRenderer.removeListener('desktop:quit-inspect',listener);},
   quitInspectResult:running=>ipcRenderer.send('desktop:quit-inspect-result',{running:running===true}),
   copyText:text=>invoke('desktop:copy-text',text),
+  scanSecrets:content=>invoke('desktop:secret-scan',content),
   createTerminal:request=>invoke('desktop:terminal-create',request),
   writeTerminal:request=>invoke('desktop:terminal-write',request),
   resizeTerminal:request=>invoke('desktop:terminal-resize',request),

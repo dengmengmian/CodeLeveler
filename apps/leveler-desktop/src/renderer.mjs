@@ -27,6 +27,7 @@ import {
   el, iconNode, iconButton, installTooltips, toast, openMenu, closeMenu, openPopover, closePopover, confirmDialog,
   copyText, trapTab,
 } from './ui.mjs';
+import { captureDraft, persistableDrafts, secretReferences } from './secret-review.mjs';
 
 const api = window.desktop;
 const $ = id => document.getElementById(id);
@@ -126,23 +127,101 @@ let trajectoryViewport = null;
 let openInAppState = { apps: null, loading: false, error: null, preferred: null };
 
 const drafts = new Map();
+// A draft may be written to local storage only when the host scan reported
+// the exact same text without a credential candidate. The raw composer text
+// stays in memory; losing an unsubmitted draft is recoverable, writing a
+// plaintext credential to disk is not.
+const cleanDrafts = new Map();
+const legacyDrafts = new Map();
 const DRAFTS_KEY = 'codeleveler.drafts.v1';
-// Drafts are user input, not Runtime facts: keep the text per session across a
-// Desktop restart. Attachments are intentionally not persisted.
+let draftScan = { key: null, text: '', status: 'idle', findings: [], useTargets: [], useFields: [], error: null };
+let draftScanTimer = null;
+let draftScanSeq = 0;
+const pendingSecretPaste = new Map();
+const requestedRevokes = new Set();
 function loadDrafts() {
   try {
     const stored = JSON.parse(localStorage.getItem(DRAFTS_KEY) || '{}');
-    for (const [key, value] of Object.entries(stored)) if (typeof value === 'string' && value) drafts.set(key, value.slice(0, 200000));
+    // Old values were written by a version that did not scan. Remove them
+    // from disk immediately; each one is rescanned and only a clean draft is
+    // written back below.
+    localStorage.removeItem(DRAFTS_KEY);
+    for (const [key, value] of Object.entries(stored)) {
+      if (typeof value !== 'string' || !value) continue;
+      const text = value.slice(0, 200000);
+      drafts.set(key, text);
+      legacyDrafts.set(key, text);
+    }
   } catch { /* unreadable storage gives an empty draft set */ }
 }
 function saveDrafts() {
   try {
-    const stored = {};
-    for (const [key, value] of drafts) if (value) stored[key] = value.slice(0, 200000);
-    localStorage.setItem(DRAFTS_KEY, JSON.stringify(stored));
+    localStorage.setItem(DRAFTS_KEY, JSON.stringify(persistableDrafts(drafts, cleanDrafts)));
   } catch { /* a full store must not break typing */ }
 }
-function clearDraft() { drafts.delete(draftKey()); saveDrafts(); }
+function queueDraftScan(key, text) {
+  clearTimeout(draftScanTimer);
+  if (!text || !text.trim()) {
+    draftScan = { key, text: '', status: 'clean', findings: [], useTargets: [], useFields: [], error: null };
+    cleanDrafts.set(key, '');
+    saveDrafts();
+    return;
+  }
+  draftScan = { key, text, status: 'pending', findings: [], useTargets: [], useFields: [], error: null };
+  draftScanTimer = setTimeout(() => { void runDraftScan(key, text); }, 250);
+}
+async function runDraftScan(key, text) {
+  const seq = ++draftScanSeq;
+  let result;
+  try {
+    result = await api.scanSecrets(text);
+  } catch (error) {
+    if (seq === draftScanSeq) {
+      draftScan = { key, text, status: 'error', findings: [], useTargets: [], useFields: [], error: error?.message ?? '凭据扫描失败' };
+      cleanDrafts.delete(key);
+      saveDrafts();
+    }
+    return draftScan;
+  }
+  if (seq !== draftScanSeq) return draftScan;
+  const findings = Array.isArray(result?.findings) ? result.findings : [];
+  draftScan = {
+    key, text,
+    status: findings.length ? 'findings' : 'clean',
+    findings,
+    useTargets: Array.isArray(result?.use_targets) ? result.use_targets : [],
+    useFields: Array.isArray(result?.use_fields) ? result.use_fields : [],
+    error: null,
+  };
+  if (findings.length) cleanDrafts.delete(key); else cleanDrafts.set(key, text);
+  saveDrafts();
+  return draftScan;
+}
+async function scanForSubmit(text) {
+  const key = draftKey();
+  if (draftScan.key === key && draftScan.text === text && ['clean', 'findings', 'error'].includes(draftScan.status)) return draftScan;
+  return runDraftScan(key, text);
+}
+async function migrateLegacyDrafts() {
+  if (!legacyDrafts.size) return;
+  let removed = 0;
+  for (const [key, text] of legacyDrafts) {
+    let scan = null;
+    try { scan = await api.scanSecrets(text); } catch { scan = null; }
+    if (scan && !(scan.findings ?? []).length) {
+      if (drafts.get(key) === text) cleanDrafts.set(key, text);
+    } else if (scan) {
+      // Removing it from the map (not just from storage) follows the TUI
+      // rule: reopening must not revive an unsafe draft.
+      if (drafts.get(key) === text) drafts.delete(key);
+      removed += 1;
+    }
+  }
+  legacyDrafts.clear();
+  saveDrafts();
+  if (removed) toast(`已从本地草稿中移除 ${removed} 条疑似包含凭据的内容`, { tone: 'warning', holdMs: 5000 });
+}
+function clearDraft() { drafts.delete(draftKey()); cleanDrafts.delete(draftKey()); draftScan = { key: null, text: '', status: 'idle', findings: [], useTargets: [], useFields: [], error: null }; saveDrafts(); }
 loadDrafts();
 let queuedMessages = [];
 // A submit that the Runtime acknowledged but whose first status event has not
@@ -228,7 +307,7 @@ function draftKey() { return current?.session.id ?? 'new-session'; }
 function uploadPending() {
   return attachments().some(item => ['uploading', 'queued', 'unknown'].includes(item.status));
 }
-function stashDraft() { drafts.set(draftKey(), $('message').value); saveDrafts(); }
+function stashDraft() { const key = draftKey(); const value = $('message').value; drafts.set(key, value); saveDrafts(); queueDraftScan(key, value); }
 
 function controls() {
   const uploads = uploadPending();
@@ -258,6 +337,9 @@ function controls() {
 // One visible state, sourced from the bridge's real transport lifecycle.
 function applyConnection(frame) {
   connectionState = { ...frame };
+  // Old drafts are rescanned only once the host bridge answers; retry on a
+  // later connection instead of leaving them permanently unpersisted.
+  if (frame.state === 'connected' && legacyDrafts.size) void migrateLegacyDrafts();
   const banner = $('connection-banner');
   if (banner) {
     if (frame.state === 'connected') {
@@ -1919,7 +2001,8 @@ function renderUserExtras(row, message) {
   const replyQuestion = clarificationReplies.get(String(message.text ?? '')) ?? null;
   const files = Array.isArray(message.files) ? message.files : [];
   const references = Array.isArray(message.references) ? message.references : [];
-  const signature = JSON.stringify([files, references, replyQuestion]);
+  const secretTokens = secretReferences(String(message.text ?? ''));
+  const signature = JSON.stringify([files, references, replyQuestion, secretTokens]);
   let extras = row.querySelector('.user-extras');
   if (!extras) {
     extras = el('div', 'user-extras');
@@ -1962,6 +2045,33 @@ function renderUserExtras(row, message) {
       chips.append(el('span', 'message-ref-chip', label));
     }
     extras.append(chips);
+  }
+  if (secretTokens.length) {
+    const row = el('div', 'secret-revoke-row');
+    for (const reference of secretTokens) {
+      const stateKey = `${message.id ?? ''}:${reference}`;
+      const already = requestedRevokes.has(stateKey);
+      const button = el('button', 'secret-revoke', already ? '已请求撤销' : `撤销凭据 ${reference.slice(0, 12)}…`);
+      button.type = 'button';
+      button.disabled = already;
+      button.title = '撤销后该引用立即失效；已写入 .env 的内容不受影响';
+      button.addEventListener('click', () => action(async () => {
+        const ok = await confirmDialog({
+          title: '撤销凭据？',
+          body: '撤销后，该引用立即失效；已写入 .env 的内容不受影响。',
+          confirm: '撤销',
+          danger: true,
+        });
+        if (!ok) return;
+        await deliver({ type: 'revoke_secret', session_id: current.session.id, secret_ref: reference });
+        requestedRevokes.add(stateKey);
+        // The Runtime's own notification reports whether anything was revoked;
+        // this row only records that the request was sent.
+        renderConversation();
+      }));
+      row.append(button);
+    }
+    extras.append(row);
   }
 }
 
@@ -3823,6 +3933,198 @@ function renderInteractions() {
   controls();
 }
 
+/* ---------------------------------------------------------- secret custody */
+
+const SECRET_LEVEL_LABELS = { high_confidence: '高置信', ambiguous: '疑似' };
+
+function secretFindingLabel(finding) {
+  const key = finding?.key ? String(finding.key) : String(finding?.kind ?? '凭据');
+  return `${SECRET_LEVEL_LABELS[finding?.level] ?? '疑似'} · ${key}`;
+}
+
+async function submitSecretCommand(command, { original, refs = [], steer }) {
+  await deliver(command);
+  const key = draftKey();
+  if ($('message').value.trim() === original) { $('message').value = ''; resizeComposer(); }
+  drafts.delete(key);
+  cleanDrafts.delete(key);
+  draftScan = { key: null, text: '', status: 'idle', findings: [], useTargets: [], useFields: [], error: null };
+  saveDrafts();
+  const sent = new Set(refs.map(ref => ref.id));
+  if (sent.size) {
+    attachmentDrafts.set(key, attachments().filter(item => !sent.has(item.attachment?.id)));
+    renderAttachments();
+  }
+  if (steer) toast('已插话：将在当前回合的下一次模型调用中送达', { tone: 'info', holdMs: 2800 });
+  else pendingSubmit = true;
+  controls();
+  await refreshMetadata();
+}
+
+function openSecretReview({ original, refs = [], scan, complement = false }) {
+  if (document.querySelector('.secret-review-modal')) return;
+  const dialog = el('dialog', 'modal secret-review-modal');
+  const card = el('div', 'secret-review-card');
+  card.setAttribute('aria-label', '凭据审查');
+  const head = el('div', 'secret-review-head');
+  head.append(el('h2', undefined, '检测到疑似凭据'));
+  const close = iconButton('close', '关闭凭据审查', { size: 16, tooltip: '关闭' });
+  head.append(close);
+  const findings = el('div', 'secret-review-findings');
+  for (const finding of scan.findings) {
+    findings.append(el('div', 'secret-review-finding', `${secretFindingLabel(finding)} ${finding.masked ?? ''}`.trim()));
+  }
+  const scope = [];
+  if (scan.useTargets?.length) scope.push(`目标：${scan.useTargets.join(', ')}`);
+  if (scan.useFields?.length) scope.push(`字段：${scan.useFields.join(', ')}`);
+  const copy = el('div', 'secret-review-copy');
+  copy.append(
+    el('p', undefined, '发送前请选择如何处理这段内容。'),
+    findings,
+    el('p', 'secret-review-scope', scope.length ? scope.join(' · ') : '消息没有声明 dotenv 目标或字段。'),
+    el('p', 'secret-review-note', '安全接管：值交给 Runtime 保管，消息里只出现引用，模型与 Provider 不会收到明文。'),
+    el('p', 'secret-review-warning', '明文发送：模型与 Provider 会看到这些字节，并可能被其保存。只有你明确选择时才会这样发送。'),
+  );
+  const error = el('p', 'secret-review-error', '');
+  error.hidden = true;
+  const actions = el('div', 'secret-review-actions');
+  const capture = el('button', 'button primary', '安全接管并发送');
+  const plaintext = el('button', 'button secondary', '明文发送（模型与 Provider 可见）');
+  const back = el('button', 'button secondary', '返回');
+  const buttons = [capture, plaintext, back];
+  for (const button of buttons) button.type = 'button';
+  back.addEventListener('click', () => dialog.close());
+  const send = async plaintextAck => {
+    for (const button of buttons) button.disabled = true;
+    error.hidden = true;
+    try {
+      if (!current) await createTask();
+      const sessionId = current.session.id;
+      const running = ['running', 'waiting_user'].includes(current.status);
+      const steer = running && (complement ? settings.busySend !== 'steer' : settings.busySend === 'steer');
+      // A client-side queued message would later be delivered through a path
+      // that cannot carry captures; blocking is the honest outcome.
+      if (running && !steer) throw new Error('回合仍在运行：排队发送不支持凭据接管；请选择插话发送或等待回合结束');
+      if (steer && refs.length) throw new Error('运行中插话不支持附件；请移除附件或等待回合结束');
+      let content = original;
+      let secret_captures = [];
+      if (!plaintextAck) {
+        const captured = captureDraft(original, scan.findings, () => crypto.randomUUID());
+        content = captured.content;
+        secret_captures = captured.captures;
+      }
+      const command = steer
+        ? { type: 'steer_user_input', session_id: sessionId, content, secret_captures, plaintext_secret_ack: plaintextAck }
+        : { type: 'submit_user_input', session_id: sessionId, content, attachments: refs, secret_captures, plaintext_secret_ack: plaintextAck };
+      await submitSecretCommand(command, { original, refs, steer });
+      dialog.close();
+    } catch (sendError) {
+      error.textContent = sendError?.message ?? '发送失败';
+      error.hidden = false;
+      for (const button of buttons) button.disabled = false;
+    }
+  };
+  capture.addEventListener('click', () => void send(false));
+  plaintext.addEventListener('click', () => void send(true));
+  actions.append(capture, plaintext, back);
+  card.append(head, copy, error, actions);
+  dialog.append(card);
+  close.addEventListener('click', () => dialog.close());
+  dialog.addEventListener('close', () => { dialog.remove(); window.dispatchEvent(new Event('ui-overlay-change')); }, { once: true });
+  document.body.append(dialog);
+  dialog.showModal();
+  window.dispatchEvent(new Event('ui-overlay-change'));
+  capture.focus();
+}
+
+function openSecretPaste() {
+  if (!current) { composerError('请先选择或新建会话，再粘贴凭据'); return; }
+  if (document.querySelector('.secret-paste-modal')) return;
+  const sessionId = current.session.id;
+  const dialog = el('dialog', 'modal secret-paste-modal');
+  const card = el('div', 'secret-paste-card');
+  card.setAttribute('aria-label', '安全粘贴凭据');
+  const head = el('div', 'secret-review-head');
+  head.append(el('h2', undefined, '安全粘贴凭据'));
+  const close = iconButton('close', '关闭安全粘贴', { size: 16, tooltip: '关闭' });
+  head.append(close);
+  const input = el('input', 'secret-paste-input');
+  input.type = 'password';
+  input.autocomplete = 'off';
+  input.spellcheck = false;
+  input.setAttribute('aria-label', '凭据值');
+  input.placeholder = '粘贴凭据';
+  const status = el('p', 'secret-paste-status', '值只会交给 Runtime 保管；消息与日志中只出现引用。');
+  const actions = el('div', 'secret-review-actions');
+  const submit = el('button', 'button primary', '接管并插入');
+  const cancel = el('button', 'button secondary', '取消');
+  submit.type = 'button'; cancel.type = 'button';
+  cancel.addEventListener('click', () => dialog.close());
+  submit.addEventListener('click', () => {
+    const value = input.value;
+    if (!value) { status.textContent = '请输入凭据'; return; }
+    submit.disabled = true;
+    input.disabled = true;
+    const requestId = crypto.randomUUID();
+    pendingSecretPaste.set(requestId, { sessionId, dialog, input, status, submit });
+    // The plaintext leaves the DOM field immediately; the command object is
+    // the only copy in this renderer.
+    input.value = '';
+    status.textContent = '正在接管…';
+    deliver({ type: 'capture_secret', session_id: sessionId, request_id: requestId, value })
+      .catch(error => {
+        pendingSecretPaste.delete(requestId);
+        status.textContent = error?.message ?? '接管失败';
+        submit.disabled = false;
+        input.disabled = false;
+      });
+    setTimeout(() => {
+      const pending = pendingSecretPaste.get(requestId);
+      if (!pending) return;
+      pendingSecretPaste.delete(requestId);
+      // A command receipt is not custody. Without the structured event the
+      // outcome is unknown; do not insert a reference that may not exist.
+      pending.status.textContent = '接管结果未知：未收到 Runtime 确认，未插入引用';
+      pending.submit.disabled = false;
+      pending.input.disabled = false;
+    }, 20000);
+  });
+  actions.append(submit, cancel);
+  card.append(head, input, status, actions);
+  dialog.append(card);
+  close.addEventListener('click', () => dialog.close());
+  dialog.addEventListener('close', () => {
+    // A closed dialog cannot receive its own capture answer; dropping the
+    // pending entry keeps the late event from writing into the composer.
+    for (const [id, pending] of pendingSecretPaste) if (pending.dialog === dialog) pendingSecretPaste.delete(id);
+    dialog.remove();
+    window.dispatchEvent(new Event('ui-overlay-change'));
+  }, { once: true });
+  document.body.append(dialog);
+  dialog.showModal();
+  window.dispatchEvent(new Event('ui-overlay-change'));
+  input.focus();
+}
+
+function applySecretCaptureEvent(event) {
+  const pending = pendingSecretPaste.get(event.request_id);
+  if (!pending || pending.sessionId !== event.session_id) return;
+  pendingSecretPaste.delete(event.request_id);
+  if (event.type === 'secret_captured') {
+    const input = $('message');
+    const token = `[secret:${event.secret_ref}]`;
+    const prefix = input.value && !input.value.endsWith('\n') ? ' ' : '';
+    input.value += prefix + token;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    pending.dialog.close();
+    toast(`已安全接管：${event.masked ?? ''}`, { tone: 'success', holdMs: 3200 });
+    return;
+  }
+  pending.status.textContent = event.error || '接管失败';
+  pending.submit.disabled = false;
+  pending.input.disabled = false;
+}
+
 /* --------------------------------------------------------------- composer */
 
 // The native picker is the only directory browser. An in-app shell with
@@ -3871,6 +4173,7 @@ function selectWorkspace(folder) {
   currentSource = null;
   $('message').value = text;
   drafts.set('new-session', text);
+  queueDraftScan('new-session', text);
   composerError('');
   render();
   $('message').focus();
@@ -3931,6 +4234,7 @@ function commandCatalog() {
   const entries = [
     ['add', 'file', '添加图片', true, 'paperclip', null, null],
     ['add', 'reference', '引用工作区文件', hasWorkspace(), 'file', null, '请先打开有工作区的会话'],
+    ['add', 'secret', '安全粘贴凭据', session, 'shield', null, '请先选择或新建会话'],
     ['commands', 'goal', '目标', true, 'compass', null, null],
     ['commands', 'plan', '计划', false, 'list', '未接入', '桌面尚未接入计划模式切换'],
     ['commands', 'feedback', '反馈', true, 'feedback', null, null],
@@ -4013,6 +4317,7 @@ async function executeCommand(id) {
   closeComposerPopovers();
   if (id === 'file') { composerError(''); controls(); uploadAttachment(); return; }
   if (id === 'reference') { openRightbarTab('files'); return; }
+  if (id === 'secret') { openSecretPaste(); return; }
   if (id === 'goal') { $('message').value = '/goal '; $('message').focus(); return; }
   $('message').value = '';
   composerError('');
@@ -4064,6 +4369,7 @@ function newSession() {
   trajectoryRange = null;
   trajectoryViewport = null;
   $('message').value = drafts.get('new-session') ?? '';
+  queueDraftScan('new-session', $('message').value);
   $('conversation').replaceChildren();
   render();
   action(createTask);
@@ -4074,6 +4380,7 @@ async function createTask() {
   const key = selection?.id ?? null;
   if (!pendingCreation || pendingCreation.key !== key) pendingCreation = { key, id: crypto.randomUUID() };
   const result = await api.createTask(key, pendingCreation.id);
+  pendingCreation = null;
   pendingCreation = null;
   history = [];
   uncertain = null;
@@ -4150,6 +4457,7 @@ async function openTask(task) {
   trajectoryRange = null;
   trajectoryViewport = null;
   $('message').value = drafts.get(current.session.id) ?? '';
+  queueDraftScan(current.session.id, $('message').value);
   $('conversation').replaceChildren();
   loadRightbar(current.session.id);
   render();
@@ -7632,6 +7940,7 @@ api.onEvent(frame => {
     trajectoryRange = null;
     trajectoryViewport = null;
     $('message').value = drafts.get(session.id) ?? $('message').value;
+    queueDraftScan(session.id, $('message').value);
     render();
     applyConnection({ event: 'connection', state: 'connected', resumed: true });
     reloadHistory();
@@ -7652,6 +7961,10 @@ api.onEvent(frame => {
     return;
   }
   if (frame.event === 'handoff') return;
+  if (frame.event === 'runtime' && ['secret_captured', 'secret_capture_failed'].includes(frame.data?.type)) {
+    applySecretCaptureEvent(frame.data);
+    return;
+  }
   if (frame.session_id === current?.session.id && frame.event === 'runtime'
     && ['attachment_added', 'attachment_processing_failed'].includes(frame.data?.type)) {
     const previous = attachments();
@@ -7763,7 +8076,11 @@ api.onEvent(frame => {
     return;
   }
   if (event.type === 'notification') {
-    if (event.level === 'warning' || event.level === 'error') toast(event.message, { tone: event.level, holdMs: 5000 });
+    // The Runtime's notification is the authority for outcomes a command
+    // receipt cannot prove (for example a revoked reference). Show info too;
+    // a warning/error keeps its longer hold.
+    const warning = ['warning', 'error'].includes(event.level);
+    toast(event.message, { tone: warning ? event.level : 'info', holdMs: warning ? 5000 : 2600 });
     return;
   }
   if (event.type === 'agents_loaded') return;
@@ -7932,6 +8249,7 @@ function boot() {
     $('brand-version').title = '桌面客户端版本；Runtime 版本见设置';
   }).catch(() => {});
   api.connectionStatus?.().then(applyConnection).catch(() => {});
+  void migrateLegacyDrafts();
   api.onBrowserState(data => {
     browserData = data;
     for (const tab of Object.values(rightbarTabs)) {
@@ -8010,6 +8328,7 @@ function boot() {
     const value = $('message').value;
     drafts.set(draftKey(), value);
     saveDrafts();
+    queueDraftScan(draftKey(), value);
     if (/^\/[a-z-]*$/.test(value.trim())) openSlashMenu(); else $('command-popover')?.remove();
   });
   $('message').addEventListener('keydown', event => {
@@ -8166,6 +8485,18 @@ async function submitComposer(complement = false) {
   if ((!content && !refs.length) || loading || uncertain || uploadPending()) return;
   const unsupported = attachmentSubmissionError(refs);
   if (unsupported) { composerError(unsupported); return; }
+  // Review before anything leaves the client. A scan that has not finished is
+  // awaited for this exact text; a draft containing a candidate never uses
+  // the plain submission path.
+  const secretScan = content ? await scanForSubmit(content) : null;
+  if (secretScan?.findings?.length) {
+    const running = ['running', 'waiting_user'].includes(current?.status);
+    const steer = running && !!content && (complement ? settings.busySend !== 'steer' : settings.busySend === 'steer');
+    if (running && !steer) { composerError('回合仍在运行：排队发送不支持凭据接管；请选择插话发送或等待回合结束'); return; }
+    if (steer && refs.length) { composerError('运行中插话不支持附件；请移除附件或等待回合结束'); return; }
+    openSecretReview({ original: content, refs, scan: secretScan, complement });
+    return;
+  }
   composerError('');
   action(async () => {
     if (!current) await createTask();

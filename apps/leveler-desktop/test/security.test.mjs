@@ -15,6 +15,46 @@ test('desktop rejects cross-session submission but accepts scoped text and live 
  assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'submit_message',session_id:'s1',content:'hi'})));
  assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'approval_decision',request_id:'a1',decision:'approve_once'})));
 });
+test('secret submissions validate captures, acknowledgement and session',()=>{
+ const capture=(over={})=>({placeholder:'{{s}}',value:'sk-test-value',...over});
+ const submit=(over={})=>({type:'submit_user_input',session_id:'s1',content:'use {{s}}',attachments:[],secret_captures:[capture()],plaintext_secret_ack:false,...over});
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope(submit())));
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope(submit({content:'plain sk-test-value',secret_captures:[],plaintext_secret_ack:true}))));
+ for(const bad of [
+   submit({plaintext_secret_ack:true}),
+   submit({content:'no placeholder'}),
+   submit({content:'use {{s}} {{s}}'}),
+   submit({secret_captures:[capture(),capture()]}),
+   submit({secret_captures:[capture({placeholder:''})]}),
+   submit({secret_captures:[capture({value:''})]}),
+   submit({secret_captures:[capture({value:'a'.repeat(65537)})]}),
+   submit({secret_captures:[capture({extra:1})]}),
+   submit({session_id:'s2'}),
+   submit({content:'a'.repeat(100001),secret_captures:[],plaintext_secret_ack:false}),
+   submit({content:'',attachments:[],secret_captures:[],plaintext_secret_ack:false}),
+ ])assert.throws(()=>security.validateEnvelope(envelope(bad)));
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'steer_user_input',session_id:'s1',content:'use {{s}}',secret_captures:[capture()],plaintext_secret_ack:false})));
+ assert.throws(()=>security.validateEnvelope(envelope({type:'steer_user_input',session_id:'s1',content:'',secret_captures:[],plaintext_secret_ack:false})));
+ assert.throws(()=>security.validateEnvelope(envelope({type:'steer_user_input',session_id:'s2',content:'x',secret_captures:[],plaintext_secret_ack:false})));
+ assert.throws(()=>security.validateEnvelope(envelope({type:'steer_user_input',session_id:'s1',content:'x',secret_captures:[],plaintext_secret_ack:false,attachments:[]})));
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'capture_secret',session_id:'s1',request_id:'r1',value:'sk-test-value'})));
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'capture_secret',session_id:'s1',request_id:'r1',value:'sk-test-value',key_hint:'API_KEY'})));
+ for(const bad of [
+   {type:'capture_secret',session_id:'s1',request_id:'r1',value:''},
+   {type:'capture_secret',session_id:'s1',request_id:'r1',value:'a'.repeat(65537)},
+   {type:'capture_secret',session_id:'s1',request_id:'',value:'x'},
+   {type:'capture_secret',session_id:'s2',request_id:'r1',value:'x'},
+   {type:'capture_secret',session_id:'s1',request_id:'r1',value:'x',extra:1},
+ ])assert.throws(()=>security.validateEnvelope(envelope(bad)));
+ const ref=`sec_${'a'.repeat(32)}`;
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'revoke_secret',session_id:'s1',secret_ref:ref})));
+ for(const bad of [
+   {type:'revoke_secret',session_id:'s1',secret_ref:'sec_short'},
+   {type:'revoke_secret',session_id:'s1',secret_ref:`sec_${'A'.repeat(32)}`},
+   {type:'revoke_secret',session_id:'s2',secret_ref:ref},
+   {type:'revoke_secret',session_id:'s1',secret_ref:ref,extra:1},
+ ])assert.throws(()=>security.validateEnvelope(envelope(bad)));
+});
 test('definition trust decisions are scoped, enumerated, and exact',()=>{
  for(const decision of ['allow_once','trust_current_version','deny'])assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'definition_trust_decision',request_id:'d1',decision,session_id:'s1'})));
  for(const session_id of ['s2','',null,undefined,' '])assert.throws(()=>security.validateEnvelope(envelope({type:'definition_trust_decision',request_id:'d1',decision:'allow_once',session_id})));
