@@ -13,7 +13,9 @@ use std::time::Duration;
 
 use leveler_app::{Application, InProcessRuntimeClient};
 use leveler_client_protocol::secret::{SecretCapture, SecretValue};
-use leveler_client_protocol::{ClientCommand, InteractiveRuntimeClient, RuntimeEvent};
+use leveler_client_protocol::{
+    ClientCommand, InteractiveRuntimeClient, MessageId, RuntimeEvent, SteerAction,
+};
 use leveler_core::{CommandId, SessionId};
 use leveler_execution::PermissionProfile;
 use leveler_model::ModelRef;
@@ -226,6 +228,18 @@ fn assert_canary_absent_except(root: &std::path::Path, allowed: &[&str]) {
 }
 
 /// The reference the runtime announced for the captured value.
+
+fn assert_value_absent_from_disk(root: &std::path::Path, value: &str) {
+    for (path, bytes) in all_files(root) {
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !text.contains(value),
+            "the canary reached {}",
+            path.display()
+        );
+    }
+}
+
 fn announced_reference(seen: &[RuntimeEvent]) -> String {
     for event in seen {
         if let RuntimeEvent::UserMessageAdded { message } = event
@@ -625,7 +639,8 @@ fn a_captured_reference_survives_an_interrupt_and_finishes_the_task() {
                 let remaining = Duration::from_secs(10);
                 match tokio::time::timeout(remaining, rx.recv()).await {
                     Ok(Ok(RuntimeEvent::TurnIncomplete { .. }))
-                    | Ok(Ok(RuntimeEvent::TurnCancelled)) => break,
+                    | Ok(Ok(RuntimeEvent::TurnCancelled))
+                    | Ok(Ok(RuntimeEvent::TurnInterrupted)) => break,
                     Ok(Ok(_)) => {}
                     Ok(Err(error)) => panic!("event stream closed: {error}"),
                     Err(_) => panic!("the interrupted turn did not settle"),
