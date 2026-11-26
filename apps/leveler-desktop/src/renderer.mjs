@@ -28,6 +28,10 @@ import {
   copyText, trapTab,
 } from './ui.mjs';
 import { captureDraft, persistableDrafts, secretReferences } from './secret-review.mjs';
+import {
+  setupGuidance, configurationUsable, providerCredentialText, connectionPresentation,
+  providerFormError, providerContext, runtimeConfigState,
+} from './provider-settings.mjs';
 
 const api = window.desktop;
 const $ = id => document.getElementById(id);
@@ -96,6 +100,16 @@ const clarificationReplies = new Map();
 let entryPage = null;
 let settingsSection = 'general';
 let fontSettingsOpen = false;
+// Provider configuration is host truth read through the desktop bridge. The
+// renderer never keeps a key: it sends one once and stores only this projection.
+let providerState = { status: 'idle', data: null, error: null, context: null, request: 0 };
+let providerTest = null;
+// Provider buttons have their own busy state. The global `loading` flag is
+// true only while an action runs, but a page rendered during that action keeps
+// the disabled attribute forever (nothing re-renders it afterwards).
+let providerBusy = null;
+let providerSetupSignature = '';
+let providerModelDiscovery = null;
 let agentsRead = null;
 let scheduleBoard = emptyScheduleView();
 const schedulePending = new Map();
@@ -1791,7 +1805,10 @@ function renderComposerMeta() {
   const permissionText = mode ? permissionLabel(mode) : '工作区内修改';
   permission.dataset.tooltip = `访问模式：${permissionText}（仅影响 Agent，用户终端按系统用户权限运行）`;
   permission.setAttribute('aria-label', `访问模式，当前：${permissionText}`);
-  const model = current ? current.session.model : pendingModel;
+  // Before a session exists the composer shows the configured default until
+  // the person picks another model; it is the same model the next session
+  // will start on, not an invented choice.
+  const model = current ? current.session.model : (pendingModel ?? providerState.data?.resolved_default_model ?? null);
   const modelText = modelLabel(model) || '请选择模型';
   $('model-picker').replaceChildren(
     el('span', 'trigger-label', modelText),
@@ -1900,6 +1917,7 @@ function refreshContextUsage() {
 
 function render() {
   renderSidebar();
+  renderProviderSetup();
   renderHeader();
   renderComposerMeta();
   renderComposerDocks();
@@ -4176,6 +4194,7 @@ function selectWorkspace(folder) {
   selection = folder;
   if (folder?.path) chosenWorkspaces.set(workspaceKey(folder.path), folder);
   currentSource = null;
+  void refreshProviders();
   $('message').value = text;
   drafts.set('new-session', text);
   queueDraftScan('new-session', text);
@@ -4224,14 +4243,15 @@ function openModelMenu(anchor) {
     const items = [];
     if (!models.length) {
       items.push({ heading: '暂无可用模型' });
-      items.push({ label: '打开模型设置', icon: 'settings', onSelect: () => openSettings('models') });
+      items.push({ label: '配置 Provider', icon: 'settings', onSelect: () => openProviderEditor({ mode: 'add' }) });
     } else {
       items.push({ heading: '模型（新会话使用）' });
       for (const model of models) {
         items.push({
           label: model.model,
           badge: model.provider,
-          checked: pendingModel?.provider === model.provider && pendingModel?.model === model.model,
+          checked: (pendingModel ?? providerState.data?.resolved_default_model)?.provider === model.provider
+            && (pendingModel ?? providerState.data?.resolved_default_model)?.model === model.model,
           onSelect: () => {
             pendingModel = { provider: model.provider, model: model.model };
             renderComposerMeta();
@@ -4389,7 +4409,13 @@ function dismissPage() {
   for (const button of document.querySelectorAll('.panel-row')) button.setAttribute('aria-current', 'false');
 }
 
-function newSession() {
+async function newSession() {
+  await ensureProviderState();
+  if (providerConfigurationBlocksStart()) {
+    composerError(providerSetupMessage());
+    render();
+    return;
+  }
   dismissPage();
   resetScheduleProjection();
   stashDraft();
@@ -4414,13 +4440,15 @@ function newSession() {
 }
 
 async function createTask() {
+  await ensureProviderState();
+  if (providerConfigurationBlocksStart()) throw new Error(providerSetupMessage());
   const draftText = $('message').value;
   const key = selection?.id ?? null;
   if (!pendingCreation || pendingCreation.key !== key) pendingCreation = { key, id: crypto.randomUUID() };
-  const pinned = pendingModel;
+  const pinned = pendingModel ?? providerState.data?.resolved_default_model ?? null;
   const result = await api.createTask(key, pendingCreation.id, pinned ?? undefined);
   pendingCreation = null;
-  if (pinned) pendingModel = null;
+  if (pendingModel) pendingModel = null;
   pendingCreation = null;
   history = [];
   uncertain = null;
@@ -4439,6 +4467,7 @@ async function createTask() {
   $('conversation').replaceChildren();
   loadRightbar(current.session.id);
   render();
+  void refreshProviders({ quiet: true });
   if (draftText) {
     $('message').value = draftText;
     resizeComposer();
@@ -4501,6 +4530,7 @@ async function openTask(task) {
   $('conversation').replaceChildren();
   loadRightbar(current.session.id);
   render();
+  void refreshProviders({ quiet: true });
   await loadHistory();
   setTimeout(refreshContextUsage, 80);
   $('conversation-scroll').scrollTop = $('conversation-scroll').scrollHeight;
@@ -6570,6 +6600,7 @@ function closeNarrowSidebar() {
 
 function openSettings(section = 'general') {
   settingsSection = section;
+  if (section === 'models') void refreshProviders({ quiet: true });
   renderSettings();
   if (!$('settings-dialog').open) $('settings-dialog').showModal();
   $('settings-nav-list').querySelector('[aria-current="page"]')?.focus();
@@ -6627,7 +6658,7 @@ function settingsNav() {
   const nav = $('settings-nav-list');
   nav.replaceChildren();
   for (const [id, label, icon] of [
-    ['general', '通用设置', 'settings'], ['models', '模型', 'layers'],
+    ['general', '通用设置', 'settings'], ['models', '模型与 Provider', 'layers'],
     ['presets', 'Agent 与技能', 'bot'],
   ]) {
     const button = el('button');
@@ -6861,53 +6892,743 @@ function showShortcuts() {
   });
 }
 
-function renderModelSettings(content) {
-  content.append(el('h2', undefined, '模型'));
-  const setup = el('div', 'settings-card');
-  setup.append(
-    el('h3', undefined, '配置模型提供商'),
-    el('p', undefined, '首次配置请在终端运行 leveler login。已有配置可通过上方的“打开配置文件”维护。保存后重新打开会话，查看 Runtime 加载的模型。'),
+/* ------------------------------------------------- providers / onboarding */
+
+function providerContextNow() {
+  return providerContext({ selection: selection?.id ?? null, sessionId: current?.session.id ?? null });
+}
+function providerContextKey(context) {
+  return `${context?.sessionId ?? ''}\u0000${context?.selection ?? ''}`;
+}
+
+/** Read the effective provider configuration from the host.
+ * The renderer stores only this projection: masked facts and model refs. */
+async function refreshProviders({ quiet = false } = {}) {
+  const context = providerContextNow();
+  const request = ++providerState.request;
+  if (!quiet && providerState.status !== 'ready') providerState = { ...providerState, status: 'loading' };
+  let next;
+  try {
+    const data = await api.providers(context);
+    if (request !== providerState.request) return providerState;
+    if (providerContextKey(providerContextNow()) !== providerContextKey(context)) return providerState;
+    next = { status: 'ready', data, error: null, context, request };
+  } catch (error) {
+    if (request !== providerState.request) return providerState;
+    next = {
+      status: 'error',
+      data: providerState.data,
+      error: error?.message ?? '无法读取 Provider 配置',
+      context,
+      request,
+    };
+  }
+  providerState = next;
+  renderProviderSetup();
+  renderComposerMeta();
+  if ($('settings-dialog').open && settingsSection === 'models') renderSettings();
+  controls();
+  return providerState;
+}
+
+/** Whether an action that would start a new session has a configured model. */
+async function ensureProviderState() {
+  // A click can arrive before the first host read answers. Wait for that read
+  // instead of reporting an unconfigured profile that was never checked.
+  if (providerState.status !== 'ready') await refreshProviders({ quiet: true });
+  return providerState;
+}
+
+function providerConfigurationBlocksStart() {
+  return providerState.status !== 'ready' || !configurationUsable(providerState.data);
+}
+
+function providerSetupMessage() {
+  if (providerState.status === 'loading' || providerState.status === 'idle') return '正在读取 Provider 配置，请稍候';
+  if (providerState.status === 'error') return '无法读取 Provider 配置，请在设置中处理';
+  return '尚未配置可用的模型 Provider，请先完成配置';
+}
+
+function renderProviderSetup() {
+  const node = $('provider-setup');
+  if (!node) return;
+  const guidance = setupGuidance(providerState);
+  const show = Boolean(guidance) && document.body.classList.contains('home');
+  node.hidden = !show;
+  if (!show) return;
+  const signature = JSON.stringify([guidance, providerState.status]);
+  if (signature === providerSetupSignature) return;
+  providerSetupSignature = signature;
+  node.replaceChildren();
+  node.dataset.tone = guidance.tone;
+  const copy = el('div', 'provider-setup-copy');
+  copy.append(el('div', 'provider-setup-title', guidance.title), el('div', 'provider-setup-detail', guidance.detail));
+  const actions = el('div', 'provider-setup-actions');
+  const add = (label, id, kind) => {
+    const button = el('button', `button ${kind} small`, label);
+    button.type = 'button';
+    button.addEventListener('click', () => runProviderGuidance(id, guidance));
+    actions.append(button);
+  };
+  if (guidance.action === 'retry') add('重试', 'retry', 'primary');
+  else if (guidance.action === 'open-settings') add('打开模型设置', 'open-settings', 'primary');
+  else if (guidance.action === 'add-model') add('添加模型', 'add-model', 'primary');
+  else add('配置 Provider', 'add-provider', 'primary');
+  if (guidance.secondary === 'open-config') add('打开配置文件', 'open-config', 'ghost');
+  else if (guidance.secondary === 'open-settings') add('模型设置', 'open-settings', 'ghost');
+  else if (guidance.secondary === 'retry') add('重试', 'retry', 'ghost');
+  node.append(copy, actions);
+}
+
+function runProviderGuidance(id, guidance) {
+  if (id === 'retry') { void refreshProviders(); return; }
+  if (id === 'open-config') { action(() => api.openConfig()); return; }
+  if (id === 'open-settings') { openSettings('models'); return; }
+  if (id === 'add-model') {
+    const provider = providerState.data?.providers?.find(candidate => candidate.id === guidance.providerId)
+      ?? providerState.data?.providers?.[0];
+    if (provider) openAddModelDialog(provider);
+    return;
+  }
+  openProviderEditor({ mode: 'add' });
+}
+
+/* --------------------------------------------------- provider settings */
+
+function protocolLabel(protocol) {
+  return ({
+    openai_chat: 'OpenAI Chat',
+    openai_responses: 'OpenAI Responses',
+    anthropic_messages: 'Anthropic Messages',
+    gemini_generate_content: 'Gemini',
+  })[protocol] ?? protocol;
+}
+
+function providerErrorCard(message) {
+  const card = el('div', 'settings-card provider-error-card');
+  card.append(
+    el('h3', undefined, '无法读取 Provider 配置'),
+    el('p', undefined, message || 'Host 未能读取配置文件'),
   );
-  const copyLogin = el('button', 'button secondary small', '复制 leveler login');
-  copyLogin.type = 'button';
-  copyLogin.addEventListener('click', () => void copyText(api, 'leveler login'));
-  setup.append(copyLogin);
-  content.append(setup);
-  const models = current?.session.available_models ?? [];
-  if (!current) content.append(el('div', 'settings-note', '请先打开或新建一个会话，再选择模型。'));
-  else if (!models.length) {
-    const card = el('div', 'settings-card');
-    card.append(el('h3', undefined, '暂无可用模型'), el('p', undefined, '当前会话没有可用模型。完成上方配置后，重新打开会话。'));
-    content.append(card);
-  } else {
-    const grouped = new Map();
+  const row = el('div', 'settings-actions');
+  const retry = el('button', 'button secondary small', '重试');
+  retry.type = 'button';
+  retry.addEventListener('click', () => void refreshProviders());
+  const open = el('button', 'button ghost small', '打开配置文件');
+  open.type = 'button';
+  open.addEventListener('click', () => action(() => api.openConfig()));
+  row.append(retry, open);
+  card.append(row);
+  return card;
+}
+
+function renderModelSettings(content) {
+  content.append(el('h2', undefined, '模型与 Provider'));
+  const head = el('div', 'provider-page-head');
+  const add = el('button', 'button primary small', '添加 Provider');
+  add.type = 'button';
+  add.disabled = providerState.status === 'loading';
+  add.addEventListener('click', () => openProviderEditor({ mode: 'add' }));
+  const refresh = el('button', 'button ghost small', '刷新');
+  refresh.type = 'button';
+  refresh.addEventListener('click', () => void refreshProviders());
+  head.append(add, refresh);
+  content.append(head);
+
+  if (providerState.status === 'error') content.append(providerErrorCard(providerState.error));
+  const data = providerState.data;
+  if (!data) {
+    content.append(el('div', 'settings-note', providerState.status === 'loading' ? '正在读取 Provider 配置…' : '尚未读取 Provider 配置。'));
+    return;
+  }
+  const meta = el('div', 'provider-config-meta');
+  meta.append(el('span', 'provider-config-path', `配置文件：${data.config_path}${data.config_exists ? '' : '（尚未创建）'}`));
+  const runtime = runtimeConfigState(data.runtime);
+  meta.append(el('span', `provider-runtime ${runtime.tone}`, runtime.text));
+  if (runtime.canReload) {
+    const reload = el('button', 'button ghost small', '立即重载');
+    reload.type = 'button';
+    reload.addEventListener('click', () => action(async () => {
+      await api.reloadRuntime();
+      toast('已请求 Runtime 重新加载配置', { tone: 'info', holdMs: 2200 });
+      await refreshProviders({ quiet: true });
+    }));
+    meta.append(reload);
+  }
+  content.append(meta);
+  if (!data.default_model && data.models?.length) {
+    content.append(el('div', 'settings-note', '尚未设置默认模型；新会话将使用 Runtime 的后备模型。可在下方模型的“设为默认”中确认。'));
+  }
+  if (data.issues?.length) content.append(el('div', 'settings-note provider-issues', data.issues.join('；')));
+  if (!data.providers.length) {
+    const empty = el('div', 'settings-card');
+    empty.append(el('h3', undefined, '还没有 Provider'), el('p', undefined, '添加一个 Provider 和模型后即可开始第一个任务。'));
+    content.append(empty);
+    return;
+  }
+  for (const provider of data.providers) content.append(providerCard(provider, data));
+  if (current) {
+    const count = (current.session.available_models ?? []).length;
+    content.append(el('div', 'settings-note', `当前会话可使用 ${count} 个模型（由 Runtime 提供）。切换当前会话的模型请使用输入区的模型选择器。`));
+  }
+}
+
+function providerCard(provider, data) {
+  const card = el('div', 'settings-card provider-card');
+  const head = el('div', 'provider-card-head');
+  head.append(el('span', 'provider-name', provider.id));
+  head.append(el('span', 'provider-tag', protocolLabel(provider.protocol)));
+  head.append(el('span', 'provider-tag', provider.source === 'project' ? '项目配置' : '全局配置'));
+  if ((data.models ?? []).some(model => model.provider === provider.id && model.default)) {
+    head.append(el('span', 'provider-tag accent', '默认来源'));
+  }
+  card.append(head);
+  const credential = el('span', `provider-credential ${provider.api_key_configured ? 'ready' : 'missing'}`, providerCredentialText(provider));
+  const facts = el('div', 'provider-facts');
+  facts.append(el('span', 'provider-fact', `Base URL：${provider.base_url || '未设置'}`));
+  facts.append(credential);
+  facts.append(el('span', 'provider-fact', `模型：${provider.model_count} 个`));
+  card.append(facts);
+
+  const models = (data.models ?? []).filter(model => model.provider === provider.id);
+  if (models.length) {
+    const list = el('div', 'provider-model-list');
     for (const model of models) {
-      if (!grouped.has(model.provider)) grouped.set(model.provider, []);
-      grouped.get(model.provider).push(model);
-    }
-    for (const [provider, list] of grouped) {
-      const card = el('div', 'settings-card');
-      const head = el('div', 'provider-row');
-      head.append(el('span', 'provider-name', provider));
-      card.append(head);
-      for (const model of list) {
-        const row = el('div', 'provider-row');
-        const selected = current.session.model?.provider === model.provider && current.session.model?.model === model.model;
-        row.append(el('span', 'provider-badge', selected ? '当前' : '可选'), el('span', 'provider-name', model.model));
-        const use = el('button', 'button secondary small', selected ? '已选择' : '使用');
-        use.type = 'button'; use.disabled = selected || loading;
-        use.addEventListener('click', () => action(async () => {
-          await deliver({ type: 'select_model', session_id: current.session.id, model });
-          await refreshMetadata();
-          renderSettings();
-        }));
+      const row = el('div', 'provider-row provider-model-row');
+      const name = el('span', 'provider-name', model.model);
+      row.append(name);
+      if (model.thinking) row.append(el('span', 'provider-badge', `思考：${model.thinking}`));
+      if (model.default) row.append(el('span', 'provider-tag accent', '默认'));
+      else {
+        const busy = providerBusy === `default:${model.provider}/${model.model}`;
+        const use = el('button', 'button ghost small', busy ? '设置中…' : '设为默认');
+        use.type = 'button';
+        use.disabled = Boolean(providerBusy);
+        use.addEventListener('click', () => void setDefaultModelFlow(model));
         row.append(use);
-        card.append(row);
       }
-      content.append(card);
+      list.append(row);
     }
+    card.append(list);
   }
 
+  const actions = el('div', 'settings-actions provider-actions');
+  const test = el('button', 'button secondary small', '测试连接');
+  test.type = 'button';
+  test.disabled = providerTest?.status === 'running';
+  test.addEventListener('click', () => void runProviderTest(provider, data));
+  actions.append(test);
+  if (provider.editable) {
+    const addModel = el('button', 'button ghost small', '添加模型');
+    addModel.type = 'button';
+    addModel.addEventListener('click', () => openAddModelDialog(provider));
+    const edit = el('button', 'button ghost small', '编辑');
+    edit.type = 'button';
+    edit.addEventListener('click', () => openProviderEditor({ mode: 'edit', provider }));
+    const remove = el('button', 'button ghost small provider-danger', '移除');
+    remove.type = 'button';
+    remove.addEventListener('click', () => void removeProviderFlow(provider, data));
+    actions.append(addModel, edit, remove);
+  } else {
+    actions.append(el('span', 'provider-note', '由项目配置提供，桌面不能修改'));
+  }
+  card.append(actions);
+
+  if (providerTest?.providerId === provider.id) {
+    const line = el('div', 'provider-test');
+    if (providerTest.status === 'running') {
+      line.dataset.tone = 'running';
+      line.textContent = '正在测试连接…';
+    } else {
+      const view = connectionPresentation(providerTest.result);
+      line.dataset.tone = view.tone;
+      line.textContent = `${view.label}：${view.message}`;
+      if (view.retryable) {
+        const retry = el('button', 'button ghost small', '重试');
+        retry.type = 'button';
+        retry.addEventListener('click', () => void runProviderTest(provider, data));
+        line.append(' ', retry);
+      }
+    }
+    card.append(line);
+  }
+  return card;
+}
+
+async function runProviderTest(provider, data) {
+  if (providerTest?.status === 'running') return;
+  providerTest = { providerId: provider.id, status: 'running' };
+  renderSettings();
+  const models = (data.models ?? []).filter(model => model.provider === provider.id);
+  const chosen = models.find(model => model.default) ?? models[0] ?? null;
+  let result;
+  try {
+    result = await api.testProvider({
+      ...providerContextNow(),
+      id: provider.id,
+      model: chosen ? { provider: provider.id, model: chosen.model } : null,
+    });
+  } catch (error) {
+    result = { status: 'error', message: error?.message ?? '连接测试失败' };
+  }
+  providerTest = { providerId: provider.id, status: 'done', result };
+  if ($('settings-dialog').open && settingsSection === 'models') renderSettings();
+}
+
+async function setDefaultModelFlow(model) {
+  if (providerBusy) return;
+  providerBusy = `default:${model.provider}/${model.model}`;
+  if ($('settings-dialog').open) renderSettings();
+  try {
+    const result = await api.setDefaultModel({
+      ...providerContextNow(),
+      model: { provider: model.provider, model: model.model },
+    });
+    providerState = { status: 'ready', data: result, error: null, context: providerContextNow(), request: providerState.request };
+    toast(`默认模型已设置为 ${model.provider}/${model.model}`, { tone: 'success', holdMs: 2400 });
+    renderProviderSetup();
+    renderComposerMeta();
+  } catch (error) {
+    toast(`默认模型保存失败：${error?.message ?? '未知错误'}`, { tone: 'error', holdMs: 5000 });
+  } finally {
+    providerBusy = null;
+    if ($('settings-dialog').open) renderSettings();
+  }
+}
+
+async function removeProviderFlow(provider, data) {
+  const models = (data.models ?? []).filter(model => model.provider === provider.id);
+  const isDefault = models.some(model => model.default);
+  const lines = [
+    `将从全局配置移除 Provider ${provider.id} 及其 ${models.length} 个模型。`,
+    '使用该 Provider 的已有会话将无法继续，直到重新配置。',
+  ];
+  if (isDefault) lines.push('默认模型会被清空；新会话将使用 Runtime 的后备模型。');
+  const ok = await confirmDialog({
+    title: `移除 Provider ${provider.id}？`,
+    body: lines.join('\n'),
+    confirm: '移除',
+    danger: true,
+  });
+  if (!ok) return;
+  try {
+    const result = await api.removeProvider({ ...providerContextNow(), id: provider.id });
+    providerTest = null;
+    providerState = { status: 'ready', data: result, error: null, context: providerContextNow(), request: providerState.request };
+    const removed = (result.removed_models ?? []).length;
+    toast(`已移除 ${provider.id}${removed ? `（${removed} 个模型）` : ''}${result.default_cleared ? '；默认模型已清空' : ''}`, { tone: 'success', holdMs: 3200 });
+    if ($('settings-dialog').open) renderSettings();
+    renderProviderSetup();
+    renderComposerMeta();
+    controls();
+  } catch (error) {
+    toast(`移除失败：${error?.message ?? '未知错误'}`, { tone: 'error', holdMs: 5200 });
+  }
+}
+
+function editorInput(value, { type = 'text', placeholder = '', disabled = false, maxLength = 2048, list = null } = {}) {
+  const input = el('input', 'provider-editor-input');
+  input.type = type;
+  input.value = value ?? '';
+  input.placeholder = placeholder;
+  input.disabled = disabled;
+  input.maxLength = maxLength;
+  input.autocomplete = 'off';
+  input.spellcheck = false;
+  if (list) input.setAttribute('list', list);
+  return input;
+}
+
+function editorSelect(options, value, { disabled = false } = {}) {
+  const select = el('select', 'provider-editor-input');
+  select.disabled = disabled;
+  for (const [key, label] of options) {
+    const option = el('option', undefined, label);
+    option.value = key;
+    select.append(option);
+  }
+  select.value = value;
+  return select;
+}
+
+function editorField(label, control, hint) {
+  const row = el('label', 'provider-editor-row');
+  row.append(el('span', 'provider-editor-label', label));
+  const body = el('span', 'provider-editor-control');
+  body.append(control);
+  if (hint) body.append(el('small', 'provider-editor-hint', hint));
+  row.append(body);
+  return row;
+}
+
+function providerEditorDialog({ title, body, saveLabel, onSave }) {
+  const dialog = el('dialog', 'modal provider-editor');
+  const card = el('form', 'modal-card provider-editor-card');
+  card.addEventListener('submit', event => event.preventDefault());
+  const head = el('div', 'modal-head');
+  head.append(el('h2', undefined, title));
+  const close = iconButton('close', '关闭', { size: 16, tooltip: '关闭' });
+  head.append(close);
+  const error = el('p', 'provider-editor-error');
+  error.hidden = true;
+  error.setAttribute('role', 'alert');
+  const actions = el('div', 'modal-actions');
+  const cancel = el('button', 'button secondary', '取消');
+  cancel.type = 'button';
+  const save = el('button', 'button primary', saveLabel);
+  save.type = 'button';
+  actions.append(cancel, save);
+  card.append(head, body, error, actions);
+  dialog.append(card);
+  document.body.append(dialog);
+  const closeDialog = () => dialog.close();
+  close.addEventListener('click', closeDialog);
+  cancel.addEventListener('click', closeDialog);
+  dialog.addEventListener('close', () => {
+    dialog.remove();
+    // The settings page may have re-rendered behind the dialog; focus the
+    // still-live control instead of leaving it on a removed node.
+    const target = $('settings-dialog')?.open ? $('settings-close') : $('message');
+    target?.focus();
+  }, { once: true });
+  dialog.addEventListener('cancel', event => { event.preventDefault(); closeDialog(); });
+  save.addEventListener('click', () => onSave({ error, save, close: closeDialog }));
+  dialog.showModal();
+  return { dialog, save, error };
+}
+
+function openProviderEditor({ mode = 'add', provider = null } = {}) {
+  if (mode === 'edit' && !provider) return;
+  const presets = providerState.data?.presets ?? [];
+  const editing = mode === 'edit';
+  const originalBaseUrl = editing ? provider.base_url : '';
+  const body = el('div', 'provider-editor-body');
+  let selectedPreset = null;
+
+  const presetSelect = editing ? null : editorSelect(
+    [['custom', '自定义 Provider'], ...presets.map(preset => [preset.id, `${preset.label}（${preset.id}）`])],
+    'custom',
+  );
+  const idInput = editorInput(editing ? provider.id : '', { placeholder: '例如 bigmodel', maxLength: 64, disabled: editing });
+  const protocolSelect = editorSelect([
+    ['openai_chat', 'OpenAI Chat'],
+    ['openai_responses', 'OpenAI Responses'],
+    ['anthropic_messages', 'Anthropic Messages'],
+    ['gemini_generate_content', 'Gemini Generate Content'],
+  ], editing ? provider.protocol : 'openai_chat');
+  presetSelect?.setAttribute('aria-label', 'Provider 预设');
+  idInput.setAttribute('aria-label', 'Provider ID');
+  protocolSelect.setAttribute('aria-label', '接口协议');
+  const baseInput = editorInput(editing ? provider.base_url : '', { placeholder: 'https://api.example.com/v1', maxLength: 2048 });
+  baseInput.setAttribute('aria-label', 'Base URL');
+  const keyInput = editorInput('', {
+    type: 'password',
+    maxLength: 16 * 1024,
+    placeholder: editing
+      ? (provider.api_key_configured
+        ? (provider.key_source === 'environment' ? '当前使用环境变量（留空保持不变）' : '已保存密钥（留空保持不变）')
+        : '粘贴 API Key（留空保持不变）')
+      : '粘贴 API Key',
+  });
+  keyInput.setAttribute('aria-label', 'API Key');
+  const envInput = editorInput(editing ? (provider.api_key_env ?? '') : '', { placeholder: '可选，例如 BIGMODEL_API_KEY', maxLength: 128 });
+  envInput.setAttribute('aria-label', '环境变量名');
+  const advanced = el('details', 'provider-editor-advanced');
+  advanced.append(el('summary', undefined, '高级'), editorField('环境变量名', envInput, '填写后 Provider 会从该环境变量读取密钥；已保存的密钥优先。留空表示不使用环境变量。'));
+  const consoleLink = el('a', 'provider-editor-console');
+  consoleLink.target = '_blank';
+  consoleLink.rel = 'noreferrer';
+  consoleLink.hidden = true;
+  consoleLink.textContent = '获取 API Key';
+
+  const modelSelect = editorSelect([], null);
+  modelSelect.hidden = true;
+  modelSelect.setAttribute('aria-label', '模型列表');
+  modelSelect.addEventListener('change', () => { if (modelSelect.value) modelInput.value = modelSelect.value; });
+  const modelInput = editorInput('', { placeholder: '模型 ID，例如 glm-5.3', maxLength: 128, list: 'provider-model-options' });
+  modelInput.setAttribute('aria-label', '模型 ID');
+  const modelOptions = el('datalist');
+  modelOptions.id = 'provider-model-options';
+  const contextInput = editorInput('', { type: 'number', placeholder: '例如 131072', maxLength: 12 });
+  contextInput.min = '1024';
+  contextInput.max = '16777216';
+  contextInput.setAttribute('aria-label', '上下文窗口');
+  const discoverButton = el('button', 'button secondary small', '获取模型');
+  discoverButton.type = 'button';
+  const discoverStatus = el('span', 'provider-discover-status');
+  const discoverRow = el('div', 'provider-model-tools');
+  discoverRow.append(discoverButton, discoverStatus);
+  const modelSection = el('div', 'provider-model-section');
+  modelSection.append(
+    el('div', 'provider-editor-section-title', editing ? '已保存的模型不会被改写；这里只添加新模型' : '模型'),
+    editorField('模型 ID', modelInput),
+    modelSelect,
+    discoverRow,
+    modelOptions,
+    editorField('上下文窗口', contextInput, '已知模型使用内置事实；未知模型使用这里的保守值。留空使用加载器默认值。'),
+  );
+
+  if (!editing) {
+    body.append(editorField('Provider 预设', presetSelect, '预设只提供端点、协议和常用模型，不表示你的账号一定能访问某个模型。'));
+    presetSelect.addEventListener('change', () => {
+      selectedPreset = presets.find(preset => preset.id === presetSelect.value) ?? null;
+      if (!selectedPreset) return;
+      idInput.value = selectedPreset.id;
+      protocolSelect.value = selectedPreset.protocol;
+      baseInput.value = selectedPreset.base_url;
+      modelInput.value = selectedPreset.suggested_model;
+      contextInput.value = String(selectedPreset.suggested_context);
+      consoleLink.href = selectedPreset.console_url;
+      consoleLink.hidden = false;
+    });
+    presetSelect.dispatchEvent(new Event('change'));
+  }
+  body.append(
+    editorField('Provider ID', idInput, editing ? 'Provider ID 不能在编辑时改名；需要改名请新增并移除。' : null),
+    editorField('接口协议', protocolSelect),
+    editorField('Base URL', baseInput, editing ? '留空保持已保存的值；显示值已移除凭据与查询参数。' : null),
+    editorField('API Key', keyInput, '密钥只保存到全局配置文件（仅当前用户可读），保存后不再回显；不会进入聊天内容、日志或本地存储。'),
+    consoleLink,
+    advanced,
+  );
+  if (!editing) body.append(modelSection);
+
+  providerEditorDialog({
+    title: editing ? `编辑 Provider ${provider.id}` : '添加 Provider',
+    body,
+    saveLabel: '保存并验证',
+    onSave: async ({ error: errorNode, save: saveButton, close }) => {
+      const draftModels = editing
+        ? []
+        : [{ id: modelInput.value.trim(), context_window: contextInput.value.trim() === '' ? null : Number(contextInput.value) }];
+      if (!editing && !modelInput.value.trim()) {
+        errorNode.textContent = '请选择或填写一个模型 ID';
+        errorNode.hidden = false;
+        return;
+      }
+      const surfaceError = providerFormError({
+        mode,
+        id: idInput.value,
+        protocol: protocolSelect.value,
+        baseUrl: baseInput.value,
+        apiKey: keyInput.value,
+        apiKeyEnv: envInput.value.trim(),
+        models: draftModels,
+      });
+      if (surfaceError) {
+        errorNode.textContent = surfaceError;
+        errorNode.hidden = false;
+        return;
+      }
+      const baseUrl = editing && baseInput.value.trim() === originalBaseUrl ? null : baseInput.value.trim();
+      const request = {
+        id: idInput.value.trim(),
+        protocol: protocolSelect.value,
+        base_url: baseUrl,
+        api_key_env: envInput.value.trim(),
+        api_key: keyInput.value ? keyInput.value : null,
+        models: draftModels,
+      };
+      saveButton.disabled = true;
+      saveButton.textContent = '正在保存并验证…';
+      errorNode.hidden = true;
+      try {
+        const result = await api.saveProvider({ ...providerContextNow(), mode, provider: request });
+        keyInput.value = '';
+        // A prior connection result described the configuration that just
+        // changed; it is no longer evidence for the new one.
+        providerTest = null;
+        providerState = { status: 'ready', data: result, error: null, context: providerContextNow(), request: providerState.request };
+        close();
+        toast(editing ? `Provider ${request.id} 已更新` : `Provider ${request.id} 已添加`, { tone: 'success', holdMs: 2600 });
+        renderProviderSetup();
+        renderComposerMeta();
+        if ($('settings-dialog').open) renderSettings();
+        controls();
+      } catch (saveError) {
+        errorNode.textContent = saveError?.message ?? '保存失败';
+        errorNode.hidden = false;
+        saveButton.disabled = false;
+        saveButton.textContent = '保存并验证';
+      }
+    },
+  });
+
+  discoverButton.addEventListener('click', async () => {
+    const surfaceError = providerFormError({
+      mode: 'add',
+      id: idInput.value || 'draft',
+      protocol: protocolSelect.value,
+      baseUrl: baseInput.value,
+      apiKey: keyInput.value,
+      apiKeyEnv: envInput.value.trim(),
+      models: [{ id: 'probe', context_window: null }],
+    });
+    if (surfaceError) {
+      discoverStatus.textContent = surfaceError;
+      discoverStatus.dataset.tone = 'error';
+      return;
+    }
+    discoverButton.disabled = true;
+    discoverStatus.textContent = '正在连接 Provider 并读取模型…';
+    discoverStatus.dataset.tone = 'running';
+    try {
+      const result = await api.listProviderModels({
+        ...providerContextNow(),
+        id: null,
+        provider: {
+          id: idInput.value.trim() || 'draft',
+          protocol: protocolSelect.value,
+          base_url: baseInput.value.trim(),
+          api_key_env: envInput.value.trim() || null,
+          api_key: keyInput.value ? keyInput.value : null,
+        },
+      });
+      const view = connectionPresentation(result);
+      if (result.status === 'ok') {
+        modelOptions.replaceChildren();
+        modelSelect.replaceChildren();
+        modelSelect.append(el('option', undefined, '选择一个模型'));
+        for (const model of view.models) {
+          const option = el('option', undefined, model);
+          option.value = model;
+          modelOptions.append(option);
+          modelSelect.append(option.cloneNode(true));
+        }
+        modelSelect.hidden = view.models.length === 0;
+        modelSelect.value = '';
+        if (view.models.length && !modelInput.value.trim()) modelInput.value = view.models[0];
+        discoverStatus.textContent = `已读取 ${view.models.length} 个模型${result.truncated ? '（仅显示前 2000 个）' : ''}`;
+        discoverStatus.dataset.tone = 'success';
+      } else {
+        discoverStatus.textContent = `${view.label}：${view.message}`;
+        discoverStatus.dataset.tone = view.tone;
+      }
+    } catch (discoverError) {
+      discoverStatus.textContent = discoverError?.message ?? '读取模型失败';
+      discoverStatus.dataset.tone = 'error';
+    } finally {
+      discoverButton.disabled = false;
+    }
+  });
+
+  if (!editing) {
+    // Fill the first preset so a first run starts from a working endpoint.
+    presetSelect.value = presets[0]?.id ?? 'custom';
+    presetSelect.dispatchEvent(new Event('change'));
+    modelInput.value = presets[0]?.suggested_model ?? modelInput.value;
+  }
+}
+
+function openAddModelDialog(provider) {
+  if (!provider) return;
+  const body = el('div', 'provider-editor-body');
+  const modelSelect = editorSelect([], null);
+  modelSelect.hidden = true;
+  const modelInput = editorInput('', { placeholder: '模型 ID，例如 glm-5.3', maxLength: 128, list: 'add-model-options' });
+  modelInput.setAttribute('aria-label', '模型 ID');
+  modelSelect.setAttribute('aria-label', '模型列表');
+  const modelOptions = el('datalist');
+  modelOptions.id = 'add-model-options';
+  const contextInput = editorInput('', { type: 'number', placeholder: '例如 131072', maxLength: 12 });
+  contextInput.min = '1024';
+  contextInput.max = '16777216';
+  contextInput.setAttribute('aria-label', '上下文窗口');
+  const discoverButton = el('button', 'button secondary small', '获取模型');
+  discoverButton.type = 'button';
+  const discoverStatus = el('span', 'provider-discover-status');
+  const discoverRow = el('div', 'provider-model-tools');
+  discoverRow.append(discoverButton, discoverStatus);
+  modelSelect.addEventListener('change', () => { if (modelSelect.value) modelInput.value = modelSelect.value; });
+  body.append(
+    el('p', 'provider-editor-hint', `为 ${provider.id} 添加模型。已保存的模型不会被改写。`),
+    editorField('模型 ID', modelInput),
+    modelSelect,
+    discoverRow,
+    modelOptions,
+    editorField('上下文窗口', contextInput, '未知模型使用这里的保守值；留空使用加载器默认值。'),
+  );
+  providerEditorDialog({
+    title: `为 ${provider.id} 添加模型`,
+    body,
+    saveLabel: '添加并验证',
+    onSave: async ({ error: errorNode, save: saveButton, close }) => {
+      const id = modelInput.value.trim();
+      const context = contextInput.value.trim() === '' ? null : Number(contextInput.value);
+      const formError = providerFormError({
+        mode: 'add',
+        id: provider.id,
+        protocol: provider.protocol,
+        baseUrl: provider.base_url,
+        apiKey: null,
+        apiKeyEnv: provider.api_key_env ?? '',
+        models: [{ id, context_window: context }],
+      });
+      if (formError) {
+        errorNode.textContent = formError;
+        errorNode.hidden = false;
+        return;
+      }
+      saveButton.disabled = true;
+      saveButton.textContent = '正在添加并验证…';
+      try {
+        const result = await api.saveProvider({
+          ...providerContextNow(),
+          mode: 'edit',
+          provider: {
+            id: provider.id,
+            protocol: provider.protocol,
+            base_url: null,
+            api_key_env: provider.api_key_env ?? '',
+            api_key: null,
+            models: [{ id, context_window: context }],
+          },
+        });
+        providerTest = null;
+        providerState = { status: 'ready', data: result, error: null, context: providerContextNow(), request: providerState.request };
+        close();
+        toast(`模型 ${id} 已添加`, { tone: 'success', holdMs: 2400 });
+        if ($('settings-dialog').open) renderSettings();
+        renderProviderSetup();
+      } catch (saveError) {
+        errorNode.textContent = saveError?.message ?? '添加失败';
+        errorNode.hidden = false;
+        saveButton.disabled = false;
+        saveButton.textContent = '添加并验证';
+      }
+    },
+  });
+  discoverButton.addEventListener('click', async () => {
+    discoverButton.disabled = true;
+    discoverStatus.textContent = '正在读取模型列表…';
+    discoverStatus.dataset.tone = 'running';
+    try {
+      const result = await api.listProviderModels({ ...providerContextNow(), id: provider.id, provider: null });
+      const view = connectionPresentation(result);
+      if (result.status === 'ok') {
+        modelOptions.replaceChildren();
+        modelSelect.replaceChildren();
+        modelSelect.append(el('option', undefined, '选择一个模型'));
+        for (const model of view.models) {
+          const option = el('option', undefined, model);
+          option.value = model;
+          modelOptions.append(option);
+          modelSelect.append(option.cloneNode(true));
+        }
+        modelSelect.hidden = view.models.length === 0;
+        discoverStatus.textContent = `已读取 ${view.models.length} 个模型`;
+        discoverStatus.dataset.tone = 'success';
+      } else {
+        discoverStatus.textContent = `${view.label}：${view.message}；可直接填写模型 ID`;
+        discoverStatus.dataset.tone = view.tone;
+      }
+    } catch (discoverError) {
+      discoverStatus.textContent = discoverError?.message ?? '读取模型失败';
+      discoverStatus.dataset.tone = 'error';
+    } finally {
+      discoverButton.disabled = false;
+    }
+  });
 }
 
 function renderPresetSettings(content) {
@@ -8123,6 +8844,19 @@ api.onEvent(frame => {
     toast(event.message, { tone: warning ? event.level : 'info', holdMs: warning ? 5000 : 2600 });
     return;
   }
+  if (event.type === 'config_reloaded') {
+    // Applied by the watcher or an explicit reload: the host read is the
+    // authority, so re-read it instead of patching a local copy. A connection
+    // result measured against the previous configuration is no longer proof.
+    providerTest = null;
+    void refreshProviders({ quiet: true });
+    if (event.outcome === 'failed') {
+      toast(`配置重新加载失败：${event.error ?? '未知错误'}`, { tone: 'error', holdMs: 5200 });
+    } else if (event.outcome === 'applied') {
+      toast(`配置已重新加载 · v${event.version}`, { tone: 'info', holdMs: 2200 });
+    }
+    return;
+  }
   if (event.type === 'agents_loaded') return;
   const pendingDiff = current.diffQuery?.status === 'pending' && event.query_id === current.diffQuery.id;
   const statusBefore = current.status;
@@ -8289,6 +9023,7 @@ function boot() {
     $('brand-version').title = '桌面客户端版本；Runtime 版本见设置';
   }).catch(() => {});
   api.connectionStatus?.().then(applyConnection).catch(() => {});
+  void refreshProviders();
   void migrateLegacyDrafts();
   api.onBrowserState(data => {
     browserData = data;
@@ -8516,6 +9251,8 @@ function resizeComposer() {
 }
 
 async function submitComposer(complement = false) {
+  if (!current) await ensureProviderState();
+  if (!current && providerConfigurationBlocksStart()) { composerError(providerSetupMessage()); return; }
   const content = $('message').value.trim();
   const intent = slashIntent(content, commandCatalog());
   if (intent.kind === 'action') { executeCommand(intent.id); return; }

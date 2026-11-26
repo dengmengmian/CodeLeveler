@@ -10,6 +10,8 @@
 //! gateways, local runtimes) return an error the caller reports as "could not
 //! list" rather than pretending the account has no models.
 
+use leveler_model::ProtocolKind;
+
 use crate::config::{ConfigError, ProviderConfig, resolve_api_key};
 
 /// Why a listing could not be produced.
@@ -22,6 +24,27 @@ pub enum DiscoveryError {
     Config(#[from] ConfigError),
     #[error("could not reach {url}: {source}")]
     Transport { url: String, source: reqwest::Error },
+    /// The endpoint answered, but not before the client's deadline.
+    #[error("{url} did not answer in time")]
+    Timeout { url: String },
+    /// The endpoint rejected the credential (401/403). Distinct from a gateway
+    /// that simply has no `/models` route: a connection test must say which
+    /// one it observed.
+    #[error("{url} rejected the credential ({status})")]
+    Auth {
+        url: String,
+        status: reqwest::StatusCode,
+    },
+    #[error("{url} is rate limiting this key ({status})")]
+    RateLimited {
+        url: String,
+        status: reqwest::StatusCode,
+    },
+    #[error("{url} failed with a server error ({status})")]
+    Server {
+        url: String,
+        status: reqwest::StatusCode,
+    },
     #[error("{url} returned {status} — this provider may not implement /models")]
     Unsupported {
         url: String,
@@ -48,28 +71,39 @@ pub async fn list_remote_models(config: &ProviderConfig) -> Result<Vec<String>, 
 
     let mut request = client.get(&url);
     // Mirror the chat path's auth rules: an explicit `x-api-key` (Anthropic)
-    // replaces bearer auth rather than being sent alongside it.
+    // replaces bearer auth rather than being sent alongside it, and the
+    // Messages protocol itself authenticates with that header pair instead of
+    // a bearer token.
     let has_explicit_key = config
         .headers
         .keys()
         .any(|k| k.eq_ignore_ascii_case("x-api-key"));
     if let Some(key) = key.as_deref().filter(|_| !has_explicit_key) {
-        request = request.bearer_auth(key);
+        if config.protocol == ProtocolKind::AnthropicMessages {
+            request = request
+                .header("x-api-key", key)
+                .header("anthropic-version", "2023-06-01");
+        } else {
+            request = request.bearer_auth(key);
+        }
     }
     for (k, v) in &config.headers {
         request = request.header(k, v);
     }
 
-    let response = request
-        .send()
-        .await
-        .map_err(|source| DiscoveryError::Transport {
-            url: url.clone(),
-            source,
-        })?;
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(source) if source.is_timeout() => return Err(DiscoveryError::Timeout { url }),
+        Err(source) => return Err(DiscoveryError::Transport { url, source }),
+    };
     let status = response.status();
     if !status.is_success() {
-        return Err(DiscoveryError::Unsupported { url, status });
+        return Err(match status.as_u16() {
+            401 | 403 => DiscoveryError::Auth { url, status },
+            429 => DiscoveryError::RateLimited { url, status },
+            500..=599 => DiscoveryError::Server { url, status },
+            _ => DiscoveryError::Unsupported { url, status },
+        });
     }
     let body: serde_json::Value = response
         .json()

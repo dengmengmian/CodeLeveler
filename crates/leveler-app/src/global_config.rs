@@ -741,14 +741,6 @@ impl GlobalConfig {
         path: &std::path::Path,
         model: &leveler_model::ModelRef,
     ) -> Result<(), GlobalConfigError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| GlobalConfigError::Write(format!("{}: {e}", parent.display())))?;
-            // The home root holds config, state, logs and skills. Keep the
-            // whole tree owner-only rather than relying on each child's mode.
-            leveler_core::private_fs::restrict_dir(parent)
-                .map_err(|e| GlobalConfigError::Write(format!("{}: {e}", parent.display())))?;
-        }
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -761,20 +753,7 @@ impl GlobalConfig {
                 .map_err(|e| GlobalConfigError::Write(format!("{}: {e}", path.display())))?
         };
         doc["default_model"] = value(model.to_string());
-        // Write a sibling file and rename it over the target: the watcher (and
-        // any other reader) must never observe a half-written configuration.
-        let staged = path.with_extension("toml.tmp");
-        std::fs::write(&staged, doc.to_string())
-            .map_err(|e| GlobalConfigError::Write(format!("{}: {e}", staged.display())))?;
-        // The file may carry provider keys and MCP environment values. Set the
-        // owner-only mode on the staged file so the rename publishes both the
-        // content and its permissions atomically.
-        leveler_core::private_fs::restrict_file(&staged)
-            .map_err(|e| GlobalConfigError::Write(format!("{}: {e}", staged.display())))?;
-        std::fs::rename(&staged, path).map_err(|e| {
-            let _ = std::fs::remove_file(&staged);
-            GlobalConfigError::Write(format!("{}: {e}", path.display()))
-        })
+        write_global_config_atomic(path, &doc.to_string())
     }
 
     /// Load the global config, or an empty one if the file is absent. A present
@@ -1082,7 +1061,23 @@ pub fn render_init_config_with_profile(
         u64::from(profile.limits.context_window),
     );
     let mut doc: DocumentMut = text.parse().expect("render_init_config returns valid TOML");
-    let model = &mut doc["models"][&profile.id];
+    let model = doc["models"][&profile.id]
+        .as_table_mut()
+        .expect("starter model entry is a table");
+    write_model_facts(model, profile);
+    annotate_generated_config(&mut doc);
+    format!(
+        "# CodeLeveler global config — created by `leveler login`.\n\
+         # Reference: https://github.com/dengmengmian/CodeLeveler#configuration\n\
+         {doc}"
+    )
+}
+
+/// Write every authoritative model fact into a `[models.<id>]` table.
+///
+/// Shared by `leveler login`'s starter config and the desktop provider editor,
+/// so a model added from either surface carries the same facts.
+pub(crate) fn write_model_facts(model: &mut toml_edit::Table, profile: &ModelProfile) {
     model["model_id"] = value(profile.model_id.clone());
     model["protocol"] = value(protocol_name(profile.protocol));
     model["streaming"] = value(profile.capabilities.streaming);
@@ -1133,12 +1128,38 @@ pub fn render_init_config_with_profile(
     if let Some(required_key) = profile.compatibility.reasoning_content_key_required {
         model["reasoning_content_key_required"] = value(required_key);
     }
-    annotate_generated_config(&mut doc);
-    format!(
-        "# CodeLeveler global config — created by `leveler login`.\n\
-         # Reference: https://github.com/dengmengmian/CodeLeveler#configuration\n\
-         {doc}"
-    )
+}
+
+/// Replace the global config file atomically with owner-only permissions.
+///
+/// One implementation for every writer (the persisted default model and the
+/// provider editor): the watcher and any other reader must never observe a
+/// half-written configuration, and the file may carry plaintext keys.
+pub(crate) fn write_global_config_atomic(
+    path: &std::path::Path,
+    text: &str,
+) -> Result<(), GlobalConfigError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| GlobalConfigError::Write(format!("{}: {e}", parent.display())))?;
+        // The home root holds config, state, logs and skills. Keep the whole
+        // tree owner-only rather than relying on each child's mode.
+        leveler_core::private_fs::restrict_dir(parent)
+            .map_err(|e| GlobalConfigError::Write(format!("{}: {e}", parent.display())))?;
+    }
+    // Write a sibling file and rename it over the target: the watcher (and any
+    // other reader) must never observe a half-written configuration.
+    let staged = path.with_extension("toml.tmp");
+    std::fs::write(&staged, text)
+        .map_err(|e| GlobalConfigError::Write(format!("{}: {e}", staged.display())))?;
+    // Set the owner-only mode on the staged file so the rename publishes both
+    // the content and its permissions atomically.
+    leveler_core::private_fs::restrict_file(&staged)
+        .map_err(|e| GlobalConfigError::Write(format!("{}: {e}", staged.display())))?;
+    std::fs::rename(&staged, path).map_err(|e| {
+        let _ = std::fs::remove_file(&staged);
+        GlobalConfigError::Write(format!("{}: {e}", path.display()))
+    })
 }
 
 /// Add bilingual explanations to every setting emitted by the first-run

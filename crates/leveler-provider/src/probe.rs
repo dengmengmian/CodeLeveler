@@ -5,8 +5,8 @@
 use tokio_util::sync::CancellationToken;
 
 use leveler_model::{
-    ContentPart, FinishReason, Message, ModelEvent, ModelRef, ModelRequest, ModelRuntime, Role,
-    TokenUsage,
+    ContentPart, FinishReason, Message, ModelError, ModelErrorKind, ModelEvent, ModelRef,
+    ModelRequest, ModelRuntime, Role, TokenUsage, TransportFault,
 };
 
 use futures::StreamExt;
@@ -28,6 +28,14 @@ pub struct BasicProbeReport {
     pub finish_reason: Option<FinishReason>,
     /// First error encountered, if any.
     pub error: Option<String>,
+    /// The error's structured classification. A caller that presents the
+    /// failure (a connection test) must not parse the message text to decide
+    /// whether a key was rejected or the host was unreachable.
+    pub error_kind: Option<ModelErrorKind>,
+    /// Upstream HTTP status, when the provider answered with one.
+    pub error_status: Option<u16>,
+    /// The transport fault the stack could name structurally.
+    pub transport_fault: Option<TransportFault>,
 }
 
 impl BasicProbeReport {
@@ -82,9 +90,7 @@ pub async fn probe_basic(
         Ok(resp) => {
             report.text_ok = has_output(&resp.message);
         }
-        Err(e) => {
-            report.error.get_or_insert(e.to_string());
-        }
+        Err(error) => record_error(&mut report, &error),
     }
 
     // 2. Streaming text.
@@ -105,18 +111,25 @@ pub async fn probe_basic(
                         report.finish_reason = Some(finish_reason);
                         completed = true;
                     }
-                    Ok(ModelEvent::Error { error }) => {
-                        report.error.get_or_insert(error.to_string());
-                    }
+                    Ok(ModelEvent::Error { error }) => record_error(&mut report, &error),
                     _ => {}
                 }
             }
             report.stream_ok = completed && report.error.is_none();
         }
-        Err(e) => {
-            report.error.get_or_insert(e.to_string());
-        }
+        Err(error) => record_error(&mut report, &error),
     }
 
     report
+}
+
+/// Keep the first failure's message AND its structured facts. The message is
+/// for a human; the kind/status/fault are what a caller branches on.
+fn record_error(report: &mut BasicProbeReport, error: &ModelError) {
+    if report.error.is_none() {
+        report.error = Some(error.to_string());
+        report.error_kind = Some(error.kind);
+        report.error_status = error.status;
+        report.transport_fault = error.transport_fault;
+    }
 }

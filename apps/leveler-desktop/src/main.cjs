@@ -129,7 +129,7 @@ async function createWindow(){
   await window.loadURL('leveler-desktop://desktop/index.html');
 }
 app.whenReady().then(async()=>{
-  const assets=new Set(['index.html','terminal.mjs','renderer.mjs','state.mjs','presentation.mjs','markdown.mjs','trajectory.mjs','styles.css','command-policy.gen.mjs','icons.mjs','ui.mjs','schedules.mjs','secret-review.mjs']);
+  const assets=new Set(['index.html','terminal.mjs','renderer.mjs','state.mjs','presentation.mjs','markdown.mjs','trajectory.mjs','styles.css','command-policy.gen.mjs','icons.mjs','ui.mjs','schedules.mjs','secret-review.mjs','provider-settings.mjs']);
   protocol.handle('leveler-desktop',request=>{const url=new URL(request.url);const name=url.pathname.slice(1);if(url.hostname!=='desktop')return new Response('Not found',{status:404});if(name==='packages/conversation-presentation/conversation.mjs')return net.fetch(pathToFileURL(path.join(__dirname,'../../../packages/conversation-presentation/conversation.mjs')).toString());if(name==='node_modules/marked/lib/marked.esm.js')return net.fetch(pathToFileURL(path.join(__dirname,'../node_modules/marked/lib/marked.esm.js')).toString());if(['node_modules/@xterm/xterm/lib/xterm.mjs','node_modules/@xterm/xterm/css/xterm.css','node_modules/@xterm/addon-fit/lib/addon-fit.mjs'].includes(name))return net.fetch(pathToFileURL(path.join(__dirname,'..',name)).toString());if(!assets.has(name))return new Response('Not found',{status:404});return net.fetch(pathToFileURL(path.join(__dirname,name)).toString());});
   session.defaultSession.setPermissionRequestHandler((_contents,_permission,callback)=>callback(false));
   session.defaultSession.setPermissionCheckHandler(()=>false);
@@ -179,6 +179,86 @@ app.whenReady().then(async()=>{
   // Session-less, read-only model list for the composer picker. Opening the
   // picker must never create a session.
   handle('desktop:models',async selection=>{let workspace=null;if(selection!==null){if(typeof selection!=='string'||!selection)throw new Error('Invalid workspace selection');workspace=folders.get(selection);if(!workspace)throw new Error('请重新选择 Workspace 文件夹');}return bridge.request('models',{workspace});});
+  // Provider management is host-side user configuration. The renderer only
+  // receives masked facts; a key travels once in the request and is never sent
+  // back. The workspace is resolved from state Main already authorized (the
+  // open session's tracked root, or a folder the native picker returned).
+  const providerRequest=(request,keys)=>{
+    if(!request||typeof request!=='object'||Array.isArray(request))throw new Error('Invalid provider request');
+    if(Object.keys(request).length!==keys.length||keys.some(key=>!Object.hasOwn(request,key)))throw new Error('Invalid provider request');
+    return request;
+  };
+  const providerWorkspace=request=>{
+    providerRequest(request,Object.keys(request));
+    if(request.sessionId!==null){
+      if(typeof request.sessionId!=='string'||!request.sessionId)throw new Error('Invalid provider request');
+      return sessionRoots.get(request.sessionId)??null;
+    }
+    if(request.selection===null)return null;
+    if(typeof request.selection!=='string'||!request.selection)throw new Error('Invalid provider request');
+    const workspace=folders.get(request.selection);
+    if(!workspace)throw new Error('请重新选择 Workspace 文件夹');
+    return workspace;
+  };
+  const providerContext=['selection','sessionId'];
+  const providerObject=(value,{models})=>{
+    if(!value||typeof value!=='object'||Array.isArray(value))throw new Error('Invalid provider');
+    const keys=['id','protocol','base_url','api_key_env','api_key',...(models?['models']:[])];
+    if(Object.keys(value).length!==keys.length||keys.some(key=>!Object.hasOwn(value,key)))throw new Error('Invalid provider');
+    for(const key of ['id','protocol'])if(typeof value[key]!=='string'||!value[key]||value[key].length>2048)throw new Error('Invalid provider');
+    // An edit may omit the base URL ("null = keep the stored one"); the bridge
+    // still requires a non-empty endpoint on add.
+    if(value.base_url!==null&&(typeof value.base_url!=='string'||value.base_url.length>2048))throw new Error('Invalid provider');
+    for(const key of ['api_key_env','api_key'])if(value[key]!==null&&(typeof value[key]!=='string'||value[key].length>16*1024))throw new Error('Invalid provider');
+    if(models){
+      if(!Array.isArray(value.models)||value.models.length>8)throw new Error('Invalid provider models');
+      for(const model of value.models){
+        if(!model||typeof model!=='object'||Array.isArray(model)||Object.keys(model).length!==2||!Object.hasOwn(model,'id')||!Object.hasOwn(model,'context_window'))throw new Error('Invalid provider model');
+        if(typeof model.id!=='string'||!model.id||model.id.length>128)throw new Error('Invalid provider model');
+        if(model.context_window!==null&&(!Number.isSafeInteger(model.context_window)||model.context_window<1024||model.context_window>16777216))throw new Error('Invalid context window');
+      }
+    }
+    return {id:value.id,protocol:value.protocol,base_url:value.base_url,api_key_env:value.api_key_env,api_key:value.api_key,...(models?{models:value.models}:{})};
+  };
+  handle('desktop:providers',request=>{providerRequest(request,providerContext);return bridge.request('providers',{workspace:providerWorkspace(request)});});
+  handle('desktop:provider-save',async request=>{
+    providerRequest(request,[...providerContext,'mode','provider']);
+    const workspace=providerWorkspace(request);
+    const mode=request.mode;
+    if(!['add','edit'].includes(mode))throw new Error('Invalid provider mode');
+    const provider=providerObject(request.provider,{models:true});
+    return bridge.request('provider_save',{workspace,mode,provider});
+  });
+  handle('desktop:provider-remove',async request=>{
+    providerRequest(request,[...providerContext,'id']);
+    const workspace=providerWorkspace(request);
+    if(typeof request.id!=='string'||!request.id||request.id.length>64)throw new Error('Invalid provider request');
+    return bridge.request('provider_remove',{workspace,id:request.id});
+  });
+  handle('desktop:provider-models',async request=>{
+    providerRequest(request,[...providerContext,'id','provider']);
+    const workspace=providerWorkspace(request);
+    const provider=request.provider===null?null:providerObject(request.provider,{models:false});
+    if(provider===null&&(typeof request.id!=='string'||!request.id||request.id.length>64))throw new Error('Invalid provider request');
+    if(provider!==null&&request.id!==null)throw new Error('Invalid provider request');
+    return bridge.request('provider_models',{workspace,id:request.id,provider});
+  });
+  handle('desktop:provider-test',async request=>{
+    providerRequest(request,[...providerContext,'id','model']);
+    const workspace=providerWorkspace(request);
+    if(typeof request.id!=='string'||!request.id||request.id.length>64)throw new Error('Invalid provider request');
+    const model=request.model??null;
+    if(model!==null&&(typeof model!=='object'||Array.isArray(model)||Object.keys(model).length!==2||typeof model.provider!=='string'||typeof model.model!=='string'||!model.model||model.model.length>128))throw new Error('Invalid provider model');
+    return bridge.request('provider_test',{workspace,id:request.id,model});
+  });
+  handle('desktop:default-model-set',async request=>{
+    providerRequest(request,[...providerContext,'model']);
+    const workspace=providerWorkspace(request);
+    const model=request.model;
+    if(!model||typeof model!=='object'||Array.isArray(model)||Object.keys(model).length!==2||typeof model.provider!=='string'||!model.provider||model.provider.length>256||typeof model.model!=='string'||!model.model||model.model.length>256)throw new Error('Invalid provider model');
+    return bridge.request('default_model_set',{workspace,model:{provider:model.provider,model:model.model}});
+  });
+  handle('desktop:runtime-reload',()=>bridge.request('runtime_reload',{}));
   handle('desktop:connection-status',()=>bridge.status());
   handle('desktop:reconnect',()=>{bridge.retry();return {ok:true};});
   handle('desktop:open-in-app-apps',async()=>{const apps=installedCatalog();return Promise.all(apps.map(async app=>({...app,icon:await appIcon(app.path)})));});

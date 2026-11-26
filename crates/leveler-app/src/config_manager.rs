@@ -206,12 +206,8 @@ impl ConfigManager {
         let loaded = crate::load_config(&layout)?;
         let fingerprint = crate::runtime_config_fingerprint(&layout)
             .map_err(|error| AppError::ConfigFingerprint(error.to_string()))?;
-        let (providers, registry_digest) = registry_inputs(&loaded);
-        let registry = ProviderRegistry::build(RegistryInputs {
-            providers,
-            models: loaded.models.clone(),
-        })?
-        .with_retry_budget(loaded.retry);
+        let (_, registry_digest) = registry_inputs(&loaded);
+        let registry = assemble_registry(&loaded)?;
         let project_digest = project_policy_digest(&layout);
         let (applied, _) = broadcast::channel(16);
         let (failed, _) = broadcast::channel(16);
@@ -344,7 +340,7 @@ impl ConfigManager {
             );
         }
 
-        let (providers, registry_digest) = registry_inputs(&loaded);
+        let (_, registry_digest) = registry_inputs(&loaded);
         let registry_changed = registry_digest != previous.registry_digest;
         let project_digest = project_policy_digest(&self.layout);
         let mut change = diff(&previous.loaded, &loaded);
@@ -358,11 +354,8 @@ impl ConfigManager {
             change.providers = true;
         }
         let registry = if registry_changed {
-            match ProviderRegistry::build(RegistryInputs {
-                providers,
-                models: loaded.models.clone(),
-            }) {
-                Ok(registry) => Arc::new(registry.with_retry_budget(loaded.retry)),
+            match assemble_registry(&loaded) {
+                Ok(registry) => Arc::new(registry),
                 Err(error) => return self.fail(error.to_string(), &previous, origin),
             }
         } else {
@@ -606,6 +599,22 @@ fn registry_inputs(loaded: &LoadedConfig) -> (Vec<(ProviderConfig, Option<String
     // policy in force.
     hasher.update(serde_json::to_vec(&loaded.retry).unwrap_or_default());
     (providers, format!("sha256:{:x}", hasher.finalize()))
+}
+
+/// Build the provider registry for one assembled generation.
+///
+/// Used by the manager itself and by the configuration editor's pre-write
+/// validation: the writer proves the candidate generation builds the same
+/// registry the runtime would, instead of discovering a bad route at startup.
+pub(crate) fn assemble_registry(
+    loaded: &LoadedConfig,
+) -> Result<ProviderRegistry, leveler_provider::RegistryError> {
+    let (providers, _) = registry_inputs(loaded);
+    ProviderRegistry::build(RegistryInputs {
+        providers,
+        models: loaded.models.clone(),
+    })
+    .map(|registry| registry.with_retry_budget(loaded.retry))
 }
 
 /// Digest of the repository policy file the runtime reads per consumer. `None`

@@ -615,6 +615,58 @@ impl Bridge {
                 let workspace = workspace_param(&params)?;
                 model_list_payload(self.layout_for(workspace)?)
             }
+            // Provider management is host-side user configuration, not
+            // runtime state: the same file `leveler login` edits, read and
+            // written through the one shared service. The renderer only ever
+            // receives masked facts; a key it sends is written and forgotten.
+            "providers" => {
+                let layout = self.layout_for(workspace_param(&params)?)?;
+                crate::desktop_provider::view(layout, self.client.as_ref(), self.layout.as_ref())
+                    .await
+            }
+            "provider_save" => {
+                let layout = self.layout_for(workspace_param(&params)?)?;
+                crate::desktop_provider::save(
+                    layout,
+                    self.client.as_ref(),
+                    self.layout.as_ref(),
+                    &params,
+                )
+                .await
+            }
+            "provider_remove" => {
+                let layout = self.layout_for(workspace_param(&params)?)?;
+                crate::desktop_provider::remove(
+                    layout,
+                    self.client.as_ref(),
+                    self.layout.as_ref(),
+                    &params,
+                )
+                .await
+            }
+            // A saved provider or a not-yet-saved draft: first-run must be
+            // able to verify a key before it is written anywhere.
+            "provider_models" => {
+                let layout = self.layout_for(workspace_param(&params)?)?;
+                crate::desktop_provider::models(&layout, &params).await
+            }
+            // A real text + streaming request through the configured route.
+            "provider_test" => {
+                let layout = self.layout_for(workspace_param(&params)?)?;
+                crate::desktop_provider::test(&layout, &params).await
+            }
+            "default_model_set" => {
+                let layout = self.layout_for(workspace_param(&params)?)?;
+                crate::desktop_provider::set_default_model(
+                    layout,
+                    self.client.as_ref(),
+                    self.layout.as_ref(),
+                    &params,
+                )
+                .await
+            }
+            // Explicit apply of the current files to the attached runtime.
+            "runtime_reload" => Ok(crate::desktop_provider::reload(self.client.as_ref()).await),
             "list_tasks" => Ok(serde_json::to_value(
                 leveler_app::global_task_index::query_global_tasks(
                     &self.home,

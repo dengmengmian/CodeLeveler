@@ -122,39 +122,21 @@ pub(crate) fn upsert_api_key(
 }
 
 /// Set one field on `providers.<id>`, preserving the rest of the document.
+///
+/// The edit itself belongs to the host-side provider configuration service so
+/// the CLI and the desktop editor write the same file with the same rules.
 pub(crate) fn set_provider_field(
     config: &str,
     provider_id: &str,
     field: &str,
     field_value: &str,
 ) -> anyhow::Result<String> {
-    let mut doc: DocumentMut = config.parse().context("global config is not valid TOML")?;
-    let providers = doc["providers"].or_insert(toml_edit::table());
-    if let Some(table) = providers.as_table_mut() {
-        table.set_implicit(true);
-    }
-    let entry = providers[provider_id].or_insert(toml_edit::table());
-    let table = entry
-        .as_table_mut()
-        .context("provider config entry must be a table")?;
-    table[field] = value(field_value);
-    let comment = match field {
-        "api_key" => Some((
-            "本机保存的 API Key，请勿提交到版本库。",
-            "Locally stored API key; never commit this file.",
-        )),
-        "protocol" => Some((
-            "供应商使用的接口协议。",
-            "API protocol used by this provider.",
-        )),
-        _ => None,
-    };
-    if let Some((zh, en)) = comment
-        && let Some(mut key) = table.key_mut(field)
-    {
-        key.leaf_decor_mut().set_prefix(format!("# {zh}\n# {en}\n"));
-    }
-    Ok(doc.to_string())
+    Ok(leveler_app::provider_config::set_provider_field_text(
+        config,
+        provider_id,
+        field,
+        field_value,
+    )?)
 }
 
 fn set_config_language(config: &str, language: FirstRunLanguage) -> anyhow::Result<String> {
@@ -186,33 +168,10 @@ pub(crate) fn protocol_key(protocol: leveler_model::ProtocolKind) -> &'static st
 /// Remove `providers.<id>.api_key`. Returns `None` when there was nothing to
 /// remove, so the caller can say so instead of claiming a logout happened.
 pub(crate) fn remove_api_key(config: &str, provider_id: &str) -> anyhow::Result<Option<String>> {
-    let mut doc: DocumentMut = config.parse().context("global config is not valid TOML")?;
-    let Some(providers) = doc.get_mut("providers").and_then(|p| p.as_table_mut()) else {
-        return Ok(None);
-    };
-    let Some(entry) = providers
-        .get_mut(provider_id)
-        .and_then(|e| e.as_table_mut())
-    else {
-        return Ok(None);
-    };
-    if entry.remove("api_key").is_none() {
-        return Ok(None);
-    }
-    Ok(Some(doc.to_string()))
-}
-
-/// Tighten the config to owner-only. It now holds a secret; the default mode
-/// would leave it readable by every account on the machine.
-#[cfg(unix)]
-fn tighten(path: &std::path::Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-}
-
-#[cfg(not(unix))]
-fn tighten(_path: &std::path::Path) -> std::io::Result<()> {
-    Ok(())
+    Ok(leveler_app::provider_config::remove_provider_key_text(
+        config,
+        provider_id,
+    )?)
 }
 
 pub(crate) async fn cmd_login(provider: Option<String>) -> anyhow::Result<std::process::ExitCode> {
@@ -262,8 +221,8 @@ pub(crate) async fn cmd_login(provider: Option<String>) -> anyhow::Result<std::p
     }
 
     let updated = upsert_api_key(&existing, &provider_id, &key)?;
-    std::fs::write(&path, updated).with_context(|| format!("write {}", path.display()))?;
-    tighten(&path).ok();
+    leveler_app::provider_config::write_global_atomic(&path, &updated)
+        .with_context(|| format!("write {}", path.display()))?;
 
     println!("{}", Line::ok(&format!("Saved key for {provider_id}")));
     println!("  {} (owner-only)", path.display());
@@ -380,11 +339,8 @@ async fn first_run_setup(
     let with_proto = starter_config(chosen, &model)?;
     let with_language = set_config_language(&with_proto, language)?;
     let with_key = upsert_api_key(&with_language, chosen.id, &key)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    std::fs::write(path, with_key).with_context(|| format!("write {}", path.display()))?;
-    tighten(path).ok();
+    leveler_app::provider_config::write_global_atomic(path, &with_key)
+        .with_context(|| format!("write {}", path.display()))?;
 
     println!();
     println!(
@@ -589,8 +545,8 @@ pub(crate) fn cmd_logout(provider: String) -> anyhow::Result<std::process::ExitC
         std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     match remove_api_key(&existing, &provider)? {
         Some(updated) => {
-            std::fs::write(&path, updated).with_context(|| format!("write {}", path.display()))?;
-            tighten(&path).ok();
+            leveler_app::provider_config::write_global_atomic(&path, &updated)
+                .with_context(|| format!("write {}", path.display()))?;
             println!("{}", Line::ok(&format!("Removed key for {provider}")));
             Ok(std::process::ExitCode::SUCCESS)
         }
