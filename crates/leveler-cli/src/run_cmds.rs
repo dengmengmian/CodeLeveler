@@ -1168,6 +1168,56 @@ fn interactive_session_request(
     }
 }
 
+/// Tell the user, on stderr, which hosted tasks lost their controlling host.
+///
+/// A real interactive boot shows this through the structured startup-recovery
+/// snapshot. An invocation that cannot take over a terminal has no first frame
+/// to protect and no client to receive that projection, so the diagnostic must
+/// stay on stderr where the pre-background path put it.
+fn report_host_recovery(recovery: &leveler_execution::execution_host::HostRecovery) {
+    use leveler_execution::execution_host::ProcessPresence;
+    let zh = matches!(leveler_tui::Locale::resolve(None), leveler_tui::Locale::Zh);
+    let pick = |zh_text: &'static str, en_text: &'static str| {
+        if zh { zh_text } else { en_text }
+    };
+    for task in &recovery.tasks {
+        let command = blocker_command_line(&task.program, &task.args);
+        let state = match task.process {
+            ProcessPresence::Gone => pick(
+                "进程已确认结束，退出状态未能记录",
+                "the process is confirmed gone; its exit status was never recorded",
+            ),
+            ProcessPresence::Present => pick(
+                "进程可能仍在运行：未终止，也未重新执行",
+                "its process may still be running: not signalled and not started again",
+            ),
+            ProcessPresence::Unobservable => pick(
+                "无法确认进程状态：未终止，也未重新执行",
+                "its process state could not be verified: not signalled and not started again",
+            ),
+        };
+        eprintln!(
+            "{} {}\n  {} ({state})",
+            pick(
+                "上一个执行宿主已退出；后台任务控制权丢失：",
+                "The previous execution host is gone; background task control was lost:",
+            ),
+            task.task_id,
+            command,
+        );
+    }
+    if !recovery.unresolved_intents.is_empty() {
+        eprintln!(
+            "{} {}",
+            pick(
+                "上一个执行宿主留下未决启动意图（是否启动无法确认，已保留记录）：",
+                "The previous execution host left unresolved spawn intents (launch unproven, records kept):",
+            ),
+            recovery.unresolved_intents.join(", "),
+        );
+    }
+}
+
 /// Open the interactive terminal UI. Reuses a healthy per-repository daemon
 /// when possible and otherwise starts the runtime inside the TUI process.
 #[allow(clippy::too_many_arguments)]
@@ -1460,7 +1510,21 @@ pub(crate) async fn cmd_tui(
     // boot synchronously, start the stages, and let them finish behind the UI:
     // snapshots and the settlement event carry the structured result, so a slow
     // or broken host is reported instead of leaving the terminal blank.
-    in_process_client.spawn_startup_recovery(false);
+    //
+    // An invocation that cannot take over a terminal has no first frame to
+    // protect and no client to receive the projection; the TUI is about to
+    // fail on its own tty check. Converge recovery synchronously so the stderr
+    // diagnostic still names the tasks that lost their controlling host.
+    use std::io::IsTerminal as _;
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        in_process_client.spawn_startup_recovery(false);
+    } else {
+        match app.reconcile_execution_services().await {
+            Ok(Some(recovery)) => report_host_recovery(&recovery),
+            Ok(None) => {}
+            Err(error) => eprintln!("后台恢复失败 · execution_services: {error}"),
+        }
+    }
     // A previous process may have quit while an extraction was in flight.
     // The durable job survived that quit; resume it now, before the user has
     // to touch the original session again.
