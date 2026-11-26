@@ -81,6 +81,20 @@ fn text_response(text: &str) -> MockResponse {
     ])
 }
 
+fn tool_call_response(id: &str, name: &str, arguments: serde_json::Value) -> MockResponse {
+    MockResponse::sse(&[
+        &serde_json::json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0, "id": id,
+                "function": {"name": name, "arguments": arguments.to_string()}
+            }]}}]
+        })
+        .to_string(),
+        r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":1}}"#,
+    ])
+}
+
 struct Fixture {
     _tmp: tempfile::TempDir,
     app: Arc<Application>,
@@ -537,6 +551,155 @@ fn revoking_a_reference_stops_it_from_resolving() {
             ));
             assert_eq!(f.app.secret_vault().available_count(f.session.as_str()), 0);
             assert_canary_absent_from_disk(f._tmp.path());
+        },
+    );
+}
+
+/// Gate F (deterministic half): an interrupted turn does not end the runtime
+/// or the vault. The captured reference stays usable for the continued work,
+/// and the model never sees the value on either side of the interruption.
+#[test]
+fn a_captured_reference_survives_an_interrupt_and_finishes_the_task() {
+    leveler_test_support::bounded_test(
+        "a_captured_reference_survives_an_interrupt_and_finishes_the_task",
+        Duration::from_secs(60),
+        || async {
+            let f = fixture(vec![text_response("captured")]).await;
+            let mut rx = f.client.subscribe();
+            f.client
+                .send(ClientCommand::SubmitUserInput {
+                    session_id: f.session.clone(),
+                    content: "帮我把 {{capture-0}} 配置到 .env".to_string(),
+                    attachments: Vec::new(),
+                    secret_captures: vec![
+                        SecretCapture::new("{{capture-0}}", CANARY)
+                            .with_key_hint(Some("DEEPSEEK_API_KEY".into())),
+                    ],
+                    plaintext_secret_ack: false,
+                })
+                .await
+                .expect("a captured message is admitted");
+            let events = f.wait_for_turn_end(&mut rx).await;
+            let reference = announced_reference(&events);
+
+            // The next turn hangs inside the provider stream so the person can
+            // interrupt it. Nothing about the capture is involved in the
+            // interruption itself.
+            let release = Arc::new(tokio::sync::Notify::new());
+            f.server.clear().await;
+            f.server
+                .push(MockResponse::GatedSse {
+                    first: "data: {\"choices\":[{\"delta\":{\"content\":\"working\"}}]}\n\n"
+                        .to_string(),
+                    tail: "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+                        .to_string(),
+                    release: release.clone(),
+                })
+                .await;
+            let before = f.server.request_count();
+            f.client
+                .send(ClientCommand::SubmitUserInput {
+                    session_id: f.session.clone(),
+                    content: "继续处理，稍后把这次捕获的值配置到 .env".to_string(),
+                    attachments: Vec::new(),
+                    secret_captures: Vec::new(),
+                    plaintext_secret_ack: false,
+                })
+                .await
+                .unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while f.server.request_count() <= before {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the interrupted turn never reached the provider"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            f.client
+                .send(ClientCommand::CancelCurrentTurn {
+                    session_id: f.session.clone(),
+                })
+                .await
+                .unwrap();
+            loop {
+                let remaining = Duration::from_secs(10);
+                match tokio::time::timeout(remaining, rx.recv()).await {
+                    Ok(Ok(RuntimeEvent::TurnIncomplete { .. }))
+                    | Ok(Ok(RuntimeEvent::TurnCancelled)) => break,
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => panic!("event stream closed: {error}"),
+                    Err(_) => panic!("the interrupted turn did not settle"),
+                }
+            }
+            release.notify_one();
+
+            // The vault is runtime-scoped, not turn-scoped: the authorized use
+            // still resolves after the interruption.
+            let workspace = leveler_execution::Workspace::new(f._tmp.path()).unwrap();
+            let context = leveler_tools::ToolContext::new(workspace, PermissionProfile::Assisted)
+                .with_session_scope(f.session.as_str())
+                .with_secret_vault(f.app.secret_vault().clone());
+            let output = leveler_tools::Tool::execute(
+                &leveler_tools::tools::SecretApplyTool,
+                serde_json::json!({
+                    "secret_ref": reference,
+                    "field": "DEEPSEEK_API_KEY",
+                    "target": ".env",
+                }),
+                context,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(!output.is_error, "{}", output.content);
+            assert_eq!(
+                std::fs::read_to_string(f._tmp.path().join(".env")).unwrap(),
+                format!("DEEPSEEK_API_KEY={CANARY}\n")
+            );
+
+            // Continue in the same runtime. The model is answered with the
+            // broker call for a new target the person names in this message.
+            f.server.clear().await;
+            f.server
+                .push(tool_call_response(
+                    "f-apply",
+                    "secret_apply",
+                    serde_json::json!({
+                        "secret_ref": reference,
+                        "field": "DEMO_API_KEY",
+                        "target": ".env.local",
+                    }),
+                ))
+                .await;
+            // The mock repeats its last response; the tool result must be
+            // followed by a terminal text answer or the model would call the
+            // same tool forever.
+            f.server.push(text_response("done")).await;
+            f.client
+                .send(ClientCommand::SubmitUserInput {
+                    session_id: f.session.clone(),
+                    content: format!(
+                        "继续：把 [secret:{reference}] 写到 .env.local\nDEMO_API_KEY="
+                    ),
+                    attachments: Vec::new(),
+                    secret_captures: Vec::new(),
+                    plaintext_secret_ack: false,
+                })
+                .await
+                .unwrap();
+            f.wait_for_turn_end(&mut rx).await;
+            assert_eq!(
+                std::fs::read_to_string(f._tmp.path().join(".env.local")).unwrap(),
+                format!("DEMO_API_KEY={CANARY}\n")
+            );
+
+            for body in f.server.request_bodies().await {
+                assert!(
+                    !body.contains(CANARY),
+                    "the captured value reached the provider: {body}"
+                );
+            }
+            assert_canary_absent_except(f._tmp.path(), &[".env", ".env.local"]);
         },
     );
 }

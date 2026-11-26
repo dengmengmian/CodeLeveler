@@ -9,8 +9,9 @@
 //! structured arguments into the same `ScheduleRequest` every other client
 //! sends, and render the authoritative response. They do not keep a list, do
 //! not decide when a schedule fires, and do not run the scheduler: `run_now`
-//! asks the existing `leveler schedule dispatch` command to make one pass,
-//! exactly as an OS wake would.
+//! asks a scoped `leveler schedule dispatch` invocation to claim exactly its
+//! slot and follow that run to a terminal fact, exactly as an explicit client
+//! request does.
 
 use std::sync::Arc;
 
@@ -28,40 +29,48 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-/// Starts the existing one-pass dispatcher for an explicit run-now.
+/// Starts a dispatcher for one explicit run-now occurrence.
 ///
-/// Injected rather than constructed here so a test can observe the request
-/// without spawning a process, and so the composition root remains the one
-/// place that knows which executable this host runs.
-pub(crate) type DispatchTrigger = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
+/// The occurrence id is the scope: a run-now request must not let a generic
+/// pass execute another schedule's overdue slot, and the dispatcher follows
+/// this run until it has a terminal fact. Injected rather than constructed
+/// here so a test can observe the request without spawning a process, and so
+/// the composition root remains the one place that knows which executable this
+/// host runs.
+pub(crate) type DispatchTrigger = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 
-/// The production trigger: this binary's `schedule dispatch` command.
+/// The production trigger: this binary's scoped follow dispatcher.
 pub(crate) fn dispatch_trigger(layout: &Layout) -> DispatchTrigger {
     let executable = std::env::current_exe()
         .map_err(|error| format!("could not resolve the leveler executable: {error}"));
     let home = layout.home().root().to_path_buf();
     let config_dir = layout.config_dir.clone();
-    Arc::new(move || {
+    Arc::new(move |occurrence: &str| {
         let executable = executable.clone()?;
-        start_dispatch(&executable, &home, &config_dir)
+        start_dispatch(&executable, &home, &config_dir, occurrence)
     })
 }
 
-/// One dispatch pass and its terminal observer, started detached.
+/// One short-lived dispatcher for an explicit run-now slot, started detached.
 ///
-/// Its output is discarded because a run's observed outcome belongs to the
-/// schedule store, never to an unobserved pipe.
+/// It claims exactly `occurrence`, delivers the action once, and follows the
+/// existing run to its terminal settlement. Its output is discarded because a
+/// run's observed outcome belongs to the schedule store, never to an
+/// unobserved pipe.
 fn start_dispatch(
     executable: &std::path::Path,
     home: &std::path::Path,
     config_dir: &std::path::Path,
+    occurrence: &str,
 ) -> Result<(), String> {
     tokio::process::Command::new(executable)
         .arg("schedule")
         .arg("dispatch")
-        .arg("--wait")
         .arg("--source")
         .arg("manual")
+        .arg("--occurrence")
+        .arg(occurrence)
+        .arg("--follow")
         .arg("--home")
         .arg(home)
         .arg("--config-dir")
@@ -518,30 +527,59 @@ impl Tool for ScheduleManageTool {
     ) -> Result<ToolOutput, ToolError> {
         let input: ManageInput = leveler_tools::tools::parse_input(self.name(), input)?;
         let (request, run_now) = request_from_input(self.name(), input)?;
+        let run_now_id = match &request {
+            ScheduleRequest::RunNow { id } => Some(id.clone()),
+            _ => None,
+        };
+        let mut run_now_occurrence = None;
         let response = tokio::select! {
             biased;
             _ = cancellation.cancelled() => {
                 return Ok(ToolOutput::error("schedule management cancelled"));
             }
-            response = self.manager.handle(request) => response,
+            response = async {
+                match run_now_id {
+                    Some(id) => match self.manager.run_now_occurrence(&id).await {
+                        Ok((response, occurrence)) => {
+                            run_now_occurrence = Some(occurrence);
+                            response
+                        }
+                        Err(error) => ScheduleResponse::Error {
+                            message: error.to_string(),
+                        },
+                    },
+                    None => self.manager.handle(request).await,
+                }
+            } => response,
         };
         let mut output = render_response(response);
         if run_now && output.metadata["kind"] == "changed" {
-            // The slot is already queued; the one-pass dispatcher is what
-            // actually claims and executes it. Report both facts separately:
-            // a queued slot without a running dispatcher is not a completed
-            // run.
-            match (self.dispatch)() {
-                Ok(()) => {
-                    output
-                        .content
-                        .push_str("dispatcher: the one-pass dispatcher was started\n");
-                    output.metadata["dispatched"] = true.into();
-                }
-                Err(error) => {
-                    output.content.push_str(&format!(
-                        "dispatcher: this process could not start the dispatcher: {error}\n"
-                    ));
+            // The slot is already queued; a scoped dispatcher claims exactly
+            // this occurrence and follows its run to a terminal fact. Report
+            // the two facts separately: a queued slot and a started dispatcher
+            // are not a completed run.
+            match run_now_occurrence {
+                Some(occurrence) => match (self.dispatch)(occurrence.as_str()) {
+                    Ok(()) => {
+                        output.content.push_str(&format!(
+                            "dispatcher: a scoped dispatcher was started for slot \
+                             {occurrence}; its terminal state is recorded in the schedule \
+                             store\n"
+                        ));
+                        output.metadata["dispatched"] = true.into();
+                    }
+                    Err(error) => {
+                        output.content.push_str(&format!(
+                            "dispatcher: this process could not start the dispatcher: {error}\n"
+                        ));
+                        output.metadata["dispatched"] = false.into();
+                    }
+                },
+                None => {
+                    output.content.push_str(
+                        "dispatcher: the run-now slot was not created; no dispatcher was \
+                         started\n",
+                    );
                     output.metadata["dispatched"] = false.into();
                 }
             }
@@ -983,15 +1021,25 @@ mod tests {
     fn noop_dispatch() -> (DispatchTrigger, Arc<AtomicUsize>) {
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = calls.clone();
-        let trigger: DispatchTrigger = Arc::new(move || {
+        let trigger: DispatchTrigger = Arc::new(move |_occurrence: &str| {
             counter.fetch_add(1, Ordering::SeqCst);
             Ok(())
         });
         (trigger, calls)
     }
 
+    fn recording_dispatch() -> (DispatchTrigger, Arc<std::sync::Mutex<Vec<String>>>) {
+        let occurrences = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = occurrences.clone();
+        let trigger: DispatchTrigger = Arc::new(move |occurrence: &str| {
+            recorded.lock().unwrap().push(occurrence.to_string());
+            Ok(())
+        });
+        (trigger, occurrences)
+    }
+
     fn failing_dispatch() -> DispatchTrigger {
-        Arc::new(|| Err("no such executable".into()))
+        Arc::new(|_occurrence: &str| Err("no such executable".into()))
     }
 
     fn create_args(workspace: &Path) -> Value {
@@ -1288,9 +1336,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_now_starts_the_existing_dispatcher_once() {
+    async fn run_now_starts_the_scoped_dispatcher_for_its_own_slot() {
         let fixture = fixture().await;
-        let (dispatch, calls) = noop_dispatch();
+        let (dispatch, occurrences) = recording_dispatch();
         let tool = ScheduleManageTool::new(fixture.manager.clone(), dispatch);
         let created = create(&tool, &fixture.workspace).await;
 
@@ -1304,7 +1352,17 @@ mod tests {
         assert!(!output.is_error, "{}", output.content);
         assert!(output.content.contains("run-now slot"));
         assert!(output.content.contains("dispatcher was started"));
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let occurrences = occurrences.lock().unwrap();
+        assert_eq!(
+            occurrences.len(),
+            1,
+            "one click must start one dispatcher: {occurrences:?}"
+        );
+        assert!(
+            output.content.contains(&occurrences[0]),
+            "the dispatcher must be scoped to the slot the tool queued: {}",
+            occurrences[0]
+        );
         assert_eq!(output.metadata["dispatched"], true);
     }
 

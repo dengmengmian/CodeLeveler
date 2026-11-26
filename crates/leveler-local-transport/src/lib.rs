@@ -3247,6 +3247,7 @@ pub use unsupported::{LocalSocketRuntimeClient, LocalSocketServer, TcpRuntimeSer
 mod tests {
     use std::net::SocketAddr;
     use std::sync::Mutex;
+    #[cfg(unix)]
     use std::time::Duration;
 
     use leveler_client_protocol::{ClientCommand, RuntimeEvent, SessionId, UiSessionSnapshot};

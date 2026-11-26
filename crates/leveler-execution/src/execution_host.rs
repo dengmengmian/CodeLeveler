@@ -2344,6 +2344,26 @@ pub async fn serve(config: ExecutionHostConfig) -> Result<(), String> {
     serve_with_idle_timeout(config, execution_host_idle_timeout()).await
 }
 
+/// Compare canonical paths, not lexical ones: Windows keeps the repository
+/// root in verbatim form (`\\?\C:\...`) while a CLI-supplied state path is
+/// usually plain (`C:\...`). A lexical `starts_with` misses that containment
+/// and would let the host place durable state inside the repository.
+fn state_dir_is_inside_repo(state_dir: &Path, repo_root: &Path) -> Result<bool, String> {
+    let state = std::fs::canonicalize(state_dir).map_err(|error| {
+        format!(
+            "could not canonicalize Execution Host state directory {}: {error}",
+            state_dir.display()
+        )
+    })?;
+    let repo = std::fs::canonicalize(repo_root).map_err(|error| {
+        format!(
+            "could not canonicalize Execution Host repository {}: {error}",
+            repo_root.display()
+        )
+    })?;
+    Ok(state.starts_with(repo))
+}
+
 /// [`serve`] with an explicit self-reclaim timeout, so tests can exercise the
 /// reclaim without mutating process-global environment.
 pub async fn serve_with_idle_timeout(
@@ -2351,6 +2371,9 @@ pub async fn serve_with_idle_timeout(
     idle_timeout: Option<Duration>,
 ) -> Result<(), String> {
     secure_dir(&config.state_dir)?;
+    if state_dir_is_inside_repo(&config.state_dir, &config.repo_root)? {
+        return Err("Execution Host state must be outside repository write authority".into());
+    }
     // The host is the durable owner of background processes. On Windows a
     // per-task job's kill-on-drop never runs when the host itself is killed,
     // so the host additionally joins a kill-on-close Job Object: every
@@ -2358,14 +2381,19 @@ pub async fn serve_with_idle_timeout(
     // the whole tree when this process dies. Without that guarantee the host
     // refuses to start — a durable supervisor that can leave unmanaged
     // orphans is worse than no supervisor.
+    //
+    // Keep the job handle for the process lifetime. Dropping it on any return
+    // path would close the last handle while this host is a member, and the
+    // kernel would terminate the host before `main` could report an error.
+    // The OS closes the leaked handle at process exit and still reclaims the
+    // descendants.
     #[cfg(windows)]
-    let _process_tree =
+    let process_tree =
         leveler_win_confine::ProcessTreeJob::adopt_current_process().map_err(|error| {
             format!("Execution Host cannot establish its process-tree boundary: {error}")
         })?;
-    if config.state_dir.starts_with(&config.repo_root) {
-        return Err("Execution Host state must be outside repository write authority".into());
-    }
+    #[cfg(windows)]
+    std::mem::forget(process_tree);
     let _owner = lock(&config.state_dir.join("host.lock"))?;
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -5106,6 +5134,32 @@ mod tests {
         assert!(
             !config.state_dir.join("ready.json").exists(),
             "a failed write must not leave a stale endpoint"
+        );
+    }
+
+    /// Windows keeps the repository root in verbatim form while a CLI state
+    /// path is usually plain. The containment check must compare canonical
+    /// paths so a state directory inside the repository cannot slip through.
+    #[cfg(windows)]
+    #[test]
+    fn a_plain_state_path_inside_a_verbatim_repo_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let state = repo.join("execution-host");
+        std::fs::create_dir(&state).unwrap();
+        let verbatim = std::fs::canonicalize(&repo).unwrap();
+        assert!(
+            verbatim.to_string_lossy().starts_with(r"\\?\"),
+            "expected a verbatim repository path, got {verbatim:?}"
+        );
+        assert!(
+            state_dir_is_inside_repo(&state, &verbatim).unwrap(),
+            "a plain state path under the verbatim repository is still inside it"
+        );
+        assert!(
+            !state_dir_is_inside_repo(root.path(), &verbatim).unwrap(),
+            "an unrelated state path is outside the repository"
         );
     }
 }

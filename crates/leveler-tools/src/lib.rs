@@ -41,6 +41,7 @@ pub use registry::{
     default_registry, is_observe_class_tool, model_surface,
 };
 pub use tool::{ParallelClass, Tool, ToolContext, ToolError, ToolOutput};
+pub use tools::record_secret_call_decision;
 
 // Re-export the risk vocabulary so consumers need not depend on execution.
 pub use leveler_execution::{PermissionProfile, RiskLevel};

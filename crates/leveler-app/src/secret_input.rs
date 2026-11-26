@@ -144,15 +144,21 @@ pub(crate) fn prepare_secret_input(
     Ok(out)
 }
 
-/// Apply the user's declared targets and fields to every reference this
-/// admitted message mentions. Unknown and foreign references are ignored: the
+/// Apply the user's declared targets and fields to the references this
+/// admitted message mentions.
+///
+/// The declaration is per reference, not per message: a target binds only to
+/// the reference whose clause names it. A mention shared by several
+/// references, or a positive mention in a multi-reference message that sits in
+/// no reference's clause, is recorded as ambiguous and grants nothing. A
+/// prohibition is recorded against every capture it can apply to and is
+/// enforced even in Full. Unknown and foreign references are ignored: the
 /// vault answers `false` and learns nothing.
 fn authorize_referenced_uses(vault: &SecretVault, session: &str, content: &str) {
-    let targets = leveler_core::dotenv_targets_in(content);
-    let fields = leveler_core::dotenv_fields_in(content);
-    if targets.is_empty() && fields.is_empty() {
-        return;
-    }
+    let declarations: std::collections::BTreeMap<String, leveler_core::DotenvUseDeclaration> =
+        leveler_core::dotenv_use_declarations(content)
+            .into_iter()
+            .collect();
     let mut seen: Vec<SecretRef> = Vec::new();
     let mut cursor = 0usize;
     while let Some(relative) = content[cursor..].find("[secret:") {
@@ -161,11 +167,16 @@ fn authorize_referenced_uses(vault: &SecretVault, session: &str, content: &str) 
             break;
         };
         let end = start + close + 1;
-        if let Some(reference) = leveler_core::parse_secret_reference_token(&content[start..end])
-            && let Ok(reference) = SecretRef::parse(reference)
+        if let Some(reference_text) =
+            leveler_core::parse_secret_reference_token(&content[start..end])
+            && let Ok(reference) = SecretRef::parse(reference_text)
             && !seen.contains(&reference)
         {
-            vault.authorize_use(session, &reference, &targets, &fields);
+            let declaration = declarations
+                .get(reference_text)
+                .cloned()
+                .unwrap_or_default();
+            vault.authorize_declaration(session, &reference, &declaration);
             seen.push(reference);
         }
         cursor = end;
@@ -438,6 +449,66 @@ mod tests {
         assert!(!prepared.contains(KEY), "{prepared}");
         assert_eq!(prepared.matches("[secret:").count(), 2);
         assert_eq!(vault.available_count("s"), 2);
+    }
+
+    #[test]
+    fn two_captures_get_only_the_target_each_clause_binds() {
+        let vault = SecretVault::new();
+        let other = "ghp_16C7e42F292c6912E7710c838347Ae178B4a";
+        let prepared = prepare_secret_input(
+            &vault,
+            &session(),
+            "A_KEY={{a}} 写到 .env\nB_KEY={{b}} 写到 .env.production\n不要修改 .env.local",
+            &[
+                SecretCapture::new("{{a}}", KEY),
+                SecretCapture::new("{{b}}", other),
+            ],
+            false,
+        )
+        .unwrap();
+        let references = references(&prepared);
+        assert_eq!(references.len(), 2);
+        let first = vault.use_scope("s", &references[0]).unwrap();
+        let second = vault.use_scope("s", &references[1]).unwrap();
+        assert_eq!(first.targets, vec![".env".to_string()]);
+        assert_eq!(first.fields, vec!["A_KEY".to_string()]);
+        assert_eq!(second.targets, vec![".env.production".to_string()]);
+        assert_eq!(second.fields, vec!["B_KEY".to_string()]);
+        for scope in [&first, &second] {
+            assert_eq!(scope.denied_targets, vec![".env.local".to_string()]);
+            assert!(!scope.ambiguous, "{scope:?}");
+        }
+    }
+
+    #[test]
+    fn an_unattributed_target_never_becomes_a_cartesian_grant() {
+        let vault = SecretVault::new();
+        let other = "ghp_16C7e42F292c6912E7710c838347Ae178B4a";
+        let prepared = prepare_secret_input(
+            &vault,
+            &session(),
+            "这是两个测试 Key：\n\nSERVICE_A_KEY={{a}}\nSERVICE_B_KEY={{b}}\n\n\
+             只把 A 配置到 .env。\n不要修改 .env.production。",
+            &[
+                SecretCapture::new("{{a}}", KEY),
+                SecretCapture::new("{{b}}", other),
+            ],
+            false,
+        )
+        .unwrap();
+        let references = references(&prepared);
+        assert_eq!(references.len(), 2);
+        for reference in &references {
+            let scope = vault.use_scope("s", reference).unwrap();
+            assert!(scope.targets.is_empty(), "{scope:?}");
+            assert!(scope.ambiguous, "{scope:?}");
+            assert!(
+                scope
+                    .denied_targets
+                    .contains(&".env.production".to_string()),
+                "{scope:?}"
+            );
+        }
     }
 
     #[test]

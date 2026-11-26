@@ -198,6 +198,7 @@ fn current_uid() -> Option<u32> {
 /// still names the pid it is about to ask. Reading the kernel's owner keeps
 /// that name honest: a runtime that reports another user's pid is not this
 /// user's to retire, and the client says so instead of acting on the report.
+#[cfg(unix)]
 pub fn process_owned_by_current_user(pid: u32) -> bool {
     match (process_uid(pid), current_uid()) {
         (Some(owner), Some(current)) => owner == current,
