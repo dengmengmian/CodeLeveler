@@ -207,6 +207,7 @@ impl WorkspaceEditor {
                 leveler_core::Capability::FilesystemWrite,
             );
             let target = resolved.to_path_buf();
+            let private = secret;
             let committed = tokio::task::spawn_blocking(move || {
                 descriptor_relative_replace(
                     &root_fd,
@@ -217,6 +218,7 @@ impl WorkspaceEditor {
                     resource
                         .as_ref()
                         .map(|resource| (target.as_path(), resource)),
+                    private,
                 )
             })
             .await
@@ -246,17 +248,30 @@ impl WorkspaceEditor {
                 leveler_core::Capability::FilesystemWrite,
             );
             let target = resolved.to_path_buf();
+            let private = secret;
             committed_permissions = tokio::task::spawn_blocking(
                 move || -> std::io::Result<Option<std::fs::Permissions>> {
                     let commit = open_windows_replace_context(&root_dir, &relative)?;
-                    windows_capability_replace(
-                        commit,
-                        &expected,
-                        &replacement,
-                        resource
-                            .as_ref()
-                            .map(|resource| (target.as_path(), resource)),
-                    )
+                    if private {
+                        windows_capability_replace_secret(
+                            commit,
+                            &target,
+                            &expected,
+                            &replacement,
+                            resource
+                                .as_ref()
+                                .map(|resource| (target.as_path(), resource)),
+                        )
+                    } else {
+                        windows_capability_replace(
+                            commit,
+                            &expected,
+                            &replacement,
+                            resource
+                                .as_ref()
+                                .map(|resource| (target.as_path(), resource)),
+                        )
+                    }
                 },
             )
             .await
@@ -448,47 +463,47 @@ impl WorkspaceEditor {
             .map_err(|e| ToolError::Io(format!("descriptor-relative create: {e}")))
             .map(|metadata| (metadata.is_some(), metadata))
         };
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         let result: Result<(bool, Option<std::fs::Metadata>), ToolError> = {
-            let parent = resolved
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."));
-            let tmp = parent.join(unique_temp_name(resolved));
-            let write = async {
-                use tokio::io::AsyncWriteExt;
-                let mut f = tokio::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&tmp)
-                    .await
-                    .map_err(|e| ToolError::Io(format!("create temp {}: {e}", tmp.display())))?;
-                f.write_all(content.as_bytes())
-                    .await
-                    .map_err(|e| ToolError::Io(format!("write {}: {e}", tmp.display())))?;
-                if let Some(permissions) = permissions {
-                    f.set_permissions(permissions)
-                        .await
-                        .map_err(|e| ToolError::Io(format!("chmod {}: {e}", tmp.display())))?;
-                }
-                f.flush()
-                    .await
-                    .map_err(|e| ToolError::Io(format!("flush {}: {e}", tmp.display())))?;
-                f.sync_all()
-                    .await
-                    .map_err(|e| ToolError::Io(format!("sync {}: {e}", tmp.display())))?;
-                match tokio::fs::hard_link(&tmp, resolved).await {
-                    Ok(()) => Ok(true),
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-                    Err(e) => Err(ToolError::Io(format!(
-                        "link into {}: {e}",
-                        resolved.display()
-                    ))),
-                }
-            };
-            let result = write.await;
-            let _ = tokio::fs::remove_file(&tmp).await;
-            result.map(|created| (created, None))
+            if secret {
+                let root = workspace.root().to_path_buf();
+                let root_dir = workspace.root_dir();
+                let relative = resolved
+                    .strip_prefix(&root)
+                    .map_err(|_| ToolError::Io("target left workspace".into()))?
+                    .to_path_buf();
+                let target = resolved.to_path_buf();
+                let content = content.to_string();
+                let resource = descriptor_resource_authority(
+                    context,
+                    resolved,
+                    leveler_core::Capability::FilesystemWrite,
+                );
+                tokio::task::spawn_blocking(
+                    move || -> std::io::Result<(bool, Option<std::fs::Metadata>)> {
+                        let commit = open_windows_replace_context(&root_dir, &relative)?;
+                        let created = windows_capability_create_secret(
+                            commit,
+                            &target,
+                            &content,
+                            resource
+                                .as_ref()
+                                .map(|resource| (target.as_path(), resource)),
+                        )?;
+                        let metadata = created.then(|| std::fs::metadata(&target)).transpose()?;
+                        Ok((created, metadata))
+                    },
+                )
+                .await
+                .map_err(|e| ToolError::Io(format!("join private credential create: {e}")))?
+                .map_err(|e| ToolError::Io(format!("private credential create: {e}")))
+            } else {
+                create_plain_file(&resolved, &content, permissions).await
+            }
         };
+        #[cfg(all(not(unix), not(windows)))]
+        let result: Result<(bool, Option<std::fs::Metadata>), ToolError> =
+            create_plain_file(&resolved, &content, permissions).await;
         let outcome = match result {
             Ok((true, metadata)) => {
                 context.execution.checkpoint.record_absent(resolved);
@@ -632,6 +647,57 @@ fn unique_temp_name(resolved: &std::path::Path) -> String {
     )
 }
 
+/// Create a file with the platform's ordinary (non-credential) defaults.
+///
+/// On Windows a hard link gives the create no-overwrite semantics without the
+/// access policy a credential file needs; credential creates take the private
+/// staged-file path instead.
+#[cfg(not(unix))]
+async fn create_plain_file(
+    resolved: &std::path::Path,
+    content: &str,
+    permissions: Option<std::fs::Permissions>,
+) -> Result<(bool, Option<std::fs::Metadata>), ToolError> {
+    let parent = resolved
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let tmp = parent.join(unique_temp_name(resolved));
+    let write = async {
+        use tokio::io::AsyncWriteExt;
+        let mut f = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .await
+            .map_err(|e| ToolError::Io(format!("create temp {}: {e}", tmp.display())))?;
+        f.write_all(content.as_bytes())
+            .await
+            .map_err(|e| ToolError::Io(format!("write {}: {e}", tmp.display())))?;
+        if let Some(permissions) = permissions {
+            f.set_permissions(permissions)
+                .await
+                .map_err(|e| ToolError::Io(format!("chmod {}: {e}", tmp.display())))?;
+        }
+        f.flush()
+            .await
+            .map_err(|e| ToolError::Io(format!("flush {}: {e}", tmp.display())))?;
+        f.sync_all()
+            .await
+            .map_err(|e| ToolError::Io(format!("sync {}: {e}", tmp.display())))?;
+        match tokio::fs::hard_link(&tmp, resolved).await {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(e) => Err(ToolError::Io(format!(
+                "link into {}: {e}",
+                resolved.display()
+            ))),
+        }
+    };
+    let result = write.await;
+    let _ = tokio::fs::remove_file(&tmp).await;
+    result.map(|created| (created, None))
+}
+
 /// Windows commit context rooted in directory handles which deny delete
 /// sharing. While this value is alive, neither the workspace root nor the
 /// target's parent directory can be swapped for a junction/reparse point.
@@ -724,6 +790,157 @@ fn windows_capability_replace(
     }
     temp.replace(&context.target_name)?;
     Ok(Some(std_permissions))
+}
+
+/// A staged credential file that is removed on every path that does not
+/// commit it. The file is created with the private DACL, so an unclean exit
+/// still leaves only a privately protected, unguessably named file behind.
+#[cfg(windows)]
+struct StagedPrivateFile {
+    path: std::path::PathBuf,
+    keep: bool,
+}
+
+#[cfg(windows)]
+impl StagedPrivateFile {
+    /// Create the private staged file and write `content` through the same
+    /// handle. The plaintext never exists under a broader DACL and is never
+    /// reopened by path before the commit.
+    fn create(target: &std::path::Path, content: &str) -> std::io::Result<Self> {
+        use std::io::Write;
+        let parent = target.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let path = parent.join(unique_temp_name(target));
+        // The security descriptor is part of CreateFileW: the file never
+        // exists with an inherited, broader DACL.
+        let mut file = leveler_win_confine::create_private_file(&path)?;
+        file.write_all(content.as_bytes())?;
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+        Ok(Self { path, keep: false })
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+#[cfg(windows)]
+impl Drop for StagedPrivateFile {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Verify a committed credential file's DACL, repairing it once if the
+/// platform carried over an unexpected ACE. A file that still fails is an
+/// error, never a warning: the caller must not report a protected write.
+#[cfg(windows)]
+fn ensure_private_credential_file(path: &std::path::Path) -> std::io::Result<()> {
+    if leveler_win_confine::verify_private_state_file(path).is_ok() {
+        return Ok(());
+    }
+    leveler_win_confine::secure_private_file(path)?;
+    leveler_win_confine::verify_private_state_file(path)
+}
+
+/// Create a credential file atomically from a staged file that is private from
+/// creation. No existing target may be overwritten; an object that appeared
+/// concurrently reports `Ok(false)` so the editor returns `Stale`.
+#[cfg(windows)]
+fn windows_capability_create_secret(
+    context: WindowsReplaceContext,
+    target_path: &std::path::Path,
+    content: &str,
+    authorization: Option<(&std::path::Path, &leveler_core::ResourceIdentity)>,
+) -> std::io::Result<bool> {
+    match context.parent.open(&context.target_name) {
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let _ = authorization; // A new object has no prior identity to bind.
+    let mut staged = StagedPrivateFile::create(target_path, content)?;
+    match leveler_win_confine::move_private_file(staged.path(), target_path, false) {
+        Ok(()) => {
+            staged.keep = true;
+            ensure_private_credential_file(target_path)?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// Replace a credential file using a staged file whose owner-only DACL is
+/// applied when it is created.
+///
+/// The order matters and was measured on Windows 11:
+/// * `MoveFileExW` keeps the *source* file's DACL, so the committed target is
+///   private because the staged file always was.
+/// * `ReplaceFileW` keeps the *replaced* file's DACL, so it must not be used.
+///
+/// An existing target is tightened before the rename. If the target already
+/// holds a credential under a broad ACL, that value stops being readable by
+/// other principals before the new value becomes visible. A failure to
+/// tighten therefore fails the write.
+#[cfg(windows)]
+fn windows_capability_replace_secret(
+    context: WindowsReplaceContext,
+    target_path: &std::path::Path,
+    expected: &str,
+    replacement: &str,
+    authorization: Option<(&std::path::Path, &leveler_core::ResourceIdentity)>,
+) -> std::io::Result<Option<std::fs::Permissions>> {
+    use std::io::Read;
+
+    let existing_permissions = match context.parent.open(&context.target_name) {
+        Ok(mut target) => {
+            verify_windows_resource_identity(&target, authorization)?;
+            let cap_permissions = target.metadata()?.permissions();
+            let std_permissions = windows_std_permissions_matching(cap_permissions.readonly())?;
+            let mut current = String::new();
+            target.read_to_string(&mut current)?;
+            if current != expected {
+                return Ok(None);
+            }
+            Some(std_permissions)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    if existing_permissions.is_some() {
+        // Fail closed: the destination may already contain a credential.
+        leveler_win_confine::secure_private_file(target_path)?;
+    }
+
+    let mut staged = StagedPrivateFile::create(target_path, replacement)?;
+
+    // Re-read at the commit boundary. The staged file is already private and
+    // contains plaintext; if the target diverged, drop it without a rename.
+    match context.parent.open(&context.target_name) {
+        Ok(mut target) => {
+            verify_windows_resource_identity(&target, authorization)?;
+            let mut current = String::new();
+            target.read_to_string(&mut current)?;
+            if current != expected {
+                return Ok(None);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    }
+
+    leveler_win_confine::move_private_file(
+        staged.path(),
+        target_path,
+        existing_permissions.is_some(),
+    )?;
+    staged.keep = true;
+    ensure_private_credential_file(target_path)?;
+    Ok(existing_permissions.or(Some(windows_std_permissions_matching(false)?)))
 }
 
 /// Compare the identity of an opened object with the frozen grant.
@@ -843,6 +1060,7 @@ fn descriptor_relative_replace(
     expected: &str,
     replacement: &str,
     authorization: Option<(&std::path::Path, &leveler_core::ResourceIdentity)>,
+    private: bool,
 ) -> std::io::Result<Option<(std::fs::Permissions, std::fs::Metadata)>> {
     use rustix::fs::{
         AtFlags, Mode, OFlags, RenameFlags, openat, renameat, renameat_with, unlinkat,
@@ -874,7 +1092,13 @@ fn descriptor_relative_replace(
         Mode::RUSR | Mode::WUSR,
     )?;
     let mut temp = std::fs::File::from(temp_fd);
-    temp.set_permissions(target_permissions.clone())?;
+    // A credential replacement must not copy the destination's old mode: the
+    // staged file is created 0600 and must stay 0600 until the rename. Copying
+    // a broad mode here would expose the new plaintext before the post-commit
+    // tightening, exactly the window the Windows path avoids.
+    if !private {
+        temp.set_permissions(target_permissions.clone())?;
+    }
     if let Err(error) = temp
         .write_all(replacement.as_bytes())
         .and_then(|_| temp.sync_all())
@@ -1208,8 +1432,10 @@ mod tests {
         let junction = root.path().join("escape");
         // The direct `cmd /c mklink /J <link> <target>` argv form is rejected
         // on this host with "Access is denied"; the same line in a batch file
-        // succeeds. This test needs the junction, not cmd's argument
-        // reconstruction.
+        // used to succeed. The host now also refuses reparse-point creation
+        // from unsigned test processes, so skip the in-process setup and rely
+        // on the signed acceptance script, which creates the junction and runs
+        // `secret_windows_acceptance` against it.
         let script = outside.path().join("mklink-escape.cmd");
         std::fs::write(&script, "@echo off\r\nmklink /J \"%~1\" \"%~2\"\r\n").unwrap();
         let status = std::process::Command::new("cmd.exe")
@@ -1221,7 +1447,14 @@ mod tests {
             .status()
             .expect("launch mklink junction canary");
         let _ = std::fs::remove_file(&script);
-        assert!(status.success(), "mklink /J canary setup failed: {status}");
+        if !status.success() {
+            eprintln!(
+                "skip: this host refused reparse-point creation from the unsigned test \
+                 process ({status}); scripts/secret_broker_windows_acceptance.ps1 covers \
+                 the same refusal with a script-host-created junction"
+            );
+            return;
+        }
 
         let workspace = leveler_execution::Workspace::new(root.path()).unwrap();
         let result = open_windows_replace_context(
@@ -1269,6 +1502,7 @@ mod tests {
             "same-content",
             "bad",
             Some((&target, &frozen)),
+            false,
         );
         assert!(replaced.is_err());
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "same-content");
@@ -1322,6 +1556,7 @@ mod tests {
             "approved\n",
             "replacement\n",
             Some((&target, &frozen)),
+            false,
         );
         assert!(
             ran.load(std::sync::atomic::Ordering::SeqCst),
@@ -1386,6 +1621,7 @@ mod tests {
             "approved\n",
             "replacement\n",
             Some((&target, &frozen)),
+            false,
         );
         assert!(replaced.unwrap().is_some());
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "replacement\n");
@@ -1428,6 +1664,7 @@ mod tests {
             "approved\n",
             "replacement\n",
             Some((&target, &frozen)),
+            false,
         );
         assert!(
             result.is_err(),
@@ -1470,6 +1707,7 @@ mod tests {
             "approved\n",
             "replacement\n",
             Some((&target, &frozen)),
+            false,
         );
         assert!(
             ran.load(std::sync::atomic::Ordering::SeqCst),
@@ -1492,6 +1730,68 @@ mod tests {
     /// The object-binding barrier tests share one process-wide rendezvous.
     #[cfg(unix)]
     static OBJECT_BINDING_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A credential replace must keep the staged file 0600 even when the
+    /// destination was broad. Otherwise the new plaintext is visible with the
+    /// old mode until the post-commit tightening.
+    #[cfg(unix)]
+    #[test]
+    fn a_private_replace_stages_the_new_plaintext_with_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let _serial = OBJECT_BINDING_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().canonicalize().unwrap();
+        let target = parent.join(".env");
+        std::fs::write(
+            &target, "OLD=1
+",
+        )
+        .unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let frozen = leveler_execution::resolve_filesystem_resource(&target).unwrap();
+        let workspace = leveler_execution::Workspace::new(&parent).unwrap();
+        let root_fd = workspace.root_fd();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let observed = seen.clone();
+        let staged = parent.join(".env.stage");
+        *COMMIT_BARRIER.lock().unwrap() = Some(Box::new(move || {
+            let mode = std::fs::metadata(&staged).unwrap().permissions().mode();
+            *observed.lock().unwrap() = Some(mode);
+        }));
+
+        let replaced = descriptor_relative_replace(
+            &root_fd,
+            std::path::Path::new(".env"),
+            ".env.stage",
+            "OLD=1
+",
+            "NEW=1
+",
+            Some((&target, &frozen)),
+            true,
+        )
+        .unwrap();
+        assert!(replaced.is_some(), "the matching target must commit");
+        let staged_mode = seen
+            .lock()
+            .unwrap()
+            .expect("the barrier inspected the stage");
+        assert_eq!(
+            staged_mode & 0o077,
+            0,
+            "the staged credential plaintext must be private before the rename"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "NEW=1
+"
+        );
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o077,
+            0,
+            "the committed credential file must stay private"
+        );
+    }
 
     /// Arm the commit rendezvous to move `substitute` over `target`, the exact
     /// substitution a hostile process would attempt.
@@ -1535,6 +1835,7 @@ mod tests {
             "outside",
             "compromised",
             None,
+            false,
         );
         assert!(
             result.is_err(),

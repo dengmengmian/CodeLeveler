@@ -170,15 +170,18 @@ pub async fn run(
     state.clock_label = crate::status_line::fmt_clock(chrono::Local::now().time());
 
     // Restore a persisted composer draft (spec §24) and the input history.
+    // Neither path may revive a value the person never decided to send: a
+    // draft or history entry that the detector still calls a candidate —
+    // high-confidence or ambiguous — is removed or masked before it reaches
+    // the composer. The raw text remains only in the live composer while the
+    // person is editing it.
     if let Some(path) = state.draft_path()
-        && let Ok(text) = std::fs::read_to_string(path)
-        && !text.trim().is_empty()
+        && let Some(text) = load_persisted_draft(path)
     {
         state.composer.replace(text);
     }
     if let Some(path) = state.history_path()
-        && let Ok(text) = std::fs::read_to_string(path)
-        && let Ok(history) = serde_json::from_str::<Vec<String>>(&text)
+        && let Some(history) = load_persisted_history(path)
     {
         state.composer.set_history(history);
     }
@@ -630,33 +633,13 @@ pub async fn run(
     crate::pending_steer::restore_draft(&mut state);
     // Persist (or clear) the composer draft for next launch (spec §24).
     if let Some(path) = state.draft_path() {
-        let draft = state.composer.canonical_text();
-        // A draft the detector calls a high-confidence credential is not
-        // persisted. Losing an unsubmitted draft is recoverable; writing a
-        // plaintext credential to `~/.leveler` is not.
-        let unsafe_draft = leveler_core::detect_secrets(&draft)
-            .iter()
-            .any(|finding| finding.level == leveler_core::SecretLevel::HighConfidence);
-        if draft.trim().is_empty() || unsafe_draft {
-            let _ = std::fs::remove_file(path);
-        } else if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-            let _ = std::fs::write(path, draft);
-        }
+        persist_draft(path, &state.composer.canonical_text());
     }
     // Persist the input history (last HISTORY_CAP entries) for ↑ recall. The
-    // same rule applies: a high-confidence value is masked, so recall cannot
+    // same rule applies: every detected candidate is masked, so recall cannot
     // replay a credential from disk.
     if let Some(path) = state.history_path() {
-        let history = state.composer.history();
-        let tail: Vec<String> = history[history.len().saturating_sub(HISTORY_CAP)..]
-            .iter()
-            .map(|entry| mask_high_confidence(entry))
-            .collect();
-        if let (Ok(json), Some(parent)) = (serde_json::to_string(&tail), path.parent()) {
-            let _ = std::fs::create_dir_all(parent);
-            let _ = std::fs::write(path, json);
-        }
+        persist_history(path, state.composer.history());
     }
 
     let session_id = state.session_id.clone();
@@ -1784,21 +1767,83 @@ fn spawn_termination_forwarder(tx: mpsc::UnboundedSender<()>) {
     let _ = tx;
 }
 
-/// Replace every high-confidence value in a history entry with its mask. The
-/// entry stays recognizable without becoming a credential store.
-fn mask_high_confidence(text: &str) -> String {
+/// Whether the detector still sees anything that must not be persisted as
+/// ordinary text. Both levels count: an ambiguous assignment may be a real
+/// credential, and the person has not decided to send it.
+fn has_secret_candidate(text: &str) -> bool {
+    !leveler_core::detect_secrets(text).is_empty()
+}
+
+/// Replace every detected candidate with its mask. The entry stays
+/// recognizable without becoming a credential store.
+fn mask_sensitive_values(text: &str) -> String {
     let findings = leveler_core::detect_secrets(text);
     let mut out = text.to_string();
     for finding in findings.iter().rev() {
-        if finding.level != leveler_core::SecretLevel::HighConfidence {
-            continue;
-        }
         out.replace_range(
             finding.start..finding.end,
             &leveler_core::masked_secret(finding.value(text)),
         );
     }
     out
+}
+
+/// Read a draft only when it holds no undecided candidate. An unsafe file is
+/// removed immediately: reopening must not revive it, and a crash after this
+/// point must not leave it behind.
+fn load_persisted_draft(path: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    if has_secret_candidate(&text) {
+        let _ = std::fs::remove_file(path);
+        return None;
+    }
+    Some(text)
+}
+
+/// Persist a draft only when it holds no undecided candidate. Losing an
+/// unsubmitted draft is recoverable; writing a plaintext credential to
+/// `~/.leveler` is not.
+fn persist_draft(path: &std::path::Path, draft: &str) {
+    if draft.trim().is_empty() || has_secret_candidate(draft) {
+        let _ = std::fs::remove_file(path);
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+        let _ = std::fs::write(path, draft);
+    }
+}
+
+fn history_tail(history: &[String]) -> Vec<String> {
+    history[history.len().saturating_sub(HISTORY_CAP)..]
+        .iter()
+        .map(|entry| mask_sensitive_values(entry))
+        .collect()
+}
+
+fn write_history(path: &std::path::Path, entries: &[String]) {
+    if let (Ok(json), Some(parent)) = (serde_json::to_string(entries), path.parent()) {
+        let _ = std::fs::create_dir_all(parent);
+        let _ = std::fs::write(path, json);
+    }
+}
+
+/// Read the persisted history, mask every candidate, and rewrite the file.
+/// The rewrite means a crash after startup cannot leave an old plaintext
+/// entry on disk; the in-memory history is already sanitized.
+fn load_persisted_history(path: &std::path::Path) -> Option<Vec<String>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let history = serde_json::from_str::<Vec<String>>(&text).ok()?;
+    let sanitized = history_tail(&history);
+    write_history(path, &sanitized);
+    Some(sanitized)
+}
+
+fn persist_history(path: &std::path::Path, history: &[String]) {
+    write_history(path, &history_tail(history));
 }
 
 async fn maybe_coalesce_text_input(
@@ -2591,17 +2636,125 @@ mod tests {
 
 #[cfg(test)]
 mod secret_persistence_tests {
-    use super::mask_high_confidence;
+    use super::{
+        has_secret_candidate, load_persisted_draft, load_persisted_history, mask_sensitive_values,
+        persist_draft, persist_history,
+    };
 
     #[test]
     fn history_entries_never_persist_a_high_confidence_value() {
         let raw = "DEEPSEEK_API_KEY=sk-CANARY-SECRET-DO-NOT-EXPOSE-001";
-        let masked = mask_high_confidence(raw);
+        let masked = mask_sensitive_values(raw);
         assert!(!masked.contains("sk-CANARY"), "{masked}");
         assert!(masked.contains("DEEPSEEK_API_KEY"), "{masked}");
         assert!(masked.contains("••••"), "{masked}");
         // Ordinary text is byte-identical.
         let ordinary = "let password = config.password;";
-        assert_eq!(mask_high_confidence(ordinary), ordinary);
+        assert_eq!(mask_sensitive_values(ordinary), ordinary);
+    }
+
+    #[test]
+    fn an_undecided_ambiguous_value_is_masked_and_never_written_to_the_draft() {
+        let raw = "API_KEY=abc123";
+        assert!(has_secret_candidate(raw));
+        let masked = mask_sensitive_values(raw);
+        assert!(!masked.contains("abc123"), "{masked}");
+        assert!(masked.contains("API_KEY"), "{masked}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let draft = dir.path().join("state").join("draft.txt");
+        persist_draft(&draft, raw);
+        assert!(
+            !draft.exists(),
+            "an undecided candidate must not be persisted"
+        );
+        persist_draft(&draft, "just an ordinary draft");
+        assert_eq!(
+            std::fs::read_to_string(&draft).unwrap(),
+            "just an ordinary draft"
+        );
+        // An empty draft clears a stale file.
+        persist_draft(&draft, "   ");
+        assert!(!draft.exists());
+    }
+
+    #[test]
+    fn reopening_removes_an_old_unsafe_draft_and_sanitizes_old_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft = dir.path().join("draft.txt");
+        std::fs::write(&draft, "API_KEY=abc123").unwrap();
+        assert_eq!(load_persisted_draft(&draft), None);
+        assert!(!draft.exists(), "an unsafe draft is removed on open");
+
+        let history = dir.path().join("history.json");
+        std::fs::write(
+            &history,
+            r#"["API_KEY=abc123","cargo test","DEEPSEEK_API_KEY=sk-CANARY-SECRET-DO-NOT-EXPOSE-001"]"#,
+        )
+        .unwrap();
+        let loaded = load_persisted_history(&history).unwrap();
+        assert_eq!(loaded.len(), 3);
+        assert!(!loaded[0].contains("abc123"), "{:?}", loaded[0]);
+        assert_eq!(loaded[1], "cargo test");
+        assert!(!loaded[2].contains("sk-CANARY"), "{:?}", loaded[2]);
+        // The old plaintext is gone from disk before the user types anything.
+        let on_disk = std::fs::read_to_string(&history).unwrap();
+        assert!(!on_disk.contains("abc123"), "{on_disk}");
+        assert!(!on_disk.contains("sk-CANARY"), "{on_disk}");
+    }
+
+    #[test]
+    fn templates_code_and_ordinary_configuration_stay_intact() {
+        for text in [
+            "API_KEY=your-key-here",
+            "let password = config.password;",
+            "export const OPENAI_API_KEY = process.env.OPENAI_API_KEY;",
+            "fn handle_secret(value: &str) {}",
+        ] {
+            assert!(!has_secret_candidate(text), "{text}");
+            assert_eq!(mask_sensitive_values(text), text, "{text}");
+        }
+    }
+
+    #[test]
+    fn multiline_history_keeps_its_shape_and_masks_only_the_value() {
+        let entry = "配置示例：\nAPI_KEY=abc123\nDATABASE_URL=postgres://localhost/db";
+        let masked = mask_sensitive_values(entry);
+        assert!(masked.contains('\n'), "{masked}");
+        assert!(masked.contains("配置示例："), "{masked}");
+        assert!(!masked.contains("abc123"), "{masked}");
+    }
+
+    #[test]
+    fn chinese_and_emoji_around_a_value_survive_masking_and_are_not_persisted() {
+        let raw = "请检查 😀 配置：\nAPI_KEY=abc123\n完成 ✅";
+        assert!(has_secret_candidate(raw));
+        let masked = mask_sensitive_values(raw);
+        assert!(!masked.contains("abc123"), "{masked}");
+        assert!(masked.contains("请检查 😀 配置："), "{masked}");
+        assert!(masked.contains("完成 ✅"), "{masked}");
+        // The byte-range replacement must not split a surrounding character.
+        assert_eq!(
+            masked.replace('\u{2022}', "").replace(" (6 chars)", ""),
+            raw.replace("abc123", "")
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let draft = dir.path().join("state").join("draft.txt");
+        persist_draft(&draft, raw);
+        assert!(!draft.exists(), "a multi-byte candidate must not persist");
+    }
+
+    #[test]
+    fn persisting_history_caps_the_tail_without_unmasking_old_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let history = dir.path().join("history.json");
+        let mut entries: Vec<String> = (0..130).map(|index| format!("entry {index}")).collect();
+        entries.push("API_KEY=abc123".to_string());
+        persist_history(&history, &entries);
+        let text = std::fs::read_to_string(&history).unwrap();
+        let parsed: Vec<String> = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed.len(), super::HISTORY_CAP);
+        assert!(!text.contains("abc123"), "{text}");
     }
 }

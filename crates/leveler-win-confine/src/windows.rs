@@ -7,20 +7,26 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 use std::ptr::{null, null_mut};
 
-use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HANDLE, INVALID_HANDLE_VALUE, LocalFree};
+use windows_sys::Win32::Foundation::{
+    ERROR_SUCCESS, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+};
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSidToSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
     SetNamedSecurityInfoW,
 };
 use windows_sys::Win32::Security::{
-    ACE_HEADER, ACL, ACL_REVISION, AddMandatoryAce, CONTAINER_INHERIT_ACE, GetAce, GetLengthSid,
-    InitializeAcl, LABEL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE, PSID,
-    SYSTEM_MANDATORY_LABEL_ACE, TOKEN_INFORMATION_CLASS,
+    ACE_HEADER, ACL, ACL_REVISION, AddAccessAllowedAceEx, AddMandatoryAce, CONTAINER_INHERIT_ACE,
+    GetAce, GetLengthSid, InitializeAcl, InitializeSecurityDescriptor, LABEL_SECURITY_INFORMATION,
+    OBJECT_INHERIT_ACE, PSID, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
+    SYSTEM_MANDATORY_LABEL_ACE, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
+    TOKEN_INFORMATION_CLASS,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO, FILE_READ_ATTRIBUTES,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileBasicInfo, FileIdInfo, GetDriveTypeW,
-    GetFileInformationByHandleEx, GetVolumeInformationByHandleW, OPEN_EXISTING,
+    CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FileBasicInfo, FileIdInfo, GetDriveTypeW, GetFileInformationByHandleEx,
+    GetVolumeInformationByHandleW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    OPEN_EXISTING,
 };
 use windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOTE;
 
@@ -588,39 +594,25 @@ fn file_attributes(path: &Path) -> io::Result<u32> {
     Ok(attributes)
 }
 
-/// Build and install an owner-only, inheritance-protected DACL on `path`.
-fn apply_private_dacl(path: &Path) -> io::Result<()> {
-    use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
-    use windows_sys::Win32::Security::{
-        ACL_REVISION, AddAccessAllowedAceEx, CONTAINER_INHERIT_ACE, InitializeAcl,
-        OBJECT_INHERIT_ACE,
-    };
-    use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
-    };
-
+/// Build an owner-only, inheritance-protected ACL in `storage`.
+///
+/// The ACL grants full access to the current user, SYSTEM and the
+/// Administrators group. It carries no inheritable grants from a parent: every
+/// caller that installs it also marks the DACL protected.
+fn owner_only_acl(storage: &mut [u8]) -> io::Result<*mut ACL> {
     let user = current_user_sid()?;
     let system = OwnedSid::parse("S-1-5-18")?;
     let administrators = OwnedSid::parse("S-1-5-32-544")?;
     let sids = [user.0, system.0, administrators.0];
-    let acl_size: usize = std::mem::size_of::<ACL>()
-        + sids
-            .iter()
-            .map(|sid| {
-                8 + std::mem::size_of::<u32>() * 2
-                    // SAFETY: every `sid` is a live SID.
-                    + unsafe { GetLengthSid(*sid) } as usize
-            })
-            .sum::<usize>()
-        + 32;
-    let mut storage = vec![0u8; acl_size];
+    let acl_size = storage.len();
     let acl = storage.as_mut_ptr() as *mut ACL;
     // SAFETY: `storage` is `acl_size` writable bytes.
     if unsafe { InitializeAcl(acl, acl_size as u32, ACL_REVISION) } == 0 {
         return Err(io::Error::last_os_error());
     }
     for sid in sids {
-        // SAFETY: the ACL has room for every ACE (sized above); `sid` is live.
+        // SAFETY: the ACL has room for every ACE (sized by the caller); `sid`
+        // is live.
         if unsafe {
             AddAccessAllowedAceEx(
                 acl,
@@ -634,6 +626,36 @@ fn apply_private_dacl(path: &Path) -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
     }
+    Ok(acl)
+}
+
+/// Writable-storage size for an ACL with three full-access SIDs.
+fn owner_only_acl_size() -> io::Result<usize> {
+    let user = current_user_sid()?;
+    let system = OwnedSid::parse("S-1-5-18")?;
+    let administrators = OwnedSid::parse("S-1-5-32-544")?;
+    let sids = [user.0, system.0, administrators.0];
+    Ok(std::mem::size_of::<ACL>()
+        + sids
+            .iter()
+            .map(|sid| {
+                8 + std::mem::size_of::<u32>() * 2
+                    // SAFETY: every `sid` is a live SID.
+                    + unsafe { GetLengthSid(*sid) } as usize
+            })
+            .sum::<usize>()
+        + 32)
+}
+
+/// Build and install an owner-only, inheritance-protected DACL on `path`.
+fn apply_private_dacl(path: &Path) -> io::Result<()> {
+    use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+
+    let mut storage = vec![0u8; owner_only_acl_size()?];
+    let acl = owner_only_acl(&mut storage)?;
     let mut path_w = wide(path);
     // SAFETY: `path_w` is NUL-terminated; `acl` outlives the call.
     let status = unsafe {
@@ -888,6 +910,104 @@ pub(crate) fn secure_private_file(path: &Path) -> io::Result<()> {
     validate_private_security(path)
 }
 
+/// Create a new regular file whose owner-only DACL exists from the moment the
+/// object becomes visible.
+///
+/// `CreateFileW` receives the security descriptor in `SECURITY_ATTRIBUTES`, so
+/// the kernel applies it atomically with object creation. The DACL is marked
+/// protected: inheritable grants on the parent directory are not merged in.
+/// The file is opened with no sharing while the caller writes, and the handle
+/// is returned for the caller to write, flush and close before any rename.
+pub(crate) fn create_private_file(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::windows::io::FromRawHandle;
+
+    let mut acl_storage = vec![0u8; owner_only_acl_size()?];
+    let acl = owner_only_acl(&mut acl_storage)?;
+    // SAFETY: a zeroed SECURITY_DESCRIPTOR is a valid uninitialized value for
+    // InitializeSecurityDescriptor.
+    let mut descriptor: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
+    // SECURITY_DESCRIPTOR_REVISION is 1.
+    // SAFETY: `descriptor` is writable local storage.
+    if unsafe { InitializeSecurityDescriptor(std::ptr::addr_of_mut!(descriptor).cast(), 1) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `descriptor` is live and `acl` outlives the call.
+    if unsafe { SetSecurityDescriptorDacl(std::ptr::addr_of_mut!(descriptor).cast(), 1, acl, 0) }
+        == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // Without an explicit protected flag the kernel merges inheritable ACEs
+    // from the parent directory into the new file's DACL — exactly the
+    // inheritance this function exists to prevent.
+    // SAFETY: `descriptor` is live.
+    if unsafe {
+        SetSecurityDescriptorControl(
+            std::ptr::addr_of_mut!(descriptor).cast(),
+            SE_DACL_PROTECTED,
+            SE_DACL_PROTECTED,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: std::ptr::addr_of_mut!(descriptor).cast(),
+        bInheritHandle: 0,
+    };
+    let path_w = wide(path);
+    // SAFETY: both pointers are NUL-terminated / live for the call.
+    let raw = unsafe {
+        CreateFileW(
+            path_w.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            0,
+            &attributes,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            null_mut(),
+        )
+    };
+    if raw == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let handle = OwnedHandle(raw);
+    if let Err(error) = validate_private_security(path) {
+        drop(handle);
+        let _ = std::fs::remove_file(path);
+        return Err(error);
+    }
+    // SAFETY: the handle is a fresh CreateFileW handle owned by this function;
+    // it is transferred to the File and never closed by OwnedHandle.
+    let file = unsafe { std::fs::File::from_raw_handle(raw as std::os::windows::io::RawHandle) };
+    std::mem::forget(handle);
+    Ok(file)
+}
+
+/// Rename `source` over `target` (or into a vacant name) with the source's
+/// security descriptor intact.
+///
+/// `MoveFileExW` moves the directory entry, so the destination carries the
+/// source's DACL. This was measured on Windows 11: `ReplaceFileW` preserves
+/// the *replaced* file's DACL, which is the opposite and would reintroduce a
+/// broad ACL on a private staged file. Callers must therefore use this rename
+/// for credential writes and must tighten an existing destination first.
+pub(crate) fn move_file(source: &Path, target: &Path, replace: bool) -> io::Result<()> {
+    let mut flags = MOVEFILE_WRITE_THROUGH;
+    if replace {
+        flags |= MOVEFILE_REPLACE_EXISTING;
+    }
+    let source_w = wide(source);
+    let target_w = wide(target);
+    // SAFETY: both path buffers are NUL-terminated and live for the call.
+    let ok = unsafe { MoveFileExW(source_w.as_ptr(), target_w.as_ptr(), flags) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Open `pid` and read its creation time. `ERROR_INVALID_PARAMETER` means no
 /// process with that id exists; any other failure is not proof of absence.
 pub(crate) fn process_creation_time(pid: u32) -> io::Result<u64> {
@@ -964,6 +1084,12 @@ pub(crate) fn process_is_running(pid: u32) -> io::Result<bool> {
 pub struct ProcessTreeJob {
     job: OwnedHandle,
 }
+
+// SAFETY: the job is an exclusively owned Windows kernel handle. Handles are
+// not thread-affine, and the owning future only moves the job between executor
+// threads; there is no thread-local state or aliasing in this wrapper. Drop
+// closes the handle on whichever thread releases it.
+unsafe impl Send for ProcessTreeJob {}
 
 impl ProcessTreeJob {
     /// Create the job, opt into kill-on-close, and join this process to it.
