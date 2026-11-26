@@ -2833,6 +2833,7 @@ mod generation_attach_tests {
                 pid: std::process::id(),
                 idle_eviction: None,
                 health: RuntimeHealth {
+                    background_tasks_unknown: false,
                     accepting_work: true,
                     active_background_tasks: if matches!(
                         decision,
@@ -3591,6 +3592,7 @@ while True:
                 pid: 42,
                 idle_eviction: None,
                 health: leveler_client_protocol::RuntimeHealth {
+                    background_tasks_unknown: false,
                     accepting_work: true,
                     active_turns: 0,
                     active_background_tasks: 0,

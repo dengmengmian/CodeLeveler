@@ -15,6 +15,7 @@ pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion {
     // 1.18: expose completed goals with incomplete verification (additive event).
     // 1.19: structured diagnostics query/answer (additive command + event).
     // 1.20: MCP management + settings projection (additive commands/events).
+    // 1.21: structured startup recovery on the session snapshot (additive field).
     //
     // Minor bumps are additive per-message changes, not envelope changes: a
     // peer that does not know an event variant skips it. The envelope major is
@@ -23,7 +24,7 @@ pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion {
     // lifecycle contract (an idle previous generation may be atomically
     // retired, a busy one is deferred) could never be applied across the
     // upgrade it exists for.
-    minor: 20,
+    minor: 21,
 };
 
 /// Features explicitly supported by the peer. Absence means a legacy peer.
@@ -143,7 +144,7 @@ mod tests {
         let json = serde_json::to_string(&env).unwrap();
         assert_eq!(
             json,
-            r#"{"protocol":{"major":1,"minor":20},"body":{"type":"quit"},"capabilities":["optional_workspace","tool_execution_timing"]}"#
+            r#"{"protocol":{"major":1,"minor":21},"body":{"type":"quit"},"capabilities":["optional_workspace","tool_execution_timing"]}"#
         );
         // And it round-trips.
         let back: ProtocolEnvelope<ClientCommand> = serde_json::from_str(&json).unwrap();

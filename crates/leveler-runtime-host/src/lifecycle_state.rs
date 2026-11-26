@@ -273,6 +273,7 @@ mod tests {
     #[test]
     fn a_shutting_down_runtime_reports_retiring_not_ready() {
         let health = RuntimeHealth {
+            background_tasks_unknown: false,
             shutting_down: true,
             quiescent: true,
             accepting_work: false,

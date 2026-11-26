@@ -1113,7 +1113,14 @@ fn classify_assignment(
     credential_scheme: bool,
 ) -> Option<SecretLevel> {
     let value = value.trim();
-    if value.len() < MIN_SECRET_LEN || is_template_value(value) || is_hash_or_uuid(value) {
+    if value.len() < MIN_SECRET_LEN
+        || is_template_value(value)
+        || is_placeholder_value(value)
+        || is_hash_or_uuid(value)
+    {
+        return None;
+    }
+    if is_bare_key_name(key) && !is_opaque_key_value(value) {
         return None;
     }
     let lower_key = key.to_ascii_lowercase();
@@ -1715,7 +1722,9 @@ fn redact_sensitive_assignments(line: &str, found: &mut Vec<DetectedSecret>) -> 
         let value_is_reference = reference_token_ranges(value)
             .iter()
             .any(|(start, end)| *start == 0 && *end == value.len());
-        if !value_is_reference && is_credential_value(value, quoted, code_line, credential_scheme) {
+        if !value_is_reference
+            && is_credential_value(&key, value, quoted, code_line, credential_scheme)
+        {
             out.push_str(SECRET_PLACEHOLDER);
             found.push(DetectedSecret {
                 value: value.to_string(),
@@ -1775,6 +1784,10 @@ fn next_sensitive_key(line: &str, from: usize) -> Option<(usize, usize)> {
         "credential",
         "credentials",
         "pwd",
+        // The bare hand-off form (`key:mgzk…`). Its value shape is checked
+        // strictly at classification time; this entry only lets the scanner
+        // find the position.
+        "key",
     ];
     let lower = line.to_ascii_lowercase();
     let mut best: Option<(usize, usize)> = None;
@@ -1784,6 +1797,16 @@ fn next_sensitive_key(line: &str, from: usize) -> Option<(usize, usize)> {
             let start = search + rel;
             let end = start + key.len();
             if is_identifier_boundary(&lower, start, end) {
+                // A bare `key` must stand on its own; `SERVICE_KEY` is an
+                // ordinary compound and is not this lane.
+                if *key == "key" && start > 0 && matches!(lower.as_bytes()[start - 1], b'_' | b'-')
+                {
+                    search = start + 1;
+                    if search >= lower.len() {
+                        break;
+                    }
+                    continue;
+                }
                 if best.is_none_or(|(b, _)| start < b) {
                     best = Some((start, end));
                 }
@@ -1808,12 +1831,24 @@ fn is_identifier_boundary(lower: &str, start: usize, end: usize) -> bool {
     let before_ok = lower[..start]
         .chars()
         .next_back()
-        .is_none_or(|c| !c.is_ascii_alphanumeric());
+        .is_none_or(|c| !c.is_ascii_alphanumeric())
+        // A JSON-encoded newline/tab is still a line start for the text that
+        // will be decoded on the other side. Without this, `\nTOKEN` reads
+        // `nTOKEN` as one identifier and the value escapes the detector.
+        || is_json_escape_boundary(lower, start);
     let after_ok = lower[end..]
         .chars()
         .next()
         .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_' && c != '-');
     before_ok && after_ok
+}
+
+/// Whether `start` follows a JSON escape that represents whitespace. The
+/// scanner works on the encoded bytes, so the two characters `\` and `n` are
+/// the line break the decoded document will contain.
+fn is_json_escape_boundary(lower: &str, start: usize) -> bool {
+    let bytes = lower.as_bytes();
+    start >= 2 && bytes[start - 2] == b'\\' && matches!(bytes[start - 1], b'n' | b'r' | b't')
 }
 
 /// The value after a separator: `(start, end, quoted)`.
@@ -1858,6 +1893,7 @@ fn value_span(line: &str, from: usize) -> Option<(usize, usize, bool)> {
 
 /// Does this value look like a credential rather than code or a placeholder?
 fn is_credential_value(
+    key: &str,
     value: &str,
     quoted: bool,
     code_line: bool,
@@ -1865,6 +1901,16 @@ fn is_credential_value(
 ) -> bool {
     let trimmed = value.trim();
     if trimmed.len() < MIN_SECRET_LEN {
+        return false;
+    }
+    // A documentation placeholder is a shape, not a credential. Treating
+    // `<YOUR_API_TOKEN>` or `{{API_TOKEN}}` as a value would redact the
+    // document the person is asking about (and used to make an accepted
+    // steer undeliverable).
+    if is_template_value(trimmed) || is_placeholder_value(trimmed) {
+        return false;
+    }
+    if is_bare_key_name(key) && !is_opaque_key_value(trimmed) {
         return false;
     }
     const NON_SECRETS: &[&str] = &[
@@ -1927,11 +1973,70 @@ fn is_credential_value(
     true
 }
 
+/// The bare word `key` is a common English noun. It is accepted as a
+/// credential key only when it stands alone (`key: …`, `key=…`), never as the
+/// suffix of an ordinary compound such as `SERVICE_KEY`.
+fn is_bare_key_name(key: &str) -> bool {
+    key.trim_matches(['"', '\'', '`'])
+        .eq_ignore_ascii_case("key")
+}
+
+/// A bare `key:` hand-off must carry an opaque token, not a word or a
+/// placeholder. This keeps `key: important` and `key: <YOUR_API_TOKEN>`
+/// readable while catching `key:mgzk…` (32 mixed alphanumerics).
+fn is_opaque_key_value(value: &str) -> bool {
+    let value = value.trim();
+    // A hand-off token is one opaque run. Separators are how ordinary
+    // business identifiers are written (`order-2026-11-26-0001`), so the bare
+    // `key:` lane refuses them; a real token that needs them is still caught
+    // by the ordinary assignment rules when its key names the credential.
+    if value
+        .chars()
+        .any(|c| c.is_whitespace() || matches!(c, '-' | '_' | '/' | ':' | '.'))
+    {
+        return false;
+    }
+    let alpha = value.chars().filter(char::is_ascii_alphabetic).count();
+    let digits = value.chars().filter(char::is_ascii_digit).count();
+    let mut seen = std::collections::HashSet::new();
+    value.chars().for_each(|c| {
+        seen.insert(c);
+    });
+    value.len() >= 16
+        // An upper-case prefix plus a date/counter (`ORD202611260001`) is an
+        // identifier, not an opaque token: a real hand-off mixes enough
+        // characters that a short identifier cannot reach this entropy.
+        && alpha >= 8
+        && digits >= 2
+        && seen.len() >= 10
+        && !is_template_value(value)
+        && !is_placeholder_value(value)
+}
+
+/// Placeholder shapes that are not enclosed in `<...>`/`{{...}}`/`${...}`.
+/// They name a credential without carrying one.
+fn is_placeholder_value(value: &str) -> bool {
+    let lower = value.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "your_api_token"
+            | "your_token"
+            | "your-api-token"
+            | "your-token"
+            | "replace_me"
+            | "replace-me"
+            | "redacted"
+            | "secret_here"
+            | "secret-here"
+    )
+}
+
 /// A value used for structured JSON/YAML key decisions. It does not know the
 /// source line, so it is deliberately the strict subset of the text rules.
 pub(crate) fn is_secret_like_value(value: &str) -> bool {
     let trimmed = value.trim();
-    if trimmed.len() < MIN_SECRET_LEN {
+    if trimmed.len() < MIN_SECRET_LEN || is_template_value(trimmed) || is_placeholder_value(trimmed)
+    {
         return false;
     }
     let lower = trimmed.to_ascii_lowercase();
@@ -2299,6 +2404,91 @@ mod tests {
                 out.to_lowercase().contains(&key.to_lowercase()),
                 "key {key:?} must survive in {out:?}"
             );
+        }
+    }
+
+    /// A JSON-encoded command keeps its line breaks as the two bytes `\n`.
+    /// The key after that escape is at a logical line start, so the detector
+    /// must treat the escape as a boundary instead of reading it as part of
+    /// the identifier.
+    #[test]
+    fn redacts_a_secret_after_a_json_escaped_line_break() {
+        let token = "canary-7f3a9c2e5b8d4f6a1c0e8b7d";
+        for text in [
+            format!("cmd: echo ok\\nTOKEN='{token}'\\nrun"),
+            format!("cmd: echo ok\\tTOKEN='{token}'\\trun"),
+        ] {
+            let (out, found) = sanitize_model_visible(&text);
+            assert!(!out.contains(token), "{text:?} -> {out:?}");
+            assert_eq!(found.len(), 1, "{text:?} -> {found:?}");
+        }
+        // A real line break already works and must keep working.
+        let real = format!("cmd: echo ok\nTOKEN='{token}'\nrun");
+        let (out, found) = sanitize_model_visible(&real);
+        assert!(!out.contains(token), "{out:?}");
+        assert_eq!(found.len(), 1);
+        // `nTOKEN` without an escape is an ordinary identifier: not a key.
+        let ordinary = format!("cmd: nTOKEN='{token}'");
+        let (out, _) = sanitize_model_visible(&ordinary);
+        assert!(
+            out.contains(token),
+            "ordinary identifier was rewritten: {out:?}"
+        );
+    }
+
+    /// `key: <value>` is a common hand-off form (`key:mgzk…`, no space). The
+    /// bare word is too ambiguous for the general key list, so it is accepted
+    /// only with an opaque-token value; prose and config labels stay readable.
+    #[test]
+    fn detects_a_bare_key_assignment_with_an_opaque_value() {
+        let token = "mgzk1gr8k7bfm6z6t8ft6tdxd8ydmm5t";
+        for text in [
+            format!("然后这是key:{token} 要用search api 再测试一次"),
+            format!("key: {token}"),
+            format!("key={token}"),
+            format!("  \"key\": \"{token}\""),
+        ] {
+            let (out, found) = sanitize_model_visible(&text);
+            assert!(!out.contains(token), "{text:?} -> {out:?}");
+            assert_eq!(found.len(), 1, "{text:?} -> {found:?}");
+            let findings = detect_secrets(&text);
+            assert_eq!(findings.len(), 1, "{text:?} -> {findings:?}");
+        }
+        for text in [
+            "the key: important",
+            "key point: measure twice, cut once",
+            "SERVICE_KEY=production",
+            "key: value",
+            "key: <YOUR_API_TOKEN>",
+            "key: order-2026-11-26-0001",
+            "key: ORD202611260001",
+            "key: 202611260001234",
+            "key: user_42_profile_settings",
+        ] {
+            let (out, found) = sanitize_model_visible(text);
+            assert_eq!(
+                out, text,
+                "ordinary text was rewritten: {text:?} -> {out:?}"
+            );
+            assert!(found.is_empty(), "{text:?} -> {found:?}");
+            assert!(detect_secrets(text).is_empty(), "{text:?}");
+        }
+    }
+
+    /// Documentation placeholders are shapes, not credentials. Refusing or
+    /// redacting them destroys the document the person is asking about.
+    #[test]
+    fn leaves_document_placeholders_alone() {
+        for text in [
+            "Authorization: Bearer <YOUR_API_TOKEN>",
+            "Authorization: Bearer {{API_TOKEN}}",
+            "请将 <YOUR_API_TOKEN> 替换为实际 Token",
+            "token: <token>",
+        ] {
+            let (out, found) = sanitize_model_visible(text);
+            assert_eq!(out, text, "placeholder was rewritten: {out:?}");
+            assert!(found.is_empty(), "{text:?} -> {found:?}");
+            assert!(detect_secrets(text).is_empty(), "{text:?}");
         }
     }
 

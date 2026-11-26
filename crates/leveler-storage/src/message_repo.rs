@@ -215,7 +215,9 @@ impl<'a> MessageRepository<'a> {
     /// both out of the transcript and out of the pending queue.
     ///
     /// Returns the row's ordinal, or `None` when the input is no longer
-    /// pending (already consumed or cancelled). `None` stores nothing.
+    /// pending (already consumed or cancelled), or when its admitted text no
+    /// longer matches the journal (an editor changed it after this round read
+    /// it). `None` stores nothing.
     pub async fn append_input_in_turn_owned(
         &self,
         token: &leveler_core::OwnershipToken,
@@ -225,6 +227,12 @@ impl<'a> MessageRepository<'a> {
         payload: &str,
         now: Timestamp,
     ) -> Result<Option<u64>, crate::OwnershipError> {
+        // The journal is the identity authority: it stores the admitted text,
+        // while the transcript stores a redacted projection of it. A secret
+        // registered after admission, or a placeholder the admission pass
+        // only partially redacted, must not look like "the user edited this
+        // input". Compare against the unredacted serialization, then insert
+        // the redacted one.
         let redacted = crate::redact_json_payload_for_session(
             "session message",
             payload,
@@ -257,7 +265,7 @@ impl<'a> MessageRepository<'a> {
         .bind(session_id.as_str())
         .bind(input_id)
         .bind(now.timestamp_millis())
-        .bind(&redacted)
+        .bind(payload)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| crate::OwnershipError::Storage(e.into()))?;
@@ -1094,6 +1102,182 @@ mod tests {
             .unwrap();
         assert_eq!(replay, None);
         assert_eq!(repo.load(&session).await.unwrap().len(), 1);
+    }
+
+    /// A steer whose text contains a value already registered for the session
+    /// must still be delivered: redaction is a persistence projection, not an
+    /// input-identity change. The journal stores the admitted text; the append
+    /// transaction must compare against that text before it rewrites the
+    /// payload for storage.
+    #[tokio::test]
+    async fn append_input_delivers_a_registered_secret_redacted() {
+        use crate::{SessionInputRepository, SessionInputState};
+
+        let db = Database::connect_in_memory().await.unwrap();
+        let record = SessionRecord::new("/r", "g", "m", leveler_core::now());
+        SessionRepository::new(&db).create(&record).await.unwrap();
+        let session = SessionId::new(record.id.clone());
+        let task = crate::TaskStore::ensure_for_session(&db, &session, leveler_core::now())
+            .await
+            .unwrap();
+        let token = crate::OwnershipStore::acquire(
+            &db,
+            &task,
+            &leveler_core::RuntimeId::new("rt-secret"),
+            &leveler_core::BootId::new("boot-secret"),
+            leveler_core::OwnerEpoch::UNOWNED,
+        )
+        .await
+        .unwrap();
+        let turn = crate::TurnRepository::new(&db)
+            .start(&session, "chat", None, leveler_core::now())
+            .await
+            .unwrap();
+        let turn_id = leveler_core::TurnId::new(turn.id);
+        let repo = MessageRepository::new(&db);
+        let inputs = SessionInputRepository::new(&db);
+        let secret = "canary-7f3a9c2e5b8d4f6a1c0e8b7d";
+        leveler_core::register_session_secrets(
+            session.as_str(),
+            &[leveler_core::DetectedSecret {
+                value: secret.to_string(),
+                key: "token".to_string(),
+            }],
+        );
+        let admitted = inputs
+            .admit(
+                "input-secret",
+                &session,
+                Some(&turn_id),
+                &format!("请用 {secret} 继续，不要换别的方式"),
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            admitted.content,
+            format!("请用 {secret} 继续，不要换别的方式")
+        );
+
+        let payload = serde_json::json!({
+            "role": "user",
+            "content": [{"type": "text", "text": admitted.content}],
+            "origin": {"kind": "user_input"}
+        })
+        .to_string();
+        let ordinal = repo
+            .append_input_in_turn_owned(
+                &token,
+                &session,
+                &turn_id,
+                "input-secret",
+                &payload,
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ordinal,
+            Some(0),
+            "a registered secret must not make the accepted steer undeliverable"
+        );
+        let stored = repo.load(&session).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(
+            !stored[0].contains(secret),
+            "the transcript payload must be projected without the secret: {}",
+            stored[0]
+        );
+        let row = inputs
+            .load(&session, "input-secret")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, SessionInputState::Consumed);
+        assert_eq!(row.ordinal, Some(0));
+    }
+
+    /// A document can mix a real credential in its header with documentation
+    /// placeholders in prose. The admission pass redacts the real value; the
+    /// placeholder must survive, and the accepted steer must still be
+    /// deliverable.
+    #[tokio::test]
+    async fn append_input_delivers_a_partially_sanitized_placeholder() {
+        use crate::SessionInputRepository;
+
+        let db = Database::connect_in_memory().await.unwrap();
+        let record = SessionRecord::new("/r", "g", "m", leveler_core::now());
+        SessionRepository::new(&db).create(&record).await.unwrap();
+        let session = SessionId::new(record.id.clone());
+        let task = crate::TaskStore::ensure_for_session(&db, &session, leveler_core::now())
+            .await
+            .unwrap();
+        let token = crate::OwnershipStore::acquire(
+            &db,
+            &task,
+            &leveler_core::RuntimeId::new("rt-placeholder"),
+            &leveler_core::BootId::new("boot-placeholder"),
+            leveler_core::OwnerEpoch::UNOWNED,
+        )
+        .await
+        .unwrap();
+        let turn = crate::TurnRepository::new(&db)
+            .start(&session, "chat", None, leveler_core::now())
+            .await
+            .unwrap();
+        let turn_id = leveler_core::TurnId::new(turn.id);
+        let repo = MessageRepository::new(&db);
+        let inputs = SessionInputRepository::new(&db);
+        let canary = "canary-7f3a9c2e5b8d4f6a1c0e8b7d";
+        let admitted = inputs
+            .admit(
+                "input-placeholder",
+                &session,
+                Some(&turn_id),
+                &format!(
+                    "请求头：Authorization: Bearer {canary}\n请将 <YOUR_API_TOKEN> 替换为实际 Token"
+                ),
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            admitted.content.contains("[REDACTED]"),
+            "the admission pass redacts the real header value: {}",
+            admitted.content
+        );
+        assert!(
+            admitted.content.contains("<YOUR_API_TOKEN>"),
+            "the prose placeholder remains: {}",
+            admitted.content
+        );
+
+        let payload = serde_json::json!({
+            "role": "user",
+            "content": [{"type": "text", "text": admitted.content}],
+            "origin": {"kind": "user_input"}
+        })
+        .to_string();
+        let ordinal = repo
+            .append_input_in_turn_owned(
+                &token,
+                &session,
+                &turn_id,
+                "input-placeholder",
+                &payload,
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ordinal,
+            Some(0),
+            "a partially sanitized document must not make the steer undeliverable"
+        );
+        let stored = repo.load(&session).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(!stored[0].contains(canary), "{}", stored[0]);
+        assert!(stored[0].contains("<YOUR_API_TOKEN>"), "{}", stored[0]);
     }
 
     #[tokio::test]

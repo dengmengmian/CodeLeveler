@@ -105,6 +105,13 @@ impl Database {
                 return Ok((TaskId::new(session_id), false));
             }
         }
+        // The goal is the headless task text and the interactive placeholder:
+        // a durable, list-visible copy of what the user typed. Project it at
+        // the one production insert every creation path uses.
+        let (goal, found) = leveler_core::sanitize_model_visible(&record.goal);
+        if !found.is_empty() {
+            leveler_core::register_session_secrets(record.id.as_str(), &found);
+        }
         sqlx::query(
             "INSERT INTO sessions \
              (id, repository, goal, status, model, state, created_at, updated_at, \
@@ -113,7 +120,7 @@ impl Database {
         )
         .bind(&record.id)
         .bind(&record.repository)
-        .bind(&record.goal)
+        .bind(&goal)
         .bind(record.status.as_str())
         .bind(&record.model)
         .bind(record.state.as_str())
@@ -181,6 +188,32 @@ mod tests {
             .unwrap();
         assert_eq!(stored.collaboration, "plan");
         assert_eq!(stored.work_profile, "single");
+    }
+
+    #[tokio::test]
+    async fn a_created_session_goal_does_not_persist_a_bare_key_handoff() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let canary = "mgzk1gr8k7bfm6z6t8ft6tdxd8ydmm5t";
+        let record = SessionRecord::new(
+            "/repo",
+            format!("任务：key:{canary} 继续"),
+            "mock/m",
+            leveler_core::now(),
+        );
+        let task = db
+            .create_task(&record, "assisted", 2, false, "direct")
+            .await
+            .unwrap();
+        let session = SessionId::new(record.id);
+        let stored = SessionRepository::new(&db)
+            .get(&session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!stored.goal.contains(canary), "{}", stored.goal);
+        assert!(stored.goal.contains("[REDACTED]"), "{}", stored.goal);
+        assert_eq!(db.task_for_session(&session).await.unwrap(), Some(task));
+        leveler_core::clear_session_secrets(session.as_str());
     }
 
     #[tokio::test]

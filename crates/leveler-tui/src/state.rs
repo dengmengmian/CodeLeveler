@@ -720,6 +720,11 @@ pub struct AppState {
     /// item.
     pub reconnected_until: Option<std::time::Instant>,
     pub notification: Option<Notification>,
+    /// The last start-up recovery fact this client surfaced. A resync carries
+    /// the same structured failure every time; showing it once per distinct
+    /// value keeps a reconnect from duplicating the row while still letting a
+    /// new failure through.
+    pub startup_recovery_notice: Option<String>,
 
     /// The `/update` panel, while a self-update is in flight or just finished.
     /// Presentation only: the update itself belongs to `leveler-update`.
@@ -1089,6 +1094,7 @@ impl AppState {
             reconnecting: None,
             reconnected_until: None,
             notification: None,
+            startup_recovery_notice: None,
             review_scope_focus: None,
             review_scope_query: None,
             review_scope_facts: None,

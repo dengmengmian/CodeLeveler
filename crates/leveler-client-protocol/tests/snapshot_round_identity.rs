@@ -121,6 +121,7 @@ fn a_session_snapshot_carries_the_rounds_of_its_running_calls() {
         execution_task: None,
         children: Vec::new(),
         foreign_origin: None,
+        startup_recovery: None,
     };
 
     let wire = serde_json::to_value(&snapshot).unwrap();

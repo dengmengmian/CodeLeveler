@@ -99,6 +99,7 @@ fn snapshot(status: &str, task: Option<UiExecutionTask>) -> UiSessionSnapshot {
         execution_task: task,
         children: Vec::new(),
         foreign_origin: None,
+        startup_recovery: None,
     }
 }
 

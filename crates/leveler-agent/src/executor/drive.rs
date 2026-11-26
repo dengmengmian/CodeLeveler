@@ -298,6 +298,12 @@ pub(crate) struct Drive<'a> {
     /// that only repairs evidence leaves it alone; `revise_answer` replaces it.
     /// Nothing infers a candidate from undeclared prose.
     answer_candidate: Option<String>,
+    /// The model step at which an evidence/scope refusal invalidated the
+    /// prose written before it. A blocked resolution may preserve earlier
+    /// prose only when no such refusal happened (a bookkeeping refusal does
+    /// not invalidate the report). A later round that writes a new answer
+    /// clears this; the new text then stands on its own.
+    block_answer_invalidated_at: Option<u32>,
     /// This drive was seeded from an open task epoch that already spent
     /// budget. An answered Chat inside that epoch must not close the ledger.
     /// A Chat that started from an empty ledger is its own task and closes.
@@ -640,6 +646,59 @@ fn compaction_failure_class(error: &AgentError) -> &'static str {
         AgentError::Cancelled => "timeout",
         _ => "other",
     }
+}
+
+/// Project a transcript through the session secret registry for an auxiliary
+/// model call. Used by compaction: its briefing request is not the
+/// conversation the person authorized, so a registered value (including one an
+/// explicit plaintext decision made visible to the main request) must not be
+/// re-sent by this second channel. Shape-based redaction is applied to tool
+/// arguments as well; JSON structure is preserved.
+fn registered_scrubbed_messages(
+    session: &str,
+    messages: &[leveler_model::Message],
+) -> Vec<leveler_model::Message> {
+    use leveler_model::ContentPart;
+    if session.is_empty() {
+        return messages.to_vec();
+    }
+    messages
+        .iter()
+        .map(|message| {
+            let mut message = message.clone();
+            for part in &mut message.content {
+                match part {
+                    ContentPart::Text { text } | ContentPart::Reasoning { text } => {
+                        let (clean, found) = leveler_core::sanitize_model_visible(text);
+                        if !found.is_empty() {
+                            leveler_core::register_session_secrets(session, &found);
+                        }
+                        *text = leveler_core::scrub_registered_secrets(session, &clean);
+                    }
+                    ContentPart::ToolResult { result } => {
+                        let (clean, found) = leveler_core::sanitize_model_visible(&result.content);
+                        if !found.is_empty() {
+                            leveler_core::register_session_secrets(session, &found);
+                        }
+                        result.content = leveler_core::scrub_registered_secrets(session, &clean);
+                    }
+                    ContentPart::ToolCall { call } => {
+                        if let Ok(encoded) = serde_json::to_string(&call.arguments)
+                            && let Ok(scrubbed) = leveler_core::redact_secrets_json_for_session(
+                                &encoded,
+                                Some(session),
+                            )
+                            && let Ok(decoded) = serde_json::from_str(&scrubbed)
+                        {
+                            call.arguments = decoded;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            message
+        })
+        .collect()
 }
 
 /// Record, in one structured line, that a briefing was not produced and what
@@ -1168,6 +1227,7 @@ impl Executor {
             recorded_background_tasks: HashSet::new(),
             goal_gate_recovery_rounds: 0,
             answer_candidate: None,
+            block_answer_invalidated_at: None,
             preserve_running_epoch,
             repeated_gate_refusal: None,
             requirements_refusal: None,
@@ -4215,8 +4275,16 @@ impl AgentHarness for Drive<'_> {
         if let Some(source) = &self.executor.steering
             && let Some(declaration) = source.take_goal_declaration()
         {
+            // The declaration is a user input like any other. Its durable
+            // home is the goal store, which keeps the redacted projection; the
+            // model projection is scrubbed unless this exact declaration came
+            // from an acknowledged plaintext command.
+            let session = self.executor.tool_context.session_scope();
+            let model_declaration = source
+                .goal_declaration_model_text(&declaration)
+                .unwrap_or_else(|| leveler_core::scrub_registered_secrets(session, &declaration));
             // A `/goal` declaration is itself the newest user input.
-            self.latest_user_input = declaration.clone();
+            self.latest_user_input = model_declaration.clone();
             // An answer given before this declaration is no longer current:
             // a scope change now needs words from the declaration or from a
             // later answer.
@@ -4244,7 +4312,7 @@ impl AgentHarness for Drive<'_> {
             if tools != self.tools {
                 self.tools = tools;
             }
-            let message = Message::user_input(declaration);
+            let message = Message::user_input(model_declaration);
             self.sink.append(std::slice::from_ref(&message)).await?;
             messages.push(message);
         }
@@ -4266,38 +4334,50 @@ impl AgentHarness for Drive<'_> {
         // model is asked anything: a correction that arrives after the work
         // is done is worthless. Empty is the normal case.
         if let Some(source) = &self.executor.steering {
+            let session = self.executor.tool_context.session_scope();
             for input in source.pending_inputs_for_round().await? {
                 let text = input.text.as_str();
                 if text.trim().is_empty() {
                     continue;
                 }
-                // The user just spoke; a declaration about the newest input
-                // must quote this one, not an earlier message the runtime has
-                // already acted on. An answer given before this input may
-                // already have been reversed, so it is no longer current
-                // scope authority either.
+                // The journal is the identity authority and may hold the
+                // admitted text; the model gets the same text projected
+                // through the session secret registry. A value registered
+                // from a tool result must not become model-visible merely
+                // because the user repeated it in a steer. The one exception
+                // is the host's typed per-input plaintext decision: it is
+                // bound to this input and its revision, never to the session.
+                let model_text = input
+                    .model_text
+                    .clone()
+                    .unwrap_or_else(|| leveler_core::scrub_registered_secrets(session, text));
                 let message = Message::user_input(text);
+                let model_message = Message::user_input(model_text.clone());
                 // A journalled input is appended and settled in one durable
                 // transaction. `false` means the user cancelled it while this
                 // round was being prepared: it must not enter the context.
                 match input.id.as_deref() {
                     Some(id) => match self.sink.append_input(id, &message).await? {
                         Some(ordinal) => source.input_consumed(id, Some(ordinal)),
-                        // Cancelled (or already consumed) while this round was
-                        // being prepared: it must not enter the context.
-                        None => break,
+                        // Cancelled, already consumed, or edited after this
+                        // round read it: this one input must not enter the
+                        // context. Later pending inputs are independent, so a
+                        // settled row does not block their delivery.
+                        None => continue,
                     },
                     None => {
-                        self.sink.append(std::slice::from_ref(&message)).await?;
+                        self.sink
+                            .append(std::slice::from_ref(&model_message))
+                            .await?;
                     }
                 }
-                self.latest_user_input = text.to_string();
+                self.latest_user_input = model_text;
                 self.scope_answers_from = self.clarification_answers.len();
                 // A user message during a running goal becomes scope only
                 // through the model's structured declaration: `declare_intent`
                 // records the reading, and `declare_scope` records the
                 // requirement change. Nothing here classifies the words.
-                messages.push(message);
+                messages.push(model_message);
             }
         }
         // Interrupted children this turn continues start before the parent's
@@ -6642,6 +6722,7 @@ impl AgentHarness for Drive<'_> {
                                 )
                             }
                             super::goal_verification::VerificationDecision::Refuse(message) => {
+                                self.block_answer_invalidated_at = Some(model_steps);
                                 self.note_refused_completion(
                                     &round_prose,
                                     declares_answer,
@@ -6777,6 +6858,7 @@ impl AgentHarness for Drive<'_> {
                                 note_gate_refusal(&mut self.requirements_refusal, &message);
                                 gate_verdict_advanced_this_round =
                                     gate_verdict_advanced_this_round || advanced;
+                                self.block_answer_invalidated_at = Some(model_steps);
                                 (self.observer)(AgentEvent::GoalIntercepted {
                                     kind: "requirements_refused".to_string(),
                                     detail: message.clone(),
@@ -8930,6 +9012,15 @@ impl AgentHarness for Drive<'_> {
         if work_executed {
             self.terminal_answer = None;
         } else if round_spoke {
+            // A new answer in a later round supersedes an evidence/scope
+            // refusal from an earlier round; the text is no longer the one
+            // that was refused.
+            if self
+                .block_answer_invalidated_at
+                .is_some_and(|step| step < model_steps)
+            {
+                self.block_answer_invalidated_at = None;
+            }
             self.terminal_answer = Some(round_prose.trim().to_string());
         }
 
@@ -8971,11 +9062,18 @@ impl AgentHarness for Drive<'_> {
                 }
                 // A blocked goal still owes the work itself, and its resolution is
                 // a report, so its round ends exactly as before — but the report
-                // is THIS round's prose. Reaching back for text from before the
-                // block would present a refused or abandoned claim as the report.
+                // is THIS round's prose when the model spoke. A textless
+                // bookkeeping repair (an invalid status, a plan bookkeeping
+                // conflict) must not erase a report written immediately before
+                // the block. An evidence/scope refusal is different: it
+                // invalidated that prose, and reaching back would present a
+                // refused claim as the delivery.
                 if reason != StopReason::Completed {
+                    let prior = self.terminal_answer.take();
                     self.terminal_answer = if round_spoke && !work_executed {
                         Some(round_prose.trim().to_string())
+                    } else if self.block_answer_invalidated_at.is_none() {
+                        prior.filter(|text| !text.trim().is_empty())
                     } else {
                         None
                     };
@@ -9242,11 +9340,18 @@ impl AgentHarness for Drive<'_> {
                     .await;
             }
             let runtime = self.executor.runtime.clone();
+            // A compaction briefing is an auxiliary model call, not the
+            // conversation the person authorized. Re-project its input through
+            // the session secret boundary so a value the model already saw (or
+            // the person explicitly disclosed for one input) is not re-sent to
+            // a provider by a context re-projection.
+            let summary_input =
+                registered_scrubbed_messages(self.executor.tool_context.session_scope(), messages);
             let request = leveler_context::summary_request(
                 runtime.as_ref(),
                 &self.executor.model,
                 crate::ModelCallKind::Compaction.default_reasoning_effort(),
-                messages,
+                &summary_input,
                 keep_recent_messages,
                 keep_recent_tokens,
                 self.executor.max_output_tokens,
@@ -9295,6 +9400,20 @@ impl AgentHarness for Drive<'_> {
                                     message: round.message,
                                     usage: round.usage,
                                     finish_reason: round.finish_reason,
+                                })
+                                .map(|summary| {
+                                    // The fold replaces persisted history, so
+                                    // it is a durable-adjacent projection: a
+                                    // credential shape or a registered value
+                                    // the briefing paraphrased must not enter
+                                    // the in-memory transcript through it.
+                                    let session = self.executor.tool_context.session_scope();
+                                    let (text, found) =
+                                        leveler_core::sanitize_model_visible(&summary);
+                                    if !found.is_empty() {
+                                        leveler_core::register_session_secrets(session, &found);
+                                    }
+                                    leveler_core::scrub_registered_secrets(session, &text)
                                 });
                             if summary.is_none() {
                                 summary_failure = Some("rejected");
@@ -12830,5 +12949,92 @@ mod investigation_record_tests {
             let error = investigation_record_from_args(&value, None).unwrap_err();
             assert!(error.contains(needle), "{error}");
         }
+    }
+}
+
+#[cfg(test)]
+mod compaction_projection_tests {
+    use super::registered_scrubbed_messages;
+    use leveler_core::ToolCallId;
+    use leveler_model::{ContentPart, Message, Role, ToolCall, ToolResultContent};
+
+    /// Compaction is an auxiliary model call. A registered value that appears
+    /// in prose, a tool result, or tool-call arguments must not be re-sent to a
+    /// provider by that second channel. JSON structure stays intact.
+    #[test]
+    fn an_auxiliary_request_cannot_resend_a_registered_value() {
+        let session = "compaction-projection-session";
+        let canary = "canary-7f3a9c2e5b8d4f6a1c0e8b7d";
+        leveler_core::clear_session_secrets(session);
+        leveler_core::register_session_secrets(
+            session,
+            &[leveler_core::DetectedSecret {
+                value: canary.to_string(),
+                key: "token".to_string(),
+            }],
+        );
+        let messages = vec![
+            Message::from_parts(
+                Role::User,
+                vec![ContentPart::Text {
+                    text: format!("请使用 {canary} 继续"),
+                }],
+                None,
+            ),
+            Message::from_parts(
+                Role::Tool,
+                vec![ContentPart::ToolResult {
+                    result: ToolResultContent {
+                        call_id: ToolCallId::new("call-1"),
+                        content: format!("DEEPSEEK_API_KEY={canary}"),
+                        is_error: false,
+                    },
+                }],
+                None,
+            ),
+            Message::from_parts(
+                Role::Assistant,
+                vec![ContentPart::ToolCall {
+                    call: ToolCall {
+                        id: ToolCallId::new("call-2"),
+                        name: "shell_command".into(),
+                        arguments: serde_json::json!({
+                            "cmd": format!("echo token={canary}")
+                        }),
+                    },
+                }],
+                None,
+            ),
+        ];
+        let projected = registered_scrubbed_messages(session, &messages);
+        let text = format!("{projected:?}");
+        assert!(!text.contains(canary), "{text}");
+        assert!(text.contains("[REDACTED]"), "{text}");
+        // The projection still parses as the same message shapes.
+        for message in &projected {
+            for part in &message.content {
+                if let ContentPart::ToolCall { call } = part {
+                    assert!(call.arguments.is_object(), "{:?}", call.arguments);
+                }
+            }
+        }
+        leveler_core::clear_session_secrets(session);
+    }
+
+    /// The ordinary path is untouched: with no registered values the messages
+    /// are byte-identical.
+    #[test]
+    fn an_auxiliary_request_without_registered_values_is_unchanged() {
+        let session = "compaction-projection-clean";
+        leveler_core::clear_session_secrets(session);
+        let message = Message::from_parts(
+            Role::User,
+            vec![ContentPart::Text {
+                text: "ordinary request".into(),
+            }],
+            None,
+        );
+        let projected = registered_scrubbed_messages(session, std::slice::from_ref(&message));
+        assert_eq!(projected, vec![message]);
     }
 }

@@ -46,10 +46,12 @@ import urllib.parse
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import pty_dogfood as base  # noqa: E402
+from synthetic_canary import SyntheticCanaryRun  # noqa: E402
 
-CANARY = "CANARY-SECRET-DO-NOT-EXPOSE-001"
-UNKNOWN = "xY9pQ2vT7UNKNOWNFORMAT42"
-GOAL_CANARY = "CANARY-GOAL-DO-NOT-EXPOSE-002"
+CANARY_RUN = SyntheticCanaryRun("secret-broker-real")
+CANARY = CANARY_RUN.require(CANARY_RUN.issue("detected", shape="sk"))
+UNKNOWN = CANARY_RUN.require(CANARY_RUN.issue("unknown"))
+GOAL_CANARY = CANARY_RUN.require(CANARY_RUN.issue("goal", shape="sk"))
 EVIDENCE = os.path.join(base.ROOT, "target", "secret-broker-real")
 os.makedirs(EVIDENCE, exist_ok=True)
 base.EVIDENCE = EVIDENCE
@@ -419,7 +421,7 @@ def scenario_d(report, pty, env):
     report.check("D", "a fresh capture is open before the restart", opened)
     if not opened:
         return None
-    value = "RESTART-BOUNDARY-CANARY-003"
+    value = CANARY_RUN.require(CANARY_RUN.issue("restart-boundary"))
     pty.write(value)
     time.sleep(0.3)
     pty.key("\r")
@@ -460,7 +462,7 @@ def scenario_d_resume(report, pty, env, reference, before):
     report.check(
         "D",
         "the dead reference did not overwrite the file",
-        "RESTART-BOUNDARY-CANARY-003" not in written and written == before,
+        value not in written and written == before,
         written,
     )
     asked = any(

@@ -225,6 +225,7 @@ fn input_recovery_session_switch_from_btw_clears_main_undo() {
                 execution_task: None,
                 children: Vec::new(),
                 foreign_origin: None,
+                startup_recovery: None,
             },
         }),
     );
@@ -455,6 +456,7 @@ fn snapshot(status: &str) -> leveler_client_protocol::UiSessionSnapshot {
         execution_task: None,
         children: Vec::new(),
         foreign_origin: None,
+        startup_recovery: None,
     }
 }
 

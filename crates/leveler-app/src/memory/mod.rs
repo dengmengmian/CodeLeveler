@@ -354,6 +354,18 @@ impl MemoryRuntime {
                 &query,
                 budget,
             )
+            .map(|mut hits| {
+                // A topic written before the capture boundary can contain a
+                // credential shape. Recall feeds a model request, so the
+                // excerpt is projected here instead of trusting the stored
+                // bytes.
+                for hit in &mut hits {
+                    hit.title = leveler_core::sanitize_model_visible(&hit.title).0;
+                    hit.description = leveler_core::sanitize_model_visible(&hit.description).0;
+                    hit.excerpt = leveler_core::sanitize_model_visible(&hit.excerpt).0;
+                }
+                hits
+            })
             .map_err(|error| format!("memory recall failed: {error}"))
         })
         .await

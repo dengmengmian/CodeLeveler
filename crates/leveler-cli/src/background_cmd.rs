@@ -478,6 +478,7 @@ mod tests {
                 pid: std::process::id(),
                 idle_eviction: None,
                 health: RuntimeHealth {
+                    background_tasks_unknown: false,
                     active_background_tasks: 1,
                     blockers: vec![UiBackgroundTaskBlocker {
                         task_id: "bg-1".into(),

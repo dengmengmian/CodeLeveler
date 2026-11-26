@@ -352,6 +352,7 @@ impl LocalRuntimeService for OldBuildRuntime {
             pid: std::process::id(),
             idle_eviction: None,
             health: RuntimeHealth {
+                background_tasks_unknown: false,
                 accepting_work: true,
                 quiescent: true,
                 ..RuntimeHealth::default()

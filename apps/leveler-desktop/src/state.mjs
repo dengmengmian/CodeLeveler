@@ -343,7 +343,7 @@ export function commandEnvelope(sessionId,command,observedVersion) {
   if(versioned&&(!Number.isSafeInteger(observedVersion)||observedVersion<0))throw new Error('snapshot version required');
   return {command_id:crypto.randomUUID(),session_id:sessionId,expected_version:versioned?observedVersion:null,issued_at:new Date().toISOString(),command};
 }
-export const terminalEvents = new Set(['turn_completed','turn_completed_partially_unverified','turn_completed_with_warnings','turn_answered','turn_paused','turn_blocked','turn_failed','turn_cancelled','task_cancelled','turn_truncated','turn_incomplete']);
+export const terminalEvents = new Set(['turn_completed','turn_completed_partially_unverified','turn_completed_with_warnings','turn_answered','turn_paused','turn_blocked','turn_failed','turn_cancelled','turn_interrupted','task_cancelled','turn_truncated','turn_incomplete']);
 export function approvalDecisions(request){return request.requires_human_consent?['approve_once','deny']:['approve_once','approve_session',...(request.always_persists?['approve_always']:[]),'deny'];}
 export function clarificationAnswer(question,{picks=[],text=''}){
   const kind=question.kind??'single';text=text.trim();

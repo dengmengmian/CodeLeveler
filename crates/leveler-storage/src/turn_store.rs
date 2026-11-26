@@ -264,9 +264,15 @@ impl TurnStore for Database {
             tx.rollback().await.map_err(StorageError::from)?;
             return Err(crate::ownership_store::sqlite_stale_error(self, token).await);
         }
+        // The declaration was stored through the projected metadata writer;
+        // apply the same projection to the compare text.
+        let (declaration, found) = leveler_core::sanitize_model_visible(declaration);
+        if !found.is_empty() {
+            leveler_core::register_session_secrets(session_id.as_str(), &found);
+        }
         sqlx::query("UPDATE sessions SET pending_goal = NULL WHERE id = ?1 AND pending_goal = ?2")
             .bind(session_id.as_str())
-            .bind(declaration)
+            .bind(&declaration)
             .execute(&mut *tx)
             .await
             .map_err(StorageError::from)?;

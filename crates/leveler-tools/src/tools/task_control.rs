@@ -553,9 +553,11 @@ async fn observe_until(
 /// What a wait reports when it stopped observing because the user is waiting.
 ///
 /// The observation is real and the process is untouched: this is the truth the
-/// model needs to answer the person, not a failure and not a completion. It
-/// also names the one thing that must not happen next — starting the same
-/// process a second time.
+/// model needs to continue the task, not a failure and not a completion. The
+/// input is admitted, not necessarily delivered to this round's context; the
+/// report must not claim otherwise or ask the model to answer text it has not
+/// seen. It also names the one thing that must not happen next — starting the
+/// same process a second time.
 fn yielded_report(
     observation: &leveler_execution::BackgroundTaskObservation,
     until: WaitUntil,
@@ -573,10 +575,11 @@ fn yielded_report(
     };
     let mut text = format!(
         "task_id: {} status: {status} readiness: none elapsed_ms: {}\n\
-         The wait stopped early because the user sent a message. The task itself was NOT \
-         stopped, its result is NOT known yet, and this is not a failure. Answer the user \
-         from what is below (and from a real check such as get_task or an HTTP probe), then \
-         continue this task. Do not start the same background task again.\n",
+         The wait stopped early because new user input is waiting for the next round. \
+         The task itself was NOT stopped, its result is NOT known yet, and this is not a \
+         failure. Do not assume you have seen that input yet; if it is still pending, it \
+         will be placed at the top of the next round. Continue this task from the real \
+         check below. Do not start the same background task again.\n",
         snap.id, snap.duration_ms
     );
     let _ = (until, quiet);

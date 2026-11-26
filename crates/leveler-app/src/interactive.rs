@@ -658,6 +658,21 @@ impl RuntimeQuiescence {
     fn quiescent(&self) -> bool {
         self.active_turns == 0 && self.background_tasks.is_empty()
     }
+
+    /// The reading available without asking the Execution Host: this process's
+    /// own turns and locally held tasks. It is a lower bound, never an idle
+    /// proof, and callers mark the hosted side unknown.
+    async fn local(
+        active: &ActiveTurns,
+        background: &leveler_execution::BackgroundTaskRegistry,
+    ) -> Self {
+        let (turns, capacity) = active.load();
+        Self {
+            active_turns: turns as u32,
+            turn_capacity: capacity as u32,
+            background_tasks: background.local_active_snapshots().await,
+        }
+    }
 }
 
 /// The ONE runtime-quiescence computation. `runtime_info` (what a client
@@ -1140,21 +1155,46 @@ impl leveler_agent::SteeringSource for SessionSteering {
             Ok(rows
                 .into_iter()
                 .take_while(|row| !row.editing_at(now))
-                .map(|row| leveler_agent::PendingUserInput {
-                    id: Some(row.id),
-                    text: row.content,
+                .map(|row| {
+                    let model_text = self.app.plaintext_disclosures().input_text(
+                        self.session_id.as_str(),
+                        &row.id,
+                        row.revision,
+                    );
+                    leveler_agent::PendingUserInput {
+                        id: Some(row.id),
+                        text: row.content,
+                        model_text,
+                    }
                 })
                 .collect())
         })
     }
 
     fn input_consumed(&self, id: &str, ordinal: Option<u64>) {
+        // The admission decision is spent once this exact input reached the
+        // transcript. A later round or turn cannot inherit it.
+        self.app
+            .plaintext_disclosures()
+            .remove_input(self.session_id.as_str(), id);
         let _ = self.events.send(RuntimeEvent::InputSettled {
             message_id: MessageId::new(id),
             state: UiInputState::Delivered,
             reason: String::new(),
             ordinal,
         });
+    }
+
+    fn take_seed_model_text(&self, seed_input_id: Option<&str>) -> Option<String> {
+        self.app
+            .plaintext_disclosures()
+            .take_seed(self.session_id.as_str(), seed_input_id)
+    }
+
+    fn goal_declaration_model_text(&self, declaration: &str) -> Option<String> {
+        self.app
+            .plaintext_disclosures()
+            .take_goal_if_matches(self.session_id.as_str(), declaration)
     }
 
     fn model_attempt_interrupt(&self) -> Option<CancellationToken> {
@@ -2031,6 +2071,63 @@ impl InProcessRuntimeClient {
             }
         }
         Ok(started)
+    }
+
+    /// Run the owed-continuation scan without making readiness wait for it.
+    ///
+    /// A continuation starts a live goal window; the scan itself is local DB
+    /// work, but starting windows is real side-effecting work that must not
+    /// gate the first client frame. Its result is part of the same structured
+    /// startup-recovery projection as Execution Host reconciliation.
+    pub fn spawn_owed_clarification_recovery(self: &Arc<Self>) {
+        let runtime = self.clone();
+        let app = self.app.clone();
+        self.app
+            .startup_recovery()
+            .begin(crate::startup_recovery::OWED_CONTINUATIONS);
+        tokio::spawn(async move {
+            let result = runtime
+                .reconcile_owed_clarification_continuations()
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+            app.startup_recovery()
+                .finish(crate::startup_recovery::OWED_CONTINUATIONS, result);
+        });
+    }
+
+    /// Start every recovery stage this runtime owns, then tell already-attached
+    /// session streams when the whole set settles.
+    ///
+    /// The initial snapshot carries the same state. This notification exists for
+    /// the failure that lands AFTER a client has opened: without it, a stalled
+    /// Execution Host would leave the first frame healthy and the failure
+    /// invisible until the next reconnect.
+    pub fn spawn_startup_recovery(self: &Arc<Self>, include_owed_continuations: bool) {
+        self.app.spawn_execution_services_recovery();
+        if include_owed_continuations {
+            self.spawn_owed_clarification_recovery();
+        }
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            let mut changes = runtime.app.startup_recovery().subscribe();
+            let settled = changes.wait_for(|state| !state.running).await;
+            let Ok(settled) = settled else {
+                return;
+            };
+            let Some(recovery) = settled.to_wire() else {
+                return;
+            };
+            // Only streams a client actually attached to exist here; a session
+            // whose stream was never created owes nothing and will read the
+            // state from its first snapshot instead.
+            let streams = runtime.session_events.streams.lock().unwrap();
+            for stream in streams.values() {
+                let _ = stream.events.send(RuntimeEvent::StartupRecovery {
+                    recovery: recovery.clone(),
+                });
+            }
+        });
     }
 
     /// Like [`Self::new`], with an explicit auto-approve switch for unattended
@@ -4172,6 +4269,27 @@ impl InProcessRuntimeClient {
         answer: String,
         session_id: Option<SessionId>,
     ) -> Result<(), ClientError> {
+        // The answer reaches the model as the clarifier's result. The
+        // clarification surface has no credential review, so a detected value
+        // is projected here; the redacted answer is also what a retry is
+        // compared against, keeping the decision deterministic.
+        let answer_session = session_id.clone().or_else(|| {
+            self.pending_clarify
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&request_id)
+                .map(|pending| pending.binding.session_id.clone())
+        });
+        let answer = match answer_session {
+            Some(session) => {
+                let (text, found) = leveler_core::sanitize_model_visible(&answer);
+                if !found.is_empty() {
+                    leveler_core::register_session_secrets(session.as_str(), &found);
+                }
+                leveler_core::scrub_registered_secrets(session.as_str(), &text)
+            }
+            None => answer,
+        };
         if resolve_clarification(&self.pending_clarify, &request_id, answer.clone()).is_ok() {
             return Ok(());
         }
@@ -4322,6 +4440,58 @@ impl InProcessRuntimeClient {
         )
     }
 
+    /// Whether the ordinary projection would change `text`: a credential
+    /// shape the sanitizer redacts, or a value this session already had
+    /// registered. Shape findings are registered here, so the same value is
+    /// scrubbed from later durable writes even though this one input was
+    /// explicitly disclosed.
+    fn plaintext_projection_differs(&self, session_id: &SessionId, text: &str) -> bool {
+        let (sanitized, found) = leveler_core::sanitize_model_visible(text);
+        if !found.is_empty() {
+            leveler_core::register_session_secrets(session_id.as_str(), &found);
+        }
+        sanitized != text
+            || leveler_core::scrub_registered_secrets(session_id.as_str(), text) != text
+    }
+
+    /// The opening message of the turn being started. Only the explicitly
+    /// acknowledged input gets a permit; the store is one-shot and cleared
+    /// when the next turn is admitted.
+    fn grant_seed_plaintext(&self, session_id: &SessionId, text: &str) {
+        if self.plaintext_projection_differs(session_id, text) {
+            self.app
+                .plaintext_disclosures()
+                .grant_seed(session_id.as_str(), text);
+        }
+    }
+
+    /// A `/goal` declaration delivered to a running turn.
+    fn grant_goal_plaintext(&self, session_id: &SessionId, text: &str) {
+        if self.plaintext_projection_differs(session_id, text) {
+            self.app
+                .plaintext_disclosures()
+                .grant_goal(session_id.as_str(), text);
+        }
+    }
+
+    /// A journaled steer, bound to the revision it was admitted at.
+    fn grant_input_plaintext(
+        &self,
+        session_id: &SessionId,
+        input_id: &str,
+        revision: i64,
+        text: &str,
+    ) {
+        if self.plaintext_projection_differs(session_id, text) {
+            self.app.plaintext_disclosures().grant_input(
+                session_id.as_str(),
+                input_id,
+                revision,
+                text,
+            );
+        }
+    }
+
     /// Revoke one capture by reference. The vault is the authority; a forged
     /// or foreign reference is simply "not found".
     async fn handle_revoke_secret(
@@ -4406,6 +4576,13 @@ impl InProcessRuntimeClient {
                 .admit(session_id)
                 .map_err(|error| ClientError::Runtime(error.to_string()))?
         };
+        // One session has one live turn. A seed or goal permit that the
+        // previous turn never consumed must not reach this one; pending input
+        // permits stay because they belong to journal rows this turn may
+        // deliver.
+        self.app
+            .plaintext_disclosures()
+            .clear_turn_slots(session_id.as_str());
         self.auxiliary_assists.cancel(session_id);
         if retitle {
             self.retitle_placeholder_session(session_id, text).await;
@@ -4499,10 +4676,16 @@ impl InProcessRuntimeClient {
             .open_database()
             .await
             .map_err(|error| ClientError::Runtime(error.to_string()))?;
-        SessionInputRepository::new(&db)
+        let settled = SessionInputRepository::new(&db)
             .cancel(session_id, id, reason, leveler_core::now())
             .await
-            .map_err(|error| ClientError::Runtime(error.to_string()))
+            .map_err(|error| ClientError::Runtime(error.to_string()))?;
+        if settled.is_some() {
+            self.app
+                .plaintext_disclosures()
+                .remove_input(session_id.as_str(), id);
+        }
+        Ok(settled)
     }
 
     /// Close live admission and settle the cancelled lineage's pending rows.
@@ -4539,6 +4722,9 @@ impl InProcessRuntimeClient {
         match settled {
             Ok(rows) => {
                 for row in rows {
+                    self.app
+                        .plaintext_disclosures()
+                        .remove_input(session_id.as_str(), &row.id);
                     self.emit_input_settled(
                         session_id,
                         &row.id,
@@ -4800,6 +4986,11 @@ impl InProcessRuntimeClient {
             if rows[index].revision != revision {
                 return Err(ClientError::SteerConflict(SteerConflict::StaleRevision));
             }
+            // Only prioritization keeps the exact text the person authorized.
+            // A withdraw, an edit lease or a saved edit changes what would be
+            // delivered, so the old plaintext decision stops here even before
+            // the row is read again.
+            let keeps_disclosure = matches!(mutation, SessionInputMutation::Prioritize);
             let updated = match journal
                 .mutate(&session_id, id.as_str(), revision, mutation, now)
                 .await
@@ -4826,6 +5017,11 @@ impl InProcessRuntimeClient {
                     return Err(ClientError::SteerConflict(reason));
                 }
             };
+            if !keeps_disclosure {
+                self.app
+                    .plaintext_disclosures()
+                    .remove_input(session_id.as_str(), id.as_str());
+            }
             if updated.state == SessionInputState::Cancelled {
                 rows.remove(index);
                 self.emit_input_settled(
@@ -5130,6 +5326,13 @@ impl InProcessRuntimeClient {
         let Some(title) = title_from_first_message(content) else {
             return;
         };
+        // The display title is a durable, list-visible copy of the first
+        // message. It is never a place to keep a credential.
+        let (title, found) = leveler_core::sanitize_model_visible(&title);
+        if !found.is_empty() {
+            leveler_core::register_session_secrets(session_id.as_str(), &found);
+        }
+        let title = leveler_core::scrub_registered_secrets(session_id.as_str(), &title);
         let Ok(db) = self.app.open_database().await else {
             return;
         };
@@ -5719,6 +5922,9 @@ impl InProcessRuntimeClient {
         let cancel = self
             .stage_turn(&session_id, &content, true, 0, None, None)
             .await?;
+        if plaintext_secret_ack {
+            self.grant_seed_plaintext(&session_id, &content);
+        }
         let accepted = self.spawn_goal_turn(session_id, content, cancel, config, model);
         await_turn_acceptance(accepted).await
     }
@@ -5749,6 +5955,9 @@ impl InProcessRuntimeClient {
         // objective are still one consistent pair on disk, and the next Goal
         // turn adopts it.
         self.persist_goal_declaration(&session_id, &task).await?;
+        if plaintext_secret_ack {
+            self.grant_goal_plaintext(&session_id, &task);
+        }
         {
             let goal = self.goal_state_for(&session_id);
             let mut goal = goal
@@ -5911,6 +6120,9 @@ impl InProcessRuntimeClient {
                 seed_input_id,
             )
             .await?;
+        if plaintext_secret_ack && !promoted {
+            self.grant_seed_plaintext(&session_id, &content);
+        }
         // CollaborationMode is the single source of turn profile:
         // goal → goal_mode / update_goal path; chat|plan → content turn.
         // Plan read_only is applied inside engine from session.collaboration.
@@ -6605,6 +6817,19 @@ impl InProcessRuntimeClient {
                         };
                         crate::side_question::render(&ctx)
                     };
+                    // The live tails come from the process streams, not from a
+                    // tool result that already passed the host sanitizer. This
+                    // is a model request boundary of its own, so project it
+                    // through the same session secret boundary.
+                    let (runtime_context, found) =
+                        leveler_core::sanitize_model_visible(&runtime_context);
+                    if !found.is_empty() {
+                        leveler_core::register_session_secrets(session_id.as_str(), &found);
+                    }
+                    let runtime_context = leveler_core::scrub_registered_secrets(
+                        session_id.as_str(),
+                        &runtime_context,
+                    );
                     let question_message = side_question_message(&question, &runtime_context);
                     // The read-only tool surface the side question may use.
                     // Composed from the same owner as a normal turn, narrowed to
@@ -7654,6 +7879,12 @@ impl InProcessRuntimeClient {
             .admit_input(&session_id, &id, &content, window.as_ref())
             .await?;
         let text = row.content.clone();
+        // Only a still-pending row can be delivered, and only that delivery
+        // may see the person's explicit plaintext choice. A retry that finds
+        // the row already consumed grants nothing.
+        if plaintext_secret_ack && row.state == SessionInputState::Pending {
+            self.grant_input_plaintext(&session_id, &id, row.revision, &content);
+        }
         match row.state {
             SessionInputState::Consumed => {
                 self.emit_input_admitted(&session_id, &id, &text);
@@ -8662,6 +8893,12 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             } => {
                 let config = self.runtime_config(&session_id).await?;
                 let model = require_model(&config, &session_id)?;
+                // A side question has no credential review surface, so it
+                // follows the same rule as every other unreviewed command: a
+                // detected credential is refused before it reaches a provider.
+                let question = self.prepare_secrets(&session_id, &question, &[], false)?;
+                let question =
+                    leveler_core::scrub_registered_secrets(session_id.as_str(), &question);
                 self.spawn_btw(session_id, question, config, model);
                 Ok(())
             }
@@ -9681,6 +9918,12 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 "could not resume a clarification continuation left owed by a crash"
             );
         }
+        // Startup recovery (Execution Host reconciliation) must never own the
+        // first snapshot. A healthy host settles inside this bounded grace and
+        // the snapshot is complete; a stalled host leaves it `running`, and the
+        // projection below uses the durable/local facts it already has instead
+        // of making the client wait on an RPC that may not answer.
+        let startup_recovery = self.app.wait_startup_recovery().await;
         // Phase times include pool checkout and SQLite busy-wait. They are not
         // a separate pool-acquire measurement: the pool handle stays inside
         // the storage crate.
@@ -9992,12 +10235,19 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
         let children = crate::children::project_children(&db, session_id, runtime_active)
             .await
             .map_err(|e| ClientError::Runtime(e.to_string()))?;
-        let active_background_tasks: Vec<leveler_client_protocol::UiActiveBackgroundTask> = self
-            .app
-            .background_tasks()
-            .try_active_snapshots()
-            .await
-            .map_err(ClientError::Runtime)?
+        let active_background_tasks: Vec<leveler_client_protocol::UiActiveBackgroundTask> =
+            if startup_recovery.permits_host_reads() {
+                self.app
+                    .background_tasks()
+                    .try_active_snapshots()
+                    .await
+                    .map_err(ClientError::Runtime)?
+            } else {
+                self.app
+                    .background_tasks()
+                    .local_active_snapshots_for_scope(session_id.as_str())
+                    .await
+            }
             .into_iter()
             .filter(|task| task.owner_scope.as_deref() == Some(session_id.as_str()))
             .map(|task| leveler_client_protocol::UiActiveBackgroundTask {
@@ -10079,6 +10329,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             execution_task,
             children,
             foreign_origin,
+            startup_recovery: self.app.startup_recovery_wire(),
         })
     }
 }
@@ -10847,14 +11098,40 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
             .runtime_id()
             .map_err(|error| ClientError::Runtime(error.to_string()))?;
         // Read the same blocker inventory once for both counts and details.
-        let quiescence = runtime_quiescence(&self.active, self.app.background_tasks()).await?;
+        // The readiness handshake must answer even while start-up recovery is
+        // still observing a slow host: in that window only local facts are
+        // known, and `background_tasks_unknown` says so. A host failure after
+        // recovery is likewise a lower bound, never a proven idle runtime.
+        let (quiescence, background_tasks_unknown) = if self
+            .app
+            .startup_recovery_permits_host_reads()
+        {
+            match runtime_quiescence(&self.active, self.app.background_tasks()).await {
+                Ok(quiescence) => (quiescence, false),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "runtime health: hosted background observation failed; reporting local facts"
+                    );
+                    (
+                        RuntimeQuiescence::local(&self.active, self.app.background_tasks()).await,
+                        true,
+                    )
+                }
+            }
+        } else {
+            (
+                RuntimeQuiescence::local(&self.active, self.app.background_tasks()).await,
+                true,
+            )
+        };
         let shutting_down = self.shutting_down.load(std::sync::atomic::Ordering::SeqCst);
         let retiring_reason = self
             .retiring_reason
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .to_owned();
-        let quiescent = quiescence.quiescent();
+        let quiescent = quiescence.quiescent() && !background_tasks_unknown;
         let active_background_tasks = quiescence.background_tasks.len() as u32;
         let blockers = quiescence
             .background_tasks
@@ -10898,6 +11175,7 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
                     && quiescence.active_turns < quiescence.turn_capacity,
                 active_turns: quiescence.active_turns,
                 active_background_tasks,
+                background_tasks_unknown,
                 quiescent,
                 turn_capacity: Some(quiescence.turn_capacity),
                 shutting_down,
@@ -11505,6 +11783,7 @@ async fn compact_conversation(
                 execution_task: None,
                 children: Vec::new(),
                 foreign_origin,
+                startup_recovery: app.startup_recovery_wire(),
             },
         });
     }

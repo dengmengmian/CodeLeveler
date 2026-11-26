@@ -3735,6 +3735,7 @@ mod tests {
                     execution_task: None,
                     children: Vec::new(),
                     foreign_origin: None,
+                    startup_recovery: None,
                 })),
             }
         }
@@ -3820,6 +3821,7 @@ mod tests {
                 pid: std::process::id(),
                 idle_eviction: None,
                 health: leveler_client_protocol::RuntimeHealth {
+                    background_tasks_unknown: false,
                     accepting_work: true,
                     active_turns: 0,
                     active_background_tasks: 0,
@@ -4916,6 +4918,7 @@ mod tests {
                 pid: self.pid.load(std::sync::atomic::Ordering::SeqCst),
                 idle_eviction: None,
                 health: leveler_client_protocol::RuntimeHealth {
+                    background_tasks_unknown: false,
                     accepting_work: true,
                     active_turns: 0,
                     active_background_tasks: 0,

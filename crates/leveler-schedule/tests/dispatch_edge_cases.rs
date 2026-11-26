@@ -127,6 +127,7 @@ impl ScriptedRuntime {
             execution_task: None,
             children: Vec::new(),
             foreign_origin: None,
+            startup_recovery: None,
         }
     }
 

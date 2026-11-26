@@ -191,6 +191,15 @@ impl<'a> SessionRepository<'a> {
     ) -> Result<(), StorageError> {
         // Explicit mode/sandbox/kind: migration 0003 DEFAULT is still the obsolete
         // `workspace_write` string; never depend on that for new rows.
+        //
+        // The goal text is the headless task string (and the interactive
+        // placeholder). It is a durable, list-visible copy of what the user
+        // typed, so a credential shape is projected at this write boundary;
+        // the value is also remembered for the session's later projections.
+        let (goal, found) = leveler_core::sanitize_model_visible(&record.goal);
+        if !found.is_empty() {
+            leveler_core::register_session_secrets(record.id.as_str(), &found);
+        }
         sqlx::query(
             "INSERT INTO sessions \
              (id, repository, goal, status, model, state, created_at, updated_at, \
@@ -199,7 +208,7 @@ impl<'a> SessionRepository<'a> {
         )
         .bind(&record.id)
         .bind(&record.repository)
-        .bind(&record.goal)
+        .bind(&goal)
         .bind(record.status.as_str())
         .bind(&record.model)
         .bind(record.state.as_str())
@@ -337,6 +346,13 @@ impl<'a> SessionRepository<'a> {
         objective: &str,
         now: Timestamp,
     ) -> Result<bool, StorageError> {
+        // The pending declaration is a durable copy of the turn's objective.
+        // It is projected exactly like the committed goal text; a later
+        // `clear_pending_goal` applies the same projection to its compare.
+        let (objective, found) = leveler_core::sanitize_model_visible(objective);
+        if !found.is_empty() {
+            leveler_core::register_session_secrets(id.as_str(), &found);
+        }
         // `pending_goal IS NULL` is the compare half: a `/goal <other>` that
         // arrived while this turn was staged is a newer user intent and must
         // not be replaced by the fallback text this turn would otherwise use.
@@ -344,7 +360,7 @@ impl<'a> SessionRepository<'a> {
             "UPDATE sessions SET pending_goal = ?2, updated_at = ?3              WHERE id = ?1 AND pending_goal IS NULL",
         )
         .bind(id.as_str())
-        .bind(objective)
+        .bind(&objective)
         .bind(now.to_rfc3339())
         .execute(self.db.pool())
         .await?;
@@ -384,11 +400,15 @@ impl<'a> SessionRepository<'a> {
         id: &SessionId,
         expected: &str,
     ) -> Result<bool, StorageError> {
+        let (expected, found) = leveler_core::sanitize_model_visible(expected);
+        if !found.is_empty() {
+            leveler_core::register_session_secrets(id.as_str(), &found);
+        }
         let cleared = sqlx::query(
             "UPDATE sessions SET pending_goal = NULL WHERE id = ?1 AND pending_goal = ?2",
         )
         .bind(id.as_str())
-        .bind(expected)
+        .bind(&expected)
         .execute(self.db.pool())
         .await?;
         Ok(cleared.rows_affected() == 1)
@@ -476,6 +496,18 @@ impl<'a> SessionRepository<'a> {
                 "collaboration",
             ),
         };
+        // Metadata values are durable, list-visible text (a `/goal`
+        // declaration above all). Project them before the row update; the
+        // event audit row carries the same projection, not the raw input.
+        let project = |text: &str| {
+            let (clean, found) = leveler_core::sanitize_model_visible(text);
+            if !found.is_empty() {
+                leveler_core::register_session_secrets(id.as_str(), &found);
+            }
+            leveler_core::scrub_registered_secrets(id.as_str(), &clean)
+        };
+        let value = value.map(project);
+        let pending = pending.map(project);
         // The event is an audit record, not just a UI invalidation: record what
         // the value was and what it became. `column` is a static literal from
         // the match above, never user input.
@@ -486,12 +518,13 @@ impl<'a> SessionRepository<'a> {
         .fetch_optional(&mut *tx)
         .await?
         .flatten();
+        let old = old.map(|text| project(&text));
         let changed = {
             let mut query = sqlx::query(sql)
                 .bind(id.as_str())
-                .bind(value)
+                .bind(value.as_deref())
                 .bind(now.to_rfc3339());
-            if let Some(pending) = pending {
+            if let Some(pending) = pending.as_deref() {
                 query = query.bind(pending);
             }
             query.execute(&mut *tx).await?
@@ -523,8 +556,8 @@ impl<'a> SessionRepository<'a> {
         if let SessionEdit::Permission { contract, .. } = edit {
             change["permission_contract"] = serde_json::json!(contract);
         }
-        if let SessionEdit::GoalDeclaration { objective, .. } = edit {
-            change["pending_goal"] = serde_json::Value::String(objective.clone());
+        if let SessionEdit::GoalDeclaration { .. } = edit {
+            change["pending_goal"] = serde_json::Value::String(pending.clone().unwrap_or_default());
         }
         let payload = serde_json::json!({
             "type": "session_metadata_changed",
@@ -638,9 +671,13 @@ impl<'a> SessionRepository<'a> {
     /// session after its first real message; does not bump `updated_at` (the
     /// message's own turn does that).
     pub async fn update_goal(&self, id: &SessionId, goal: &str) -> Result<(), StorageError> {
+        let (goal, found) = leveler_core::sanitize_model_visible(goal);
+        if !found.is_empty() {
+            leveler_core::register_session_secrets(id.as_str(), &found);
+        }
         sqlx::query("UPDATE sessions SET goal = ?2 WHERE id = ?1")
             .bind(id.as_str())
-            .bind(goal)
+            .bind(&goal)
             .execute(self.db.pool())
             .await?;
         Ok(())
@@ -1269,6 +1306,66 @@ mod tests {
             leveler_core::secret::registered_secret_count(id.as_str()),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn a_session_goal_does_not_persist_a_bare_key_handoff() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let repo = SessionRepository::new(&db);
+        let canary = "mgzk1gr8k7bfm6z6t8ft6tdxd8ydmm5t";
+        let record = SessionRecord::new(
+            "/repo",
+            format!("任务：key:{canary} 继续"),
+            "deepseek/deepseek-flash",
+            leveler_core::now(),
+        );
+        repo.create(&record).await.unwrap();
+        let listed = repo.list().await.unwrap();
+        assert!(!listed[0].goal.contains(canary), "{}", listed[0].goal);
+        assert!(listed[0].goal.contains("[REDACTED]"), "{}", listed[0].goal);
+        leveler_core::clear_session_secrets(&record.id);
+    }
+
+    #[tokio::test]
+    async fn a_goal_declaration_does_not_persist_a_bare_key_handoff() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let repo = SessionRepository::new(&db);
+        let record = SessionRecord::new(
+            "/repo",
+            "fix bug",
+            "deepseek/deepseek-flash",
+            leveler_core::now(),
+        );
+        repo.create(&record).await.unwrap();
+        let id = SessionId::new(record.id.clone());
+        let canary = "mgzk1gr8k7bfm6z6t8ft6tdxd8ydmm5t";
+        repo.set_goal_declaration(
+            &id,
+            "goal",
+            &format!("任务：key:{canary} 继续"),
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
+        let pending: Option<String> =
+            sqlx::query_scalar("SELECT pending_goal FROM sessions WHERE id = ?1")
+                .bind(id.as_str())
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let pending = pending.unwrap_or_default();
+        assert!(!pending.contains(canary), "{pending}");
+        assert!(pending.contains("[REDACTED]"), "{pending}");
+        let payload: String = sqlx::query_scalar(
+            "SELECT payload FROM events WHERE session_id = ?1              AND type = 'session_metadata_changed'",
+        )
+        .bind(id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(!payload.contains(canary), "{payload}");
+        assert!(payload.contains("[REDACTED]"), "{payload}");
+        leveler_core::clear_session_secrets(id.as_str());
     }
 
     #[tokio::test]

@@ -606,7 +606,21 @@ impl crate::ports::GoalBinder for TurnGoalBinder {
             .pending_goal(&self.session_id)
             .await
             .map_err(binder_store_error)?;
-        let objective = pending.as_deref().unwrap_or(objective);
+        let objective = match &pending {
+            // A stored declaration already went through the same projection.
+            Some(text) => text.clone(),
+            None => {
+                // Goal identity is the durable (projected) objective. A raw
+                // objective with a credential shape must match the sanitized
+                // running-goal row instead of opening a duplicate identity.
+                let (clean, found) = leveler_core::sanitize_model_visible(objective);
+                if !found.is_empty() {
+                    leveler_core::register_session_secrets(self.session_id.as_str(), &found);
+                }
+                leveler_core::scrub_registered_secrets(self.session_id.as_str(), &clean)
+            }
+        };
+        let objective = objective.as_str();
         // Reopen a running goal for this exact objective if one exists —
         // a crash between `open` and the declaration clear leaves both facts
         // and must not create a duplicate identity.

@@ -82,6 +82,7 @@ fn opened_bare() -> AppState {
         execution_task: None,
         children: Vec::new(),
         foreign_origin: None,
+        startup_recovery: None,
     };
     reduce(
         &mut s,
@@ -1635,6 +1636,7 @@ fn turn_end_status(status: TurnEndStatus) -> &'static str {
         TurnEndStatus::NoFinalAnswer => "no_final_answer",
         TurnEndStatus::Failed => "failed",
         TurnEndStatus::Cancelled => "cancelled",
+        TurnEndStatus::Interrupted => "interrupted",
         TurnEndStatus::Yielded => "yielded",
     }
 }

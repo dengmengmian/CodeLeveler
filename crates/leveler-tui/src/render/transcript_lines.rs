@@ -1195,6 +1195,9 @@ pub(crate) fn turn_end_marker(
         TurnEndStatus::Failed => (format!("✗ {}", t.final_failed), theme.status.error),
         // Cancelled is user-initiated, not a failure: stopped glyph, muted.
         TurnEndStatus::Cancelled => (format!("⊘ {}", t.final_cancelled), theme.text.secondary),
+        // Interrupted says the runtime stopped, not that the user did. Same
+        // glyph family as a pause, but the wording never claims cancellation.
+        TurnEndStatus::Interrupted => (format!("⊘ {}", t.final_interrupted), theme.text.secondary),
     }
 }
 
@@ -3625,6 +3628,11 @@ mod tests {
         assert!(failed.contains("✗ 失败"), "{failed}");
         let cancelled = turn_end_text(TurnEndStatus::Cancelled, None);
         assert!(cancelled.contains("⊘ 已取消"), "{cancelled}");
+        let interrupted = turn_end_text(TurnEndStatus::Interrupted, None);
+        assert!(
+            interrupted.contains("⊘ 已中断") && !interrupted.contains("已取消"),
+            "a process kill is not a user cancellation: {interrupted}"
+        );
     }
 
     /// The blocked terminal tells the reader three separate facts: the model's

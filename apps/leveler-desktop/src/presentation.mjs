@@ -402,6 +402,7 @@ export function turnTerminalFromEvent(type,messages,tools){
  if(type==='turn_blocked')return 'blocked';
  if(type==='turn_failed')return 'failed';
  if(type==='turn_cancelled'||type==='task_cancelled')return 'cancelled';
+ if(type==='turn_interrupted')return 'interrupted';
  return null;
 }
 
@@ -509,6 +510,7 @@ const RECEIPT_LABELS = {
   blocked: ['⚠', '目标受阻'],
   failed: ['✗', '失败'],
   cancelled: ['⊘', '已取消'],
+  interrupted: ['⊘', '已中断'],
 };
 /** @type {Record<string,string>} */
 const RECEIPT_TONES = {
@@ -516,7 +518,7 @@ const RECEIPT_TONES = {
   completed_with_warnings: 'warning', truncated: 'warning',
   incomplete: 'warning', no_final_answer: 'warning',
   paused: 'muted', blocked: 'warning',
-  failed: 'error', cancelled: 'muted',
+  failed: 'error', cancelled: 'muted', interrupted: 'muted',
 };
 
 /** The terminal status as the conversation's own receipt vocabulary.

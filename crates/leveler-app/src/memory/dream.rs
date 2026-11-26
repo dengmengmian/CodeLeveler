@@ -462,6 +462,10 @@ async fn execute(
             return DreamOutcome::Failed(error);
         }
     };
+    // The plan is model-authored durable topic text. A credential shape it
+    // copied or hallucinated is projected before it becomes a memory file;
+    // Memory is a long-lived store, not a second place to keep a secret.
+    let operations = sanitize_topic_operations(operations);
     if cancel.is_cancelled() {
         guard.release("Dream task cancelled").await;
         finish_activity(runtime, &scope, false);
@@ -515,6 +519,71 @@ async fn execute(
             DreamOutcome::Failed(detail)
         }
     }
+}
+
+/// Project model-authored topic operations before they are committed. Paths
+/// and evidence are scope-relative identities, not free text; only the topic
+/// bodies can carry a credential shape.
+fn sanitize_topic_operations(operations: Vec<TopicOperation>) -> Vec<TopicOperation> {
+    let scrub = |text: String| leveler_core::sanitize_model_visible(&text).0;
+    operations
+        .into_iter()
+        .map(|operation| match operation {
+            TopicOperation::Create {
+                path,
+                content,
+                evidence,
+            } => TopicOperation::Create {
+                path,
+                content: scrub(content),
+                evidence,
+            },
+            TopicOperation::Update {
+                path,
+                content,
+                evidence,
+            } => TopicOperation::Update {
+                path,
+                content: scrub(content),
+                evidence,
+            },
+            TopicOperation::Rename {
+                from,
+                to,
+                content,
+                evidence,
+            } => TopicOperation::Rename {
+                from,
+                to,
+                content: scrub(content),
+                evidence,
+            },
+            TopicOperation::Merge {
+                sources,
+                destination,
+                content,
+                evidence,
+            } => TopicOperation::Merge {
+                sources,
+                destination,
+                content: scrub(content),
+                evidence,
+            },
+            TopicOperation::Split {
+                source,
+                destinations,
+                evidence,
+            } => TopicOperation::Split {
+                source,
+                destinations: destinations
+                    .into_iter()
+                    .map(|(path, content)| (path, scrub(content)))
+                    .collect(),
+                evidence,
+            },
+            other => other,
+        })
+        .collect()
 }
 
 fn finish_activity(runtime: &MemoryRuntime, session_scope: &str, success: bool) {
@@ -574,8 +643,19 @@ async fn request_plan_once(
 ) -> Result<Vec<TopicOperation>, String> {
     let payload = serde_json::json!({
         "operation_id": input.operation_id,
-        "claimed_observations": input.observations,
-        "existing_topics": input.topics,
+        // Observations are already redacted at capture, and existing topics
+        // may predate that boundary. Both are model input here, so a
+        // credential shape is projected once more before the request.
+        "claimed_observations": input
+            .observations
+            .iter()
+            .map(|(path, text)| (path, leveler_core::sanitize_model_visible(text).0))
+            .collect::<Vec<_>>(),
+        "existing_topics": input
+            .topics
+            .iter()
+            .map(|(path, text)| (path, leveler_core::sanitize_model_visible(text).0))
+            .collect::<Vec<_>>(),
     })
     .to_string();
     let mut request = ModelRequest::new(
@@ -895,6 +975,20 @@ impl Drop for DreamLeaseGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_committed_topic_body_cannot_carry_a_credential_shape() {
+        let canary = "mgzk1gr8k7bfm6z6t8ft6tdxd8ydmm5t";
+        let operations = vec![TopicOperation::Create {
+            path: "topics/ops.md".into(),
+            content: format!("# Ops\nkey:{canary}"),
+            evidence: vec!["observations/_inbox/a.md".into()],
+        }];
+        let projected = sanitize_topic_operations(operations);
+        let text = format!("{projected:?}");
+        assert!(!text.contains(canary), "{text}");
+        assert!(text.contains("[REDACTED]"), "{text}");
+    }
 
     #[test]
     fn a_plan_parses_every_operation_shape() {

@@ -327,6 +327,16 @@ impl<'a> ModelRequestRepository<'a> {
     /// Fails if the row cannot be written — including a duplicate
     /// [`ModelRequestRecord::id`], which the database rejects.
     pub async fn insert(&self, record: &ModelRequestRecord) -> Result<(), StorageError> {
+        // A transport observation can quote the provider body. Project it
+        // through the same session secret boundary as every other durable
+        // diagnostic; the value is not needed to diagnose the failure.
+        let error_detail = record.error_detail.as_deref().map(|text| {
+            let (text, found) = leveler_core::sanitize_model_visible(text);
+            if !found.is_empty() {
+                leveler_core::register_session_secrets(record.session_id.as_str(), &found);
+            }
+            leveler_core::scrub_registered_secrets(record.session_id.as_str(), &text)
+        });
         sqlx::query(
             "INSERT INTO model_requests \
              (id, session_id, provider, model, input_tokens, output_tokens, finish_reason, \
@@ -390,7 +400,7 @@ impl<'a> ModelRequestRepository<'a> {
         )
         .bind(&record.budget_scope)
         .bind(record.estimated_tokens.map(|value| value.min(i64::MAX as u64) as i64))
-        .bind(&record.error_detail)
+        .bind(error_detail.as_deref())
         .bind(&record.turn_id)
         .execute(self.db.pool())
         .await?;
@@ -761,6 +771,36 @@ mod tests {
     /// T1/T2. What the provider reported is what comes back out — including
     /// the cached share, which used to be dropped between the usage struct
     /// and the row.
+    #[tokio::test]
+    async fn a_transport_error_detail_does_not_persist_a_registered_secret() {
+        let (db, session) = seeded().await;
+        let canary = "mgzk1gr8k7bfm6z6t8ft6tdxd8ydmm5t";
+        leveler_core::register_session_secrets(
+            session.as_str(),
+            &[leveler_core::DetectedSecret {
+                value: canary.to_string(),
+                key: "token".to_string(),
+            }],
+        );
+        let repo = ModelRequestRepository::new(&db);
+        let mut failing = record("r-secret", &session);
+        failing.error_kind = Some("transport".into());
+        failing.finish_reason = None;
+        failing.error_detail = Some(format!("provider echoed key:{canary}"));
+        repo.insert(&failing).await.unwrap();
+        let loaded = repo.load_for_session(&session).await.unwrap();
+        assert!(
+            !loaded[0]
+                .error_detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains(canary),
+            "{:?}",
+            loaded[0].error_detail
+        );
+        leveler_core::clear_session_secrets(session.as_str());
+    }
+
     #[tokio::test]
     async fn a_request_round_trips_its_usage_exactly() {
         let (db, session) = seeded().await;

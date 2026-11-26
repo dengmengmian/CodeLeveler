@@ -878,6 +878,54 @@ async fn a_textless_block_does_not_reuse_an_earlier_refused_claim() {
     assert!(run.final_text().contains("Module cache is read-only."));
 }
 
+/// A bookkeeping refusal is not an evidence/scope refusal. A blocked report
+/// written with the first (malformed) resolution must survive a later
+/// textless repair; the user already saw this report, and the model did write
+/// it. The refused-claim rule above applies only when evidence or scope
+/// rejected the claim itself.
+#[tokio::test]
+async fn a_textless_bookkeeping_repair_keeps_the_blocked_report() {
+    let report = "Blocked: the search token expired after the first probes. \
+                  The endpoint and parameter table are verified; the five business \
+                  tasks remain outstanding. A fresh token is the only missing input.";
+    let run = run_goal(vec![
+        assistant_says_and_calls(
+            "g1",
+            report,
+            "update_goal",
+            serde_json::json!({
+                "blocked_kind": "external",
+                "summary": "Search token expired.",
+            }),
+        ),
+        assistant_tool_call(
+            "g2",
+            "update_goal",
+            serde_json::json!({
+                "status": "blocked",
+                "blocked_kind": "external",
+                "summary": "Search token expired.",
+            }),
+        ),
+    ])
+    .await;
+
+    assert_eq!(run.outcome.stop_reason, StopReason::Blocked);
+    assert_eq!(
+        run.final_text(),
+        report,
+        "the report written before the bookkeeping repair is the delivery"
+    );
+    assert!(
+        !run.outcome
+            .completion_warnings
+            .iter()
+            .any(|warning| warning.contains("no final answer")),
+        "a report was written; the terminal must not claim otherwise: {:?}",
+        run.outcome.completion_warnings
+    );
+}
+
 const BLOCKED_REPORT: &str = "Blocked: the migration ledger needs database credentials that are \
 not present. Progress: the schema diff and the rollback plan are written and reviewed. Remaining: \
 applying the migration and re-running the isolation suite. Continue when the ledger credentials \

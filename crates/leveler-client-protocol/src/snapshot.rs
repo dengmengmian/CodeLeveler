@@ -210,6 +210,7 @@ mod tests {
             execution_task: None,
             children: Vec::new(),
             foreign_origin: None,
+            startup_recovery: None,
         };
         // Unset axes stay off the wire (old-client compatibility).
         let value = serde_json::to_value(&snap).unwrap();
@@ -290,6 +291,7 @@ mod tests {
             execution_task: None,
             children: Vec::new(),
             foreign_origin: None,
+            startup_recovery: None,
         };
         let value = serde_json::to_value(&snap).unwrap();
         assert!(value.get("thinking").is_none(), "{value}");
@@ -459,6 +461,11 @@ pub struct RuntimeHealth {
     /// away. Reported so a client can see WHY a retiring runtime has not gone.
     #[serde(default)]
     pub active_background_tasks: u32,
+    /// The Execution Host could not be observed for this reading. The counts
+    /// above then cover only work this process already knows; they are a lower
+    /// bound, never a proven zero, and `quiescent` stays false.
+    #[serde(default)]
+    pub background_tasks_unknown: bool,
     /// The runtime can exit now: no main turn and no background task left.
     /// Computed by the runtime from the SAME two counters, so a client can
     /// never be told "idle" by an accounting the drain disagrees with.
@@ -526,7 +533,9 @@ impl RuntimeHealth {
     /// Whether the runtime may exit now. The one predicate shared by the
     /// client-side handover wait and the runtime's own drain.
     pub fn quiescent(&self) -> bool {
-        self.active_turns == 0 && self.active_background_tasks == 0
+        self.active_turns == 0
+            && self.active_background_tasks == 0
+            && !self.background_tasks_unknown
     }
 
     /// Whether the runtime is retiring for a generation handover (as opposed
@@ -978,6 +987,49 @@ pub struct UiSessionSnapshot {
     /// runtimes that predate import.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreign_origin: Option<crate::UiForeignOrigin>,
+    /// Recovery work the runtime does AFTER it can serve clients. Absent on a
+    /// runtime that never started one (headless, tests, an older peer). While
+    /// `running` is true, facts that only the Execution Host can answer are not
+    /// yet refreshed; a client must not present them as settled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_recovery: Option<UiStartupRecovery>,
+}
+
+/// Runtime recovery that must never delay the first client frame.
+///
+/// The runtime binds its endpoint and serves canonical durable state first, then
+/// reconciles background services and owed continuations. This projection is
+/// the authority for whether that work finished, is still running, or failed:
+/// a failed stage is a real, typed fact (not a silent absence of tasks), and a
+/// client shows it instead of claiming the runtime is healthy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiStartupRecovery {
+    /// At least one recovery stage is still in flight.
+    #[serde(default)]
+    pub running: bool,
+    /// Stages that failed. The runtime keeps serving; their facts stay unknown
+    /// until the underlying problem is resolved.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failures: Vec<UiStartupRecoveryFailure>,
+    /// Background tasks whose controlling Execution Host was already gone and
+    /// that recovery converged on OS evidence. Never a success claim: the task
+    /// is not running under this runtime and its exit may be unrecorded.
+    #[serde(default, skip_serializing_if = "crate::is_zero_u32")]
+    pub recovered_tasks: u32,
+    /// Spawn intents whose launch could not be proven. Records are kept.
+    #[serde(default, skip_serializing_if = "crate::is_zero_u32")]
+    pub unresolved_intents: u32,
+}
+
+/// One recovery stage that failed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiStartupRecoveryFailure {
+    /// Stable stage name (`execution_services`, `owed_continuations`).
+    pub stage: String,
+    /// The runtime's own error text. Diagnostics only; never an authority.
+    pub message: String,
 }
 
 /// The durable task a Chat session owes, as projected for a client that is

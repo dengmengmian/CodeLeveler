@@ -32,6 +32,7 @@ mod mcp_service;
 pub mod memory;
 pub mod observability;
 mod parallel;
+mod plaintext_disclosure;
 mod prompt_assist;
 mod prompt_bridge;
 pub mod provider_config;
@@ -46,6 +47,7 @@ pub mod session_projection;
 pub mod settings_service;
 mod side_question;
 pub mod skills;
+mod startup_recovery;
 mod tool_output;
 pub mod usage;
 mod user_shell;
@@ -950,6 +952,12 @@ pub struct Application {
     execution_overrides: Option<leveler_agent::coding::ExecutionOverrides>,
     /// Collaboration mode (chat / plan / goal).
     collaboration: CollaborationMode,
+    /// True only for a headless invocation that passed
+    /// `--allow-plaintext-secrets`. The one headless turn then installs a
+    /// one-shot steering source carrying the task text as the person's
+    /// explicit per-command plaintext decision. Never persisted and never
+    /// reused for another command.
+    plaintext_seed_ack: bool,
     /// Model-step safety ceiling for this application's top-level runs, from
     /// the CLI's `--max-model-steps` (alias `--max-rounds`). `None` pins no
     /// ceiling; the CLI resolves "flag absent" to
@@ -1039,6 +1047,10 @@ pub struct Application {
     /// command admission path and every tool context of this runtime, so one
     /// authority answers "is this reference usable in this session".
     secret_vault: std::sync::Arc<leveler_execution::secret_vault::SecretVault>,
+    /// Per-input explicit plaintext decisions. Memory-only and bounded; a
+    /// permit widens exactly one input's model projection and never becomes a
+    /// session-wide switch. Durable stores still receive the redacted text.
+    plaintext_disclosures: std::sync::Arc<plaintext_disclosure::PlaintextDisclosures>,
     /// A startup fact this process learned while resolving the default model and
     /// that the next created session's client must be told: today, the persisted
     /// default was not resolvable here and a configured model was used instead.
@@ -1047,6 +1059,9 @@ pub struct Application {
     /// stream has no subscriber at creation time; the created session's
     /// bootstrap is the one channel a client is guaranteed to read.
     default_model_notice: std::sync::Mutex<Option<String>>,
+    /// Execution-service/owed-continuation recovery, structured so clients can
+    /// open immediately and still see whether their background facts are final.
+    startup_recovery: std::sync::Arc<startup_recovery::StartupRecovery>,
 }
 
 impl Drop for Application {
@@ -1386,6 +1401,7 @@ impl Application {
             // that resolved an explicit axis (`--collaboration`, the transport
             // request) override it via `with_collaboration` or the create path.
             collaboration: CollaborationMode::default(),
+            plaintext_seed_ack: false,
             model_step_ceiling: None,
             environment,
             background_tasks,
@@ -1399,7 +1415,11 @@ impl Application {
             review_live: Default::default(),
             memory,
             secret_vault: std::sync::Arc::new(leveler_execution::secret_vault::SecretVault::new()),
+            plaintext_disclosures: std::sync::Arc::new(
+                plaintext_disclosure::PlaintextDisclosures::new(),
+            ),
             default_model_notice: std::sync::Mutex::new(None),
+            startup_recovery: std::sync::Arc::new(startup_recovery::StartupRecovery::new()),
             permission_profiles: std::sync::Mutex::new(std::collections::HashMap::new()),
             definition_trust_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
             capability_activations: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1409,6 +1429,13 @@ impl Application {
     /// The runtime's credential custody.
     pub fn secret_vault(&self) -> &std::sync::Arc<leveler_execution::secret_vault::SecretVault> {
         &self.secret_vault
+    }
+
+    /// Per-input plaintext decisions recorded by the admission path.
+    pub(crate) fn plaintext_disclosures(
+        &self,
+    ) -> &std::sync::Arc<plaintext_disclosure::PlaintextDisclosures> {
+        &self.plaintext_disclosures
     }
 
     /// The configuration generation in force right now.
@@ -1572,6 +1599,14 @@ impl Application {
         self
     }
 
+    /// The headless CLI's explicit `--allow-plaintext-secrets` choice. It
+    /// applies to exactly this process's one task text; the durable stores
+    /// still receive the sanitized projection.
+    pub fn with_plaintext_seed_ack(mut self, ack: bool) -> Self {
+        self.plaintext_seed_ack = ack;
+        self
+    }
+
     /// Model-step safety ceiling for this application's top-level runs, from
     /// the CLI's `--max-model-steps` (alias `--max-rounds`): absent means the
     /// default ([`DEFAULT_MODEL_STEP_CEILING`]), `0` means no ceiling, `n`
@@ -1638,25 +1673,103 @@ impl Application {
         Ok(db)
     }
 
-    /// Recover hosted process settlements at an explicit runtime startup
-    /// boundary. Merely reading the session database never performs this work.
+    /// Bind this boot to the background registry without touching the host.
     ///
-    /// The same boundary binds this runtime's boot identity to the background
-    /// registry. A hosted goal task is attributed to the boot that admitted it,
-    /// and a replacement boot can then prove the previous generation gone
-    /// instead of silently adopting its live process as its own.
-    pub async fn reconcile_execution_services(
-        &self,
-    ) -> Result<Option<leveler_execution::HostRecovery>, AppError> {
+    /// A hosted goal task is attributed to the boot that admitted it, and a
+    /// replacement boot can then prove the previous generation gone instead of
+    /// silently adopting its live process as its own. Binding is local and
+    /// cheap; it belongs before clients are served, while host reconciliation
+    /// does not.
+    pub fn bind_runtime_boot(&self) -> Result<(), AppError> {
         let boot = self.boot_id()?;
         let probe: std::sync::Arc<dyn leveler_core::BootLivenessProbe> = std::sync::Arc::new(
             runtime_boot::StateDirBootLiveness::new(&self.layout.state_dir),
         );
         self.background_tasks.bind_runtime_boot(boot, probe);
-        self.background_tasks
+        Ok(())
+    }
+
+    /// Recover hosted process settlements at an explicit runtime startup
+    /// boundary. Merely reading the session database never performs this work.
+    ///
+    /// Prefer [`Self::spawn_execution_services_recovery`] on a path a client is
+    /// waiting on, and [`Self::bind_runtime_boot`] first: this await includes
+    /// calls to a process that another workload can leave busy.
+    pub async fn reconcile_execution_services(
+        &self,
+    ) -> Result<Option<leveler_execution::HostRecovery>, AppError> {
+        self.bind_runtime_boot()?;
+        self.reconcile_hosted_backgrounds().await
+    }
+
+    async fn reconcile_hosted_backgrounds(
+        &self,
+    ) -> Result<Option<leveler_execution::HostRecovery>, AppError> {
+        let started = std::time::Instant::now();
+        let result = self
+            .background_tasks
             .reconcile_hosted()
             .await
-            .map_err(AppError::ExecutionHost)
+            .map_err(AppError::ExecutionHost);
+        tracing::info!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            ok = result.is_ok(),
+            "execution services reconciled at startup"
+        );
+        result
+    }
+
+    /// Reconcile hosted background services without making a client wait.
+    ///
+    /// The boot must already be bound (or this binds it synchronously before
+    /// spawning). The outcome is recorded in [`Self::startup_recovery`] and
+    /// logged; a failure never takes the runtime down, because the client can
+    /// still read canonical session state and must be told what is unknown.
+    pub fn spawn_execution_services_recovery(self: &Arc<Self>) {
+        if let Err(error) = self.bind_runtime_boot() {
+            self.startup_recovery
+                .finish(startup_recovery::EXECUTION_SERVICES, Err(error.to_string()));
+            return;
+        }
+        let app = self.clone();
+        self.startup_recovery
+            .begin(startup_recovery::EXECUTION_SERVICES);
+        tokio::spawn(async move {
+            let result = app
+                .reconcile_hosted_backgrounds()
+                .await
+                .map_err(|error| error.to_string());
+            app.startup_recovery
+                .finish_with_recovery(startup_recovery::EXECUTION_SERVICES, result);
+        });
+    }
+
+    /// The recovery ledger every session projection reads.
+    pub(crate) fn startup_recovery(&self) -> &startup_recovery::StartupRecovery {
+        &self.startup_recovery
+    }
+
+    /// Wait a bounded grace for recovery to settle before building a snapshot.
+    /// A stalled host does not hold the snapshot past the grace; the snapshot
+    /// then reports `running` and omits host-only facts.
+    pub(crate) async fn wait_startup_recovery(&self) -> startup_recovery::RecoveryReadout {
+        self.startup_recovery
+            .wait_settled(std::time::Duration::from_millis(500))
+            .await
+    }
+
+    /// The structured recovery state a client must see on the snapshot.
+    pub(crate) fn startup_recovery_wire(
+        &self,
+    ) -> Option<leveler_client_protocol::UiStartupRecovery> {
+        self.startup_recovery.read().to_wire()
+    }
+
+    /// Whether a projection or health reading may ask the Execution Host for
+    /// live tasks. While recovery is in flight or failed, only durable/local
+    /// facts are available.
+    pub(crate) fn startup_recovery_permits_host_reads(&self) -> bool {
+        self.startup_recovery.read().permits_host_reads()
     }
 
     /// All configured model references.

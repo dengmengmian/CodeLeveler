@@ -789,6 +789,10 @@ pub enum RuntimeEvent {
     },
     /// The current turn was cancelled (resumable).
     TurnCancelled,
+    /// The turn ended because its owning runtime or process stopped before a
+    /// normal terminal. The durable `turn_finished` outcome is `interrupted`,
+    /// not a user cancellation; a client must show that difference.
+    TurnInterrupted,
     /// The logical task was explicitly cancelled by the user. Terminal: unlike
     /// [`Self::TurnCancelled`] a continuation must not reopen it.
     TaskCancelled,
@@ -1012,6 +1016,14 @@ pub enum RuntimeEvent {
         level: NotificationLevel,
         message: String,
     },
+    /// Start-up recovery settled after this client's first snapshot.
+    ///
+    /// The snapshot already carries the same structure; this event exists so a
+    /// failure that happens later is not silent until the next reconnect. The
+    /// runtime sends it to the session streams that are already attached. A
+    /// client that never saw the snapshot's `running` state can treat it as the
+    /// same fact and deduplicate by stage + message.
+    StartupRecovery { recovery: crate::UiStartupRecovery },
     /// What this turn's message selected and whether each Skill package was
     /// loaded into the turn context. Emitted once at turn start; the durable
     /// record is the engine's skill-delivery audit event.
@@ -1307,6 +1319,7 @@ mod tests {
             execution_task: None,
             children: Vec::new(),
             foreign_origin: None,
+            startup_recovery: None,
         }
     }
 
@@ -2095,6 +2108,7 @@ mod tests {
     #[test]
     fn turn_cancelled_roundtrips() {
         roundtrip(RuntimeEvent::TurnCancelled, "turn_cancelled");
+        roundtrip(RuntimeEvent::TurnInterrupted, "turn_interrupted");
         roundtrip(
             RuntimeEvent::BackgroundTaskStarted {
                 task_id: "bg-1".into(),

@@ -37,9 +37,11 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import pty_dogfood as base  # noqa: E402
+from synthetic_canary import SyntheticCanaryRun  # noqa: E402
 
-CANARY = "sk-CANARY-SECRET-DO-NOT-EXPOSE-001"
-UNKNOWN = "xY9pQ2vT7"
+CANARY_RUN = SyntheticCanaryRun("secret-broker-pty")
+CANARY = CANARY_RUN.require(CANARY_RUN.issue("detected", shape="sk"))
+UNKNOWN = CANARY_RUN.require(CANARY_RUN.issue("unknown"))
 EVIDENCE = os.path.join(base.ROOT, "target", "secret-broker-pty")
 os.makedirs(EVIDENCE, exist_ok=True)
 base.EVIDENCE = EVIDENCE

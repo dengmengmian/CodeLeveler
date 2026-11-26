@@ -154,8 +154,8 @@ pub use snapshot::{
     UiActiveBackgroundTask, UiActiveToolCall, UiBackgroundTaskBlocker, UiBackgroundTaskRecord,
     UiBackgroundTaskState, UiCheckpoint, UiExecutionTask, UiInputState, UiInterruptedCallState,
     UiInterruptedToolCall, UiMessage, UiMessageKind, UiRole, UiSessionHistory, UiSessionSnapshot,
-    UiSessionSummary, UiTaskDeclaration, UiThinkingAccess, UiThinkingState, UiToolTiming,
-    UiTurnBlocker, UiUserShell,
+    UiSessionSummary, UiStartupRecovery, UiStartupRecoveryFailure, UiTaskDeclaration,
+    UiThinkingAccess, UiThinkingState, UiToolTiming, UiTurnBlocker, UiUserShell,
 };
 pub use usage::{UiModelUsage, UiUsageReport, UiUsageScope};
 pub use version::{
@@ -164,6 +164,11 @@ pub use version::{
 pub use wire_types::{
     AnswerEffect, ApprovalDecision, ApprovalPolicy, PermissionContract, PermissionProfile,
 };
+
+/// Serde helper for integer fields whose zero value is omitted on the wire.
+pub fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
 
 #[cfg(feature = "testing")]
 pub mod mock;
