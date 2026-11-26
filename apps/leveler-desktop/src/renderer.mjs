@@ -249,11 +249,13 @@ let pendingModel = null;
 let pendingCollaboration = 'chat';
 // One axis switch in flight: {sessionId, target}. Presentation only.
 let collaborationSwitch = null;
-// Sessions whose goal state was refreshed once for the current turn. The
-// snapshot is the only source of the owed-goal dock; a goal record can appear
-// just after the submit acknowledgement, so the first tool of the turn is the
-// first reliable point to re-read it without polling.
-const goalDockProbed = new Set();
+// Per-turn attempts to read the owed-goal projection. The snapshot is the only
+// source of the goal dock; the goal record can land after the submit
+// acknowledgement, so the first tool is the first reliable point to re-read
+// it. A probe that arrives too early is bounded and retried on a later tool of
+// the same turn, never on a timer.
+const goalDockProbes = new Map();
+const GOAL_DOCK_PROBE_LIMIT = 3;
 // A submit that the Runtime acknowledged but whose first status event has not
 // reached the page yet is still work that a quit would interrupt.
 let pendingSubmit = false;
@@ -8995,17 +8997,16 @@ api.onEvent(frame => {
   if (current.status !== statusBefore || current.activity !== activityBefore) { renderHeader(); renderComposerMeta(); }
   modelRetry = event.type === 'model_retrying' ? { attempt: event.attempt ?? 0, max: event.max_attempts ?? 0 } : null;
   if (terminalEvents.has(event.type)) { pendingSubmit = false; setTimeout(flushQueuedMessage, 0); }
-  if (terminalEvents.has(event.type) && current?.session?.id) goalDockProbed.delete(current.session.id);
-  if (event.type === 'user_message_added' && current?.session?.id) goalDockProbed.delete(current.session.id);
+  if (terminalEvents.has(event.type) && current?.session?.id) goalDockProbes.delete(current.session.id);
+  if (event.type === 'user_message_added' && current?.session?.id) goalDockProbes.delete(current.session.id);
   if (event.type === 'tool_call_started' && current?.session?.id
     && (current.session.collaboration ?? 'chat') === 'goal'
     && !current.session.execution_task
-    && !goalDockProbed.has(current.session.id)) {
-    // The goal record can be committed after the submit acknowledgement, so
-    // the first tool of the turn is where the owed-goal projection becomes
-    // reliably readable. One snapshot read per turn; failures leave the dock
-    // absent rather than inventing a state.
-    goalDockProbed.add(current.session.id);
+    && (goalDockProbes.get(current.session.id) ?? 0) < GOAL_DOCK_PROBE_LIMIT) {
+    // The goal record can be committed after the submit acknowledgement. A
+    // probe can therefore miss it; retry on a later tool of the same turn (at
+    // most three times) instead of leaving the dock absent or polling.
+    goalDockProbes.set(current.session.id, (goalDockProbes.get(current.session.id) ?? 0) + 1);
     void refreshMetadata().then(() => renderComposerDocks()).catch(() => {});
   }
   if (event.type === 'turn_yielded') {

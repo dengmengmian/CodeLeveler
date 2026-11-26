@@ -86,7 +86,7 @@ const provider = createServer(async (request, response) => {
       if (!toolResults.length) {
         // A real tool keeps the first window open long enough for the owed-
         // goal dock (read from the Runtime snapshot) to be observed.
-        response.end(sseTools([{ id: 'goal-slow', name: 'run_command', arguments: { program: 'sh', args: ['-c', 'sleep 2'], reason: 'hold the goal window open' } }]));
+        response.end(sseTools([{ id: 'goal-slow', name: 'run_command', arguments: { program: 'sh', args: ['-c', 'sleep 4'], reason: 'hold the goal window open' } }]));
       } else if (toolResults.length === 1) {
         response.end(sseTools([{ id: 'goal-single', name: 'update_goal', arguments: { status: 'complete', summary: 'GOAL_SINGLE_DONE', deliver_answer: true } }]));
       } else {
