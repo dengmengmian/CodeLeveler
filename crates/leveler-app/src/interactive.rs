@@ -7770,28 +7770,41 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 query_id,
                 request,
             } => {
-                let run_now = matches!(
-                    *request,
-                    leveler_client_protocol::schedule::ScheduleRequest::RunNow { .. }
-                );
+                let mut run_now_occurrence = None;
                 let mut response = match self.app.schedule_manager().await {
-                    Ok(manager) => manager.handle(*request).await,
+                    Ok(manager) => match *request {
+                        leveler_client_protocol::schedule::ScheduleRequest::RunNow { id } => {
+                            match manager.run_now_occurrence(&id).await {
+                                Ok((response, occurrence)) => {
+                                    run_now_occurrence = Some(occurrence);
+                                    response
+                                }
+                                Err(error) => {
+                                    leveler_client_protocol::schedule::ScheduleResponse::Error {
+                                        message: error.to_string(),
+                                    }
+                                }
+                            }
+                        }
+                        other => manager.handle(other).await,
+                    },
                     Err(error) => leveler_client_protocol::schedule::ScheduleResponse::Error {
                         message: error.to_string(),
                     },
                 };
                 // Run-now is an explicit user request; leaving the slot for a
                 // later OS wake would make the button appear broken when
-                // background scheduling is off. Start the existing dispatcher
-                // command, which connects to this runtime as an ordinary local
-                // client; nothing here executes the action itself.
-                if run_now
+                // background scheduling is off. Start one dispatcher scoped to
+                // this exact slot; it claims this slot, follows the run to its
+                // terminal fact, and never consumes another schedule's due
+                // occurrence.
+                if let Some(occurrence) = run_now_occurrence
                     && let leveler_client_protocol::schedule::ScheduleResponse::Changed {
                         message,
                         ..
                     } = &mut response
                 {
-                    match spawn_schedule_dispatch(self.app.as_ref()) {
+                    match spawn_schedule_dispatch(self.app.as_ref(), occurrence.as_str()) {
                         Ok(()) => message.push_str("; the dispatcher was started"),
                         Err(error) => message.push_str(&format!(
                             "; but this process could not start the dispatcher: {error}"
@@ -12658,14 +12671,15 @@ compatibility: { synthesize_tool_call_ids: true, drop_unsupported_fields: true }
     }
 }
 
-/// Start the existing short-lived dispatch command for an explicit run-now.
+/// Start the short-lived dispatcher for one explicit run-now slot.
 ///
-/// The action itself is still claimed and executed by the dispatcher through
-/// this runtime; the child only performs one due pass, exactly as an OS wake
-/// would. Its output is discarded because a run's observed outcome belongs to
-/// the schedule store, never to an unobserved pipe.
-fn spawn_schedule_dispatch(app: &Application) -> Result<(), String> {
-    crate::schedule_tools::dispatch_trigger(&app.layout)()
+/// The action is still claimed and executed by the shared dispatcher through
+/// this runtime. The child claims only the named occurrence, follows that run
+/// to its terminal fact, and exits; it never performs a generic due pass. Its
+/// output is discarded because a run's observed outcome belongs to the
+/// schedule store, never to an unobserved pipe.
+fn spawn_schedule_dispatch(app: &Application, occurrence: &str) -> Result<(), String> {
+    crate::schedule_tools::dispatch_trigger(&app.layout)(occurrence)
 }
 
 #[cfg(test)]

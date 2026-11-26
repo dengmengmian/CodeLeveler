@@ -12,7 +12,7 @@
 #![cfg(unix)]
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -212,6 +212,24 @@ impl RuntimeConnector for StaticConnector {
     }
 }
 
+/// Connects for the first dispatch, then behaves as a runtime that crashed:
+/// the run was delivered but observation can no longer reach it.
+struct FlakyConnector {
+    runtime: Arc<ScriptedRuntime>,
+    calls: AtomicUsize,
+    fail_after: usize,
+}
+
+#[async_trait]
+impl RuntimeConnector for FlakyConnector {
+    async fn connect(&self, _workspace: &Path) -> Result<Arc<dyn LocalRuntimeService>, String> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) >= self.fail_after {
+            return Err("the runtime is gone".into());
+        }
+        Ok(self.runtime.clone())
+    }
+}
+
 struct Fixture {
     store: ScheduleStore,
     definition_id: leveler_schedule::ScheduleId,
@@ -271,6 +289,448 @@ fn dispatcher(runtime: &Arc<ScriptedRuntime>, store: ScheduleStore) -> Dispatche
     )
     .with_lease(Duration::from_secs(30))
     .with_poll_interval(Duration::from_millis(10))
+}
+
+/// A run-now exercised the way the TUI, Desktop and agent tool do it: one
+/// dispatcher scoped to the explicit occurrence, following its run. The shell
+/// is visible as `running` first and reports `success` later; the run must
+/// settle without any further dispatch pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_now_follow_settles_the_run_without_a_second_pass() {
+    let observed = Arc::new(AtomicUsize::new(0));
+    let counter = observed.clone();
+    let runtime = Arc::new(ScriptedRuntime::new(
+        move |delivered: &[CommandEnvelope]| {
+            let Some(envelope) = delivered
+                .iter()
+                .find(|envelope| matches!(envelope.command, ClientCommand::RunUserShell { .. }))
+            else {
+                return Ok(Vec::new());
+            };
+            let seen = counter.fetch_add(1, Ordering::SeqCst);
+            let status = if seen < 2 { "running" } else { "success" };
+            Ok(vec![ScriptedRuntime::shell(
+                &envelope.command_id,
+                status,
+                (seen >= 2).then_some(0),
+            )])
+        },
+    ));
+    let fixture = fixture(&runtime, Duration::from_secs(30)).await;
+    let definition = fixture
+        .store
+        .definition(&fixture.definition_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let occurrence = fixture.store.create_run_now(&definition).await.unwrap();
+
+    let state = dispatcher(&runtime, fixture.store.clone())
+        .with_follow(true)
+        .dispatch_occurrence(&occurrence.id)
+        .await
+        .unwrap();
+
+    assert_eq!(state, Some(RunState::Succeeded));
+    let run = fixture
+        .store
+        .run_for_occurrence(&occurrence.id)
+        .await
+        .unwrap()
+        .expect("the run-now slot produced a run");
+    assert_eq!(run.state, RunState::Succeeded);
+    assert_eq!(run.exit_code, Some(0));
+    assert!(run.finished_at.is_some());
+    assert_eq!(
+        runtime.run_envelopes().len(),
+        1,
+        "following must observe the run, not deliver the action again"
+    );
+    assert!(
+        observed.load(Ordering::SeqCst) >= 3,
+        "the follower must observe past the first running snapshot"
+    );
+}
+
+/// A followed run that outlives its timeout still ends in a terminal fact:
+/// the shared deadline path cancels the execution and records `unknown`. The
+/// action is not delivered again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_now_that_outlives_its_timeout_settles_unknown() {
+    let runtime = Arc::new(ScriptedRuntime::new(|delivered: &[CommandEnvelope]| {
+        let Some(envelope) = delivered
+            .iter()
+            .find(|envelope| matches!(envelope.command, ClientCommand::RunUserShell { .. }))
+        else {
+            return Ok(Vec::new());
+        };
+        Ok(vec![ScriptedRuntime::shell(
+            &envelope.command_id,
+            "running",
+            None,
+        )])
+    }));
+    let fixture = fixture(&runtime, Duration::from_secs(1)).await;
+    let definition = fixture
+        .store
+        .definition(&fixture.definition_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let occurrence = fixture.store.create_run_now(&definition).await.unwrap();
+
+    let state = dispatcher(&runtime, fixture.store.clone())
+        .with_follow(true)
+        .dispatch_occurrence(&occurrence.id)
+        .await
+        .unwrap();
+
+    assert_eq!(state, Some(RunState::Unknown));
+    let run = fixture
+        .store
+        .run_for_occurrence(&occurrence.id)
+        .await
+        .unwrap()
+        .expect("the run-now slot produced a run");
+    assert_eq!(run.state, RunState::Unknown);
+    assert!(run.finished_at.is_some());
+    assert_eq!(
+        runtime.run_envelopes().len(),
+        1,
+        "a timed-out run must not be delivered again"
+    );
+    assert_eq!(
+        runtime.cancel_envelopes().len(),
+        1,
+        "the deadline must request one cancellation"
+    );
+}
+
+/// A runtime that disappears after taking the run leaves no terminal record.
+/// The follower cannot observe it, so the explicit request ends as `unknown`
+/// at its factual deadline instead of staying `running` forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_now_whose_runtime_disappears_settles_unknown() {
+    let runtime = Arc::new(ScriptedRuntime::new(|delivered: &[CommandEnvelope]| {
+        let Some(envelope) = delivered
+            .iter()
+            .find(|envelope| matches!(envelope.command, ClientCommand::RunUserShell { .. }))
+        else {
+            return Ok(Vec::new());
+        };
+        Ok(vec![ScriptedRuntime::shell(
+            &envelope.command_id,
+            "running",
+            None,
+        )])
+    }));
+    let fixture = fixture(&runtime, Duration::from_secs(1)).await;
+    let definition = fixture
+        .store
+        .definition(&fixture.definition_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let occurrence = fixture.store.create_run_now(&definition).await.unwrap();
+    let dispatcher = Dispatcher::new(
+        fixture.store.clone(),
+        Arc::new(FlakyConnector {
+            runtime: runtime.clone(),
+            calls: AtomicUsize::new(0),
+            // The dispatch connects once; every observation after it fails.
+            fail_after: 1,
+        }),
+    )
+    .with_lease(Duration::from_secs(30))
+    .with_poll_interval(Duration::from_millis(10))
+    .with_follow(true);
+
+    let state = dispatcher
+        .dispatch_occurrence(&occurrence.id)
+        .await
+        .unwrap();
+
+    assert_eq!(state, Some(RunState::Unknown));
+    let run = fixture
+        .store
+        .run_for_occurrence(&occurrence.id)
+        .await
+        .unwrap()
+        .expect("the run-now slot produced a run");
+    assert_eq!(run.state, RunState::Unknown);
+    assert!(run.finished_at.is_some());
+    assert_eq!(
+        runtime.run_envelopes().len(),
+        1,
+        "a run whose outcome is unknown must not be delivered again"
+    );
+}
+
+/// A cancel request on a followed run reaches the runtime and settles the
+/// shared `cancelled` fact; the shell is delivered once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_now_cancel_request_settles_cancelled() {
+    let runtime = Arc::new(ScriptedRuntime::new(|delivered: &[CommandEnvelope]| {
+        let Some(envelope) = delivered
+            .iter()
+            .find(|envelope| matches!(envelope.command, ClientCommand::RunUserShell { .. }))
+        else {
+            return Ok(Vec::new());
+        };
+        let cancelled = delivered
+            .iter()
+            .any(|envelope| matches!(envelope.command, ClientCommand::CancelUserShell { .. }));
+        Ok(vec![ScriptedRuntime::shell(
+            &envelope.command_id,
+            if cancelled { "cancelled" } else { "running" },
+            None,
+        )])
+    }));
+    let fixture = fixture(&runtime, Duration::from_secs(30)).await;
+    let definition = fixture
+        .store
+        .definition(&fixture.definition_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let occurrence = fixture.store.create_run_now(&definition).await.unwrap();
+    let definition_id = fixture.definition_id.clone();
+    let store = fixture.store.clone();
+    let dispatcher = dispatcher(&runtime, store.clone()).with_follow(true);
+    let occurrence_id = occurrence.id.clone();
+    let running = tokio::spawn(async move { dispatcher.dispatch_occurrence(&occurrence_id).await });
+    let mut run = None;
+    for _ in 0..200 {
+        run = store.run_for_occurrence(&occurrence.id).await.unwrap();
+        if run.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(run.is_some(), "the claim must create a run");
+    store
+        .request_cancel_definition(&definition_id)
+        .await
+        .unwrap();
+    let state = running.await.unwrap().unwrap();
+    assert_eq!(state, Some(RunState::Cancelled));
+    let run = store
+        .run_for_occurrence(&occurrence.id)
+        .await
+        .unwrap()
+        .expect("the run-now slot produced a run");
+    assert_eq!(run.state, RunState::Cancelled);
+    assert_eq!(
+        runtime.run_envelopes().len(),
+        1,
+        "cancel must not deliver the action a second time"
+    );
+    assert_eq!(
+        runtime.cancel_envelopes().len(),
+        1,
+        "cancel must reach the runtime exactly once"
+    );
+}
+
+/// Dispatching the same explicit slot again observes its existing terminal
+/// run; it never creates a second execution.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_settled_run_now_slot_is_not_executed_twice() {
+    let runtime = Arc::new(ScriptedRuntime::new(|delivered: &[CommandEnvelope]| {
+        let Some(envelope) = delivered
+            .iter()
+            .find(|envelope| matches!(envelope.command, ClientCommand::RunUserShell { .. }))
+        else {
+            return Ok(Vec::new());
+        };
+        Ok(vec![ScriptedRuntime::shell(
+            &envelope.command_id,
+            "success",
+            Some(0),
+        )])
+    }));
+    let fixture = fixture(&runtime, Duration::from_secs(30)).await;
+    let definition = fixture
+        .store
+        .definition(&fixture.definition_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let occurrence = fixture.store.create_run_now(&definition).await.unwrap();
+
+    let first = dispatcher(&runtime, fixture.store.clone())
+        .with_follow(true)
+        .dispatch_occurrence(&occurrence.id)
+        .await
+        .unwrap();
+    let second = dispatcher(&runtime, fixture.store.clone())
+        .with_follow(true)
+        .dispatch_occurrence(&occurrence.id)
+        .await
+        .unwrap();
+
+    assert_eq!(first, Some(RunState::Succeeded));
+    assert_eq!(second, Some(RunState::Succeeded));
+    assert_eq!(
+        runtime.run_envelopes().len(),
+        1,
+        "a second request for the same settled slot must not deliver again"
+    );
+    assert_eq!(
+        fixture
+            .store
+            .runs(Some(&fixture.definition_id), 10)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "the slot owns exactly one run"
+    );
+}
+
+/// When a background pass has already claimed the run-now slot, the manual
+/// follower adopts that run instead of claiming a second one. This is the
+/// background-scheduling-on race the shared store must resolve without a
+/// duplicate delivery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_now_follow_adopts_a_run_another_dispatcher_claimed() {
+    let observed = Arc::new(AtomicUsize::new(0));
+    let counter = observed.clone();
+    let runtime = Arc::new(ScriptedRuntime::new(
+        move |delivered: &[CommandEnvelope]| {
+            let Some(envelope) = delivered
+                .iter()
+                .find(|envelope| matches!(envelope.command, ClientCommand::RunUserShell { .. }))
+            else {
+                return Ok(Vec::new());
+            };
+            let seen = counter.fetch_add(1, Ordering::SeqCst);
+            let status = if seen < 2 { "running" } else { "success" };
+            Ok(vec![ScriptedRuntime::shell(
+                &envelope.command_id,
+                status,
+                (seen >= 2).then_some(0),
+            )])
+        },
+    ));
+    let fixture = fixture(&runtime, Duration::from_secs(30)).await;
+    let definition = fixture
+        .store
+        .definition(&fixture.definition_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let occurrence = fixture.store.create_run_now(&definition).await.unwrap();
+
+    // The background-style pass claims and hands off; its run is still open.
+    let handed_off = dispatcher(&runtime, fixture.store.clone())
+        .dispatch_run_now(&occurrence.id)
+        .await
+        .unwrap();
+    assert_eq!(handed_off, Some(RunState::Running));
+
+    let followed = dispatcher(&runtime, fixture.store.clone())
+        .with_follow(true)
+        .dispatch_occurrence(&occurrence.id)
+        .await
+        .unwrap();
+
+    assert_eq!(followed, Some(RunState::Succeeded));
+    assert_eq!(
+        runtime.run_envelopes().len(),
+        1,
+        "adopting an existing run must not deliver the action a second time"
+    );
+    let run = fixture
+        .store
+        .run_for_occurrence(&occurrence.id)
+        .await
+        .unwrap()
+        .expect("the run-now slot produced a run");
+    assert_eq!(run.state, RunState::Succeeded);
+}
+
+/// A run-now dispatcher claims exactly its explicit slot. Another schedule
+/// with an overdue slot must stay pending: Run Now is not a general pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_now_dispatcher_never_claims_another_schedules_due_slot() {
+    let runtime = Arc::new(ScriptedRuntime::new(|delivered: &[CommandEnvelope]| {
+        let Some(envelope) = delivered
+            .iter()
+            .find(|envelope| matches!(envelope.command, ClientCommand::RunUserShell { .. }))
+        else {
+            return Ok(Vec::new());
+        };
+        Ok(vec![ScriptedRuntime::shell(
+            &envelope.command_id,
+            "success",
+            Some(0),
+        )])
+    }));
+    let fixture = fixture(&runtime, Duration::from_secs(30)).await;
+    let workspace = fixture
+        .store
+        .definition(&fixture.definition_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .workspace;
+    let other = fixture
+        .store
+        .create_definition(NewScheduleDefinition {
+            name: "unrelated".into(),
+            workspace,
+            action: leveler_schedule::ScheduleAction::Shell {
+                command: "printf 'unrelated\\n'".into(),
+            },
+            trigger: ScheduleTrigger::Once {
+                at: leveler_core::now() - chrono::Duration::seconds(1),
+            },
+            session_policy: leveler_schedule::SessionPolicy::Continue,
+            overlap: leveler_schedule::OverlapPolicy::SkipIfRunning,
+            mode: PermissionProfile::Assisted,
+            permission_contract: leveler_client_protocol::PermissionContract::V2,
+            model: None,
+            timeout: Duration::from_secs(30),
+            misfire: leveler_schedule::MisfirePolicy::Skip,
+            misfire_grace: Duration::from_secs(300),
+            unattended: Some(UnattendedRequest {
+                allow_external_side_effects: true,
+            }),
+        })
+        .await
+        .unwrap();
+    let definition = fixture
+        .store
+        .definition(&fixture.definition_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let occurrence = fixture.store.create_run_now(&definition).await.unwrap();
+
+    let state = dispatcher(&runtime, fixture.store.clone())
+        .with_follow(true)
+        .dispatch_occurrence(&occurrence.id)
+        .await
+        .unwrap();
+
+    assert_eq!(state, Some(RunState::Succeeded));
+    let other_occurrences = fixture.store.occurrences(&other.id, 10).await.unwrap();
+    assert_eq!(other_occurrences.len(), 1);
+    assert_eq!(
+        other_occurrences[0].state,
+        leveler_schedule::OccurrenceState::Pending,
+        "the unrelated overdue slot must not be claimed"
+    );
+    assert!(
+        fixture
+            .store
+            .runs(Some(&other.id), 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the unrelated schedule must not start a run"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

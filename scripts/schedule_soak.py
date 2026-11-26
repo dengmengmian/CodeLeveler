@@ -103,6 +103,10 @@ def parse_iso(value: str) -> dt.datetime:
     return parsed.astimezone(dt.timezone.utc)
 
 
+def parse_optional_iso(value: Optional[str]) -> Optional[dt.datetime]:
+    return parse_iso(value) if value else None
+
+
 def seconds_between(start: Optional[str], end: Optional[str]) -> Optional[float]:
     if not start or not end:
         return None
@@ -813,14 +817,124 @@ def percentile(values: Sequence[float], fraction: float) -> Optional[float]:
 
 def latency_stats(values: Sequence[float]) -> Dict[str, Any]:
     if not values:
-        return {"count": 0, "p50": None, "p95": None, "p99": None, "max": None}
+        return {
+            "count": 0,
+            "p50": None,
+            "p90": None,
+            "p95": None,
+            "p99": None,
+            "max": None,
+        }
     return {
         "count": len(values),
         "p50": percentile(values, 0.50),
+        "p90": percentile(values, 0.90),
         "p95": percentile(values, 0.95),
         "p99": percentile(values, 0.99),
         "max": max(values),
     }
+
+
+def _seconds(delta: dt.timedelta) -> float:
+    return delta.total_seconds()
+
+
+# The latency evidence keeps the gate's claim statistic and the phases that
+# make it up. A late OS wake and a backlog behind an earlier slot are different
+# product facts; reporting only the total hides which one moved.
+LATENCY_BUCKETS = (
+    "claim",
+    "os_wake",
+    "backlog",
+    "dispatch",
+    "delivery",
+    "execution_start",
+    "execution",
+    "end_to_end",
+)
+
+
+def decompose_run_latency(
+    scheduled_for: dt.datetime,
+    claimed_at: dt.datetime,
+    wake_starts: Sequence[dt.datetime],
+    delivered_at: Optional[dt.datetime] = None,
+    running_at: Optional[dt.datetime] = None,
+    handed_off_at: Optional[dt.datetime] = None,
+    finished_at: Optional[dt.datetime] = None,
+) -> Dict[str, Optional[float]]:
+    """Split scheduled -> claimed into OS wake, queueing and pass work.
+
+    `wake_starts` are the dispatcher process starts. The first wake inside
+    ``[scheduled_for, claimed_at]`` is the first chance to dispatch a slot that
+    was already materialized; the claiming wake is the last start at or before
+    the claim. A wake that began before a run-now slot was created is not OS
+    timer delay for that slot, so both queue buckets are zero there and the
+    pass duration is measured from the claiming wake.
+    """
+    wake_starts = sorted(wake_starts)
+    values: Dict[str, Optional[float]] = {"claim": _seconds(claimed_at - scheduled_for)}
+    first = next((wake for wake in wake_starts if scheduled_for <= wake <= claimed_at), None)
+    claiming = None
+    for wake in wake_starts:
+        if wake <= claimed_at:
+            claiming = wake
+        else:
+            break
+    if first is not None and claiming is not None:
+        values["os_wake"] = _seconds(first - scheduled_for)
+        values["backlog"] = _seconds(max(claiming - first, dt.timedelta(0)))
+    else:
+        values["os_wake"] = 0.0
+        values["backlog"] = 0.0
+    values["dispatch"] = (
+        _seconds(max(claimed_at - claiming, dt.timedelta(0))) if claiming is not None else None
+    )
+    if delivered_at is not None:
+        values["delivery"] = _seconds(delivered_at - claimed_at)
+    observed = running_at or handed_off_at or delivered_at
+    if observed is not None:
+        values["execution_start"] = _seconds(observed - claimed_at)
+    if finished_at is not None:
+        if observed is not None:
+            values["execution"] = _seconds(finished_at - observed)
+        values["end_to_end"] = _seconds(finished_at - scheduled_for)
+    return values
+
+
+def queue_depth_at_claim(
+    scheduled_for: dt.datetime,
+    claimed_at: dt.datetime,
+    definition_rows: Sequence[Dict[str, Any]],
+) -> int:
+    """Newer slots that were already due and still unclaimed at this claim.
+
+    Reconstructed from durable rows, not a sampled queue: a newer occurrence
+    in the window is waiting behind this one when its own claim is later or
+    absent. A policy-terminal row without a claim was not waiting work.
+    """
+    depth = 0
+    for row in definition_rows:
+        raw_scheduled = row.get("scheduled_for")
+        if not raw_scheduled:
+            continue
+        other_scheduled = parse_iso(raw_scheduled)
+        if not (scheduled_for < other_scheduled <= claimed_at):
+            continue
+        raw_claim = row.get("claimed_at")
+        if raw_claim:
+            if parse_iso(raw_claim) > claimed_at:
+                depth += 1
+        elif row.get("state") not in (
+            "skipped",
+            "missed",
+            "blocked",
+            "cancelled",
+            "waiting_approval",
+            "completed",
+        ):
+            depth += 1
+    return depth
 
 
 def assert_isolated_home(home: Path, live_root: Path) -> None:
@@ -3540,6 +3654,10 @@ def aggregate_run(
     claim_latencies: List[float] = []
     completion_latencies: List[float] = []
     handoff_latencies: List[float] = []
+    decomposed_latencies: Dict[str, List[float]] = {key: [] for key in LATENCY_BUCKETS}
+    decomposed_by_lane: Dict[str, Dict[str, Any]] = {}
+    decomposed_by_definition: Dict[str, Dict[str, List[float]]] = {}
+    queue_depths: List[float] = []
     session_gaps: List[float] = []
     usage = {
         "requests": 0,
@@ -3561,9 +3679,24 @@ def aggregate_run(
         lane_occurrence_states: Dict[str, int] = {}
         lane_effects = marker_counts(lane, specs_by_lane.get(lane_name, []))
         succeeded_by_definition: Dict[str, int] = {}
+        lane_decomposed: Dict[str, List[float]] = {key: [] for key in LATENCY_BUCKETS}
+        lane_queue_depths: List[float] = []
+        lane_by_definition: Dict[str, Dict[str, List[float]]] = {}
         occurrences_by_id = {
             occurrence.get("id"): occurrence for occurrence in snapshot["occurrences"]
         }
+        definition_rows: Dict[str, List[Dict[str, Any]]] = {}
+        for occurrence in snapshot["occurrences"]:
+            definition_rows.setdefault(occurrence.get("definition_id"), []).append(occurrence)
+        wake_starts = sorted(
+            parse_iso(row["started_at"])
+            for row in snapshot["wakeups"]
+            if row.get("started_at")
+        )
+        wake_gaps = [
+            (later - earlier).total_seconds()
+            for earlier, later in zip(wake_starts, wake_starts[1:])
+        ]
         for run in snapshot["runs"]:
             _bump(lane_states, run.get("state"))
             _bump(total_states, run.get("state"))
@@ -3611,7 +3744,40 @@ def aggregate_run(
                 occurrence = occurrences_by_id.get(run.get("occurrence_id")) or {}
                 scheduled_for = run.get("scheduled_for") or occurrence.get("scheduled_for")
                 if scheduled_for:
-                    claim_latencies.append((started - parse_iso(scheduled_for)).total_seconds())
+                    scheduled_dt = parse_iso(scheduled_for)
+                    claim_latencies.append((started - scheduled_dt).total_seconds())
+                    claimed_raw = occurrence.get("claimed_at") or run.get("started_at")
+                    if claimed_raw:
+                        claimed_dt = parse_iso(claimed_raw)
+                        values = decompose_run_latency(
+                            scheduled_dt,
+                            claimed_dt,
+                            wake_starts,
+                            delivered_at=parse_optional_iso(run.get("delivered_at")),
+                            running_at=parse_optional_iso(run.get("running_at")),
+                            handed_off_at=parse_optional_iso(run.get("handed_off_at")),
+                            finished_at=parse_optional_iso(run.get("finished_at")),
+                        )
+                        for key, value in values.items():
+                            if value is not None:
+                                lane_decomposed.setdefault(key, []).append(value)
+                        depth = queue_depth_at_claim(
+                            scheduled_dt,
+                            claimed_dt,
+                            definition_rows.get(run.get("definition_id"), []),
+                        )
+                        lane_queue_depths.append(float(depth))
+                        definition_name = (
+                            definition.get("name") or str(run.get("definition_id"))
+                        )
+                        bucket = lane_by_definition.setdefault(
+                            definition_name,
+                            {key: [] for key in LATENCY_BUCKETS},
+                        )
+                        for key, value in values.items():
+                            if value is not None:
+                                bucket.setdefault(key, []).append(value)
+                        bucket.setdefault("queue_depth", []).append(float(depth))
                 if run.get("finished_at"):
                     completion_latencies.append((parse_iso(run["finished_at"]) - started).total_seconds())
                 if run.get("handed_off_at"):
@@ -3715,9 +3881,34 @@ def aggregate_run(
                     for source in sorted({row.get("source") for row in snapshot["wakeups"]})
                 },
                 "max_gap_secs": _max_wake_gap(snapshot["wakeups"]),
+                "gap_secs": latency_stats(wake_gaps),
             },
+            "latency_secs": {
+                key: latency_stats(lane_decomposed.get(key, []))
+                for key in LATENCY_BUCKETS
+            },
+            "queue_depth": latency_stats(lane_queue_depths),
             "database_bytes": Path(snapshot["database"]).stat().st_size if Path(snapshot["database"]).is_file() else 0,
         }
+        if lane_by_definition:
+            evidence["lanes"][lane_name]["latency_by_definition"] = {
+                name: {
+                    key: latency_stats(values)
+                    for key, values in sorted(buckets.items())
+                }
+                for name, buckets in sorted(lane_by_definition.items())
+            }
+        decomposed_by_lane[lane_name] = evidence["lanes"][lane_name]["latency_secs"]
+        for key in LATENCY_BUCKETS:
+            decomposed_latencies[key].extend(lane_decomposed.get(key, []))
+        queue_depths.extend(lane_queue_depths)
+        for name, buckets in lane_by_definition.items():
+            target = decomposed_by_definition.setdefault(
+                lane_name + "." + name,
+                {key: [] for key in LATENCY_BUCKETS},
+            )
+            for key, values in buckets.items():
+                target.setdefault(key, []).extend(values)
         sessions = read_agent_sessions(Path(lane["home"]), Path(lane["repo"]))
         if sessions["sessions"]:
             evidence["lanes"][lane_name]["sessions"] = sessions["sessions"]
@@ -3743,6 +3934,18 @@ def aggregate_run(
         "claim": latency_stats(claim_latencies),
         "completion": latency_stats(completion_latencies),
         "handoff": latency_stats(handoff_latencies),
+    }
+    for key in LATENCY_BUCKETS:
+        if key != "claim":
+            evidence["latency_secs"][key] = latency_stats(decomposed_latencies.get(key, []))
+    evidence["latency_secs"]["queue_depth"] = latency_stats(queue_depths)
+    evidence["latency_by_lane"] = decomposed_by_lane
+    evidence["latency_by_definition"] = {
+        name: {
+            key: latency_stats(values)
+            for key, values in sorted(buckets.items())
+        }
+        for name, buckets in sorted(decomposed_by_definition.items())
     }
     evidence["usage"] = usage
     evidence["usage"]["cost_usd"] = round(usage["cost_usd_micros"] / 1_000_000.0, 6)
@@ -4361,15 +4564,100 @@ def render_report(report: Dict[str, Any]) -> str:
     lines.append("")
     lines.append("## Latency")
     lines.append("")
-    lines.append("| Phase | count | P50 | P95 | P99 | max |")
-    lines.append("| --- | --- | --- | --- | --- | --- |")
+    lines.append("| Phase | count | P50 | P90 | P95 | P99 | max |")
+    lines.append("| --- | --- | --- | --- | --- | --- | --- |")
     for key in ("claim", "completion", "handoff"):
         row = (report.get("latency_secs") or {}).get(key) or {}
         lines.append(
-            "| %s | %s | %s | %s | %s | %s |"
-            % (key, row.get("count"), row.get("p50"), row.get("p95"), row.get("p99"), row.get("max"))
+            "| %s | %s | %s | %s | %s | %s | %s |"
+            % (
+                key,
+                row.get("count"),
+                row.get("p50"),
+                row.get("p90"),
+                row.get("p95"),
+                row.get("p99"),
+                row.get("max"),
+            )
         )
     lines.append("")
+    lines.append(
+        "`claim` is the frozen gate statistic (scheduled_for -> run start). The rows below "
+        "split it: OS wake is the first dispatcher start after the grid time, backlog is "
+        "waiting behind an earlier slot, dispatch is the pass work before the claim."
+    )
+    lines.append("")
+    lines.append("| Decomposed phase | count | P50 | P90 | P95 | P99 | max |")
+    lines.append("| --- | --- | --- | --- | --- | --- | --- |")
+    for key in (
+        "os_wake",
+        "backlog",
+        "dispatch",
+        "delivery",
+        "execution_start",
+        "execution",
+        "end_to_end",
+        "queue_depth",
+    ):
+        row = (report.get("latency_secs") or {}).get(key) or {}
+        if not row.get("count"):
+            continue
+        lines.append(
+            "| %s | %s | %s | %s | %s | %s | %s |"
+            % (
+                key,
+                row.get("count"),
+                row.get("p50"),
+                row.get("p90"),
+                row.get("p95"),
+                row.get("p99"),
+                row.get("max"),
+            )
+        )
+    lines.append("")
+    lane_latency = report.get("latency_by_lane") or {}
+    if lane_latency:
+        lines.append("### Per-lane claim decomposition")
+        lines.append("")
+        lines.append(
+            "| Lane | claim p50 | claim p90 | claim p95 | OS wake p95 | backlog p95 | "
+            "dispatch p95 | exec start p95 | exec p95 | end-to-end p95 | queue depth p95 | "
+            "wake gap p95 |"
+        )
+        lines.append(
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+        )
+
+        def _value(row: Optional[Dict[str, Any]], key: str) -> str:
+            value = (row or {}).get(key)
+            return "-" if value is None else "%.1f" % value
+
+        for lane, row in sorted(lane_latency.items()):
+            lane_evidence = (report.get("lanes") or {}).get(lane) or {}
+            gap = ((lane_evidence.get("wakeups") or {}).get("gap_secs") or {})
+            lines.append(
+                "| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |"
+                % (
+                    lane,
+                    _value(row.get("claim"), "p50"),
+                    _value(row.get("claim"), "p90"),
+                    _value(row.get("claim"), "p95"),
+                    _value(row.get("os_wake"), "p95"),
+                    _value(row.get("backlog"), "p95"),
+                    _value(row.get("dispatch"), "p95"),
+                    _value(row.get("execution_start"), "p95"),
+                    _value(row.get("execution"), "p95"),
+                    _value(row.get("end_to_end"), "p95"),
+                    _value(lane_evidence.get("queue_depth"), "p95"),
+                    _value(gap, "p95"),
+                )
+            )
+        lines.append("")
+        lines.append(
+            "Per-definition decomposition is in `report.json` under "
+            "`latency_by_definition` and each lane's `latency_by_definition`."
+        )
+        lines.append("")
     resources = report.get("resources") or {}
     lines.append("## Resources")
     lines.append("")

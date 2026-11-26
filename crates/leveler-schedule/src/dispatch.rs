@@ -194,6 +194,11 @@ pub struct Dispatcher {
     usage: Option<Arc<dyn UsageReader>>,
     lease: Duration,
     poll_interval: Duration,
+    /// Manual run-now dispatchers observe the run they were asked to execute
+    /// until a terminal fact exists. Background passes keep handing runs off:
+    /// their next natural wake owns the observation, and a pass must not be
+    /// held by a long action.
+    follow: bool,
 }
 
 impl Dispatcher {
@@ -205,6 +210,7 @@ impl Dispatcher {
             usage: None,
             lease: Duration::from_secs(120),
             poll_interval: Duration::from_millis(250),
+            follow: false,
         }
     }
 
@@ -228,6 +234,21 @@ impl Dispatcher {
     pub fn with_poll_interval(mut self, interval: Duration) -> Self {
         self.poll_interval = interval;
         self
+    }
+
+    /// Observe an explicitly requested run until it has a terminal fact.
+    ///
+    /// Only the manual run-now path sets this. A background pass deliberately
+    /// hands a delivered shell or agent run to a later wake, so following
+    /// there would let one long action hold every other due schedule.
+    pub fn with_follow(mut self, follow: bool) -> Self {
+        self.follow = follow;
+        self
+    }
+
+    /// The store this dispatcher settles into.
+    pub fn store(&self) -> &ScheduleStore {
+        &self.store
     }
 
     /// Recover expired claims, settle handed-off agent runs, apply overlap and
@@ -354,6 +375,63 @@ impl Dispatcher {
             );
         }
         result
+    }
+
+    /// Execute one explicit run-now occurrence and, when following is enabled,
+    /// observe that occurrence's run until it has a terminal fact.
+    ///
+    /// The claim is scoped to `occurrence_id`; this method never falls back to
+    /// a generic pass, so a run-now request cannot execute another schedule's
+    /// overdue slot. If another dispatcher already claimed the slot, the
+    /// existing run is followed without delivering the action again.
+    pub async fn dispatch_occurrence(
+        &self,
+        occurrence_id: &OccurrenceId,
+    ) -> Result<Option<RunState>, ScheduleError> {
+        let state = self.dispatch_run_now(occurrence_id).await?;
+        if !self.follow {
+            return Ok(state);
+        }
+        let Some(run) = self.store.run_for_occurrence(occurrence_id).await? else {
+            return Ok(state);
+        };
+        if run.state.is_terminal() {
+            return Ok(Some(run.state));
+        }
+        self.follow_run(&run.id).await.map(Some)
+    }
+
+    /// Observe one run to its terminal settlement using the same reconciliation
+    /// the background pass uses. This performs no new delivery: the run already
+    /// exists and its action was delivered by its claim.
+    async fn follow_run(&self, run_id: &RunId) -> Result<RunState, ScheduleError> {
+        let Some(initial) = self.store.run(run_id).await? else {
+            return Ok(RunState::Unknown);
+        };
+        if initial.state.is_terminal() {
+            return Ok(initial.state);
+        }
+        let grace = chrono::Duration::from_std(OBSERVE_RETRY_GRACE.max(AGENT_CANCEL_GRACE))
+            .unwrap_or_else(|_| chrono::Duration::zero());
+        let hard_stop = initial.deadline_at.unwrap_or(initial.started_at) + grace;
+        loop {
+            let now = leveler_core::now();
+            self.reconcile_shell_runs(now).await?;
+            self.reconcile_agent_runs(now).await?;
+            let Some(current) = self.store.run(run_id).await? else {
+                return Ok(RunState::Unknown);
+            };
+            if current.state.is_terminal() {
+                return Ok(current.state);
+            }
+            if now >= hard_stop {
+                // Both reconciliation paths have had their full grace window.
+                // There is no authoritative terminal to record here; returning
+                // the observed state keeps the run honest for a later pass.
+                return Ok(current.state);
+            }
+            tokio::time::sleep(self.poll_interval).await;
+        }
     }
 
     /// The earliest pending occurrence, for a long-lived driver's sleep.

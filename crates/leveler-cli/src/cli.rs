@@ -1179,7 +1179,8 @@ pub enum ScheduleCommand {
     },
     /// Run one dispatch pass: apply the misfire policy, recover expired
     /// leases, then execute due occurrences. This is the short-lived path an
-    /// OS timer invokes.
+    /// OS timer invokes. With --occurrence, claim exactly that run-now slot
+    /// instead of any due occurrence.
     Dispatch {
         /// Maximum occurrences to execute in this pass.
         #[arg(long, default_value_t = 4)]
@@ -1187,6 +1188,14 @@ pub enum ScheduleCommand {
         /// Who started this pass. Recorded with the wake.
         #[arg(long, value_enum, default_value = "manual")]
         source: ScheduleSource,
+        /// Execute only this explicit run-now occurrence.
+        #[arg(long, value_name = "OCCURRENCE_ID")]
+        occurrence: Option<String>,
+        /// Observe the explicit occurrence until it has a terminal fact.
+        /// Requires --occurrence: a generic pass must not be held by a long
+        /// action.
+        #[arg(long, requires = "occurrence")]
+        follow: bool,
         /// Print the summary as JSON.
         #[arg(long)]
         json: bool,
@@ -1434,9 +1443,32 @@ mod tests {
             Some(Command::Schedule(ScheduleCommand::Dispatch {
                 max: 2,
                 source: ScheduleSource::Manual,
+                occurrence: None,
+                follow: false,
                 json: true
             }))
         ));
+
+        let scoped = parse(&[
+            "leveler",
+            "schedule",
+            "dispatch",
+            "--occurrence",
+            "occ-1",
+            "--follow",
+        ]);
+        assert!(matches!(
+            scoped.command,
+            Some(Command::Schedule(ScheduleCommand::Dispatch {
+                occurrence: Some(ref occurrence),
+                follow: true,
+                ..
+            })) if occurrence == "occ-1"
+        ));
+        assert!(
+            Cli::try_parse_from(["leveler", "schedule", "dispatch", "--follow"]).is_err(),
+            "--follow without an explicit occurrence must be refused"
+        );
 
         let os_dispatch = parse(&["leveler", "schedule", "dispatch", "--source", "os"]);
         assert!(matches!(

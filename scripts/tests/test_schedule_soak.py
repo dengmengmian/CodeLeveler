@@ -57,7 +57,67 @@ class StatisticsTests(unittest.TestCase):
         self.assertIsNone(soak.percentile([], 0.5))
 
     def test_latency_stats_empty(self):
-        self.assertEqual(soak.latency_stats([]), {"count": 0, "p50": None, "p95": None, "p99": None, "max": None})
+        self.assertEqual(
+            soak.latency_stats([]),
+            {
+                "count": 0,
+                "p50": None,
+                "p90": None,
+                "p95": None,
+                "p99": None,
+                "max": None,
+            },
+        )
+
+
+class LatencyDecompositionTests(unittest.TestCase):
+    start = dt.datetime(2026, 11, 6, tzinfo=dt.timezone.utc)
+
+    def at(self, seconds):
+        return self.start + dt.timedelta(seconds=seconds)
+
+    def test_a_slot_behind_an_earlier_one_separates_wake_queue_and_pass(self):
+        values = soak.decompose_run_latency(
+            self.at(0),
+            self.at(62),
+            [self.at(1), self.at(61)],
+            delivered_at=self.at(63),
+            running_at=self.at(64),
+            finished_at=self.at(90),
+        )
+        self.assertEqual(values["os_wake"], 1)
+        self.assertEqual(values["backlog"], 60)
+        self.assertEqual(values["dispatch"], 1)
+        self.assertEqual(values["claim"], 62)
+        self.assertEqual(values["delivery"], 1)
+        self.assertEqual(values["execution_start"], 2)
+        self.assertEqual(values["execution"], 26)
+        self.assertEqual(values["end_to_end"], 90)
+
+    def test_a_run_now_created_inside_the_wake_has_no_wake_or_queue_delay(self):
+        values = soak.decompose_run_latency(
+            self.at(0),
+            self.at(1),
+            [self.at(-2)],
+        )
+        self.assertEqual(values["os_wake"], 0)
+        self.assertEqual(values["backlog"], 0)
+        self.assertEqual(values["dispatch"], 3)
+
+    def test_a_run_without_a_wake_record_does_not_invent_a_dispatch_phase(self):
+        values = soak.decompose_run_latency(self.at(0), self.at(5), [])
+        self.assertEqual(values["claim"], 5)
+        self.assertIsNone(values["dispatch"])
+
+    def test_queue_depth_counts_only_newer_unclaimed_slots(self):
+        rows = [
+            {"scheduled_for": soak.iso(self.at(0)), "claimed_at": soak.iso(self.at(62))},
+            {"scheduled_for": soak.iso(self.at(60)), "claimed_at": soak.iso(self.at(63)), "state": "completed"},
+            {"scheduled_for": soak.iso(self.at(120)), "claimed_at": None, "state": "pending"},
+            {"scheduled_for": soak.iso(self.at(-60)), "claimed_at": soak.iso(self.at(1)), "state": "completed"},
+            {"scheduled_for": soak.iso(self.at(30)), "claimed_at": None, "state": "skipped"},
+        ]
+        self.assertEqual(soak.queue_depth_at_claim(self.at(0), self.at(62), rows), 1)
 
 
 class TriggerTests(unittest.TestCase):
