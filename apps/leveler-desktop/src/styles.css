@@ -2994,3 +2994,5 @@ body.blank-session .view-tabs, body.home .view-tabs { display: none; }
 .review-finding-reproduced { font-size: 11px; line-height: 16px; color: var(--text-caption); }
 .review-final-message { margin: 0; padding: 10px 12px; border-radius: 8px; background: var(--bg-module); font-family: var(--font-code); font-size: 11px; line-height: 16px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .review-report-markdown { padding: 0; }
+/* A chip inside a report section is a badge, not a full-width bar. */
+.review-report-section > .review-chip { align-self: flex-start; }

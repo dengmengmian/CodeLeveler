@@ -5518,9 +5518,12 @@ function requestCancelReview(reviewId) {
 
 function openReviewReport(reviewId) {
   const card = reviewCardById(reviewId);
+  const model = card ? reviewCardModel(card.summary) : null;
+  // Two reports can be open at once; the tab names the object it is about so
+  // they stay distinguishable.
   const tab = openRightbarTab('review', {
     reviewId,
-    title: '审查报告',
+    title: model ? `审查 · ${model.scopeLabel}` : '审查报告',
     focus: card?.summary?.scope ? reviewScopeText(card.summary.scope) : null,
   });
   ensureReviewReport(reviewId);
@@ -11229,6 +11232,7 @@ function boot() {
   $('find-next').append(iconNode('chevronDown', { size: 14 }));
   $('find-close').append(iconNode('close', { size: 14 }));
   $('attachment-add').append(iconNode('plus', { size: 16 }));
+  $('review-entry').append(iconNode('search', { size: 16 }));
   $('settings-close').append(iconNode('close', { size: 16 }));
   $('scroll-bottom').append(iconNode('arrowDown', { size: 16 }));
   $('conversation-scroll').addEventListener('scroll', updateScrollBottom, { passive: true });
