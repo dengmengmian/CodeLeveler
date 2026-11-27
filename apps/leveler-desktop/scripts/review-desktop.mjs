@@ -377,6 +377,11 @@ try {
   await page.waitForFunction(() => document.querySelectorAll('.review-card').length === 3, null, { timeout: 60000 });
   const cancelReview = await latestCardId();
   await waitCard(cancelReview, 'running');
+  // A running review has no settled counts or spend; the summary's zeros are
+  // "not recorded yet" and must not be painted as a result.
+  const runningText = await card(cancelReview).textContent();
+  assert.doesNotMatch(runningText, /共 0 条/);
+  assert.doesNotMatch(runningText, /输入 0 · 输出 0/);
   await card(cancelReview).getByRole('button', { name: '取消审查' }).click();
   await waitCard(cancelReview, 'cancelled', 60000);
   const cancelEvent = (await reviewEvents()).find(event => event.type === 'review_finished' && event.id === cancelReview);

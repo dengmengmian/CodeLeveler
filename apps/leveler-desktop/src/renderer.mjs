@@ -5635,7 +5635,11 @@ function reviewCardNode(existing, item) {
   } else if (model.status.settled) {
     facts.append(el('span', 'review-card-note', '审查者没有声明总体结论；这不等于没有问题。'));
   }
-  facts.append(el('span', 'review-card-counts', model.countsText));
+  // A running review has no settled counts and no settled usage: the summary's
+  // zeros are "not recorded yet", not "nothing found" or "cost nothing". The
+  // live line carries the reviewer's real progress; the totals appear only
+  // when the durable terminal exists.
+  if (model.status.settled) facts.append(el('span', 'review-card-counts', model.countsText));
   body.append(facts);
   if (model.live) {
     const live = [];
@@ -5664,8 +5668,10 @@ function reviewCardNode(existing, item) {
     open.type = 'button';
     open.addEventListener('click', event => { event.stopPropagation(); openReviewReport(model.id); });
     actions.append(open);
-  } else {
-    actions.append(el('span', 'review-card-usage', model.usageText));
+  } else if (model.usageText && model.live && (model.live.inputTokens || model.live.outputTokens)) {
+    // Interim spend is a live fact; it is never presented as the settlement's
+    // accounting.
+    actions.append(el('span', 'review-card-usage', `本刻用量 ${model.live.inputTokens} / ${model.live.outputTokens}`));
   }
   node.addEventListener('click', event => {
     if (event.target.closest('button')) return;
@@ -5704,9 +5710,13 @@ function reviewDetailView(tab) {
   if (model.focus) fact('审查重点', model.focus);
   fact('状态', model.status.label);
   if (model.conclusion) fact('结论', model.conclusion.label);
-  fact('问题统计', model.countsText);
+  // Counts and spend are settlement facts. While the review runs, the live
+  // progress below is the only truthful reading.
+  if (model.status.settled) {
+    fact('问题统计', model.countsText);
+    if (model.usageText) fact('用量', model.usageText);
+  }
   if (model.model) fact('模型', model.model);
-  if (model.usageText) fact('用量', model.usageText);
   if (model.createdAt) fact('发起时间', `${model.createdAt}${model.finishedAt ? ` → ${model.finishedAt}` : ''}`);
   fact('审查 ID', model.id);
   view.append(meta);
@@ -5714,6 +5724,13 @@ function reviewDetailView(tab) {
   else if (model.stopDetail) view.append(el('div', 'review-card-failure', `中止原因：${model.stopDetail}`));
 
   if (!model.status.settled) {
+    if (model.live) {
+      const live = [];
+      if (model.live.tool) live.push(`最近工具 ${model.live.tool}`);
+      if (model.live.elapsedMs) live.push(`已用时 ${Math.round(model.live.elapsedMs / 1000)}s`);
+      if (model.live.inputTokens || model.live.outputTokens) live.push(`输入 ${model.live.inputTokens} · 输出 ${model.live.outputTokens}`);
+      if (live.length) view.append(el('div', 'review-report-status', live.join(' · ')));
+    }
     view.append(el('div', 'review-report-status', '审查仍在进行；结果以 Runtime 的终态为准。'));
     return view;
   }
