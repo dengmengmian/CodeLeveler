@@ -1,5 +1,5 @@
 const {SNAPSHOT_VERSIONED_COMMANDS}=require('./command-policy.gen.cjs');
-const allowed=new Set(['submit_message','submit_user_input','steer_current_turn','steer_user_input','cancel_current_turn','cancel_task','resume_task','approval_decision','answer_clarification','definition_trust_decision','capture_secret','revoke_secret','query_session_history','query_tool_output','request_diff','list_agents','get_agent','query_context','query_observability','select_model','set_permission_profile','set_product_axes','rename_session','archive_session','unarchive_session','fork_session','compact_context','cancel_background_task','manage_schedule','manage_mcp']);
+const allowed=new Set(['submit_message','submit_user_input','steer_current_turn','steer_user_input','cancel_current_turn','cancel_task','resume_task','approval_decision','answer_clarification','definition_trust_decision','capture_secret','revoke_secret','query_session_history','query_tool_output','request_diff','list_agents','get_agent','list_skills','get_skill','query_context','query_observability','select_model','set_permission_profile','set_product_axes','rename_session','archive_session','unarchive_session','fork_session','compact_context','cancel_background_task','manage_schedule','manage_mcp']);
 const decisions=new Set(['approve_once','approve_session','approve_always','deny']);
 const {validRef}=require('./attachment-ingress.cjs');
 function string(value,max=256){return typeof value==='string'&&value.length>0&&value.length<=max;}
@@ -144,10 +144,14 @@ function validateEnvelope(envelope,authorizeAttachment){
     if(!exactKeys(command,keys)||!nonblank(command.session_id)||command.session_id!==envelope.session_id||!string(command.query_id,256)||!nonblank(command.call_id)||command.call_id.length>256||!/^[A-Za-z0-9_.:-]+$/.test(command.call_id)||!Number.isSafeInteger(command.offset)||command.offset<0||command.offset>1073741824||!Number.isInteger(command.max_bytes)||command.max_bytes<1||command.max_bytes>262144)throw new Error('Invalid tool output query');
     if(Object.hasOwn(command,'index')&&(!Number.isInteger(command.index)||command.index<0||command.index>1024))throw new Error('Invalid tool output part');
   }
-  if(['list_agents','get_agent','query_context','query_observability'].includes(command.type)){
-    const keys=['type','session_id','query_id',...(command.type==='get_agent'?['name']:[]),...(command.type==='query_observability'?['center_seq','before','after']:[])];
+  if(['list_agents','get_agent','list_skills','get_skill','query_context','query_observability'].includes(command.type)){
+    const keys=['type','session_id','query_id',...(command.type==='get_agent'||command.type==='get_skill'?['name']:[]),...(command.type==='query_observability'?['center_seq','before','after']:[])];
     if(!exactKeys(command,keys)||!nonblank(command.session_id)||command.session_id!==envelope.session_id||!nonblank(command.query_id))throw new Error('Invalid settings query');
     if(command.type==='get_agent'&&(typeof command.name!=='string'||command.name.length>64||!/^[a-z](?:[a-z0-9-]*[a-z0-9])?$/.test(command.name)||/^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/.test(command.name)))throw new Error('Invalid agent name');
+    // A Skill name is a directory identity, not prose: one bounded path
+    // component. The Runtime still resolves it against its own registry; the
+    // IPC boundary only refuses a shape it could never address.
+    if(command.type==='get_skill'&&(typeof command.name!=='string'||!command.name||command.name.length>64||command.name.startsWith('.')||!/^[A-Za-z0-9._-]+$/.test(command.name)))throw new Error('Invalid skill name');
     if(command.type==='query_observability'&&(!(command.center_seq===null||(Number.isSafeInteger(command.center_seq)&&command.center_seq>=0))||![command.before,command.after].every(value=>Number.isInteger(value)&&value>=0&&value<=100)))throw new Error('Invalid observability window');
   }
   if(command.type==='manage_schedule'){

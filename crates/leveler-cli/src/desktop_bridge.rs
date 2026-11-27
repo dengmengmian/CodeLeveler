@@ -70,6 +70,12 @@ fn validate_command(session: &SessionId, command: &ClientCommand) -> anyhow::Res
         ClientCommand::GetAgent { query_id, name, .. }
             if valid_desktop_query_id(query_id)
                 && leveler_agent::agent_registry::validate_agent_name(name).is_ok() => {}
+        // Skill reads are the runtime's registry, not a Desktop discovery
+        // path. The bridge bounds the request shape; names, trust state and
+        // the loaded content are the runtime's answer.
+        ClientCommand::ListSkills { query_id, .. } if valid_desktop_query_id(query_id) => {}
+        ClientCommand::GetSkill { query_id, name, .. }
+            if valid_desktop_query_id(query_id) && valid_desktop_skill_name(name) => {}
         ClientCommand::QueryObservability {
             query_id,
             center_seq,
@@ -200,6 +206,19 @@ fn validate_command(session: &SessionId, command: &ClientCommand) -> anyhow::Res
 
 fn valid_desktop_query_id(id: &Option<leveler_core::CommandId>) -> bool {
     id.as_ref().is_some_and(valid_desktop_command_id)
+}
+
+/// The loose shape a discovered skill directory must have to be addressable.
+/// This mirrors `leveler_skills::validate_read_name`'s boundary (a single,
+/// non-hidden, referenceable component) without importing the registry into
+/// the bridge; the runtime validates the exact name again.
+fn valid_desktop_skill_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with('.')
+        && name.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
 }
 
 /// A tool-call identity is a provider/host token, not free prose: the query
@@ -708,6 +727,41 @@ impl Bridge {
         self.terminal_clients.insert(key, client.clone());
         Ok(client)
     }
+    /// Start one delivery without blocking the bridge's read loop.
+    ///
+    /// A command can be interactive: an explicit `/skill` send parks inside
+    /// `SubmitMessage` until the same client answers its definition-trust
+    /// request. The bridge is the only path that answer can travel, so awaiting
+    /// the send on the read loop would deadlock the waiter it is waiting for.
+    /// The runtime remains the authority for ordering and ownership; this only
+    /// lets the bridge relay the next line while an earlier command is open.
+    fn spawn_delivery(
+        &self,
+        params: Value,
+        id: Value,
+        output: mpsc::Sender<Value>,
+    ) -> anyhow::Result<()> {
+        let envelope: CommandEnvelope = serde_json::from_value(params["envelope"].clone())?;
+        anyhow::ensure!(
+            self.selected.as_ref() == Some(&envelope.session_id),
+            "session is not selected"
+        );
+        validate_command(&envelope.session_id, &envelope.command)?;
+        let client = self.client()?;
+        tokio::spawn(async move {
+            let response = match client.deliver(envelope).await {
+                Ok(()) => json!({"id": id, "ok": true, "result": Value::Null}),
+                Err(error) => json!({
+                    "id": id,
+                    "ok": false,
+                    "error": error_payload(&anyhow::Error::new(error)),
+                }),
+            };
+            let _ = output.send(response).await;
+        });
+        Ok(())
+    }
+
     async fn handle(&mut self, method: &str, params: Value) -> anyhow::Result<Value> {
         match method {
             // Transport liveness only. Desktop uses it to prove a respawned
@@ -947,16 +1001,6 @@ impl Bridge {
             "runtime_info" => Ok(serde_json::to_value(
                 LocalRuntimeService::runtime_info(self.client()?.as_ref()).await?,
             )?),
-            "deliver" => {
-                let envelope: CommandEnvelope = serde_json::from_value(params["envelope"].clone())?;
-                anyhow::ensure!(
-                    self.selected.as_ref() == Some(&envelope.session_id),
-                    "session is not selected"
-                );
-                validate_command(&envelope.session_id, &envelope.command)?;
-                self.client()?.deliver(envelope).await?;
-                Ok(Value::Null)
-            }
             _ => anyhow::bail!("unknown desktop method: {method}"),
         }
     }
@@ -993,6 +1037,16 @@ pub(crate) async fn run(config_dir: Option<PathBuf>) -> anyhow::Result<std::proc
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     while let Some(line) = lines.next_line().await? {
         let response = match serde_json::from_str::<Request>(&line) {
+            Ok(request) if request.method == "deliver" => {
+                let id = request.id.clone();
+                match bridge.spawn_delivery(request.params, id.clone(), output.clone()) {
+                    // The task writes this request's response when the runtime
+                    // settles it; keep reading so an interactive command can
+                    // receive the decision it is waiting for.
+                    Ok(()) => continue,
+                    Err(error) => json!({"id":id,"ok":false,"error":error_payload(&error)}),
+                }
+            }
             Ok(request) => match bridge.handle(&request.method, request.params).await {
                 Ok(result) => json!({"id":request.id,"ok":true,"result":result}),
                 Err(error) => json!({"id":request.id,"ok":false,"error":error_payload(&error)}),
@@ -1451,6 +1505,58 @@ compatibility: { synthesize_tool_call_ids: true, drop_unsupported_fields: true }
                         center_seq,
                         before,
                         after
+                    }
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn desktop_skill_reads_are_session_scoped_and_bounded() {
+        let session = SessionId::new("desktop-skills");
+        let list = ClientCommand::ListSkills {
+            session_id: session.clone(),
+            query_id: Some("q".into()),
+        };
+        assert!(validate_command(&session, &list).is_ok());
+        assert!(validate_command(&SessionId::new("other"), &list).is_err());
+
+        for name in ["deploy", "pdf2", "my_skill", "a.b-c_1"] {
+            let get = ClientCommand::GetSkill {
+                session_id: session.clone(),
+                name: name.into(),
+                query_id: Some("q".into()),
+            };
+            assert!(validate_command(&session, &get).is_ok(), "{name}");
+            assert!(validate_command(&SessionId::new("other"), &get).is_err());
+        }
+        for name in ["", " ", "../escape", ".hidden", "a/b", &"a".repeat(65)] {
+            assert!(
+                validate_command(
+                    &session,
+                    &ClientCommand::GetSkill {
+                        session_id: session.clone(),
+                        name: (*name).to_string(),
+                        query_id: Some("q".into()),
+                    }
+                )
+                .is_err(),
+                "{name}"
+            );
+        }
+        for id in [
+            None,
+            Some("".into()),
+            Some(" ".into()),
+            Some("a".repeat(257).into()),
+        ] {
+            assert!(
+                validate_command(
+                    &session,
+                    &ClientCommand::ListSkills {
+                        session_id: session.clone(),
+                        query_id: id
                     }
                 )
                 .is_err()

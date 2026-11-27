@@ -129,7 +129,7 @@ test('existing settings reads require exact scoped correlated query fields',()=>
  const command=queries.at(-1);
  for(const fields of [{center_seq:-1},{center_seq:0.5},{center_seq:Number.MAX_SAFE_INTEGER+1},{center_seq:'2'},{before:-1},{after:101},{before:0.5},{after:null},{limit:1}])assert.throws(()=>security.validateEnvelope(envelope({...command,...fields})));
  assert.doesNotThrow(()=>security.validateEnvelope(envelope({...command,center_seq:Number.MAX_SAFE_INTEGER,before:100,after:0})));
- for(const type of ['create_agent','update_agent','delete_agent','list_skills'])assert.throws(()=>security.validateEnvelope(envelope({type,session_id:'s1',query_id:'q'})));
+ for(const type of ['create_agent','update_agent','delete_agent'])assert.throws(()=>security.validateEnvelope(envelope({type,session_id:'s1',query_id:'q'})));
 });
 
 
@@ -208,4 +208,13 @@ test('desktop mode switching accepts only the three exact current-session axes',
  for(const session_id of ['s2','',null,undefined,' '])assert.throws(()=>security.validateEnvelope(envelope(command({session_id}))));
  for(const work_profile of ['',null,undefined,'x'.repeat(65)])assert.throws(()=>security.validateEnvelope(envelope(command({work_profile}))));
  for(const extra of [{mode:'assisted'},{expected_version:1},{permission:'full'}])assert.throws(()=>security.validateEnvelope(envelope({...command(),...extra})));
+});
+
+test('Skill reads are session-bound, exact and bounded',()=>{
+ const list=over=>({type:'list_skills',session_id:'s1',query_id:'q1',...over});
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope(list())));
+ for(const over of [{session_id:'s2'},{session_id:''},{query_id:''},{query_id:' '},{query_id:'a'.repeat(257)},{extra:1},{name:'deploy'}])assert.throws(()=>security.validateEnvelope(envelope(list(over))),undefined,JSON.stringify(over));
+ const get=over=>({type:'get_skill',session_id:'s1',name:'deploy',query_id:'q1',...over});
+ for(const name of ['deploy','pdf2','my_skill','a.b-c_1'])assert.doesNotThrow(()=>security.validateEnvelope(envelope(get({name}))));
+ for(const over of [{name:''},{name:null},{name:'.hidden'},{name:'../escape'},{name:'a/b'},{name:'a b'},{name:'a'.repeat(65)},{session_id:'s2'},{query_id:''},{extra:1}])assert.throws(()=>security.validateEnvelope(envelope(get(over))),undefined,JSON.stringify(over));
 });
