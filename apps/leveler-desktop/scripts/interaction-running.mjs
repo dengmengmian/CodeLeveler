@@ -161,11 +161,12 @@ try {
   await page.locator('#stop').click();
   await page.waitForFunction(() => !['running', 'waiting_user'].includes((document.querySelector('#conversation-status')?.textContent ?? '')) || /取消|中断/.test(document.querySelector('#conversation-status')?.textContent ?? ''), null, { timeout: 30000 });
   await page.waitForFunction(() => ['已取消', '已中断'].some(label => document.querySelector('#conversation-status')?.textContent?.includes(label)), null, { timeout: 30000 });
+  const cancelStatus = await status();
   assert.equal(await page.locator('#message').inputValue(), 'DRAFT_AFTER_CANCEL');
   await page.locator('#message').fill('');
   await send('PLAIN_AFTER_CANCEL');
   await page.waitForFunction(() => [...document.querySelectorAll('.message.assistant .markdown')].some(node => node.textContent.includes('PLAIN_OK')), null, { timeout: 30000 });
-  evidence.cancel = { status: await status(), draft_kept: true, usable_after: true };
+  evidence.cancel = { status: cancelStatus, draft_kept: true, usable_after: true };
 
   // Multi-session isolation: a second session answers while the first still
   // runs; switching back shows the first session's own transcript.
@@ -206,5 +207,8 @@ try {
   process.exitCode = 1;
 } finally {
   try { await app?.close(); } catch { /* the test owns the app */ }
+  // A slow SSE turn can still hold its socket when the assertions finish;
+  // without this, server.close() waits forever for that connection.
+  server.closeAllConnections?.();
   await new Promise(resolve => server.close(resolve));
 }
