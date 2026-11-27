@@ -4733,7 +4733,7 @@ function openSlashMenu() {
   const value = $('message').value;
   const trimmed = value.trim();
   const candidates = /^\/[A-Za-z0-9._:-]*$/.test(trimmed)
-    ? (trimmed === '/' ? commandCatalog().filter(item => item.quick) : commandCandidates(value, commandCatalog()))
+    ? (trimmed === '/' ? commandCatalog().filter(item => item.quick || item.kind === 'skill') : commandCandidates(value, commandCatalog()))
     : [];
   // Discovery is the runtime's, but opening the menu is the moment a newly
   // added package should become reachable. Refresh in the background; the
