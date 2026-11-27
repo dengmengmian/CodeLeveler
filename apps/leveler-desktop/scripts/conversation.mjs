@@ -51,7 +51,7 @@ try{
  await page.locator('#message').fill('conversation-rich: render the structured answer');await page.locator('#send').click();await settled('RICH_STREAM_COMPLETE');runtime=await page.evaluate(()=>window.desktop.runtimeInfo());assert.ok(Number.isInteger(runtime.pid)&&runtime.pid>0,'own Runtime PID must be observed');evidence.runtime=runtime;
  const sessionId=await page.locator('.session-row[aria-selected="true"]').getAttribute('data-session-id');
  const snapshot=await page.evaluate(id=>window.desktop.snapshot(id),sessionId);
- assert.ok(snapshot.goal,'the real Runtime session must have a title');
+ assert.ok(snapshot.title || snapshot.goal,'the real Runtime session must have a title');
  assert.equal(await page.locator('#composer-docks .goal-dock').count(),0,'a session title must not become an editable goal above the composer');
  evidence.session_title_not_composer_goal=true;
  const body=page.locator('.message.assistant .markdown').last();

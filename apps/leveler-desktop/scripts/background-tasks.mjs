@@ -30,8 +30,12 @@ const server = createServer(async (request, response) => {
   const messages = body.messages ?? [];
   const lastUserIndex = messages.findLastIndex(message => message.role === 'user');
   const toolResults = messages.slice(lastUserIndex + 1).filter(message => message.role === 'tool').length;
-  const lastUser = [...(body.messages ?? [])].reverse().find(message => message.role === 'user');
-  const lastText = typeof lastUser?.content === 'string' ? lastUser.content : JSON.stringify(lastUser?.content ?? '');
+  // A finished background job injects a continuation turn as a user message;
+  // the fixture must answer the original BG_ request, not the continuation.
+  const userText = message => typeof message?.content === 'string' ? message.content : JSON.stringify(message?.content ?? '');
+  const lastUser = [...(body.messages ?? [])].reverse().find(message => message.role === 'user' && /(^|\s)(BG_|SEED)/.test(userText(message)))
+    ?? [...(body.messages ?? [])].reverse().find(message => message.role === 'user');
+  const lastText = userText(lastUser);
   response.writeHead(200, { 'content-type': 'text/event-stream' });
   const chunk = (delta, finish) => JSON.stringify({ id: 'bg', object: 'chat.completion.chunk', created: 1, model: 'm', choices: [{ index: 0, delta, finish_reason: finish }] });
   if (lastText.startsWith('SEED')) {
