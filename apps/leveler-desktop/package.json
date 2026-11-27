@@ -21,6 +21,8 @@
     "test:modes": "node scripts/modes.mjs",
     "test:mcp": "node scripts/mcp-desktop.mjs",
     "test:mcp:dogfood": "node scripts/mcp-dogfood.mjs",
+    "test:skills": "node scripts/skills-desktop.mjs && node scripts/skills-modes.mjs",
+    "test:skills:dogfood": "node scripts/skills-dogfood.mjs",
     "test:r2c": "node scripts/r2c-tool-output.mjs && node scripts/r2c-goal-boundary.mjs",
     "test:long-session": "node scripts/long-session.mjs",
     "test:session-actions": "node scripts/session-actions.mjs",
