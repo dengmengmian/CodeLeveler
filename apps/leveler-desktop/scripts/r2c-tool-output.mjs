@@ -180,7 +180,10 @@ try {
   // ---- Small output: a complete short result must not pretend to have more.
   await send('R2C_SMALL 读取一个小文件');
   const smallRow = page.locator('.tool-row[data-kind="read"]').last();
-  await smallRow.locator('summary').click();
+  if ((await smallRow.getAttribute('open')) === null) await smallRow.locator('summary').click();
+  // Opening a details row paints its body on the toggle event; read the row
+  // only after the read card exists instead of racing that paint.
+  await smallRow.locator('.tool-read-card').waitFor({ state: 'visible', timeout: 5000 });
   assert.ok((await smallRow.innerText()).includes('alpha'), 'the preview is the real file content');
   assert.equal(await smallRow.locator('.tool-output-action').count(), 0, 'a complete short result has no full-output action');
   evidence.steps.small_output = { action: false };
