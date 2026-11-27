@@ -32,7 +32,9 @@
     "test:composer": "node scripts/composer.mjs",
     "test:composer-narrow": "node scripts/composer-narrow.mjs",
     "test:terminal-permissions": "node scripts/terminal-permissions.mjs",
-    "test:terminal-permissions:finder": "node scripts/terminal-permissions-finder.mjs"
+    "test:terminal-permissions:finder": "node scripts/terminal-permissions-finder.mjs",
+    "test:memory": "node scripts/r6-memory.mjs",
+    "test:memory:dogfood": "node scripts/r6-memory-dogfood.mjs"
   },
   "devDependencies": {
     "electron": "44.5.1",
