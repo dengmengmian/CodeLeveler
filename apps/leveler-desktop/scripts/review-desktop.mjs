@@ -456,6 +456,17 @@ try {
   for (const response of held) { try { response.destroy(); } catch { /* closed */ } }
   provider.close();
   if (app) { try { await app.evaluate(({ app }) => app.exit(0)); } catch { /* already gone */ } }
+  // Daemons and execution hosts for this unique temp run name the temp root on
+  // their command line. Stop them so no process outlives the directory.
+  try {
+    const { stdout } = await execFile('ps', ['-axo', 'pid=,command='], { maxBuffer: 8 * 1024 * 1024 });
+    for (const line of stdout.split('\n')) {
+      if (!line.includes(temporary) || !line.includes('leveler')) continue;
+      const pid = Number(line.trim().split(/\s+/)[0]);
+      if (!Number.isSafeInteger(pid) || pid <= 0) continue;
+      try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ }
+    }
+  } catch { /* ps unavailable */ }
   // Electron flushes its profile on exit; a best-effort cleanup must not turn
   // a passing run into a failure.
   await new Promise(resolve => setTimeout(resolve, 1500));

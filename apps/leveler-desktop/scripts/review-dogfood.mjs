@@ -337,6 +337,22 @@ try {
     await execFile(leveler, ['runtime', 'stop'], { cwd: workspace, timeout: 30000 }).catch(() => {});
     await new Promise(resolve => setTimeout(resolve, 800));
   }
+  // A runtime or execution host whose command line names THIS unique temp
+  // workspace is this run's residue. Stop it before deleting the state it
+  // holds open, or it will re-create the project directory after the removal.
+  const stopWorkspaceProcesses = async () => {
+    try {
+      const { stdout } = await execFile('ps', ['-axo', 'pid=,command='], { maxBuffer: 8 * 1024 * 1024 });
+      for (const line of stdout.split('\n')) {
+        if (!line.includes(workspace) || !line.includes('leveler')) continue;
+        const pid = Number(line.trim().split(/\s+/)[0]);
+        if (!Number.isSafeInteger(pid) || pid <= 0) continue;
+        try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ }
+      }
+    } catch { /* ps unavailable */ }
+  };
+  await stopWorkspaceProcesses();
+  await new Promise(resolve => setTimeout(resolve, 500));
   const projectsRoot = path.join(realHome, '.leveler', 'state', 'projects');
   const socketsRoot = path.join(realHome, '.leveler', 'run', 'sockets');
   const workspaceTag = path.basename(workspace);
@@ -350,8 +366,14 @@ try {
       }
     }
   };
-  await removeRunState();
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    await removeRunState();
+    await new Promise(resolve => setTimeout(resolve, 300));
+  }
   await rm(workspace, { recursive: true, force: true }).catch(() => {});
   await new Promise(resolve => setTimeout(resolve, 500));
-  await removeRunState();
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    await removeRunState();
+    await new Promise(resolve => setTimeout(resolve, 300));
+  }
 }
