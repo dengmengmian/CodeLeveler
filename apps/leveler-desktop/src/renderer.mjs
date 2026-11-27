@@ -5234,7 +5234,7 @@ function renderAttachments() {
   controls();
 }
 
-async function uploadAttachment(previous = null) {
+async function uploadAttachment(previous = null, pasted = null) {
   composerError('');
   await action(async () => {
     if (!current) await createTask();
@@ -5248,7 +5248,9 @@ async function uploadAttachment(previous = null) {
     }));
     renderAttachments();
     try {
-      const result = await api.chooseAttachment(sessionId);
+      const result = pasted
+        ? await api.pasteAttachment({ sessionId, name: pasted.name, data_base64: pasted.data_base64 })
+        : await api.chooseAttachment(sessionId);
       const draft = attachmentDrafts.get(sessionId) ?? [];
       const next = result.status === 'cancelled' ? uploadDraft(draft, { remove: key }) : reconcileUploadReply(draft, { ...result, key }, receiving.events);
       attachmentDrafts.set(sessionId, next);
@@ -5261,6 +5263,45 @@ async function uploadAttachment(previous = null) {
       uploadingKey = null;
     }
   }, { onError: composerError, clearGlobal: false });
+}
+
+function fileBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result ?? '');
+      const comma = result.indexOf(',');
+      if (comma < 0) { reject(new Error('无法读取粘贴的图片')); return; }
+      resolve(result.slice(comma + 1));
+    };
+    reader.onerror = () => reject(new Error('无法读取粘贴的图片'));
+    reader.readAsDataURL(file);
+  });
+}
+
+/** The paste path accepts image bytes only; Main decodes and re-checks them. */
+function installPasteImages() {
+  $('message').addEventListener('paste', event => {
+    const files = [...(event.clipboardData?.items ?? [])]
+      .filter(item => item.kind === 'file' && String(item.type).startsWith('image/'))
+      .map(item => item.getAsFile())
+      .filter(Boolean);
+    if (!files.length) return;
+    event.preventDefault();
+    if (loading || uncertain || uploadPending()) { composerError('请先处理当前未完成操作'); return; }
+    if (files.length > 16) { composerError('一次最多添加 16 张图片'); return; }
+    void (async () => {
+      for (const [index, file] of files.entries()) {
+        try {
+          const data = await fileBase64(file);
+          const extension = String(file.type).split('/')[1]?.replace('jpeg', 'jpg') ?? 'png';
+          await uploadAttachment(null, { name: file.name || `粘贴图片-${index + 1}.${extension}`, data_base64: data });
+        } catch (error) {
+          composerError(`粘贴图片失败：${error.message}`);
+        }
+      }
+    })();
+  });
 }
 
 /* ---------------------------------------------------------------- message */
@@ -11730,6 +11771,7 @@ function boot() {
   $('find-next').append(iconNode('chevronDown', { size: 14 }));
   $('find-close').append(iconNode('close', { size: 14 }));
   $('attachment-add').append(iconNode('plus', { size: 16 }));
+  installPasteImages();
   $('review-entry').append(iconNode('search', { size: 16 }));
   $('settings-close').append(iconNode('close', { size: 16 }));
   $('scroll-bottom').append(iconNode('arrowDown', { size: 16 }));

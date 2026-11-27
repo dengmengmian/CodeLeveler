@@ -167,6 +167,15 @@ app.whenReady().then(async()=>{
   handle('desktop:open-config',async()=>{const base=process.env.LEVELER_HOME??path.join(os.homedir(),'.leveler');const file=path.join(base,'config.toml');if(!existsSync(file))throw new Error('配置文件不存在');const error=await shell.openPath(file);if(error)throw new Error(error);return {ok:true};});
   handle('desktop:recent-folder',path=>recentWorkspaces.select(path));
   handle('desktop:attachment',sessionId=>attachments.choose(text(sessionId,'session')));
+  // A pasted image carries bytes, not a path. Main bounds and decodes them and
+  // only forwards real image content; the Runtime revalidates the payload.
+  handle('desktop:attachment-paste',value=>{
+    if(!value||typeof value!=='object'||Array.isArray(value))throw new Error('Invalid pasted attachment');
+    if(Object.keys(value).length!==3||!Object.hasOwn(value,'sessionId')||!Object.hasOwn(value,'name')||!Object.hasOwn(value,'data_base64'))throw new Error('Invalid pasted attachment');
+    if(typeof value.name!=='string'||!value.name||value.name.length>1024)throw new Error('Invalid pasted attachment');
+    if(typeof value.data_base64!=='string'||!value.data_base64||value.data_base64.length>(20*1024*1024*4)/3+8)throw new Error('Invalid pasted attachment');
+    return attachments.importData(text(value.sessionId,'session'),{name:value.name,data_base64:value.data_base64});
+  });
   handle('desktop:discard-upload',value=>{if(!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).length!==2||!Object.hasOwn(value,'sessionId')||!Object.hasOwn(value,'importId'))throw new Error('Invalid upload discard');return attachments.discard(text(value.sessionId,'session'),text(value.importId,'import'));});
   handle('desktop:folder',async()=>{const result=await dialog.showOpenDialog(window,{title:'选择 Workspace 文件夹',properties:['openDirectory']});if(result.canceled)return null;const id=randomUUID();folders.set(id,result.filePaths[0]);return {id,path:result.filePaths[0]};});
   handle('desktop:create',async selection=>{let workspace=null;if(selection!==null){workspace=folders.get(selection);if(!workspace)throw new Error('请重新选择 Workspace 文件夹');}attachments.activate(null);const connection=await bridge.request('connect',{workspace});selectedSource=connection.source_id;const result=await bridge.request('create',{goal:''});addRoot(workspace);trackSnapshot(result.session);rememberTask(result.session);attachmentSession(result.session);return result;});

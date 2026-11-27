@@ -108,3 +108,23 @@ test('matching successful import before acknowledgement stays ready without file
  let f;f=fixture(async()=>'/chosen/note.txt',async envelope=>{f.ingress.observe(resultFrame(f,{type:'attachment_added',attachment:{...ref,name:'runtime-canonical.txt'}},envelope.command_id));return {};});
  const ready=await f.ingress.choose('s1');assert.equal(ready.status,'ready');assert.equal(ready.attachment.name,'runtime-canonical.txt');assert.equal(f.ingress.authorize('s1',ready.attachment),true);
 });
+
+test('clipboard image import is bounded, decoded and path-free', async () => {
+  const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+  const first = fixture();
+  const result = await first.ingress.importData('s1', { name: '../../shot.png', data_base64: png });
+  assert.equal(result.status, 'unknown');
+  assert.equal(first.requests.length, 1);
+  assert.equal(first.requests[0].command.type, 'add_attachment_data');
+  assert.equal(first.requests[0].command.data_base64, png);
+  assert.equal(first.requests[0].command.name, 'shot.png', 'the host keeps a basename, never a path');
+  assert.equal(first.requests[0].command.path, undefined);
+  // A foreign session is refused by the owner gate.
+  await assert.rejects(first.ingress.importData('other', { name: 'x.png', data_base64: png }));
+  // A non-image payload and an oversized payload never reach the Runtime.
+  const second = fixture();
+  await assert.rejects(second.ingress.importData('s1', { name: 'x.png', data_base64: Buffer.from('not an image').toString('base64') }), /PNG|JPEG|GIF|WebP|附件/);
+  assert.equal(second.requests.length, 0);
+  await assert.rejects(second.ingress.importData('s1', { name: 'x.png', data_base64: 'A'.repeat((MAX_UPLOAD_BYTES * 4) / 3 + 9) }));
+  assert.equal(second.requests.length, 0);
+});

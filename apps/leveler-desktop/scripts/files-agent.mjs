@@ -58,6 +58,7 @@ await writeFile(path.join(workspace, 'existing.txt'), 'original\n');
 await writeFile(path.join(workspace, 'delete-me.txt'), 'delete me\n');
 await writeFile(path.join(workspace, 'base.png'), png(4, 2, [220, 40, 40]));
 await writeFile(path.join(workspace, 'base2.png'), png(3, 5, [40, 80, 220]));
+await writeFile(path.join(workspace, 'large.png'), png(2400, 1600, [30, 140, 90]));
 execFileSync('git', ['init', '-q'], { cwd: workspace });
 execFileSync('git', ['add', '.'], { cwd: workspace });
 execFileSync('git', ['-c', 'user.email=fixture@example.test', '-c', 'user.name=Fixture', 'commit', '-qm', 'baseline'], { cwd: workspace });
@@ -184,10 +185,25 @@ try {
   await page.locator('.files-row[data-path="agent.png"]').click();
   await page.waitForFunction(() => document.querySelector('.preview-image')?.naturalWidth === 4, null, { timeout: 30000 });
   assert.deepEqual(await page.locator('.preview-image').evaluate(image => [image.naturalWidth, image.naturalHeight]), [4, 2]);
-  evidence.agent_files = { tree, deleted_preview: deletedPreview.slice(0, 80), image: [4, 2] };
+  const imageBox = await page.locator('.preview-image').boundingBox();
+  assert.ok(imageBox && Math.abs(imageBox.width / imageBox.height - 2) < 0.06, `image was cropped: ${JSON.stringify(imageBox)}`);
+  // A large image decodes without freezing the client: the files tab remains
+  // responsive and its natural size is observed within a bounded time.
+  await showFiles();
+  const largeStart = Date.now();
+  await page.locator('.files-row[data-path="large.png"]').click();
+  await page.waitForFunction(() => document.querySelector('.preview-image')?.naturalWidth === 2400, null, { timeout: 20000 });
+  evidence.large_image_ms = Date.now() - largeStart;
+  await showFiles();
+  await page.locator('.files-row[data-path="newdir"]').click();
+  evidence.large_image_responsive = true;
+  evidence.agent_files = { tree, deleted_preview: deletedPreview.slice(0, 80), image: [4, 2], aspect: 2, large_ms: evidence.large_image_ms };
   await page.screenshot({ path: path.join(output, 'files-agent.png') });
 
   // A second Agent turn replaces the image while its preview tab is open.
+  await showFiles();
+  await page.locator('.files-row[data-path="agent.png"]').click();
+  await page.waitForFunction(() => document.querySelector('.preview-image')?.naturalWidth === 4);
   await send('IMAGE_SWAP 替换图片');
   await waitAnswer('IMAGE_SWAP_DONE');
   await page.waitForFunction(() => document.querySelector('.preview-image')?.naturalWidth === 3, null, { timeout: 30000 });

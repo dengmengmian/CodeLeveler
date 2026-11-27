@@ -13,6 +13,7 @@ contextBridge.exposeInMainWorld('desktop',Object.freeze({
   listTasks:options=>invoke('desktop:list',options),
   chooseFolder:()=>invoke('desktop:folder'),
   chooseAttachment:sessionId=>invoke('desktop:attachment',sessionId),
+  pasteAttachment:request=>invoke('desktop:attachment-paste',request),
   discardUpload:(sessionId,importId)=>invoke('desktop:discard-upload',{sessionId,importId}),
   chooseRecentWorkspace:path=>invoke('desktop:recent-folder',path),
   appInfo:()=>invoke('desktop:app-info'),

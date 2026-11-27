@@ -71,6 +71,31 @@ class AttachmentIngress {
   const known=this.refs.get(this.key(this.selected))?.get(ref.id);
   return !!known&&Object.keys(known).every(key=>known[/** @type {keyof AttachmentRef} */(key)]===ref[/** @type {keyof AttachmentRef} */(key)]);
  }
+ /**
+  * Import image bytes from the renderer clipboard. The renderer is an untrusted
+  * boundary: Main bounds the base64, decodes it, and accepts only a real
+  * image; the Runtime validates the payload again. No path is involved.
+  * @param {string} sessionId @param {unknown} file
+  */
+ async importData(sessionId, file){
+  const context=this.selected;
+  if(!context||sessionId!==context.sessionId)throw new Error('请先选择当前任务');
+  if(this.picking)throw new Error('请先完成当前文件选择');
+  if(this.pending){if(this.pending.status!=='unknown')throw new Error('上一附件仍在处理');return this.import(this.pending);}
+  if(!file||typeof file!=='object'||Array.isArray(file))throw new Error('Invalid pasted attachment');
+  const name=typeof file.name==='string'?basename(file.name).slice(0,1024):'';
+  const dataBase64=typeof file.data_base64==='string'?file.data_base64:'';
+  if(!name)throw new Error('粘贴的图片缺少文件名');
+  if(!dataBase64||dataBase64.length>(MAX_UPLOAD_BYTES*4)/3+8)throw new Error('附件不能超过 20 MiB');
+  let bytes;
+  try{bytes=Buffer.from(dataBase64,'base64');}catch{throw new Error('粘贴的图片数据无效');}
+  if(bytes.length>MAX_UPLOAD_BYTES)throw new Error('附件不能超过 20 MiB');
+  if(!imageMime(bytes))throw new Error('粘贴内容仅支持 PNG、JPEG、GIF 和 WebP 图片。');
+  const generation=this.generation;
+  const envelope={command_id:randomUUID(),session_id:sessionId,expected_version:null,issued_at:new Date().toISOString(),command:{type:'add_attachment_data',session_id:sessionId,name,data_base64:dataBase64}};
+  const pending={context,generation,envelope:/** @type {UploadEnvelope} */(envelope),status:'queued'};this.pending=pending;
+  return await this.import(pending);
+ }
  /** @param {string} sessionId */
  async choose(sessionId){
   const context=this.selected;
