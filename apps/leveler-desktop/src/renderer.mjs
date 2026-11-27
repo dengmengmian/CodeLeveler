@@ -4698,6 +4698,12 @@ function openCommandMenu(candidates = commandCatalog()) {
   const onKey = event => {
     if (!node.isConnected) { document.removeEventListener('keydown', onKey, true); return; }
     if (event.isComposing || event.keyCode === 229) return;
+    // A modal dialog or another control owns its own keyboard. The discovery
+    // menu only steers keys typed in the composer it belongs to, so Tab is
+    // never stolen from a settings dialog or a sidebar control.
+    const target = event.target;
+    if (document.querySelector('dialog[open]')) return;
+    if (!(target === document.body || target === $('message') || target?.closest?.('#composer-card, #command-popover'))) return;
     if (event.key === 'Escape') {
       event.preventDefault();
       closeComposerPopovers();
