@@ -83,8 +83,9 @@ class AttachmentIngress {
   if(this.picking)throw new Error('请先完成当前文件选择');
   if(this.pending){if(this.pending.status!=='unknown')throw new Error('上一附件仍在处理');return this.import(this.pending);}
   if(!file||typeof file!=='object'||Array.isArray(file))throw new Error('Invalid pasted attachment');
-  const name=typeof file.name==='string'?basename(file.name).slice(0,1024):'';
-  const dataBase64=typeof file.data_base64==='string'?file.data_base64:'';
+  const record=/** @type {{name?:unknown,data_base64?:unknown}} */(file);
+  const name=typeof record.name==='string'?basename(record.name).slice(0,1024):'';
+  const dataBase64=typeof record.data_base64==='string'?record.data_base64:'';
   if(!name)throw new Error('粘贴的图片缺少文件名');
   if(!dataBase64||dataBase64.length>(MAX_UPLOAD_BYTES*4)/3+8)throw new Error('附件不能超过 20 MiB');
   let bytes;
