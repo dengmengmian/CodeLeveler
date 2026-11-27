@@ -194,17 +194,18 @@ test('leading slash names with unsupported arguments stay local while filesystem
  const {slashIntent}=await import('../src/presentation.mjs');const commands=[{id:'settings',label:'设置',enabled:true}];
  assert.equal(slashIntent('/unknown arg',commands).kind,'blocked');
  assert.equal(slashIntent('/settings arg',commands).kind,'blocked');
+ assert.deepEqual(slashIntent('/goal 修复测试',commands),{kind:'goal',content:'修复测试'});
  assert.equal(slashIntent('/settings   ',commands).kind,'action');
  assert.equal(slashIntent('/Users/a/file',commands).kind,'message');
  assert.equal(slashIntent('// comment',commands).kind,'message');
 });
 
-test('/goal with an objective is runtime-owned: it is sent as text, never answered by a client-side command',async()=>{
+test('/goal with an objective is a typed runtime command, never prose sent to the model',async()=>{
  const {slashIntent}=await import('../src/presentation.mjs');
  const commands=[{id:'goal',label:'目标',enabled:true}];
- assert.equal(slashIntent('/goal 完成运营端全覆盖',commands).kind,'message');
+ assert.deepEqual(slashIntent('/goal 完成运营端全覆盖',commands),{kind:'goal',content:'完成运营端全覆盖'});
  assert.equal(slashIntent('/goal',commands).kind,'blocked');
- assert.equal(slashIntent('/goal status',commands).kind,'message');
+ assert.deepEqual(slashIntent('/goal status',commands),{kind:'goal',content:'status'});
 });
 
 test('a resolved Skill is sent as a message, takes arguments, and a refused one keeps its reason',async()=>{

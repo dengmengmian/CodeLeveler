@@ -1,5 +1,5 @@
 const {SNAPSHOT_VERSIONED_COMMANDS}=require('./command-policy.gen.cjs');
-const allowed=new Set(['submit_message','submit_user_input','steer_current_turn','steer_user_input','cancel_current_turn','cancel_task','resume_task','approval_decision','answer_clarification','definition_trust_decision','capture_secret','revoke_secret','query_session_history','query_tool_output','request_diff','list_agents','get_agent','list_skills','get_skill','query_context','query_observability','select_model','set_permission_profile','set_product_axes','rename_session','archive_session','unarchive_session','fork_session','compact_context','cancel_background_task','manage_schedule','manage_mcp','run_review','cancel_review','query_review_report','list_reviews','query_review_scopes']);
+const allowed=new Set(['submit_message','submit_user_input','steer_current_turn','steer_user_input','cancel_current_turn','cancel_task','resume_task','approval_decision','answer_clarification','definition_trust_decision','capture_secret','revoke_secret','query_session_history','query_tool_output','request_diff','list_agents','get_agent','list_skills','get_skill','query_context','query_observability','select_model','set_permission_profile','set_product_axes','rename_session','run_goal','set_thinking_level','archive_session','unarchive_session','fork_session','compact_context','cancel_background_task','manage_schedule','manage_mcp','run_review','cancel_review','query_review_report','list_reviews','query_review_scopes']);
 const decisions=new Set(['approve_once','approve_session','approve_always','deny']);
 const {validRef}=require('./attachment-ingress.cjs');
 function string(value,max=256){return typeof value==='string'&&value.length>0&&value.length<=max;}
@@ -132,6 +132,23 @@ function validateEnvelope(envelope,authorizeAttachment){
     if(command.type==='resume_task'&&!string(command.content,100000))throw new Error('Invalid continuation');
   }
   if(command.type==='cancel_current_turn'&&command.session_id!==envelope.session_id)throw new Error('Invalid cancellation');
+  // An explicit goal turn is a typed Runtime command. Its objective is user
+  // text, bounded here; `require_new_turn` is the only optional field and is
+  // a boolean, never inferred from prose.
+  if(command.type==='run_goal'){
+    const keys=Object.keys(command);
+    if(!keys.includes('type')||!keys.includes('session_id')||!keys.includes('content')
+      ||keys.some(key=>!['type','session_id','content','require_new_turn'].includes(key))
+      ||!string(command.content,100000)||!command.content.trim()
+      ||(command.require_new_turn!==undefined&&typeof command.require_new_turn!=='boolean'))throw new Error('Invalid goal command');
+  }
+  // Thinking is a session setting with a closed vocabulary; the Runtime maps
+  // the level to the model's declared capability.
+  if(command.type==='set_thinking_level'){
+    const levels=['auto','off','minimal','low','medium','high','max'];
+    if(!exactKeys(command,['type','session_id','level'])
+      ||(command.level!==null&&!levels.includes(command.level)))throw new Error('Invalid thinking level');
+  }
   if(command.type==='cancel_background_task'&&(!exactKeys(command,['type','session_id','task_id'])||!nonblank(command.session_id)||command.session_id!==envelope.session_id||!nonblank(command.task_id)))throw new Error('Invalid background task cancellation');
   if(command.type==='approval_decision'&&(!string(command.request_id)||!decisions.has(command.decision)))throw new Error('Invalid approval decision');
   if(command.type==='definition_trust_decision'){

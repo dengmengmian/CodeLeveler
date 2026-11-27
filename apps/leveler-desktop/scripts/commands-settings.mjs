@@ -69,11 +69,25 @@ try {
     badge: item.querySelector('.badge-unconnected')?.textContent ?? null,
   })));
   await page.keyboard.press('Escape');
-  assert.deepEqual(commandBadges.filter(item => item.badge).map(item => item.id).sort(), ['export']);
-  for (const id of ['compact', 'permission', 'model']) {
+  // Every Runtime/TUI command is discoverable; only the ones with no Desktop
+  // surface carry 未接入, and they say why in the tooltip.
+  const unimplemented = ['btw', 'clean', 'doctor', 'dream', 'export', 'flush', 'jump', 'memory', 'permission-contract', 'recap', 'recover', 'remember', 'restore', 'resume-claude', 'resume-codex', 'trust', 'update'];
+  assert.deepEqual(commandBadges.filter(item => item.badge).map(item => item.id).sort(), unimplemented);
+  for (const id of ['compact', 'permission', 'model', 'thinking', 'plan', 'review', 'diff', 'skills', 'agents', 'trace', 'usage', 'find', 'tasks', 'new', 'rename', 'fork', 'copy', 'settings', 'mcp', 'schedules', 'theme', 'reload', 'help']) {
     assert.equal(commandBadges.find(item => item.id === id)?.badge, null, `${id} must not claim 未接入`);
   }
+  // A bare `/` is the short discovery list; typing searches the full catalog.
+  await page.locator('#message').fill('/');
+  await page.waitForSelector('#command-popover');
+  const quick = await page.evaluate(() => [...document.querySelectorAll('#command-popover .menu-item')].map(item => item.dataset.commandId));
+  assert.ok(quick.includes('help') && quick.includes('thinking') && !quick.includes('doctor'), JSON.stringify(quick));
+  await page.locator('#message').fill('/doct');
+  await page.waitForFunction(() => [...document.querySelectorAll('#command-popover .menu-item')].some(item => item.dataset.commandId === 'doctor'));
+  await page.keyboard.press('Escape');
+  assert.equal(await page.locator('#message').inputValue(), '/doct', 'Escape must keep the draft');
+  await page.locator('#message').fill('');
   evidence.command_badges_truthful = commandBadges;
+  evidence.command_quick_menu = quick;
   await app.evaluate(({ dialog }, folder) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [folder] }); }, workspace);
   await page.locator('#add-workspace').click();
   await page.waitForFunction(() => document.querySelector('#workspace-picker')?.textContent.includes('workspace'));

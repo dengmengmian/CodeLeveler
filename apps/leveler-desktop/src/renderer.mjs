@@ -4586,32 +4586,73 @@ function skillRowsForSession() {
 function commandCatalog() {
   const frozen = loading || !!uncertain || uploadPending();
   const session = !!current;
+  const workspace = hasWorkspace();
+  // Every product command the runtime or the terminal exposes. `quick` is the
+  // bare `/` list; the rest is reachable by typing. An unavailable command
+  // keeps the real reason so a typed `/name` is refused with a fact, never
+  // with a generic "unknown command".
   const entries = [
-    ['add', 'file', '添加图片', true, 'paperclip', null, null],
-    ['add', 'reference', '引用工作区文件', hasWorkspace(), 'file', null, '请先打开有工作区的会话'],
-    ['add', 'secret', '安全粘贴凭据', session, 'shield', null, '请先选择或新建会话'],
-    ['commands', 'goal', '目标', true, 'compass', null, null],
-    ['commands', 'feedback', '反馈', true, 'feedback', null, null],
-    ['commands', 'diff', '工作区变更', !!current?.session.repository, 'diff', null, '当前会话没有工作区'],
-    // Review is manual only; this is the same entry as the composer's 审查
-    // button, named here so a typed `/review` reaches it too.
-    ['commands', 'review', '审查', !!current, 'search', null, '请先选择或新建会话'],
-    ['commands', 'compact', '压缩', session, 'archive', null, null],
-    ['commands', 'permission', '权限', session, 'shield', null, null],
-    ['commands', 'model', '模型', session, 'layers', null, null],
-    ['commands', 'export', '下载日志', false, 'download', '未接入', 'Runtime 未提供 Session 打包导出接口'],
+    ['add', 'file', '添加图片', true, 'paperclip', null, null, true, ['image']],
+    ['add', 'reference', '引用工作区文件', workspace, 'file', null, '请先打开有工作区的会话', false],
+    ['add', 'secret', '安全粘贴凭据', session, 'shield', null, '请先选择或新建会话', true],
+    ['agent', 'model', '模型', session, 'layers', null, '请先选择或新建会话', true],
+    ['agent', 'permission', '权限', session, 'shield', null, '请先选择或新建会话', true, ['mode']],
+    ['agent', 'thinking', 'Thinking', session, 'sparkle', null, '请先选择或新建会话', true],
+    ['agent', 'plan', '协作模式', session, 'compass', null, '请先选择或新建会话', true, ['collab']],
+    ['agent', 'goal', '目标', true, 'compass', null, null, true],
+    ['agent', 'review', '审查', !!current, 'search', null, '请先选择或新建会话', true],
+    ['agent', 'compact', '压缩', session, 'archive', null, '请先选择或新建会话', true],
+    ['agent', 'skills', '技能', true, 'sparkle', null, null, false],
+    ['agent', 'agents', 'Agent 定义', true, 'bot', null, null, false],
+    ['view', 'diff', '工作区变更', !!current?.session.repository, 'diff', null, '当前会话没有工作区', true],
+    ['view', 'trace', '执行轨迹', !!current, 'activity', null, '请先选择或新建会话', false],
+    ['view', 'usage', 'Token 用量', session, 'chart', null, '请先选择或新建会话', false, ['context']],
+    ['view', 'find', '查找对话', session, 'search', null, '请先选择或新建会话', true, ['search']],
+    ['view', 'tasks', '会话列表', true, 'list', null, null, false, ['sessions']],
+    ['session', 'new', '新会话', true, 'plus', null, null, true],
+    ['session', 'rename', '重命名会话', session, 'edit', null, '请先选择或新建会话', false],
+    ['session', 'fork', '分叉会话', session, 'branch', null, '请先选择或新建会话', false],
+    ['session', 'copy', '复制最后回答', session, 'copy', null, '请先选择或新建会话', false],
+    ['session', 'output', '完整工具输出', !!current?.tools?.length, 'terminal', null, '当前会话还没有工具调用', false],
+    ['session', 'export', '下载日志', false, 'download', '未接入', 'Runtime 未提供 Session 打包导出接口', false, ['save']],
+    ['system', 'settings', '设置', true, 'settings', null, null, false],
+    ['system', 'mcp', 'MCP 服务', true, 'plugins', null, null, false],
+    ['system', 'schedules', '自动化任务', true, 'automation', null, null, false],
+    ['system', 'theme', '外观', true, 'sun', null, null, false],
+    ['system', 'reload', '重新加载配置', true, 'refresh', null, null, false],
+    ['system', 'help', '命令与快捷键', true, 'help', null, null, true],
+    // Runtime/TUI capabilities with no Desktop surface yet. They are real
+    // commands; the Desktop states that instead of pretending they ran.
+    ['system', 'btw', '侧边提问', false, 'chat', '未接入', '桌面端尚未提供侧边提问视图', false],
+    ['system', 'recap', '目标回顾', false, 'bookmark', '未接入', '桌面端尚未提供目标回顾视图', false],
+    ['system', 'restore', '恢复检查点', false, 'history', '未接入', '桌面端尚未提供检查点选择器', false, ['checkpoint', 'rewind']],
+    ['system', 'recover', '恢复中断调用', false, 'refresh', '未接入', '桌面端尚未提供崩溃恢复确认页', false],
+    ['system', 'doctor', '诊断', false, 'stethoscope', '未接入', '诊断属于命令行工具；桌面端尚无对应页面', false],
+    ['system', 'clean', '清理本地存储', false, 'trash', '未接入', '桌面端尚未提供本地存储清理页', false],
+    ['system', 'trust', '定义信任', false, 'shield', '未接入', '桌面端只在技能实际使用时请求授权，没有集中信任页', false],
+    ['system', 'memory', '记忆', false, 'book', '未接入', '桌面端尚未提供记忆管理页', false],
+    ['session', 'remember', '记住一条', false, 'book', '未接入', '桌面端尚未提供记忆写入入口', false],
+    ['session', 'dream', '记忆整理', false, 'book', '未接入', '桌面端尚未提供记忆整理入口', false],
+    ['session', 'flush', '记忆写入', false, 'book', '未接入', '桌面端尚未提供记忆写入入口', false],
+    ['system', 'update', '更新运行时', false, 'download', '未接入', '桌面端只检查更新；安装请运行 leveler update', false, ['upgrade']],
+    ['system', 'jump', '跳转回合', false, 'arrow', '未接入', '桌面端尚未提供回合跳转', false],
+    ['system', 'resume-claude', '继续 Claude 会话', false, 'download', '未接入', '桌面端尚未提供外部会话导入', false],
+    ['system', 'resume-codex', '继续 Codex 会话', false, 'download', '未接入', '桌面端尚未提供外部会话导入', false],
+    ['system', 'permission-contract', '权限契约', false, 'shield', '未接入', '桌面端尚未提供权限契约迁移入口', false],
   ];
-  const base = entries.map(([group, id, label, available, icon, badge, reason]) => ({
-    group, id, label, icon, badge,
+  const base = entries.map(([group, id, label, available, icon, badge, reason, quick, aliases]) => ({
+    group, id, label, icon, badge, aliases: aliases ?? [], quick: !!quick,
     enabled: available && !frozen,
     reason: frozen ? '请先处理当前未完成操作' : reason ?? '请先选择或新建会话',
   }));
   // Skills come from the Runtime's own registry. A disabled Skill keeps its
   // reason so a typed `/name` is refused with the fact that made it unusable,
   // never with a generic "unknown command".
-  const owned = new Set(base.map(entry => entry.id));
+  const owned = new Set(base.flatMap(entry => [entry.id, ...entry.aliases]));
   const skills = skillCommandEntries(skillRowsForSession(), owned).map(skill => ({
     ...skill,
+    quick: false,
+    aliases: skill.aliases ?? [],
     // The composer is frozen while another send is unresolved, exactly like
     // every product command; the Runtime still re-resolves on submit.
     enabled: skill.enabled && !frozen,
@@ -4621,7 +4662,7 @@ function commandCatalog() {
 }
 
 function openCommandMenu(candidates = commandCatalog()) {
-  $('command-popover')?.remove();
+  closeComposerPopovers();
   if (!candidates.length) return;
   const node = el('div', 'menu command-popover');
   node.id = 'command-popover';
@@ -4631,7 +4672,7 @@ function openCommandMenu(candidates = commandCatalog()) {
   for (const command of candidates) {
     if (command.group !== group) {
       group = command.group;
-      node.append(el('div', 'menu-heading', group === 'add' ? '添加' : group === 'skills' ? '技能' : '指令'));
+      node.append(el('div', 'menu-heading', ({ add: '添加', agent: 'Agent', view: '查看', session: '会话', system: '系统', skills: '技能' })[group] ?? '指令'));
     }
     const button = el('button', 'menu-item');
     button.type = 'button';
@@ -4651,6 +4692,35 @@ function openCommandMenu(candidates = commandCatalog()) {
     node.append(button);
   }
   node.append(el('div', 'menu-note', '↑↓ 选择 · Enter 执行 · Esc 关闭'));
+  // One document-level handler: the menu stays usable even when focus is on
+  // an anchor button, and a keystroke cannot race the input's own listener.
+  const onKey = event => {
+    if (!node.isConnected) { document.removeEventListener('keydown', onKey, true); return; }
+    if (event.isComposing || event.keyCode === 229) return;
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      closeComposerPopovers();
+      $('message').focus();
+      return;
+    }
+    const buttons = [...node.querySelectorAll('button:not(:disabled)')];
+    if (!buttons.length) return;
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      const at = buttons.findIndex(button => button.dataset.commandId === node.dataset.selected);
+      const next = buttons[(at + (event.key === 'ArrowDown' ? 1 : -1) + buttons.length) % buttons.length];
+      node.dataset.selected = next.dataset.commandId;
+      for (const button of node.querySelectorAll('button')) button.setAttribute('aria-selected', String(button === next));
+      return;
+    }
+    if ((event.key === 'Enter' && !event.shiftKey) || (event.key === 'Tab' && !event.shiftKey)) {
+      event.preventDefault();
+      const selected = node.querySelector(`button[data-command-id="${node.dataset.selected}"]`);
+      if (selected && !selected.disabled) executeCommand(selected.dataset.commandId);
+    }
+  };
+  node._keyHandler = onKey;
+  document.addEventListener('keydown', onKey, true);
   document.body.append(node);
   const card = $('composer-card').getBoundingClientRect();
   const height = node.getBoundingClientRect().height;
@@ -4661,8 +4731,9 @@ function openCommandMenu(candidates = commandCatalog()) {
 
 function openSlashMenu() {
   const value = $('message').value;
-  const candidates = /^\/[A-Za-z0-9._:-]*$/.test(value.trim())
-    ? commandCandidates(value, commandCatalog())
+  const trimmed = value.trim();
+  const candidates = /^\/[A-Za-z0-9._:-]*$/.test(trimmed)
+    ? (trimmed === '/' ? commandCatalog().filter(item => item.quick) : commandCandidates(value, commandCatalog()))
     : [];
   // Discovery is the runtime's, but opening the menu is the moment a newly
   // added package should become reachable. Refresh in the background; the
@@ -4672,7 +4743,10 @@ function openSlashMenu() {
 }
 
 function closeComposerPopovers() {
-  $('command-popover')?.remove();
+  const node = $('command-popover');
+  if (!node) return;
+  if (node._keyHandler) document.removeEventListener('keydown', node._keyHandler, true);
+  node.remove();
 }
 
 function insertCommand(id) {
@@ -4684,7 +4758,7 @@ function insertCommand(id) {
   controls();
 }
 
-async function executeCommand(id) {
+async function executeCommand(id, argument = '') {
   const command = commandCatalog().find(item => item.id === id);
   if (!command?.enabled) { composerError(command?.reason ?? '命令当前不可用'); return; }
   closeComposerPopovers();
@@ -4699,7 +4773,42 @@ async function executeCommand(id) {
   if (id === 'file') { composerError(''); controls(); uploadAttachment(); return; }
   if (id === 'reference') { openRightbarTab('files'); return; }
   if (id === 'secret') { openSecretPaste(); return; }
-  if (id === 'goal') { $('message').value = '/goal '; $('message').focus(); return; }
+  if (id === 'goal') {
+    // A bare `/goal` edits the composer; `/goal <task>` is the Runtime's typed
+    // RunGoal command, never a prose message that only looks like a command.
+    const objective = argument.trim();
+    if (!objective) { $('message').value = '/goal '; $('message').focus(); return; }
+    const head = objective.split(/\s+/)[0].toLowerCase();
+    if (head === 'status') {
+      const execution = current.session.execution_task;
+      const state = execution
+        ? execution.user_paused ? '已暂停 · 等待你的指令' : execution.running ? '执行中' : '待继续'
+        : collaborationLabel(current.session.collaboration);
+      toast(`目标状态：${state}`, { tone: 'info', holdMs: 3200 });
+      return;
+    }
+    if (['clear', 'cancel', 'stop'].includes(head)) {
+      action(async () => {
+        const wasGoal = (current.session.collaboration ?? 'chat') === 'goal';
+        if (wasGoal) await deliver(collaborationCommand(current.session.id, 'chat'));
+        if (current.session.execution_task || ['running', 'waiting_user'].includes(current.status)) {
+          await deliver({ type: 'cancel_task', session_id: current.session.id });
+        }
+        await refreshMetadata();
+        toast(wasGoal ? '已结束目标模式' : '当前没有进行中的目标', { tone: 'info', holdMs: 2400 });
+      }, { onError: composerError, clearGlobal: false });
+      return;
+    }
+    action(async () => {
+      await deliver({ type: 'run_goal', session_id: current.session.id, content: objective, require_new_turn: false });
+      pendingSubmit = true;
+      $('message').value = '';
+      clearDraft();
+      resizeComposer();
+      await refreshMetadata();
+    }, { onError: composerError, clearGlobal: false });
+    return;
+  }
   $('message').value = '';
   composerError('');
   controls();
@@ -4720,7 +4829,78 @@ async function executeCommand(id) {
     });
     return;
   }
+  if (id === 'thinking') { openThinkingMenu($('model-picker')); return; }
+  if (id === 'plan') { openCollaborationMenu($('mode-picker')); return; }
+  if (id === 'skills' || id === 'agents') { openSettings('presets'); return; }
+  if (id === 'settings' || id === 'theme') { openSettings('general'); return; }
+  if (id === 'mcp') { openSettings('mcp'); return; }
+  if (id === 'schedules') { openSchedulesPage(); return; }
+  if (id === 'help') { openCommandMenu(commandCatalog()); return; }
+  if (id === 'trace') { document.querySelector('#view-tabs [data-view="trajectory"]')?.click(); return; }
+  if (id === 'usage') {
+    if (!current?.usage) { composerError('会话尚无用量数据'); return; }
+    openUsageDialog(current.usage);
+    return;
+  }
+  if (id === 'find') { openFind(); return; }
+  if (id === 'tasks') { openSidebarSearch(); return; }
+  if (id === 'new') { void newSession(); return; }
+  if (id === 'rename') { beginTitleEdit(); return; }
+  if (id === 'fork') {
+    const task = tasks.find(item => item.id === current.session.id);
+    if (!task) { composerError('当前会话尚未进入任务列表'); return; }
+    void forkTask(task);
+    return;
+  }
+  if (id === 'copy') {
+    const answers = [...document.querySelectorAll('#conversation .message.assistant .markdown')];
+    const text = answers.at(-1)?.innerText ?? '';
+    if (!text) { composerError('当前会话还没有可复制的回答'); return; }
+    action(() => copyText(api, text));
+    return;
+  }
+  if (id === 'output') {
+    const tool = [...(current.tools ?? [])].reverse().find(item => item.output || item.status === 'completed' || item.status === 'failed');
+    if (!tool) { composerError('当前会话还没有可查看的工具输出'); return; }
+    openToolOutput(tool);
+    return;
+  }
+  if (id === 'reload') {
+    action(async () => {
+      const result = await api.reloadRuntime();
+      if (result?.requested) toast('已请求 Runtime 重新加载配置', { tone: 'success', holdMs: 2200 });
+      else if (result?.reason === 'no_runtime') toast('当前没有运行中的 Runtime', { tone: 'info', holdMs: 2200 });
+      else toast(`重新加载失败：${result?.message ?? '未知原因'}`, { tone: 'error', holdMs: 3600 });
+    });
+    return;
+  }
   composerError(command.reason ?? '命令当前不可用');
+}
+
+const THINKING_LABELS = { auto: '自动', off: '关闭', minimal: '最低', low: '低', medium: '中', high: '高', max: '最高' };
+
+function openThinkingMenu(anchor) {
+  // Thinking is session metadata from the Runtime snapshot; the projection
+  // never keeps a second copy at the top level.
+  const thinking = current?.session?.thinking;
+  if (!thinking) { composerError('Runtime 未返回 Thinking 状态'); return; }
+  if (thinking.access === 'unsupported') { composerError('当前模型不进行思考'); return; }
+  if (thinking.access === 'fixed' || !thinking.choices.length) { composerError('当前模型不能调整思考强度'); return; }
+  openMenu({
+    anchor, align: 'end', width: 220,
+    items: [
+      { heading: 'Thinking' },
+      ...thinking.choices.map(level => ({
+        label: THINKING_LABELS[level] ?? level,
+        checked: thinking.current === level,
+        onSelect: () => action(async () => {
+          await deliver({ type: 'set_thinking_level', session_id: current.session.id, level });
+          await refreshMetadata();
+          toast(`Thinking：${THINKING_LABELS[level] ?? level}`, { tone: 'success', holdMs: 1800 });
+        }),
+      })),
+    ],
+  });
 }
 
 /* --------------------------------------------------------------- lifecycle */
@@ -11631,27 +11811,7 @@ function boot() {
   });
   $('message').addEventListener('keydown', event => {
     if (event.isComposing || event.keyCode === 229) return;
-    const menu = $('command-popover');
-    if (menu) {
-      if (event.key === 'Escape') { event.preventDefault(); $('message').value = ''; closeComposerPopovers(); controls(); return; }
-      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
-        event.preventDefault();
-        const buttons = [...menu.querySelectorAll('button:not(:disabled)')];
-        if (!buttons.length) return;
-        const at = buttons.findIndex(button => button.dataset.commandId === menu.dataset.selected);
-        const next = buttons[(at + (event.key === 'ArrowDown' ? 1 : -1) + buttons.length) % buttons.length];
-        menu.dataset.selected = next.dataset.commandId;
-        for (const button of menu.querySelectorAll('button')) button.setAttribute('aria-selected', String(button === next));
-        return;
-      }
-      if (event.key === 'Enter' && !event.shiftKey) {
-        event.preventDefault();
-        const selected = menu.querySelector(`button[data-command-id="${menu.dataset.selected}"]`);
-        if (selected && !selected.disabled) executeCommand(selected.dataset.commandId);
-        return;
-      }
-    }
-    if (event.key === 'Enter' && !event.shiftKey) {
+    if (event.key === 'Enter' && !event.shiftKey && !$('command-popover')) {
       event.preventDefault();
       submitComposer(event.metaKey || event.ctrlKey);
     }
@@ -11805,6 +11965,7 @@ async function submitComposer(complement = false) {
   const content = $('message').value.trim();
   const intent = slashIntent(content, commandCatalog());
   if (intent.kind === 'action') { executeCommand(intent.id); return; }
+  if (intent.kind === 'goal') { executeCommand('goal', intent.content); return; }
   if (intent.kind === 'blocked') { composerError(intent.reason); return; }
   const refs = attachments().filter(item => item.status === 'ready').map(item => item.attachment);
   if (connectionState.state !== 'connected') { composerError('连接已断开，消息未发送；正在重连'); return; }

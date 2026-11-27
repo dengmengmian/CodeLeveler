@@ -142,9 +142,9 @@ export function focusRestoreIndex(candidates,overlay){return candidates.findInde
 
 /** @typedef {{id:string,label:string,enabled:boolean,reason?:string,kind?:string}} PaletteCommand */
 /** @param {string} text @param {PaletteCommand[]} commands */
-export function slashIntent(text,commands){const match=/^\/([a-z-]*)(?:\s+([\s\S]*))?$/.exec(text.trim());if(!match)return {kind:'message'};if(match[1]==='goal')return match[2]?{kind:'message'}:{kind:'blocked',reason:'用法：/goal <目标>'};const command=commands.find(item=>item.id===match[1]);if(!command)return {kind:'blocked',reason:'没有匹配的命令，请选择候选或修改输入。'};if(command.kind==='skill')return command.enabled?{kind:'skill'}:{kind:'blocked',reason:command.reason??'此技能当前不可用'};if(match[2])return {kind:'blocked',reason:'此命令不接受参数。请选择命令后发送，使用打开的控件完成操作。'};if(!command.enabled)return {kind:'blocked',reason:command.reason??'此命令当前不可用'};return {kind:'action',id:command.id};}
+export function slashIntent(text,commands){const match=/^\/([a-z-]*)(?:\s+([\s\S]*))?$/.exec(text.trim());if(!match)return {kind:'message'};if(match[1]==='goal')return match[2]?{kind:'goal',content:match[2]}:{kind:'blocked',reason:'用法：/goal <目标>'};const command=commands.find(item=>item.id===match[1]||(item.aliases??[]).includes(match[1]));if(!command)return {kind:'blocked',reason:'没有匹配的命令，请选择候选或修改输入。'};if(command.kind==='skill')return command.enabled?{kind:'skill',id:command.id}:{kind:'blocked',reason:command.reason??'此技能当前不可用'};if(match[2])return {kind:'blocked',reason:'此命令不接受参数。请选择命令后发送，使用打开的控件完成操作。'};if(!command.enabled)return {kind:'blocked',reason:command.reason??'此命令当前不可用'};return {kind:'action',id:command.id};}
 /** @param {string} text @param {PaletteCommand[]} commands */
-export function commandCandidates(text,commands){const match=/^\/([A-Za-z0-9._:-]*)$/.exec(text.trim());return match?commands.filter(item=>item.id.startsWith(match[1])):[];}
+export function commandCandidates(text,commands){const match=/^\/([A-Za-z0-9._:-]*)$/.exec(text.trim());return match?commands.filter(item=>item.id.startsWith(match[1])||(item.aliases??[]).some(alias=>alias.startsWith(match[1]))):[];}
 
 /** @param {{composing:boolean,modalOpen:boolean,settingsOpen:boolean}} state @param {()=>void} open */
 export function activateSettingsShortcut(state,open){if(state.composing||state.modalOpen||state.settingsOpen)return false;open();return true;}

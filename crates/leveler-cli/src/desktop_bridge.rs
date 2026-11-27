@@ -206,12 +206,17 @@ fn validate_command(session: &SessionId, command: &ClientCommand) -> anyhow::Res
         ClientCommand::ListReviews { query_id, .. }
         | ClientCommand::QueryReviewScopes { query_id, .. }
             if valid_desktop_query_id(query_id) => {}
+        // An explicit goal objective is user text; the runtime owns the goal
+        // lifecycle. `require_new_turn` is a typed flag, never inferred.
+        ClientCommand::RunGoal { content, .. }
+            if !content.trim().is_empty() && content.len() <= 100_000 => {}
         ClientCommand::SteerCurrentTurn { .. }
         | ClientCommand::CancelCurrentTurn { .. }
         | ClientCommand::CancelTask { .. }
         | ClientCommand::QuerySessionHistory { .. }
         | ClientCommand::SelectModel { .. }
         | ClientCommand::SetPermissionProfile { .. }
+        | ClientCommand::SetThinkingLevel { .. }
         | ClientCommand::RenameSession { .. }
         | ClientCommand::ArchiveSession { .. }
         | ClientCommand::UnarchiveSession { .. }
