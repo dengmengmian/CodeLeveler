@@ -6662,6 +6662,23 @@ function filesStateFor(session) {
   return state;
 }
 
+/** Reload every already-loaded directory and open preview for a finished
+ *  turn. Files the Agent changed must never remain on screen as old bytes. */
+function refreshWorkspaceViews(session) {
+  // Serialized: the host admits a bounded number of file reads at once, and a
+  // burst of one per open tab would turn a routine refresh into visible
+  // "读取繁忙" errors. One reader at a time is plenty after a turn.
+  void (async () => {
+    const state = fileTreeStates.get(session?.id);
+    if (state) {
+      for (const rel of [...state.entries.keys()]) await filesLoad(state, rel, { force: true });
+    }
+    for (const tab of Object.values(rightbarTabs)) {
+      if (tab.kind === 'preview' && tab.path) await loadPreview(tab, { force: true });
+    }
+  })();
+}
+
 function filesRefresh(state) {
   state.entries.clear();
   state.errors.clear();
@@ -6671,12 +6688,12 @@ function filesRefresh(state) {
 }
 
 function filesLoad(state, rel = '', { force = false } = {}) {
-  if (state.loading.has(rel)) return;
-  if (!force && state.entries.has(rel)) return;
+  if (state.loading.has(rel)) return Promise.resolve();
+  if (!force && state.entries.has(rel)) return Promise.resolve();
   state.loading.add(rel);
   state.errors.delete(rel);
   if (rel === '') state.status = 'loading';
-  api.filesList({ sessionId: state.sessionId, path: rel }).then(result => {
+  return api.filesList({ sessionId: state.sessionId, path: rel }).then(result => {
     state.entries.set(rel, result);
     state.loading.delete(rel);
     if (rel === '') state.status = 'ready';
@@ -11553,6 +11570,11 @@ api.onEvent(frame => {
     action(async () => { await refreshSnapshot(); });
   }
   if (terminalEvents.has(event.type) && current?.session?.repository) {
+    // The turn may have created, changed or removed files. Reload the file
+    // tree's already-open directories and every open preview from disk; the
+    // tab's own renderer choice and scroll target survive, only the bytes
+    // change. A preview is read-only, so there is no edit to protect.
+    refreshWorkspaceViews(current.session);
     const attemptDiff = (attempt = 0) => {
       if (attempt > 6 || !current?.session?.repository) return;
       if (loading || uncertain) { setTimeout(() => attemptDiff(attempt + 1), 400); return; }
