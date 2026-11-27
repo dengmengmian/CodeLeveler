@@ -4592,7 +4592,7 @@ function commandCatalog() {
   // keeps the real reason so a typed `/name` is refused with a fact, never
   // with a generic "unknown command".
   const entries = [
-    ['add', 'file', '添加图片', true, 'paperclip', null, null, true, ['image']],
+    ['add', 'file', '添加图片', true, 'paperclip', null, null, true, ['image', 'attach']],
     ['add', 'reference', '引用工作区文件', workspace, 'file', null, '请先打开有工作区的会话', false],
     ['add', 'secret', '安全粘贴凭据', session, 'shield', null, '请先选择或新建会话', true],
     ['agent', 'model', '模型', session, 'layers', null, '请先选择或新建会话', true],
@@ -4639,6 +4639,7 @@ function commandCatalog() {
     ['system', 'resume-claude', '继续 Claude 会话', false, 'download', '未接入', '桌面端尚未提供外部会话导入', false],
     ['system', 'resume-codex', '继续 Codex 会话', false, 'download', '未接入', '桌面端尚未提供外部会话导入', false],
     ['system', 'permission-contract', '权限契约', false, 'shield', '未接入', '桌面端尚未提供权限契约迁移入口', false],
+    ['system', 'exit', '退出桌面', false, 'close', '未接入', '关闭窗口请使用系统关闭或 ⌘Q；桌面端不提供静默退出命令', false, ['quit']],
   ];
   const base = entries.map(([group, id, label, available, icon, badge, reason, quick, aliases]) => ({
     group, id, label, icon, badge, aliases: aliases ?? [], quick: !!quick,
