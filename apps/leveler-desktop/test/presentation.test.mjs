@@ -278,22 +278,6 @@ test('an MCP tool card names the server and the remote tool, not only a display 
   assert.equal(toolLabel({ name: 'mcp__broken' }), '工具调用');
 });
 
-test('the task dock reports per-status counts in the reference order', async () => {
-  const { planProgressLabel } = await import('../src/presentation.mjs');
-  const steps = [
-    { status: 'done' }, { status: 'done' }, { status: 'done' },
-    { status: 'running' },
-    { status: 'pending' }, { status: 'pending' },
-  ];
-  assert.equal(planProgressLabel(steps), '3 已完成 · 1 进行中 · 2 待处理');
-  assert.equal(planProgressLabel([{ status: 'running' }]), '1 进行中');
-  assert.equal(planProgressLabel([{ status: 'done' }, { status: 'failed' }, { status: 'skipped' }]),
-    '1 已完成 · 1 失败 · 1 已跳过');
-  // An abandoned step is replacement history, never delivered work.
-  assert.equal(planProgressLabel([{ status: 'done' }, { status: 'abandoned' }]), '1 已完成 · 1 已弃用');
-  assert.equal(planProgressLabel([]), '');
-});
-
 test('skills, subagents and harness controls keep their real identity', async () => {
   const { toolLabel } = await import('../src/presentation.mjs');
   assert.equal(toolLabel({ name: 'load_skill' }), '使用技能');

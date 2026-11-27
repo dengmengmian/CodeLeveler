@@ -2290,19 +2290,7 @@ body.blank-session .view-tabs, body.home .view-tabs { display: none; }
 .composer-dock-action:hover { color: var(--text-primary); background: var(--hover-solid); }
 .composer-dock-row { display: flex; align-items: center; gap: 6px; margin-top: 4px; color: var(--text-secondary); font-size: 12px; line-height: 18px; }
 .composer-dock-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* Reference TodoPanel: 16px menu surface, 13px title/progress, 8px dots. */
-.todo-dock { padding: 6px 12px; border: 0; border-radius: 16px; background: var(--menu-bg); box-shadow: var(--composer-shadow); }
-.todo-dock .todo-head { gap: 10px; color: var(--text-primary); font-size: 13px; line-height: 24px; font-weight: 500; }
 .todo-title { flex: none; }
-.todo-progress { flex: 1 1 auto; min-width: 0; overflow: hidden; color: var(--text-tertiary); font-size: 13px; line-height: 20px; font-weight: 400; text-overflow: ellipsis; white-space: nowrap; }
-.todo-chevron { display: grid; flex: none; place-items: center; color: var(--text-tertiary); }
-.todo-row { gap: 10px; margin-top: 8px; color: var(--text-secondary); font-size: 13px; line-height: 20px; }
-.composer-step-dot { flex: none; width: 8px; height: 8px; border-radius: 999px; background: var(--text-caption); }
-.composer-step-dot[data-state="done"] { background: #36a762; }
-.composer-step-dot[data-state="ongoing"] { background: #dd8629; }
-.composer-step-dot[data-state="error"] { background: var(--error); }
-.todo-dock summary { cursor: pointer; list-style: none; }
-.todo-dock summary::-webkit-details-marker { display: none; }
 
 /* ------------------------------------------------------------- trajectory */
 .trajectory-root { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; background: var(--bg-base); }

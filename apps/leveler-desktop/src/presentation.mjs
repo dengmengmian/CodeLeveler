@@ -107,23 +107,6 @@ export function contractRoundStatus(round){const statuses=round.tools.map(tool=>
 
 /** @param {string} status */
 export function planStepLabel(status){const labels=/** @type {Record<string,string>} */({pending:'待执行',running:'进行中',done:'已完成',failed:'失败',skipped:'已跳过',abandoned:'已弃用'});return labels[status]??`未知状态：${status}`;}
-/**
- * The task dock's one-line progress summary: per-status counts in the
- * reference order, zero segments dropped, separated by wide spaces.
- * @param {{status?:string}[]} steps
- */
-export function planProgressLabel(steps){
- const count=(/** @type {string} */ status)=>steps.filter(step=>step.status===status).length;
- const done=count('done'),running=count('running'),pending=count('pending'),failed=count('failed'),skipped=count('skipped'),abandoned=count('abandoned');
- return [
-  done?`${done} 已完成`:'',
-  running?`${running} 进行中`:'',
-  pending?`${pending} 待处理`:'',
-  failed?`${failed} 失败`:'',
-  skipped?`${skipped} 已跳过`:'',
-  abandoned?`${abandoned} 已弃用`:'',
- ].filter(Boolean).join(' · ');
-}
 /** Delivered/open steps, excluding history the model abandoned.
  *  @param {{status?:string}[]} steps */
 export function planActiveSteps(steps){return steps.filter(step=>step.status!=='abandoned');}

@@ -100,12 +100,17 @@ try {
   await send('PLAN regression');
   const planSession = await selectedId();
   await page.waitForSelector('.plan-card-row', { timeout: 30000 });
-  await page.waitForSelector('.todo-dock', { timeout: 10000 });
-  const todoText = await page.locator('.todo-dock').innerText();
-  assert.match(todoText, /\d+ 已完成/);
-  assert.match(todoText, /\d+ 进行中/);
-  assert.doesNotMatch(todoText, /任务 \d+\/\d+/);
-  cases.plan_dock_on_event = true;
+  // One lightweight summary in the transcript; the full step list belongs to
+  // the right panel, not a second expandable copy beside the composer.
+  const planCardText = await page.locator('.plan-card-row').first().innerText();
+  assert.match(planCardText, /执行计划/);
+  assert.match(planCardText, /\d+ \/ \d+ 步骤已完成/);
+  assert.equal(await page.locator('.todo-dock').count(), 0, 'plan steps must not be duplicated');
+  await page.locator('.plan-card-row').first().click();
+  await page.waitForSelector('.plan-view');
+  const planViewText = await page.locator('.plan-view').innerText();
+  assert.match(planViewText, /已完成|进行中|待执行/);
+  cases.plan_summary_on_event = true;
   await page.locator('#stop').click();
   await page.waitForFunction(() => document.querySelector('#conversation-status').textContent === '已中断');
 

@@ -234,7 +234,7 @@ try {
   await page.locator('#send').click();
   await waitSnapshot(value => value.collaboration === 'plan', 'created session must carry the plan axis');
   const planId = await selectedId();
-  await page.waitForSelector('.todo-dock', { timeout: 120000 });
+  await page.waitForSelector('.plan-card-row', { timeout: 120000 });
   await waitTurn(receiptsBeforePlan);
   const planSnapshot = await snapshot();
   assert.equal(planSnapshot.collaboration, 'plan');
@@ -243,9 +243,11 @@ try {
   assert.ok(planRequest, 'the plan turn must reach the provider');
   assert.equal(planRequest.toolNames.includes('update_goal'), false, 'plan must not expose the goal executor');
   assert.ok(planRequest.toolNames.includes('update_plan'), 'plan keeps the plan control');
-  const todoText = await page.locator('.todo-dock').innerText();
-  assert.match(todoText, /已完成/);
-  await page.locator('.plan-card-row').filter({ hasText: '执行计划' }).first().click();
+  const planCardText = await page.locator('.plan-card-row').first().innerText();
+  assert.match(planCardText, /执行计划/);
+  assert.match(planCardText, /步骤已完成/);
+  assert.equal(await page.locator('.todo-dock').count(), 0, 'the plan must not repeat beside its transcript summary');
+  await page.locator('.plan-card-row').first().click();
   await page.waitForSelector('.plan-view');
   const planViewText = await page.locator('.plan-view').innerText();
   for (const step of planSnapshot.plan.steps) assert.ok(planViewText.includes(step.description), `plan view must show ${step.description}`);

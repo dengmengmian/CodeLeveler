@@ -19,22 +19,15 @@ async function requestDiff(){const count=await page.evaluate(()=>globalThis.__vi
 
 try{
 app=await electron.launch({args:[root,'--user-data-dir='+path.join(temporary,'profile')],env:{...process.env,ELECTRON_RUN_AS_NODE:undefined,LEVELER_HOME:home,LEVELER_CONFIG_DIR:undefined,LEVELER_BINARY:process.env.LEVELER_BINARY??path.resolve(root,'../../target/debug/leveler'),LEVELER_DAEMON_IDLE_TIMEOUT_SECS:'10'}});page=await app.firstWindow();page.setDefaultTimeout(15000);page.on('pageerror',err=>errors.push(err.message));await page.waitForFunction(()=>window.desktop&&document.querySelector('#new-session')&&document.querySelector('#brand-version')?.textContent.startsWith('v'));await app.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows()[0].setSize(1600,1000));await page.evaluate(()=>{globalThis.__viewsEvents=[];window.desktop.onEvent(f=>globalThis.__viewsEvents.push(f));});await app.evaluate(({dialog},workspace)=>{dialog.showOpenDialog=async()=>({canceled:false,filePaths:[workspace]});},workspace);await page.locator('#add-workspace').click();await page.waitForFunction(()=>document.querySelector('#workspace-picker')?.textContent.includes('workspace'));await page.locator('#message').fill('Create a real plan for this isolated workspace');await page.locator('#send').click();await page.waitForFunction(()=>globalThis.__viewsEvents.filter(f=>f.data?.type==='plan_updated').length>=2,null,{timeout:60000});id=await page.locator('.session-row[aria-selected="true"]').getAttribute('data-session-id');const snapshot=await page.evaluate(id=>window.desktop.snapshot(id),id);assert.equal(snapshot.repository,await realpath(workspace));assert.equal(snapshot.plan.steps.length,3);const planEvents=await page.evaluate(()=>globalThis.__viewsEvents.filter(f=>f.data?.type==='plan_updated').map(f=>f.data.plan));assert.ok(planEvents.length>=2);assert.ok(planEvents.some(p=>p.steps.some(s=>s.status==='running')));evidence.real_registered_plan_tool_updates=planEvents.length;
-// The composer dock is the persistent plan-progress surface and must refresh
-// from plan_updated itself, before any work message commits.
-await page.waitForSelector('.todo-dock', { timeout: 10000 });
-const todoText = await page.locator('.todo-dock').innerText();
-  assert.match(todoText, /\d+ 已完成/);
-  assert.match(todoText, /\d+ 进行中/);
-  assert.doesNotMatch(todoText, /任务 \d+\/\d+/);
-const dockGeometry = await page.evaluate(() => {
-  const dock = document.querySelector('.todo-dock').getBoundingClientRect();
-  const card = document.querySelector('#composer-card').getBoundingClientRect();
-  return { dockWidth: Math.round(dock.width), cardWidth: Math.round(card.width), dockLeft: Math.round(dock.left), cardLeft: Math.round(card.left) };
-});
-assert.equal(dockGeometry.cardWidth - dockGeometry.dockWidth, 32, `dock is not the card minus its insets: ${JSON.stringify(dockGeometry)}`);
-assert.equal(dockGeometry.dockLeft - dockGeometry.cardLeft, 16, `dock is not centered on the card: ${JSON.stringify(dockGeometry)}`);
-evidence.plan_dock_geometry = dockGeometry;
-evidence.plan_dock_visible = true;
+// The transcript keeps one lightweight plan summary and refreshes it from
+// plan_updated itself, before any work message commits. Steps live in the
+// right panel only.
+await page.waitForSelector('.plan-card-row', { timeout: 10000 });
+const planCardText = await page.locator('.plan-card-row').first().innerText();
+assert.match(planCardText, /执行计划/);
+assert.match(planCardText, /\d+ \/ \d+ 步骤已完成/);
+assert.equal(await page.locator('.todo-dock').count(), 0, 'plan steps must not be duplicated');
+evidence.plan_summary_visible = true;
 await page.locator('.plan-card-row').first().click();await page.waitForFunction(()=>document.querySelector('.plan-view')?.textContent.includes('Inspect temporary Git workspace'));assert.match(await page.locator('.plan-view').textContent(),/已完成|进行中|待执行/);await capture('views-plan');finishPlan();await page.waitForFunction(()=>document.querySelector('.message.assistant .markdown')?.textContent.includes('VIEWS_PLAN_COMPLETE')&&['已回答','已完成'].includes(document.querySelector('#conversation-status').textContent),null,{timeout:60000});
 const diff=await requestDiff();assert.equal(diff.type,'diff_updated');assert.equal(diff.diff.files.length,2);assert.ok(diff.diff.files.some(f=>f.path==='note.txt'&&f.added===2&&f.removed===2));assert.ok(diff.diff.files.some(f=>f.path==='long.txt'&&f.patch.length>60000));await capture('views-overview');await page.locator('.review-file').click();await page.locator('.menu .menu-item').filter({hasText:'long.txt'}).first().click();await page.waitForFunction(()=>document.querySelector('.review-body')?.textContent.includes('updated-0'));const patch=page.locator('.review-body');const patchLength=(await patch.textContent()).length;assert.ok(patchLength>60000);await capture('views-changes');evidence.real_git_diff={files:2,note_added:2,note_removed:2,long_patch_chars:patchLength};
 await rename(path.join(workspace,'.git'),path.join(workspace,'.git-unavailable'));const failed=await requestDiff();assert.equal(failed.type,'diff_failed');await page.waitForFunction(()=>!document.querySelector('.review-status.error')?.hidden);await capture('views-error');await rename(path.join(workspace,'.git-unavailable'),path.join(workspace,'.git'));const countBefore=await page.evaluate(()=>globalThis.__viewsEvents.filter(f=>f.data?.type==='diff_updated').length);const retry=page.locator('.review-status.error button');if(await retry.count())await retry.first().click();await page.waitForFunction(count=>globalThis.__viewsEvents.filter(f=>f.data?.type==='diff_updated').length>count,countBefore);await page.waitForFunction(()=>document.querySelector('.review-body')?.textContent.length>0);evidence.real_diff_error_retry=true;

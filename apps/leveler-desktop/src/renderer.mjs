@@ -3,7 +3,7 @@ import { renderMarkdown } from './markdown.mjs';
 import {
   modelLabel, workspaceLabel, toolLabel, toolTarget, browserActivity, sourceErrorSummary,
   relativeActivity, permissionLabel, recentWorkspaces, renameCommand, messageKind,
-  historyQuestions, planStepLabel, planProgressLabel, browserChrome, browserSurfaceBounds, workspaceTaskGroups,
+  historyQuestions, planStepLabel, browserChrome, browserSurfaceBounds, workspaceTaskGroups,
   attachmentErrorPresentation, slashIntent, commandCandidates,
   contractToolStatus, failureReason, displayPreview,
   confirmedDiffOf, diffCounts, messageTime, conversationItems, executionStatusLabel, confirmedChangeFiles,
@@ -106,8 +106,6 @@ let paintPending = false;
 let attachmentEarly = null;
 let uploadingKey = null;
 let titleEditing = false;
-let todoDockOpen = false;
-let todoDockSessionId = null;
 let lastEscapeAt = 0;
 let titleComposing = false;
 let findMatches = [];
@@ -1794,14 +1792,13 @@ function renderComposerDocks() {
   const host = $('composer-docks');
   if (!host) return;
   host.replaceChildren();
-  // A plan is real progress even before its first work message commits; the
-  // composer dock must not disappear just because the session still looks home.
-  const hasPlan = (current?.plan?.steps ?? []).length > 0;
   // An owed goal is runtime state, not transcript: a paused or continued goal
-  // keeps its dock even when the screen would otherwise look idle.
+  // keeps its dock even when the screen would otherwise look idle. Plans are
+  // not duplicated here — the transcript's single summary card is the only
+  // in-conversation plan surface, and the right panel owns the full list.
   const execution = current?.session?.execution_task ?? null;
   const goalStop = current ? goalStops.get(current.session.id) ?? null : null;
-  if (!current || (isHome() && !hasPlan && !execution && !goalStop)) { host.hidden = true; queuedMessages = queuedMessages.filter(item => item.sessionId === current?.session.id); return; }
+  if (!current || (isHome() && !execution && !goalStop)) { host.hidden = true; queuedMessages = queuedMessages.filter(item => item.sessionId === current?.session.id); return; }
   queuedMessages = queuedMessages.filter(item => item.sessionId === current.session.id);
   host.hidden = false;
   // The runtime stopped opening empty Goal windows. This is a policy stop,
@@ -1851,34 +1848,8 @@ function renderComposerDocks() {
     dock.append(row);
     host.append(dock);
   }
-  // Reference task panel: the list stays readable in every plan state, and the
-  // header names per-status counts instead of a bare ratio.
-  const steps = current.plan?.steps ?? [];
-  if (steps.length) {
-    if (todoDockSessionId !== current.session.id) { todoDockSessionId = current.session.id; todoDockOpen = false; }
-    const dock = el('details', 'composer-dock todo-dock');
-    const summary = el('summary', 'composer-dock-head todo-head');
-    const chevron = el('span', 'todo-chevron');
-    chevron.append(iconNode(todoDockOpen ? 'chevronDown' : 'chevronUp', { size: 14 }));
-    summary.append(iconNode('list', { size: 16 }), el('span', 'todo-title', '任务'),
-      el('span', 'todo-progress', planProgressLabel(steps)), chevron);
-    dock.append(summary);
-    for (const step of steps) {
-      const row = el('div', 'composer-dock-row todo-row');
-      const dot = el('span', 'composer-step-dot');
-      dot.dataset.state = step.status === 'done' ? 'done'
-        : step.status === 'running' ? 'ongoing'
-          : step.status === 'failed' ? 'error' : 'idle';
-      row.append(dot, el('span', 'composer-dock-text', step.description));
-      dock.append(row);
-    }
-    dock.open = todoDockOpen;
-    dock.addEventListener('toggle', () => {
-      todoDockOpen = dock.open;
-      chevron.replaceChildren(iconNode(todoDockOpen ? 'chevronDown' : 'chevronUp', { size: 14 }));
-    });
-    host.append(dock);
-  }
+  // The transcript owns the single lightweight plan summary; a second
+  // expandable step list here would repeat the same Runtime plan facts.
 }
 
 async function flushQueuedMessage(attempt = 0) {
@@ -11133,10 +11104,9 @@ api.onEvent(frame => {
     renderRightbar();
     renderConversation();
   } else if (event.type === 'plan_updated') {
+    // The transcript's plan summary and the right panel both project the same
+    // snapshot; scheduleConversation below refreshes the summary.
     renderRightbar();
-    // The composer dock is a plan progress surface; refresh it on the event
-    // that changes the plan instead of waiting for an unrelated full render.
-    renderComposerDocks();
   }
   controls();
   scheduleConversation();
