@@ -195,6 +195,21 @@ try {
   const followed = await page.evaluate(() => { const list = document.querySelector('#conversation-scroll'); return list.scrollHeight - list.scrollTop - list.clientHeight; });
   assert.ok(followed < 120, `near-bottom view did not follow: ${followed}`);
   evidence.scroll = { away, followed };
+  // The closing app must not have to wait on a still-running turn; let this
+  // last slow turn finish and observe it like the earlier turns.
+  await page.waitForFunction(() => [...document.querySelectorAll('.message.assistant .markdown')].some(node => node.textContent.includes('RUN_SLOW_DONE')), null, { timeout: 60000 });
+  // The quit path treats a still-running task status as a reason to ask; wait
+  // for the authoritative snapshot to settle before closing the app.
+  await page.waitForFunction(async () => {
+    const id = document.querySelector('.session-row[aria-selected="true"]')?.dataset.sessionId;
+    if (!id) return false;
+    const value = await window.desktop.snapshot(id);
+    return !['running', 'waiting_user'].includes(value.task_status);
+  }, null, { timeout: 30000 });
+  await page.waitForFunction(async () => {
+    const result = await window.desktop.listTasks();
+    return (result.tasks ?? []).every(task => !['running', 'waiting_user'].includes(task.status));
+  }, null, { timeout: 30000 });
   await page.screenshot({ path: path.join(output, 'interaction-running.png') });
 
   assert.deepEqual(errors, []);
@@ -206,9 +221,14 @@ try {
   console.error(JSON.stringify({ ...evidence, passed: false, error: error.message, errors, providerErrors, requests: requests.slice(-6) }, null, 2));
   process.exitCode = 1;
 } finally {
-  try { await app?.close(); } catch { /* the test owns the app */ }
+  // Electron's quit path can open a native confirmation dialog while the
+  // renderer still reports queued/upload work; a test cannot dismiss that
+  // dialog. Exit directly, then bound the wait so a harness never hangs.
+  const proc = app?.process();
+  try { await Promise.race([app?.evaluate(({ app: electronApp }) => electronApp.exit(0)), new Promise(resolve => setTimeout(resolve, 3000))]); } catch { /* already gone */ }
+  try { proc?.kill('SIGKILL'); } catch { /* already gone */ }
   // A slow SSE turn can still hold its socket when the assertions finish;
   // without this, server.close() waits forever for that connection.
   server.closeAllConnections?.();
-  await new Promise(resolve => server.close(resolve));
+  await Promise.race([new Promise(resolve => server.close(resolve)), new Promise(resolve => setTimeout(resolve, 3000))]);
 }
