@@ -334,6 +334,62 @@ mod tests {
         );
     }
 
+    /// The Desktop banner counts source errors, so a terminal row written by a
+    /// pre-verification-gate binary must project through the real storage path
+    /// instead of failing the whole source. `verified` and
+    /// `completed_unverified` were the legacy outcome spellings; a regression
+    /// here is what produced "任务来源读取失败" against historical profiles.
+    #[tokio::test]
+    async fn legacy_terminal_outcomes_do_not_fail_the_global_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = LevelerHome::from_root(tmp.path());
+        std::fs::create_dir_all(home.no_workspace_state_dir()).unwrap();
+        let db = Database::connect(&home.no_workspace_state_dir().join("sessions.db"))
+            .await
+            .unwrap();
+        let mut ids = Vec::new();
+        for (outcome, title) in [
+            ("completed_unverified", "legacy unverified"),
+            ("verified", "legacy verified"),
+        ] {
+            let record = leveler_storage::SessionRecord::without_workspace(
+                title,
+                "m",
+                leveler_core::now(),
+            );
+            let id = SessionId::new(record.id.clone());
+            leveler_storage::SessionRepository::new(&db)
+                .create(&record)
+                .await
+                .unwrap();
+            leveler_storage::EventRepository::new(&db)
+                .append(
+                    &id,
+                    None,
+                    "task_finished",
+                    &format!(r#"{{"type":"task_finished","payload":{{"outcome":"{outcome}"}}}}"#),
+                    leveler_core::now(),
+                )
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+        let index = query_global_tasks(&home, false).await;
+        assert!(
+            index.source_errors.is_empty(),
+            "legacy outcomes must not surface as source errors: {:?}",
+            index.source_errors
+        );
+        assert_eq!(index.tasks.len(), 2);
+        for id in ids {
+            let task = index.tasks.iter().find(|task| task.id == id).unwrap();
+            assert_eq!(
+                task.status,
+                leveler_client_protocol::UiTaskStatus::Completed
+            );
+        }
+    }
+
     #[tokio::test]
     async fn legacy_store_without_title_resolves_the_source_and_workspace() {
         use sqlx::ConnectOptions;
