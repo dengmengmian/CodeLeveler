@@ -158,6 +158,18 @@ New sessions and sessions reopened after a restart use the configured setting.
 The key leaves `config.toml` alone and cannot enable memory when the configured
 rollout is `off`.
 
+### Desktop
+
+In the Desktop, `/memory` opens the cross-session memory page as a modal over
+the conversation: rollout and pause state, both scopes' counters, the file
+list, a read-only preview, and the runtime's management actions. `/remember
+<text>` writes a note from the composer, `/dream [batch]` runs a consolidation,
+and `/flush` drains this session's capture queue. Every action is a typed
+runtime command; the page never opens the store, and forgetting sends back the
+BLAKE3 of the bytes the preview showed, so a file that changed is refused.
+`/memory` and `/remember` stay available while a turn runs; `/dream` and
+`/flush` wait for the turn to settle, the same rule as the TUI.
+
 ### CLI
 
 ```sh
