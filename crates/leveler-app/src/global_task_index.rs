@@ -352,11 +352,8 @@ mod tests {
             ("completed_unverified", "legacy unverified"),
             ("verified", "legacy verified"),
         ] {
-            let record = leveler_storage::SessionRecord::without_workspace(
-                title,
-                "m",
-                leveler_core::now(),
-            );
+            let record =
+                leveler_storage::SessionRecord::without_workspace(title, "m", leveler_core::now());
             let id = SessionId::new(record.id.clone());
             leveler_storage::SessionRepository::new(&db)
                 .create(&record)
