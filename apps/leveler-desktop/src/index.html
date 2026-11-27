@@ -110,7 +110,20 @@
         </div>
         <div id="provider-setup" class="provider-setup" role="status" hidden></div>
         <div id="composer-docks" class="composer-docks"></div>
+        <section id="btw-panel" class="btw-panel" aria-label="侧边提问" hidden>
+          <div class="btw-head">
+            <span class="btw-title">侧边提问 · 只读</span>
+            <button id="btw-stop" class="button secondary small" type="button">停止</button>
+            <button id="btw-close" class="button secondary small" type="button">关闭</button>
+          </div>
+          <div id="btw-question" class="btw-question"></div>
+          <div id="btw-answer" class="btw-answer"></div>
+        </section>
         <div id="composer-card" class="composer-card">
+          <div id="drop-hint" class="drop-hint" aria-hidden="true">
+            <span class="drop-hint-title">松开以添加图片</span>
+            <span class="drop-hint-detail">PNG、JPEG、GIF 或 WebP</span>
+          </div>
           <div class="composer-input-wrap">
             <textarea id="message" class="composer-input" rows="1" placeholder="描述任务，/ 调用指令" aria-label="消息"></textarea>
           </div>

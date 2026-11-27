@@ -2580,10 +2580,28 @@ body.blank-session .view-tabs, body.home .view-tabs { display: none; }
 .message-image-tile {
   display: inline-flex; width: 64px; height: 64px; align-items: center; justify-content: center;
   border: .5px solid var(--border-l2); border-radius: 10px; background: var(--bg-module);
-  color: var(--text-tertiary);
+  color: var(--text-tertiary); overflow: hidden; padding: 0; cursor: pointer;
 }
+button.message-image-tile:hover { border-color: var(--border-l3); }
+.message-image-tile.ready { background: var(--bg-sunken, var(--bg-module)); }
+.message-image-thumb { width: 100%; height: 100%; object-fit: cover; display: block; }
 .message-images.single .message-image-tile { width: 240px; height: 160px; border-radius: 12px; }
+.message-image-loading { font-size: 14px; color: var(--text-tertiary); }
+.message-image-unavailable { font-size: 9px; line-height: 12px; text-align: center; padding: 0 3px; }
+.message-images.single .message-image-unavailable { font-size: 11px; }
 .message-image-more { display: inline-flex; width: 64px; height: 64px; align-items: center; justify-content: center; border-radius: 10px; background: var(--bg-module); color: var(--text-tertiary); font-size: 12px; }
+
+.tool-image-badge { color: var(--text-tertiary); font-size: 10px; }
+.tool-images { justify-content: flex-start; margin: 2px 0 8px; }
+.tool-images .message-image-tile { width: 72px; height: 72px; }
+.tool-images .message-image-unavailable { font-size: 9px; }
+.tool-images-error { margin: 0 0 8px; color: var(--warning, var(--text-secondary)); font-size: 11px; }
+
+.image-lightbox-card { width: min(960px, 92vw); max-height: 88vh; display: flex; flex-direction: column; }
+.image-lightbox-body { display: flex; flex: 1; min-height: 120px; align-items: center; justify-content: center; overflow: auto; background: var(--bg-sunken, var(--bg-module)); border-radius: 10px; }
+.image-lightbox-image { max-width: 100%; max-height: 70vh; object-fit: contain; display: block; }
+.image-lightbox-state { color: var(--text-tertiary); font-size: 12px; padding: 24px; }
+.image-lightbox-meta { color: var(--text-tertiary); font-size: 11px; padding: 6px 2px 0; word-break: break-all; }
 
 .tool-search-title { font-size: 12px; line-height: 18px; font-weight: 500; }
 .tool-search-summary { flex: 1; min-width: 0; color: var(--text-tertiary); font-size: 11px; line-height: 16px; }
@@ -2994,3 +3012,32 @@ body.blank-session .view-tabs, body.home .view-tabs { display: none; }
 .review-report-markdown { padding: 0; }
 /* A chip inside a report section is a badge, not a full-width bar. */
 .review-report-section > .review-chip { align-self: flex-start; }
+
+/* Side question: chrome beside the composer, never a transcript row. */
+.btw-panel { display: flex; flex-direction: column; gap: 6px; margin: 0 0 8px; padding: 10px 12px; border: .5px solid var(--border-l2); border-radius: 12px; background: var(--bg-module); max-height: 32vh; overflow: auto; }
+.btw-head { display: flex; align-items: center; gap: 6px; }
+.btw-title { flex: 1; min-width: 0; color: var(--text-secondary); font-size: 11px; font-weight: 500; }
+.btw-question { color: var(--text-primary); font-size: 12px; line-height: 18px; font-weight: 500; }
+.btw-answer { color: var(--text-secondary); font-size: 12px; line-height: 18px; white-space: pre-wrap; word-break: break-word; }
+.diagnostics-body { display: flex; flex-direction: column; gap: 8px; max-height: 60vh; overflow: auto; }
+.diagnostic-row { display: flex; flex-direction: column; gap: 3px; padding: 8px 10px; border: .5px solid var(--border-l2); border-radius: 10px; }
+.diagnostic-row[data-status="fail"] { border-color: var(--danger); }
+.diagnostic-row[data-status="warn"] { border-color: var(--warning, var(--border-l3)); }
+.diagnostic-title { display: flex; align-items: baseline; gap: 8px; font-size: 12px; }
+.diagnostic-status { font-weight: 500; }
+.diagnostic-id { flex: 1; min-width: 0; color: var(--text-secondary); font-family: var(--mono, monospace); font-size: 11px; word-break: break-all; }
+.diagnostic-severity { color: var(--text-tertiary); font-size: 10px; }
+.diagnostic-evidence { margin: 0; padding: 4px 6px; border-radius: 6px; background: var(--bg-sunken, var(--bg-module)); color: var(--text-secondary); font-size: 11px; white-space: pre-wrap; word-break: break-word; }
+.checkpoint-list, .recovery-body { display: flex; flex-direction: column; gap: 6px; max-height: 52vh; overflow: auto; }
+.checkpoint-row, .recovery-row { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border: .5px solid var(--border-l2); border-radius: 8px; font-size: 12px; }
+.checkpoint-label, .recovery-tool { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.checkpoint-ordinal, .recovery-state { color: var(--text-tertiary); font-size: 10px; }
+.recovery-call { color: var(--text-tertiary); font-family: var(--mono, monospace); font-size: 10px; }
+
+/* Finder drag target: the composer itself is the drop zone. */
+.composer-card { position: relative; }
+.composer-card.drop-target { outline: 2px dashed var(--accent, #5b7cfa); outline-offset: 2px; }
+.drop-hint { position: absolute; inset: 0; z-index: 3; display: none; flex-direction: column; align-items: center; justify-content: center; gap: 2px; border-radius: inherit; background: color-mix(in srgb, var(--bg-module) 88%, transparent); pointer-events: none; }
+.composer-card.drop-target .drop-hint { display: flex; }
+.drop-hint-title { color: var(--text-primary); font-size: 13px; font-weight: 500; }
+.drop-hint-detail { color: var(--text-tertiary); font-size: 11px; }

@@ -146,6 +146,17 @@ let agentOptionsState = { status: 'idle', data: null, error: null, request: 0 };
 let agentOptionsForm = null;
 let agentOptionsSaving = false;
 let agentOptionsNote = null;
+// Global Thinking default and the Agent browser product. Both are host config
+// facts read through the bridge; the forms hold the person's draft, never a
+// second copy of what the file currently says.
+let thinkingSettingsState = { status: 'idle', data: null, error: null, request: 0 };
+let thinkingDraft = null;
+let thinkingSaving = false;
+let thinkingNote = null;
+let browserSettingsState = { status: 'idle', data: null, error: null, request: 0 };
+let browserDraft = null;
+let browserSaving = false;
+let browserNote = null;
 let agentsRead = null;
 // Skills projection: the runtime registry is the only row source. The same
 // answer feeds the settings page and the composer's slash catalog, so a Skill
@@ -2039,6 +2050,7 @@ function render() {
   renderHeader();
   renderComposerMeta();
   renderComposerDocks();
+  renderBtw();
   renderContextMeter();
   renderConversation();
   renderTrajectory();
@@ -2049,6 +2061,143 @@ function render() {
 }
 
 /* ---------------------------------------------------------- conversation */
+
+// Stored images are content-addressed: a message or tool card names a hash,
+// and the Runtime returns the bytes. Caching is per client and bounded; the
+// image itself is never persisted in a tab record or localStorage.
+const imageDataCache = new Map();
+const IMAGE_DATA_CACHE_MAX = 48;
+const LIGHTBOX_MIME = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
+
+function storedImageData(ref) {
+  const sha256 = String(ref?.sha256 ?? '');
+  if (!/^[a-f0-9]{64}$/.test(sha256)) return Promise.reject(new Error('图片引用无效'));
+  const cached = imageDataCache.get(sha256);
+  if (cached) return Promise.resolve(cached);
+  return api.fetchImage(sha256).then(result => {
+    const mime = String(result?.mime_type ?? '');
+    const data = result?.data_base64;
+    // A raster image is the only thing this surface renders; an HTML or SVG
+    // payload would be active content, so it is refused rather than embedded.
+    if (!LIGHTBOX_MIME.has(mime) || typeof data !== 'string' || !data) throw new Error('图片数据无效');
+    const url = `data:${mime};base64,${data}`;
+    if (imageDataCache.size >= IMAGE_DATA_CACHE_MAX) imageDataCache.delete(imageDataCache.keys().next().value);
+    imageDataCache.set(sha256, url);
+    return url;
+  });
+}
+
+function imageCaption(ref, index, total) {
+  const name = typeof ref?.name === 'string' && ref.name ? ref.name : `图片 ${index + 1}`;
+  const size = ref?.width && ref?.height ? `${ref.width}×${ref.height}` : '';
+  const suffix = total > 1 ? ` · ${index + 1}/${total}` : '';
+  return size ? `${name} · ${size}${suffix}` : `${name}${suffix}`;
+}
+
+/** A small clickable thumbnail; the real bytes load lazily and a failure says
+ *  so instead of drawing a tile that pretends to be the picture. */
+function storedImageTile(ref, refs, index) {
+  const tile = el('button', 'message-image-tile');
+  tile.type = 'button';
+  tile.dataset.sha256 = String(ref?.sha256 ?? '');
+  tile.setAttribute('aria-label', imageCaption(ref, index, refs.length));
+  tile.title = imageCaption(ref, index, refs.length);
+  const placeholder = el('span', 'message-image-loading', '…');
+  tile.append(placeholder);
+  storedImageData(ref).then(url => {
+    const image = el('img', 'message-image-thumb');
+    image.src = url;
+    image.alt = imageCaption(ref, index, refs.length);
+    image.draggable = false;
+    tile.replaceChildren(image);
+    tile.classList.add('ready');
+  }).catch(error => {
+    tile.classList.add('unavailable');
+    tile.replaceChildren(iconNode('image', { size: 18 }), el('span', 'message-image-unavailable', '图片不可用'));
+    tile.title = `图片不可用：${error?.message ?? '文件缺失'}`;
+  });
+  tile.addEventListener('click', event => {
+    event.preventDefault();
+    event.stopPropagation();
+    openImageLightbox(refs, index);
+  });
+  return tile;
+}
+
+/** A bounded strip (at most four tiles plus a +N remainder). */
+function storedImageStrip(refs, className = 'message-images') {
+  const row = el('div', className);
+  row.classList.toggle('single', refs.length === 1);
+  for (let index = 0; index < Math.min(refs.length, 4); index += 1) {
+    row.append(storedImageTile(refs[index], refs, index));
+  }
+  if (refs.length > 4) row.append(el('span', 'message-image-more', `+${refs.length - 4}`));
+  return row;
+}
+
+/** A lightbox for one stored image or a set. It lives only while open and is
+ *  never written to the persisted rightbar state. */
+function openImageLightbox(refs, start = 0) {
+  document.querySelector('#image-lightbox')?.remove();
+  let index = Math.max(0, Math.min(start, refs.length - 1));
+  const dialog = el('dialog', 'modal image-lightbox');
+  dialog.id = 'image-lightbox';
+  const card = el('div', 'modal-card image-lightbox-card');
+  const head = el('div', 'modal-head');
+  const title = el('strong', undefined, '图片');
+  const close = iconButton('close', '关闭图片查看器');
+  close.classList.add('modal-close');
+  head.append(title, close);
+  const body = el('div', 'image-lightbox-body');
+  const image = el('img', 'image-lightbox-image');
+  image.alt = '';
+  const loading = el('div', 'image-lightbox-state', '正在读取图片…');
+  body.append(loading, image);
+  const meta = el('div', 'image-lightbox-meta');
+  const actions = el('div', 'modal-actions');
+  const prev = el('button', 'button secondary small', '上一张');
+  prev.type = 'button';
+  const next = el('button', 'button secondary small', '下一张');
+  next.type = 'button';
+  const done = el('button', 'button primary small', '关闭');
+  done.type = 'button';
+  actions.append(prev, next, done);
+  card.append(head, body, meta, actions);
+  dialog.append(card);
+  document.body.append(dialog);
+  const render = () => {
+    const ref = refs[index];
+    title.textContent = imageCaption(ref, index, refs.length);
+    meta.textContent = ref?.mime_type ? `${ref.mime_type}${ref?.sha256 ? ` · ${String(ref.sha256).slice(0, 12)}…` : ''}` : '';
+    prev.disabled = refs.length < 2;
+    next.disabled = refs.length < 2;
+    loading.hidden = false;
+    loading.textContent = '正在读取图片…';
+    image.removeAttribute('src');
+    image.hidden = true;
+    storedImageData(ref).then(url => {
+      image.src = url;
+      image.hidden = false;
+      loading.hidden = true;
+    }).catch(error => {
+      loading.hidden = false;
+      loading.textContent = `图片不可用：${error?.message ?? '文件缺失'}`;
+    });
+  };
+  const step = delta => { index = (index + delta + refs.length) % refs.length; render(); };
+  prev.addEventListener('click', () => step(-1));
+  next.addEventListener('click', () => step(1));
+  close.addEventListener('click', () => dialog.close());
+  done.addEventListener('click', () => dialog.close());
+  dialog.addEventListener('close', () => dialog.remove());
+  dialog.addEventListener('keydown', event => {
+    if (event.key === 'ArrowLeft') { event.preventDefault(); step(-1); }
+    if (event.key === 'ArrowRight') { event.preventDefault(); step(1); }
+  });
+  render();
+  dialog.showModal();
+  done.focus();
+}
 
 function userMessageNode(existing, message) {
   const key = `message:${message.id}`;
@@ -2066,26 +2215,37 @@ function userMessageNode(existing, message) {
   }
   decorateMessageActions(row, message);
   const images = Number(message.images ?? 0);
+  const refs = Array.isArray(message.image_refs) ? message.image_refs : [];
+  const signature = `${images}:${refs.map(ref => String(ref?.sha256 ?? '')).join(',')}`;
   let imageRow = row.querySelector('.message-images');
   if (images > 0 && !imageRow) {
     imageRow = el('div', 'message-images');
     row.querySelector('.bubble').after(imageRow);
   }
-  if (imageRow && imageRow.dataset.count !== String(images)) {
-    imageRow.dataset.count = String(images);
+  if (imageRow && imageRow.dataset.signature !== signature) {
+    imageRow.dataset.signature = signature;
     imageRow.replaceChildren();
-    imageRow.classList.toggle('single', images === 1);
-    for (let index = 0; index < Math.min(images, 4); index += 1) {
-      // The runtime reports only how many images a message carries; the
-      // content is not readable, so the tile states that instead of offering
-      // a preview it cannot show.
-      const tile = el('span', 'message-image-tile');
-      tile.setAttribute('aria-label', `图片 ${index + 1}：运行时只提供数量，未提供图片内容`);
-      tile.title = '运行时只提供图片数量，未提供图片内容';
-      tile.append(iconNode('image', { size: images === 1 ? 28 : 18 }));
-      imageRow.append(tile);
+    if (refs.length > 0) {
+      // The runtime persisted the stored image for this message, so the
+      // thumbnail is the real picture and opens at full size.
+      const strip = storedImageStrip(refs);
+      strip.dataset.signature = signature;
+      imageRow.replaceWith(strip);
+      imageRow = strip;
+    } else {
+      // A legacy row carries only a count: the bytes were never stored in a
+      // form this client can read, and pretending otherwise would fake the
+      // person's own history.
+      imageRow.classList.toggle('single', images === 1);
+      for (let index = 0; index < Math.min(images, 4); index += 1) {
+        const tile = el('span', 'message-image-tile unavailable');
+        tile.setAttribute('aria-label', `图片 ${index + 1}：历史消息只保存了数量，原始图片不可用`);
+        tile.title = '历史消息只保存了数量，原始图片不可用';
+        tile.append(iconNode('image', { size: images === 1 ? 28 : 18 }), el('span', 'message-image-unavailable', '图片不可用'));
+        imageRow.append(tile);
+      }
+      if (images > 4) imageRow.append(el('span', 'message-image-more', `+${images - 4}`));
     }
-    if (images > 4) imageRow.append(el('span', 'message-image-more', `+${images - 4}`));
   }
   if (images <= 0 && imageRow) imageRow.remove();
   renderUserExtras(row, message);
@@ -2422,6 +2582,12 @@ function toolNode(existing, tool) {
       extras.append(el('span', 'tool-diffstat add', `+${added}`), el('span', 'tool-diffstat del', `−${removed}`));
     }
   }
+  const toolImages = Array.isArray(tool.images) ? tool.images : [];
+  if (toolImages.length > 0) {
+    const badge = el('span', 'tool-image-badge', `图片 ${toolImages.length}`);
+    badge.title = '展开查看工具返回的图片';
+    extras.append(badge);
+  }
   row.querySelector('.tool-duration').textContent = tool.durationMs
     ? `${(tool.durationMs / 1000).toFixed(tool.durationMs < 10000 ? 1 : 0)}s` : '';
   if (browserActivity(tool)) {
@@ -2474,7 +2640,8 @@ function renderToolDetails(row, id) {
     detail = el('div', 'tool-details');
     row.append(detail);
   }
-  const signature = [kind, tool.status, tool.exit_code, patch, argsRaw, output].join('\u0000');
+  const imageSignature = `${(tool.images ?? []).map(image => String(image?.sha256 ?? '')).join(',')}|${tool.imagesError ?? ''}`;
+  const signature = [kind, tool.status, tool.exit_code, patch, argsRaw, output, imageSignature].join('\u0000');
   if (detail.dataset.signature === signature) return;
   detail.dataset.signature = signature;
   detail.dataset.kind = kind;
@@ -2671,6 +2838,15 @@ function renderToolDetails(row, id) {
     detail.append(bar);
   }
   detail.append(card);
+  if (Array.isArray(tool.images) && tool.images.length > 0) {
+    detail.append(el('div', 'settings-note', '工具返回的图片（点击查看大图）'));
+    detail.append(storedImageStrip(tool.images, 'tool-images'));
+  }
+  if (tool.imagesError) {
+    // The model still received the image; this says the client could not
+    // archive it, which is a different fact from a call that had no image.
+    detail.append(el('div', 'tool-images-error', `图片无法在界面中显示：${tool.imagesError}`));
+  }
   const raw = el('details', 'tool-raw');
   raw.append(el('summary', undefined, '技术详情'), el('pre', undefined, `工具：${tool.name}\n调用：${tool.id}\n参数：${argsRaw ?? ''}${tool.exit_code !== undefined ? `\n退出码：${tool.exit_code}` : ''}`));
   detail.append(raw);
@@ -3258,6 +3434,200 @@ function openUsageDialog(usage) {
   dialog.addEventListener('close', () => dialog.remove(), { once: true });
   close.addEventListener('click', () => dialog.close());
   dialog.showModal();
+}
+
+/** Read the runtime's structured health report. The event is the answer; a
+ *  query that never answers rejects instead of showing invented health. */
+const diagnosticRequests = new Map(); // query_id -> {resolve, reject, timer}
+function requestDiagnostics() {
+  const sessionId = current?.session?.id;
+  if (!sessionId) return Promise.reject(new Error('没有选中的会话'));
+  const queryId = crypto.randomUUID();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      diagnosticRequests.delete(queryId);
+      reject(new Error('15 秒内没有收到 Runtime 诊断结果'));
+    }, 15000);
+    diagnosticRequests.set(queryId, { resolve, reject, timer });
+    deliver({
+      type: 'query_diagnostics',
+      requester_session_id: sessionId,
+      query_id: queryId,
+      locale: 'zh',
+    }).catch(error => {
+      const pending = diagnosticRequests.get(queryId);
+      if (pending) { clearTimeout(pending.timer); diagnosticRequests.delete(queryId); }
+      reject(error);
+    });
+  });
+}
+
+const DIAGNOSTIC_STATUS_LABELS = {
+  pass: '通过', warn: '警告', fail: '失败', unknown: '未知',
+  not_checked: '未检查', not_applicable: '不适用',
+};
+
+function openDiagnosticsDialog(report) {
+  const dialog = el('dialog', 'modal diagnostics-dialog');
+  const card = el('div', 'modal-card');
+  const head = el('div', 'modal-head');
+  head.append(el('h2', undefined, '诊断'));
+  const close = iconButton('close', '关闭诊断', { size: 16, tooltip: '关闭' });
+  head.append(close);
+  const body = el('div', 'diagnostics-body');
+  const findings = Array.isArray(report?.findings) ? report.findings : [];
+  if (!findings.length) body.append(el('p', 'settings-note', 'Runtime 没有返回诊断发现。'));
+  for (const finding of findings) {
+    const row = el('div', 'diagnostic-row');
+    row.dataset.status = String(finding.status ?? 'unknown');
+    const title = el('div', 'diagnostic-title');
+    title.append(
+      el('span', 'diagnostic-status', DIAGNOSTIC_STATUS_LABELS[finding.status] ?? String(finding.status ?? '未知')),
+      el('span', 'diagnostic-id', [finding.id, finding.subject].filter(Boolean).join(' · ')),
+      el('span', 'diagnostic-severity', ({ info: '信息', warning: '警告', error: '错误' })[finding.severity] ?? ''),
+    );
+    row.append(title);
+    for (const line of finding.evidence ?? []) row.append(el('pre', 'diagnostic-evidence', line));
+    body.append(row);
+  }
+  if (report?.generated_at) body.append(el('p', 'settings-note', `生成时间：${report.generated_at}`));
+  card.append(head, body, el('div', 'modal-actions'));
+  const actions = card.querySelector('.modal-actions');
+  const done = el('button', 'button primary small', '关闭');
+  done.type = 'button';
+  actions.append(done);
+  dialog.append(card);
+  document.body.append(dialog);
+  done.addEventListener('click', () => dialog.close());
+  close.addEventListener('click', () => dialog.close());
+  dialog.addEventListener('close', () => dialog.remove(), { once: true });
+  dialog.showModal();
+  done.focus();
+}
+
+function openCheckpointDialog() {
+  const checkpoints = current?.session?.checkpoints ?? [];
+  if (!checkpoints.length) { composerError('当前会话没有可恢复的检查点'); return; }
+  const dialog = el('dialog', 'modal checkpoint-dialog');
+  const card = el('div', 'modal-card');
+  const head = el('div', 'modal-head');
+  head.append(el('h2', undefined, '恢复检查点'));
+  const close = iconButton('close', '关闭检查点', { size: 16, tooltip: '关闭' });
+  head.append(close);
+  const body = el('div', 'checkpoint-list');
+  body.append(el('p', 'settings-note', '恢复会截断此后的对话记录，并保留当前工作区文件。'));
+  for (const checkpoint of [...checkpoints].reverse()) {
+    const row = el('div', 'checkpoint-row');
+    row.append(
+      el('span', 'checkpoint-label', checkpoint.label || checkpoint.id),
+      el('span', 'checkpoint-ordinal', `${checkpoint.ordinal} 条消息`),
+    );
+    const restore = el('button', 'button secondary small', '恢复');
+    restore.type = 'button';
+    restore.addEventListener('click', () => {
+      dialog.close();
+      action(async () => {
+        const ok = await confirmDialog({
+          title: '恢复检查点',
+          body: `将对话恢复到「${checkpoint.label || checkpoint.id}」。之后的对话记录会被截断，工作区文件不会被还原。`,
+          confirm: '恢复', danger: true,
+        });
+        if (!ok) return;
+        await deliver({ type: 'restore_checkpoint', session_id: current.session.id, checkpoint_id: checkpoint.id });
+        await refreshMetadata();
+        reloadHistory();
+        toast('已请求恢复检查点', { tone: 'success', holdMs: 2400 });
+      }, { onError: composerError, clearGlobal: false });
+    });
+    row.append(restore);
+    body.append(row);
+  }
+  card.append(head, body);
+  dialog.append(card);
+  document.body.append(dialog);
+  close.addEventListener('click', () => dialog.close());
+  dialog.addEventListener('close', () => dialog.remove(), { once: true });
+  dialog.showModal();
+}
+
+function openRecoveryDialog() {
+  const calls = current?.session?.interrupted_tool_calls ?? [];
+  if (!calls.length) { composerError('当前没有需要确认的中断调用'); return; }
+  const dialog = el('dialog', 'modal recovery-dialog');
+  const card = el('div', 'modal-card');
+  const head = el('div', 'modal-head');
+  head.append(el('h2', undefined, '确认中断的调用'));
+  const close = iconButton('close', '关闭恢复确认', { size: 16, tooltip: '关闭' });
+  head.append(close);
+  const body = el('div', 'recovery-body');
+  body.append(el('p', 'settings-note', '这些调用在运行时崩溃时没有结果。确认表示你承认它们的结果未知；Runtime 之后才允许继续。'));
+  for (const call of calls) {
+    const row = el('div', 'recovery-row');
+    row.append(
+      el('code', 'recovery-tool', call.tool || '工具'),
+      el('span', 'recovery-call', call.call_id),
+      el('span', 'recovery-state', call.pending_approval ? '等待批准时中断' : String(call.state ?? 'unknown')),
+    );
+    body.append(row);
+  }
+  const actions = el('div', 'modal-actions');
+  const cancel = el('button', 'button secondary small', '取消');
+  cancel.type = 'button';
+  const confirm = el('button', 'button danger small', '确认结果未知');
+  confirm.type = 'button';
+  actions.append(cancel, confirm);
+  card.append(head, body, actions);
+  dialog.append(card);
+  document.body.append(dialog);
+  cancel.addEventListener('click', () => dialog.close());
+  close.addEventListener('click', () => dialog.close());
+  confirm.addEventListener('click', () => {
+    dialog.close();
+    action(async () => {
+      await deliver({ type: 'acknowledge_crash_window', session_id: current.session.id });
+      await refreshMetadata();
+      reloadHistory();
+      toast('已确认中断调用的结果未知', { tone: 'success', holdMs: 2600 });
+    }, { onError: composerError, clearGlobal: false });
+  });
+  dialog.addEventListener('close', () => dialog.remove(), { once: true });
+  dialog.showModal();
+}
+
+async function confirmPermissionContract() {
+  const ok = await confirmDialog({
+    title: '迁移到权限契约 V2',
+    body: '此会话之后的执行将按 V2 的资源边界和审批语义运行。已有批准不会自动扩展。',
+    confirm: '迁移到 V2', danger: true,
+  });
+  if (!ok) return;
+  await deliver({
+    type: 'set_permission_profile',
+    session_id: current.session.id,
+    mode: current.session.mode,
+    contract: 'v2',
+  });
+  await refreshMetadata();
+  toast('已迁移到权限契约 V2', { tone: 'success', holdMs: 2400 });
+}
+
+/** The side-question surface. It is chrome, never transcript: a side answer
+ *  has its own lifecycle and stopping it must not stop the main turn. */
+function renderBtw() {
+  const panel = $('btw-panel');
+  if (!panel) return;
+  const btw = current?.btw ?? null;
+  panel.hidden = !btw;
+  if (!btw) return;
+  $('btw-question').textContent = btw.question || '侧边提问';
+  const answer = $('btw-answer');
+  const status = btw.status === 'running' ? '思考中…'
+    : btw.status === 'cancelled' ? '已停止（保留已有回答）'
+      : btw.status === 'failed' ? `失败：${btw.error ?? '未知错误'}` : '';
+  const tools = (btw.tools ?? []).map(tool => `${tool.tool}${tool.status === 'running' ? ' · 运行中' : tool.status === 'failed' ? ' · 失败' : ''}`).join('，');
+  const text = btw.text || (btw.status === 'running' ? '' : '（无回答）');
+  answer.textContent = [text, status, tools ? `工具：${tools}` : ''].filter(Boolean).join('\n\n');
+  $('btw-stop').hidden = btw.status !== 'running';
 }
 
 function userShellNode(shell) {
@@ -4614,7 +4984,7 @@ function commandCatalog() {
     ['session', 'fork', '分叉会话', session, 'branch', null, '请先选择或新建会话', false],
     ['session', 'copy', '复制最后回答', session, 'copy', null, '请先选择或新建会话', false],
     ['session', 'output', '完整工具输出', !!current?.tools?.length, 'terminal', null, '当前会话还没有工具调用', false],
-    ['session', 'export', '下载日志', false, 'download', '未接入', 'Runtime 未提供 Session 打包导出接口', false, ['save']],
+    ['session', 'export', '下载日志', false, 'download', '终端专属', '终端中 /export 将对话导出为 Markdown；桌面端尚无保存文件入口', false, ['save']],
     ['system', 'settings', '设置', true, 'settings', null, null, false],
     ['system', 'mcp', 'MCP 服务', true, 'plugins', null, null, false],
     ['system', 'schedules', '自动化任务', true, 'automation', null, null, false],
@@ -4623,26 +4993,26 @@ function commandCatalog() {
     ['system', 'help', '命令与快捷键', true, 'help', null, null, true],
     // Runtime/TUI capabilities with no Desktop surface yet. They are real
     // commands; the Desktop states that instead of pretending they ran.
-    ['system', 'btw', '侧边提问', false, 'chat', '未接入', '桌面端尚未提供侧边提问视图', false],
-    ['system', 'recap', '目标回顾', false, 'bookmark', '未接入', '桌面端尚未提供目标回顾视图', false],
-    ['system', 'restore', '恢复检查点', false, 'history', '未接入', '桌面端尚未提供检查点选择器', false, ['checkpoint', 'rewind']],
-    ['system', 'recover', '恢复中断调用', false, 'refresh', '未接入', '桌面端尚未提供崩溃恢复确认页', false],
-    ['system', 'doctor', '诊断', false, 'stethoscope', '未接入', '诊断属于命令行工具；桌面端尚无对应页面', false],
-    ['system', 'clean', '清理本地存储', false, 'trash', '未接入', '桌面端尚未提供本地存储清理页', false],
-    ['system', 'trust', '定义信任', false, 'shield', '未接入', '桌面端只在技能实际使用时请求授权，没有集中信任页', false],
+    ['system', 'btw', '侧边提问', true, 'chat', null, '用法：/btw <问题>', true, [], true],
+    ['system', 'recap', '目标回顾', true, 'bookmark', null, '请先选择或新建会话', true],
+    ['system', 'restore', '恢复检查点', true, 'history', null, '请先选择或新建会话', false, ['checkpoint', 'rewind']],
+    ['system', 'recover', '恢复中断调用', true, 'refresh', null, '请先选择或新建会话', false],
+    ['system', 'doctor', '诊断', true, 'stethoscope', null, null, false],
+    ['system', 'clean', '清理本地存储', false, 'trash', '终端专属', '清理由 leveler clean 在终端执行；桌面端不直接删除本地存储', false],
+    ['system', 'trust', '定义信任', true, 'shield', null, null, false],
     ['system', 'memory', '记忆', false, 'book', '未接入', '桌面端尚未提供记忆管理页', false],
     ['session', 'remember', '记住一条', false, 'book', '未接入', '桌面端尚未提供记忆写入入口', false],
     ['session', 'dream', '记忆整理', false, 'book', '未接入', '桌面端尚未提供记忆整理入口', false],
     ['session', 'flush', '记忆写入', false, 'book', '未接入', '桌面端尚未提供记忆写入入口', false],
-    ['system', 'update', '更新运行时', false, 'download', '未接入', '桌面端只检查更新；安装请运行 leveler update', false, ['upgrade']],
-    ['system', 'jump', '跳转回合', false, 'arrow', '未接入', '桌面端尚未提供回合跳转', false],
-    ['system', 'resume-claude', '继续 Claude 会话', false, 'download', '未接入', '桌面端尚未提供外部会话导入', false],
-    ['system', 'resume-codex', '继续 Codex 会话', false, 'download', '未接入', '桌面端尚未提供外部会话导入', false],
-    ['system', 'permission-contract', '权限契约', false, 'shield', '未接入', '桌面端尚未提供权限契约迁移入口', false],
-    ['system', 'exit', '退出桌面', false, 'close', '未接入', '关闭窗口请使用系统关闭或 ⌘Q；桌面端不提供静默退出命令', false, ['quit']],
+    ['system', 'update', '更新运行时', false, 'download', '终端专属', '桌面端只检查更新；安装请运行 leveler update', false, ['upgrade']],
+    ['system', 'jump', '跳转回合', true, 'arrow', null, '用法：/jump <轮次>', false, [], true],
+    ['system', 'resume-claude', '继续 Claude 会话', false, 'download', '未接入', '外部会话导入目前是终端能力；桌面端本轮未提供', false],
+    ['system', 'resume-codex', '继续 Codex 会话', false, 'download', '未接入', '外部会话导入目前是终端能力；桌面端本轮未提供', false],
+    ['system', 'permission-contract', '权限契约', true, 'shield', null, '用法：/permission-contract v2', false, [], true],
+    ['system', 'exit', '退出桌面', false, 'close', '等效入口', '关闭窗口请使用系统关闭或 ⌘Q；桌面端不提供静默退出命令', false, ['quit']],
   ];
-  const base = entries.map(([group, id, label, available, icon, badge, reason, quick, aliases]) => ({
-    group, id, label, icon, badge, aliases: aliases ?? [], quick: !!quick,
+  const base = entries.map(([group, id, label, available, icon, badge, reason, quick, aliases, takesArgument]) => ({
+    group, id, label, icon, badge, aliases: aliases ?? [], quick: !!quick, takesArgument: !!takesArgument,
     enabled: available && !frozen,
     reason: frozen ? '请先处理当前未完成操作' : reason ?? '请先选择或新建会话',
   }));
@@ -4819,6 +5189,61 @@ async function executeCommand(id, argument = '') {
   $('message').value = '';
   composerError('');
   controls();
+  if (id === 'btw') {
+    if (!current) { composerError('请先选择或新建会话'); return; }
+    const question = String(argument ?? '').trim();
+    if (!question) { composerError('用法：/btw <问题>'); return; }
+    action(async () => {
+      await deliver({ type: 'btw', session_id: current.session.id, question });
+      toast('侧边提问已发送（只读，不影响主任务）', { tone: 'info', holdMs: 2200 });
+    }, { onError: composerError, clearGlobal: false });
+    return;
+  }
+  if (id === 'recap') {
+    if (!current) { composerError('请先选择或新建会话'); return; }
+    action(async () => {
+      await deliver({ type: 'recap', session_id: current.session.id });
+      toast('已请求生成目标回顾', { tone: 'info', holdMs: 2200 });
+    });
+    return;
+  }
+  if (id === 'restore') {
+    if (!current) { composerError('请先选择或新建会话'); return; }
+    if (['running', 'waiting_user'].includes(current.status)) { composerError('回合运行中不能恢复检查点，请先停止或等待结束'); return; }
+    openCheckpointDialog();
+    return;
+  }
+  if (id === 'recover') {
+    if (!current) { composerError('请先选择或新建会话'); return; }
+    if (['running', 'waiting_user'].includes(current.status)) { composerError('回合运行中不能确认中断调用，请先停止或等待结束'); return; }
+    openRecoveryDialog();
+    return;
+  }
+  if (id === 'doctor') {
+    action(async () => {
+      const report = await requestDiagnostics();
+      openDiagnosticsDialog(report);
+    }, { onError: composerError, clearGlobal: false });
+    return;
+  }
+  if (id === 'trust') { openSettings('presets'); return; }
+  if (id === 'jump') {
+    const turn = Number.parseInt(String(argument ?? '').trim(), 10);
+    const nodes = [...document.querySelectorAll('#conversation .message.user[data-message-id]')];
+    if (!Number.isInteger(turn) || turn < 1 || turn > nodes.length) {
+      composerError(nodes.length ? `用法：/jump <1-${nodes.length}>` : '当前对话还没有可跳转的回合');
+      return;
+    }
+    nodes[turn - 1].scrollIntoView({ block: 'start', behavior: 'smooth' });
+    return;
+  }
+  if (id === 'permission-contract') {
+    if (!current) { composerError('请先选择或新建会话'); return; }
+    const argumentText = String(argument ?? '').trim().toLowerCase();
+    if (argumentText !== 'v2') { composerError('用法：/permission-contract v2'); return; }
+    action(confirmPermissionContract, { onError: composerError, clearGlobal: false });
+    return;
+  }
   if (id === 'feedback') { openFeedbackDialog(); return; }
   if (id === 'diff') {
     if (!current?.session.repository) { composerError('当前会话没有工作区'); return; }
@@ -5308,6 +5733,77 @@ function installPasteImages() {
         }
       }
     })();
+  });
+}
+
+/** A real file drag from Finder lands here as bytes, exactly like a paste.
+ *  The page can read the File it was given; it never learns a filesystem path
+ *  and Main re-validates the image before the Runtime sees it. */
+function installDropImages() {
+  const card = $('composer-card');
+  let depth = 0;
+  const hasFiles = event => [...(event.dataTransfer?.types ?? [])].includes('Files');
+  const clear = () => {
+    depth = 0;
+    card.classList.remove('drop-target');
+    $('drop-hint').setAttribute('aria-hidden', 'true');
+  };
+  const show = () => {
+    card.classList.add('drop-target');
+    $('drop-hint').setAttribute('aria-hidden', 'false');
+  };
+  card.addEventListener('dragenter', event => {
+    if (!hasFiles(event)) return;
+    event.preventDefault();
+    depth += 1;
+    show();
+  });
+  card.addEventListener('dragover', event => {
+    if (!hasFiles(event)) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'copy';
+    show();
+  });
+  card.addEventListener('dragleave', event => {
+    if (!hasFiles(event)) return;
+    event.preventDefault();
+    depth = Math.max(0, depth - 1);
+    if (depth === 0) clear();
+  });
+  card.addEventListener('drop', event => {
+    if (!hasFiles(event)) return;
+    event.preventDefault();
+    clear();
+    const files = [...(event.dataTransfer?.files ?? [])];
+    if (loading || uncertain || uploadPending()) { composerError('请先处理当前未完成操作'); return; }
+    if (files.length > 16) { composerError('一次最多添加 16 张图片'); return; }
+    const images = files.filter(file => String(file.type).startsWith('image/'));
+    const empties = files.filter(file => !file.type && file.size === 0);
+    if (empties.length && !images.length) { composerError('不支持拖入文件夹；请拖入图片文件'); return; }
+    if (images.length !== files.length) {
+      composerError(images.length
+        ? `已添加 ${images.length} 张图片；其他文件请从工作区文件中引用`
+        : '仅支持拖入 PNG、JPEG、GIF 或 WebP 图片；普通文件请从工作区文件中引用');
+    }
+    if (!images.length) return;
+    void (async () => {
+      for (const [index, file] of images.entries()) {
+        try {
+          const data = await fileBase64(file);
+          const extension = String(file.type).split('/')[1]?.replace('jpeg', 'jpg') ?? 'png';
+          await uploadAttachment(null, { name: file.name || `拖入图片-${index + 1}.${extension}`, data_base64: data });
+        } catch (error) {
+          composerError(`拖入图片失败：${error.message}`);
+        }
+      }
+    })();
+  });
+  // A drop outside the composer must not navigate the window to the file.
+  document.addEventListener('dragover', event => {
+    if (hasFiles(event)) event.preventDefault();
+  });
+  document.addEventListener('drop', event => {
+    if (hasFiles(event)) event.preventDefault();
   });
 }
 
@@ -8049,6 +8545,7 @@ function openSettings(section = 'general') {
   settingsSection = section;
   if (section === 'models') void refreshProviders({ quiet: true });
   if (section === 'search') { searchForm = null; searchSaveNote = null; void refreshSearchSettings(); }
+  if (section === 'presets') { void refreshThinkingSettings(); void refreshBrowserSettings(); }
   if (section === 'mcp') openMcpPage();
   else stopMcpPolling();
   renderSettings();
@@ -8560,6 +9057,21 @@ function providerCard(provider, data) {
       const name = el('span', 'provider-name', model.model);
       row.append(name);
       if (model.thinking) row.append(el('span', 'provider-badge', `思考：${model.thinking}`));
+      // Capability/limit/price facts belong to the profile the runtime uses.
+      // They are shown, never edited as ordinary settings: a false vision or
+      // price claim would change what the runtime advertises or admits.
+      if (model.vision) row.append(el('span', 'provider-badge', '视觉'));
+      if (model.reasoning) row.append(el('span', 'provider-badge', '推理'));
+      if (Number.isFinite(model.context_window)) {
+        const size = model.context_window >= 1024 * 1024
+          ? `${(model.context_window / (1024 * 1024)).toFixed(model.context_window % (1024 * 1024) ? 1 : 0)}M`
+          : `${Math.round(model.context_window / 1024)}K`;
+        row.append(el('span', 'provider-fact', `上下文 ${size}`));
+      }
+      if (model.pricing) {
+        const cached = model.pricing.cached_input_usd_per_mtok;
+        row.append(el('span', 'provider-fact', `价格 $${model.pricing.input_usd_per_mtok}/$${model.pricing.output_usd_per_mtok} 每百万${cached != null ? ` · 缓存 $${cached}` : ''}`));
+      }
       if (model.default) row.append(el('span', 'provider-tag accent', '默认'));
       else {
         const busy = providerBusy === `default:${model.provider}/${model.model}`;
@@ -8572,6 +9084,7 @@ function providerCard(provider, data) {
       list.append(row);
     }
     card.append(list);
+    card.append(el('div', 'settings-note', '视觉、推理、上下文与价格来自 Runtime 实际使用的模型配置，这里只读展示；需要精确覆盖时请在 config.toml 的 [models.<id>] 中修改。'));
   }
 
   const actions = el('div', 'settings-actions provider-actions');
@@ -9465,6 +9978,169 @@ async function saveAgentOptions() {
   }
 }
 
+async function refreshThinkingSettings() {
+  const request = ++thinkingSettingsState.request;
+  thinkingSettingsState = { ...thinkingSettingsState, status: 'loading', error: null, request };
+  try {
+    const data = await api.thinkingSettings();
+    if (request !== thinkingSettingsState.request) return;
+    thinkingSettingsState = { status: 'ready', data, error: null, request };
+    if (thinkingDraft === undefined || thinkingDraft === null) thinkingDraft = data.configured;
+  } catch (error) {
+    if (request !== thinkingSettingsState.request) return;
+    thinkingSettingsState = { status: 'error', data: null, error: error?.message ?? '无法读取 Thinking 默认', request };
+  }
+  if ($('settings-dialog').open && settingsSection === 'presets') renderSettings();
+}
+
+async function saveThinkingSettings() {
+  if (thinkingSaving) return;
+  thinkingSaving = true;
+  thinkingNote = null;
+  try {
+    const result = await api.saveThinkingSettings({ level: thinkingDraft ?? null });
+    thinkingSettingsState = { status: 'ready', data: result, error: null, request: thinkingSettingsState.request };
+    thinkingDraft = result.configured ?? null;
+    const reload = result.runtime_reload ?? {};
+    if (reload.requested) thinkingNote = { text: '已保存，Runtime 已请求重新加载；下一回合生效。', tone: 'ok' };
+    else if (reload.reason === 'no_runtime') thinkingNote = { text: '已保存；当前没有运行中的 Runtime，下次启动时生效。', tone: 'ok' };
+    else if (reload.reason === 'request_failed') thinkingNote = { text: `已保存；Runtime 重载请求失败：${reload.message ?? '未知原因'}`, tone: 'error' };
+    else thinkingNote = { text: '已保存。', tone: 'ok' };
+    toast('Thinking 默认已保存', { tone: 'success', holdMs: 1600 });
+  } catch (error) {
+    thinkingNote = { text: `保存失败：${error?.message ?? '未知错误'}`, tone: 'error' };
+  } finally {
+    thinkingSaving = false;
+    if ($('settings-dialog').open && settingsSection === 'presets') renderSettings();
+  }
+}
+
+function renderThinkingSettings(content) {
+  content.append(el('h3', undefined, '全局 Thinking 默认'));
+  content.append(el(
+    'p',
+    'settings-note',
+    '新会话没有单独指定时使用的思考强度。单个模型的 [models.<id>].thinking 与当前会话的 /thinking 都优先于它；模型无法表达该强度时会退回自动。保存写入全局 config.toml。',
+  ));
+  if (thinkingSettingsState.status !== 'ready') {
+    if (thinkingSettingsState.status === 'error') {
+      content.append(el('div', 'settings-note', `读取 Thinking 默认失败：${thinkingSettingsState.error}`));
+      const retry = el('button', 'button ghost small', '重试');
+      retry.type = 'button';
+      retry.addEventListener('click', () => void refreshThinkingSettings());
+      content.append(retry);
+    } else {
+      content.append(el('div', 'settings-note', '正在读取 Thinking 默认…'));
+      if (thinkingSettingsState.status === 'idle') void refreshThinkingSettings();
+    }
+    return;
+  }
+  if (thinkingDraft === null || thinkingDraft === undefined) thinkingDraft = thinkingSettingsState.data.configured ?? null;
+  const data = thinkingSettingsState.data;
+  const labels = { auto: '自动', off: '关闭', minimal: '最低', low: '低', medium: '中', high: '高', max: '最高' };
+  const options = [
+    { value: null, label: data.configured === null ? `跟随默认（${labels[data.effective] ?? data.effective}）` : '跟随默认（高）' },
+    ...(data.choices ?? []).map(level => ({ value: level, label: labels[level] ?? level })),
+  ];
+  const group = el('div', 'settings-group');
+  group.append(settingRow('默认强度', '选择显式默认，或移除默认让模型使用产品默认（高）', menuControl(thinkingDraft, options, value => {
+    thinkingDraft = value;
+    renderSettings();
+  }, { label: 'Thinking 默认强度' })));
+  const row = el('div', 'search-save-row');
+  if (thinkingNote) row.append(el('span', `search-save-note ${thinkingNote.tone ?? ''}`, thinkingNote.text));
+  const save = el('button', 'button primary', thinkingSaving ? '正在保存…' : '保存 Thinking 默认');
+  save.type = 'button';
+  save.disabled = thinkingSaving;
+  save.addEventListener('click', () => void saveThinkingSettings());
+  row.append(save);
+  group.append(row);
+  content.append(group);
+}
+
+async function refreshBrowserSettings() {
+  const request = ++browserSettingsState.request;
+  browserSettingsState = { ...browserSettingsState, status: 'loading', error: null, request };
+  try {
+    const data = await api.browserSettings();
+    if (request !== browserSettingsState.request) return;
+    browserSettingsState = { status: 'ready', data, error: null, request };
+    if (browserDraft === undefined) browserDraft = data.configured ?? null;
+  } catch (error) {
+    if (request !== browserSettingsState.request) return;
+    browserSettingsState = { status: 'error', data: null, error: error?.message ?? '无法读取浏览器配置', request };
+  }
+  if ($('settings-dialog').open && settingsSection === 'presets') renderSettings();
+}
+
+async function saveBrowserSettings() {
+  if (browserSaving) return;
+  browserSaving = true;
+  browserNote = null;
+  try {
+    const result = await api.saveBrowserSettings({ product: browserDraft ?? null });
+    browserSettingsState = { status: 'ready', data: result, error: null, request: browserSettingsState.request };
+    browserDraft = result.configured ?? null;
+    browserNote = { text: '已保存。Runtime 在启动时组装浏览器句柄，需重启 Runtime 后生效。', tone: 'ok' };
+    toast('浏览器默认已保存', { tone: 'success', holdMs: 1800 });
+  } catch (error) {
+    browserNote = { text: `保存失败：${error?.message ?? '未知错误'}`, tone: 'error' };
+  } finally {
+    browserSaving = false;
+    if ($('settings-dialog').open && settingsSection === 'presets') renderSettings();
+  }
+}
+
+function renderBrowserSettings(content) {
+  content.append(el('h3', undefined, 'Agent 浏览器'));
+  content.append(el(
+    'p',
+    'settings-note',
+    'Agent 的 browser 工具驱动的浏览器，不是右侧手动浏览器面板。未指定时使用这里的默认；自动会按 Chrome → Edge → Chromium 选择已安装的可驱动浏览器，Safari 只在显式选择时使用。修改在 Runtime 重启后生效。',
+  ));
+  if (browserSettingsState.status !== 'ready') {
+    if (browserSettingsState.status === 'error') {
+      content.append(el('div', 'settings-note', `读取浏览器配置失败：${browserSettingsState.error}`));
+      const retry = el('button', 'button ghost small', '重试');
+      retry.type = 'button';
+      retry.addEventListener('click', () => void refreshBrowserSettings());
+      content.append(retry);
+    } else {
+      content.append(el('div', 'settings-note', '正在读取可驱动的浏览器…'));
+      if (browserSettingsState.status === 'idle') void refreshBrowserSettings();
+    }
+    return;
+  }
+  if (browserDraft === undefined) browserDraft = browserSettingsState.data.configured ?? null;
+  const data = browserSettingsState.data;
+  const options = [
+    { value: null, label: data.effective ? `自动（当前：${data.options.find(option => option.id === data.effective)?.label ?? data.effective}）` : '自动' },
+    ...(data.options ?? []).map(option => ({
+      value: option.id,
+      label: option.label,
+      badge: option.available ? null : '不可用',
+      disabled: false,
+    })),
+  ];
+  const group = el('div', 'settings-group');
+  group.append(settingRow('默认浏览器', 'Agent 浏览器调用未显式指定产品时使用', menuControl(browserDraft, options, value => {
+    browserDraft = value;
+    renderSettings();
+  }, { label: 'Agent 默认浏览器' })));
+  for (const option of data.options ?? []) {
+    if (option.note) group.append(el('div', 'settings-note', `${option.label}：${option.note}`));
+  }
+  const row = el('div', 'search-save-row');
+  if (browserNote) row.append(el('span', `search-save-note ${browserNote.tone ?? ''}`, browserNote.text));
+  const save = el('button', 'button primary', browserSaving ? '正在保存…' : '保存浏览器默认');
+  save.type = 'button';
+  save.disabled = browserSaving;
+  save.addEventListener('click', () => void saveBrowserSettings());
+  row.append(save);
+  group.append(row);
+  content.append(group);
+}
+
 function renderAgentOptions(content) {
   content.append(el('h3', undefined, '执行与协作'));
   content.append(el(
@@ -9516,6 +10192,8 @@ function renderPresetSettings(content) {
   standard.append(head, el('div', 'preset-desc', '使用 Runtime 默认的工具与执行方式；模型会按任务需要选择检索、编辑和终端能力。'));
   content.append(standard);
   renderAgentOptions(content);
+  renderThinkingSettings(content);
+  renderBrowserSettings(content);
   if (!current) {
     content.append(el('div', 'settings-note', '打开会话后可读取 Runtime 的 Agent 定义。'));
     renderSkillsSettings(content);
@@ -11466,6 +12144,17 @@ api.onEvent(frame => {
   }
   if (frame.event !== 'runtime') return;
   const event = frame.data;
+  if (event.type === 'diagnostics_loaded') {
+    // A query answer, not conversation state: resolve the waiter that asked
+    // for this exact report and never let it enter the transcript.
+    const pending = diagnosticRequests.get(event.query_id);
+    if (pending) {
+      clearTimeout(pending.timer);
+      diagnosticRequests.delete(event.query_id);
+      pending.resolve(event.report);
+    }
+    return;
+  }
   if (event.type === 'tool_output_loaded') {
     // A read answer, not conversation state: it resolves the query that asked
     // for it and never enters the transcript, trajectory or seq watermark.
@@ -11577,6 +12266,7 @@ api.onEvent(frame => {
   const statusBefore = current.status;
   const activityBefore = current.activity;
   current = applyEvent(current, event);
+  if (event.type.startsWith('btw_') || event.type === 'goal_recap_created') renderBtw();
   // A review card and the report tab both read the conversation projection.
   // The terminal arrives here (not through a query), so the pane is repainted
   // from the durable fact instead of a local guess.
@@ -11779,6 +12469,7 @@ function boot() {
   $('find-close').append(iconNode('close', { size: 14 }));
   $('attachment-add').append(iconNode('plus', { size: 16 }));
   installPasteImages();
+  installDropImages();
   $('review-entry').append(iconNode('search', { size: 16 }));
   $('settings-close').append(iconNode('close', { size: 16 }));
   $('scroll-bottom').append(iconNode('arrowDown', { size: 16 }));
@@ -11863,6 +12554,11 @@ function boot() {
   $('find-prev').addEventListener('click', () => moveFind(-1));
   $('find-next').addEventListener('click', () => moveFind(1));
   $('find-close').addEventListener('click', closeFind);
+  $('btw-close').addEventListener('click', () => { if (current) current = { ...current, btw: null }; renderBtw(); });
+  $('btw-stop').addEventListener('click', () => action(async () => {
+    if (!current?.session?.id) return;
+    await deliver({ type: 'cancel_btw', session_id: current.session.id });
+  }, { onError: composerError, clearGlobal: false }));
   $('settings-close').addEventListener('click', closeSettings);
   $('settings-dialog').addEventListener('cancel', event => { event.preventDefault(); closeSettings(); });
   $('settings-dialog').addEventListener('keydown', event => { trapTab($('settings-dialog'), event); if (event.key === 'Escape') event.stopPropagation(); });
@@ -12035,7 +12731,7 @@ async function submitComposer(complement = false) {
   if (!current && providerConfigurationBlocksStart()) { composerError(providerSetupMessage()); return; }
   const content = $('message').value.trim();
   const intent = slashIntent(content, commandCatalog());
-  if (intent.kind === 'action') { executeCommand(intent.id); return; }
+  if (intent.kind === 'action') { executeCommand(intent.id, intent.argument ?? ''); return; }
   if (intent.kind === 'goal') { executeCommand('goal', intent.content); return; }
   if (intent.kind === 'blocked') { composerError(intent.reason); return; }
   const refs = attachments().filter(item => item.status === 'ready').map(item => item.attachment);

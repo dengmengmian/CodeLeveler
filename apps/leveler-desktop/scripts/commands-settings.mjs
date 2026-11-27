@@ -71,7 +71,7 @@ try {
   await page.keyboard.press('Escape');
   // Every Runtime/TUI command is discoverable; only the ones with no Desktop
   // surface carry 未接入, and they say why in the tooltip.
-  const unimplemented = ['btw', 'clean', 'doctor', 'dream', 'exit', 'export', 'flush', 'jump', 'memory', 'permission-contract', 'recap', 'recover', 'remember', 'restore', 'resume-claude', 'resume-codex', 'trust', 'update'];
+  const unimplemented = ['clean', 'dream', 'exit', 'export', 'flush', 'memory', 'remember', 'resume-claude', 'resume-codex', 'update'];
   assert.deepEqual(commandBadges.filter(item => item.badge).map(item => item.id).sort(), unimplemented);
   for (const id of ['compact', 'permission', 'model', 'thinking', 'plan', 'review', 'diff', 'skills', 'agents', 'trace', 'usage', 'find', 'tasks', 'new', 'rename', 'fork', 'copy', 'settings', 'mcp', 'schedules', 'theme', 'reload', 'help']) {
     assert.equal(commandBadges.find(item => item.id === id)?.badge, null, `${id} must not claim 未接入`);

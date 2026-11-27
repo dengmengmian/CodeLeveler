@@ -87,6 +87,9 @@ try {
   await page.locator('#message').fill('/thinking');
   await page.waitForFunction(() => document.querySelector('#command-popover')?.dataset.selected === 'thinking');
   await page.keyboard.press('Tab');
+  // The candidate list must be gone before reading the control it opens;
+  // otherwise a loaded machine can sample the old popover's own item.
+  await page.waitForFunction(() => !document.querySelector('#command-popover'));
   await page.waitForFunction(() => !!document.querySelector('.menu .menu-item'));
   const thinkingMenu = await page.evaluate(() => [...document.querySelectorAll('.menu .menu-item')].map(item => item.textContent));
   assert.ok(thinkingMenu.some(item => item.includes('高')), JSON.stringify(thinkingMenu));

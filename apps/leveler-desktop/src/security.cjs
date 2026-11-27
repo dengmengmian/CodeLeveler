@@ -1,5 +1,5 @@
 const {SNAPSHOT_VERSIONED_COMMANDS}=require('./command-policy.gen.cjs');
-const allowed=new Set(['submit_message','submit_user_input','steer_current_turn','steer_user_input','cancel_current_turn','cancel_task','resume_task','approval_decision','answer_clarification','definition_trust_decision','capture_secret','revoke_secret','query_session_history','query_tool_output','request_diff','list_agents','get_agent','list_skills','get_skill','query_context','query_observability','select_model','set_permission_profile','set_product_axes','rename_session','run_goal','set_thinking_level','archive_session','unarchive_session','fork_session','compact_context','cancel_background_task','manage_schedule','manage_mcp','run_review','cancel_review','query_review_report','list_reviews','query_review_scopes']);
+const allowed=new Set(['btw','cancel_btw','recap','restore_checkpoint','acknowledge_crash_window','query_diagnostics','submit_message','submit_user_input','steer_current_turn','steer_user_input','cancel_current_turn','cancel_task','resume_task','approval_decision','answer_clarification','definition_trust_decision','capture_secret','revoke_secret','query_session_history','query_tool_output','request_diff','list_agents','get_agent','list_skills','get_skill','query_context','query_observability','select_model','set_permission_profile','set_product_axes','rename_session','run_goal','set_thinking_level','archive_session','unarchive_session','fork_session','compact_context','cancel_background_task','manage_schedule','manage_mcp','run_review','cancel_review','query_review_report','list_reviews','query_review_scopes']);
 const decisions=new Set(['approve_once','approve_session','approve_always','deny']);
 const {validRef}=require('./attachment-ingress.cjs');
 function string(value,max=256){return typeof value==='string'&&value.length>0&&value.length<=max;}
@@ -225,7 +225,20 @@ function validateEnvelope(envelope,authorizeAttachment){
     if(!exactKeys(command,['type','session_id','query_id'])||!nonblank(command.session_id)||command.session_id!==envelope.session_id||!string(command.query_id,256))throw new Error('Invalid review history query');
   }
   if(command.type==='request_diff'&&(!exactKeys(command,Object.hasOwn(command,'query_id')?['type','session_id','query_id']:['type','session_id'])||!nonblank(command.session_id)||command.session_id!==envelope.session_id||(Object.hasOwn(command,'query_id')&&!nonblank(command.query_id))))throw new Error('Invalid diff query');
-  if(command.type==='set_permission_profile'&&(!exactKeys(command,['type','session_id','mode'])||!nonblank(command.session_id)||command.session_id!==envelope.session_id||!['full_access','assisted','request_approval'].includes(command.mode)))throw new Error('Invalid permission selection');
+  if(command.type==='set_permission_profile'){
+    const keys=['type','session_id','mode',...(Object.hasOwn(command,'contract')?['contract']:[])];
+    if(!exactKeys(command,keys)||!nonblank(command.session_id)||command.session_id!==envelope.session_id||!['full_access','assisted','request_approval'].includes(command.mode))throw new Error('Invalid permission selection');
+    if(Object.hasOwn(command,'contract')&&command.contract!=='v2')throw new Error('Invalid permission contract');
+  }
+  if(command.type==='btw'){
+    if(!exactKeys(command,['type','session_id','question'])||!nonblank(command.session_id)||command.session_id!==envelope.session_id||!nonblank(command.question)||utf8Bytes(command.question)>64*1024)throw new Error('Invalid side question');
+  }
+  if(['cancel_btw','recap','acknowledge_crash_window'].includes(command.type)&&(!exactKeys(command,['type','session_id'])||!nonblank(command.session_id)||command.session_id!==envelope.session_id))throw new Error('Invalid session command');
+  if(command.type==='restore_checkpoint'&&(!exactKeys(command,['type','session_id','checkpoint_id'])||!nonblank(command.session_id)||command.session_id!==envelope.session_id||!nonblank(command.checkpoint_id)||command.checkpoint_id.length>256))throw new Error('Invalid checkpoint restore');
+  if(command.type==='query_diagnostics'){
+    const keys=['type','requester_session_id','query_id',...(Object.hasOwn(command,'locale')?['locale']:[])];
+    if(!exactKeys(command,keys)||!nonblank(command.requester_session_id)||command.requester_session_id!==envelope.session_id||!string(command.query_id,256)||(Object.hasOwn(command,'locale')&&!['zh','en'].includes(command.locale)))throw new Error('Invalid diagnostics query');
+  }
   // The product mode is a durable session fact written by the Runtime. The
   // renderer never states whether the switch succeeded — only which of the
   // three representable axes it is asking for. The deprecated `work_profile`

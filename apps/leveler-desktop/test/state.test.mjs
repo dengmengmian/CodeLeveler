@@ -48,6 +48,29 @@ test('tool evidence survives history replay but past approval cannot be clicked'
   assert.equal(state.tools[0].preview,'file contents');
   assert.equal(state.tools[0].status,'success');
 });
+test('archived tool images attach to their call and survive history replay', () => {
+  const image = {sha256:'a'.repeat(64),mime_type:'image/png',width:4,height:3};
+  const state = projectSnapshot(snapshot,[
+    {event:{type:'tool_call_started',id:'t1',name:'view_image',arguments:'{"path":"a.png"}'}},
+    {event:{type:'tool_call_completed',id:'t1',ok:true,preview:'已加载图片 a.png'}},
+    {event:{type:'tool_call_images',id:'t1',images:[image]}},
+  ]);
+  assert.deepEqual(state.tools[0].images,[image]);
+  // The completion may arrive after the images event: merging by id keeps the
+  // refs instead of replacing the whole row.
+  const late = applyEvent(state,{type:'tool_call_images',id:'t1',images:[image,{...image,sha256:'b'.repeat(64)}],error:null});
+  assert.equal(late.tools[0].images.length,2);
+  assert.equal(late.tools[0].status,'success');
+  const failed = applyEvent(state,{type:'tool_call_images',id:'t2',images:[],error:'图片无法保存到本地存储'});
+  assert.equal(failed.tools.find(t=>t.id==='t2').imagesError,'图片无法保存到本地存储');
+});
+test('user messages keep the image refs the runtime persisted', () => {
+  const refs = [{sha256:'c'.repeat(64),mime_type:'image/png',width:2,height:1,name:'shot.png'}];
+  const state = projectSnapshot({...snapshot,messages:[{id:'u2',role:'user',text:'看图',images:1,image_refs:refs}]});
+  assert.deepEqual(state.messages[0].image_refs,refs);
+  const live = applyEvent(state,{type:'user_message_added',message:{id:'u3',role:'user',text:'再看',images:1,image_refs:refs}});
+  assert.deepEqual(live.messages.at(-1).image_refs,refs);
+});
 test('runtime resolves waiter and envelope carries one stable idempotency id', () => {
   let state=projectSnapshot(snapshot);
   state=applyEvent(state,{type:'approval_requested',request:{id:'a1'}});

@@ -15,7 +15,7 @@ import {
 } from './presentation.mjs';
 
 export function projectSnapshot(snapshot, history = []) {
-  let state = {session:snapshot, messages:[], reviews:[], nextSeq:0, status:snapshot.task_status ?? snapshot.status ?? 'unknown', tools:[], thoughts:[], reasoning:'', reasoningSuperseded:false, approvals:[], clarifications:[], definitionTrust:[], activity:'', activityElapsedMs:null, plan:snapshot.plan??null,diff:snapshot.diff??null,diffError:null,streamingMessageId:null,lastTerminal:null,turnErrors:[],turnTerminals:[],turnStartedAt:null};
+  let state = {session:snapshot, messages:[], reviews:[], nextSeq:0, status:snapshot.task_status ?? snapshot.status ?? 'unknown', tools:[], thoughts:[], reasoning:'', reasoningSuperseded:false, approvals:[], clarifications:[], definitionTrust:[], btw:null, activity:'', activityElapsedMs:null, plan:snapshot.plan??null,diff:snapshot.diff??null,diffError:null,streamingMessageId:null,lastTerminal:null,turnErrors:[],turnTerminals:[],turnStartedAt:null};
   if (history.length > 0) {
     // The durable log is the conversation; the snapshot's `messages` are the
     // ACTIVE MODEL CONTEXT (`/compact` leaves one summary row there). Replaying
@@ -104,6 +104,14 @@ function applyToolEvent(state, event) {
         answerEffect:event.answer_effect??'work',appliedDiff:null,batch,seq:event.seq??nextSeq++,
         ...(event.snapshotContext?{snapshotContext:true}:{live:true})});
     }
+  } else if (event.type === 'tool_call_images') {
+    // The runtime archived the bytes a tool returned; the event carries
+    // content hashes, never the picture. A call that reported images but
+    // could not store them keeps the reason so the card can say so.
+    if (!tool) {tool={id:event.id,name:'工具',arguments:'',status:'unknown',preview:'',appliedDiff:null,parallel:false,modelStep:null,answerEffect:'work',batch:null,live:true}; tools.push(tool);}
+    tool.images = Array.isArray(event.images) ? event.images.map(image=>({...image})) : [];
+    tool.imagesError = event.error ?? null;
+    return {...state,tools,nextSeq};
   } else if (event.type === 'tool_call_completed' || event.type === 'tool_call_output') {
     if (!tool) {tool={id:event.id,name:'工具',arguments:'',status:'unknown',preview:'',appliedDiff:null,parallel:false,modelStep:null,answerEffect:'work',batch:null,live:true}; tools.push(tool);}
     delete tool.snapshotContext;
@@ -284,6 +292,19 @@ export function applyEvent(state,event) {
       const id=`skill-delivery-${seq}`;
       if(!next.messages.some(m=>m.id===id)) next.messages=[...next.messages,{id,role:'user',kind:'runtime_notice',text,seq}];
     }
+  }
+  if(event.type==='btw_started') next.btw={question:event.question??'',text:'',status:'running',error:null,tools:[]};
+  if(event.type==='btw_text_delta'){if(!next.btw)next.btw={question:'',text:'',status:'running',error:null,tools:[]};next.btw={...next.btw,text:next.btw.text+event.delta};}
+  if(event.type==='btw_completed'&&next.btw) next.btw={...next.btw,status:'completed'};
+  if(event.type==='btw_cancelled'&&next.btw) next.btw={...next.btw,status:'cancelled'};
+  if(event.type==='btw_failed') next.btw={...(next.btw??{question:'',text:''}),status:'failed',error:event.error??'侧边提问失败'};
+  if(event.type==='btw_tool_started'&&next.btw) next.btw={...next.btw,tools:[...next.btw.tools,{id:event.call_id,tool:event.tool,status:'running'}]};
+  if(event.type==='btw_tool_finished'&&next.btw) next.btw={...next.btw,tools:next.btw.tools.map(tool=>tool.id===event.call_id?{...tool,status:event.is_error?'failed':'completed',elapsedMs:event.elapsed_ms}:tool)};
+  // A goal recap is a durable runtime fact with a runtime-rendered summary. It
+  // is not the person's words, so it reopens as a runtime notice.
+  if(event.type==='goal_recap_created'&&event.recap){
+    const recap=event.recap;const id=`recap-${recap.checkpoint_id}`;
+    if(!next.messages.some(message=>message.id===id))next.messages=[...next.messages,{id,role:'user',kind:'runtime_notice',text:recap.display_summary||'目标回顾',seq:event.seq??next.nextSeq++}];
   }
   if(event.type==='diff_updated'){next.diff=event.diff;next.diffError=null;if(event.query_id)next.diffQuery={id:event.query_id,status:'confirmed',error:null};}
   if(event.type==='diff_failed'){next.diff=null;next.diffError=event.message;if(event.query_id)next.diffQuery={id:event.query_id,status:'failed',error:event.message};}

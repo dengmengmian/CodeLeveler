@@ -9,6 +9,8 @@ test('desktop permission menu accepts only three exact current-session modes',()
  for(const mode of ['full','auto','restricted','auto_approve','FullAccess','',null,undefined,{},true])assert.throws(()=>security.validateEnvelope(envelope({type:'set_permission_profile',session_id:'s1',mode})));
  for(const session_id of ['s2','',null,undefined,' '])assert.throws(()=>security.validateEnvelope(envelope({type:'set_permission_profile',session_id,mode:'full_access'})));
  for(const extra of [{approval_policy:'auto_approve'},{network_scope:'all'},{resource_grants:[]},{sandbox:false}])assert.throws(()=>security.validateEnvelope(envelope({type:'set_permission_profile',session_id:'s1',mode:'full_access',...extra})));
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'set_permission_profile',session_id:'s1',mode:'assisted',contract:'v2'})));
+ for(const contract of ['v1','V2','',null,2])assert.throws(()=>security.validateEnvelope(envelope({type:'set_permission_profile',session_id:'s1',mode:'assisted',contract})));
 });
 test('desktop rejects cross-session submission but accepts scoped text and live approvals',()=>{
  assert.throws(()=>security.validateEnvelope(envelope({type:'submit_message',session_id:'s2',content:'hi'})));
@@ -91,6 +93,20 @@ test('image-only input is supported while unknown submit authority stays rejecte
 test('diff query accepts only selected-session optional bounded query identity',()=>{
  for(const fields of [{},{query_id:'query-1'}])assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'request_diff',session_id:'s1',...fields})));
  for(const fields of [{session_id:'s2'},{session_id:''},{query_id:''},{query_id:' '},{query_id:null},{query_id:42},{query_id:'a'.repeat(257)},{path:'/private'},{include_all:true}])assert.throws(()=>security.validateEnvelope(envelope({type:'request_diff',session_id:'s1',...fields})));
+});
+
+test('recovery, recap, side question and diagnostics stay bound to the selected session',()=>{
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'btw',session_id:'s1',question:'为什么？'})));
+ for(const bad of [{type:'btw',session_id:'s2',question:'x'},{type:'btw',session_id:'s1',question:''},{type:'btw',session_id:'s1',question:'x',path:'/etc/passwd'}])assert.throws(()=>security.validateEnvelope(envelope(bad)));
+ for(const type of ['cancel_btw','recap','acknowledge_crash_window'])assert.doesNotThrow(()=>security.validateEnvelope(envelope({type,session_id:'s1'})));
+ for(const type of ['cancel_btw','recap','acknowledge_crash_window'])assert.throws(()=>security.validateEnvelope(envelope({type,session_id:'s2'})));
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'restore_checkpoint',session_id:'s1',checkpoint_id:'chk-1'})));
+ for(const bad of [{type:'restore_checkpoint',session_id:'s1',checkpoint_id:''},{type:'restore_checkpoint',session_id:'s2',checkpoint_id:'chk-1'},{type:'restore_checkpoint',session_id:'s1',checkpoint_id:'a'.repeat(257)},{type:'restore_checkpoint',session_id:'s1',checkpoint_id:'chk-1',path:'/tmp'}])assert.throws(()=>security.validateEnvelope(envelope(bad)));
+ const query={type:'query_diagnostics',requester_session_id:'s1',query_id:'q1',locale:'zh'};
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope(query)));
+ const {locale,...withoutLocale}=query;
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope(withoutLocale)));
+ for(const bad of [{...query,requester_session_id:'s2'},{...query,query_id:''},{...query,locale:'fr'},{...query,path:'/tmp'}])assert.throws(()=>security.validateEnvelope(envelope(bad)));
 });
 
 test('tool output queries carry only a call id, a bounded part and a byte window',()=>{

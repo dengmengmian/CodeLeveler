@@ -1,6 +1,7 @@
-// R4 image input: clipboard paste, multiple images, removal, and the actual
-// multimodal bytes the provider receives. Historical messages expose only the
-// Runtime's image count; that limit is asserted instead of faked.
+// R5 image input: clipboard paste, multiple images, removal, the actual
+// multimodal bytes the provider receives, and the stored pictures a user
+// message keeps after sending (real bytes, not a count).
+/* global File, DataTransfer, DragEvent */
 import { _electron as electron } from 'playwright';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
@@ -150,14 +151,54 @@ try {
   assert.deepEqual(dimensions(one.images[0]), [4, 3], 'the remaining image is still the pasted one');
   evidence.remove_before_send = { image_parts: one.images.length, dimensions: [4, 3] };
 
-  // Historical messages expose the Runtime's count only: two tiles for the
-  // two-image turn, and the tile says content is not available.
+  // A user message keeps the stored pictures: both tiles load the real bytes
+  // at their true sizes, in the order they were sent.
   const twoMessage = page.locator('.message.user').filter({ hasText: 'IMG_TWO' });
-  assert.equal(await twoMessage.locator('.message-image-tile').count(), 2);
-  const label = await twoMessage.locator('.message-image-tile').first().getAttribute('aria-label');
-  assert.match(label, /运行时只提供数量/);
-  evidence.history_limit = { tiles: 2, label };
+  await page.waitForFunction(() => {
+    const row = [...document.querySelectorAll('.message.user')].find(node => node.textContent.includes('IMG_TWO'));
+    const images = [...(row?.querySelectorAll('.message-images img.message-image-thumb') ?? [])];
+    return images.length === 2 && images.every(image => image.naturalWidth > 0);
+  }, null, { timeout: 30000 });
+  const historyDimensions = await twoMessage.locator('.message-images img.message-image-thumb').evaluateAll(images => images.map(image => [image.naturalWidth, image.naturalHeight]));
+  assert.deepEqual(historyDimensions.map(size => size.join('x')).sort(), ['3x4', '4x3']);
+  await twoMessage.locator('.message-image-tile').first().click();
+  await page.waitForSelector('#image-lightbox[open] img.image-lightbox-image');
+  await page.waitForFunction(() => document.querySelector('#image-lightbox img.image-lightbox-image')?.naturalWidth > 0);
+  await page.locator('#image-lightbox .modal-actions button', { hasText: '关闭' }).click();
+  evidence.history_images = { tiles: 2, dimensions: historyDimensions };
   await page.screenshot({ path: path.join(output, 'image-input.png') });
+
+  // A real file drag lands through the same byte boundary as a paste. The
+  // synthetic DragEvent carries the real File bytes; the Finder gesture is
+  // exercised separately in the real-local dogfood.
+  const dropResult = await page.evaluate(async ({ base64, textBase64 }) => {
+    const fileFrom = (encoded, name, type) => {
+      const bytes = Uint8Array.from(atob(encoded), character => character.charCodeAt(0));
+      return new File([bytes], name, { type });
+    };
+    const card = document.querySelector('#composer-card');
+    const drag = files => {
+      const transfer = new DataTransfer();
+      for (const file of files) transfer.items.add(file);
+      return transfer;
+    };
+    const image = fileFrom(base64, 'dropped.png', 'image/png');
+    const imageDrag = drag([image]);
+    card.dispatchEvent(new DragEvent('dragenter', { bubbles: true, cancelable: true, dataTransfer: imageDrag }));
+    const hintVisible = getComputedStyle(document.querySelector('#drop-hint')).display !== 'none';
+    card.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: imageDrag }));
+    await new Promise(resolve => setTimeout(resolve, 50));
+    const textDrag = drag([fileFrom(textBase64, 'note.txt', 'text/plain')]);
+    card.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: textDrag }));
+    return { hintVisible };
+  }, { base64: imageA.toString('base64'), textBase64: Buffer.from('hello').toString('base64') });
+  assert.equal(dropResult.hintVisible, true, 'a file drag shows the drop target');
+  await page.waitForFunction(() => document.querySelectorAll('.attachment-chip').length === 1);
+  await ready();
+  assert.match(await page.locator('#composer-error').innerText().catch(() => ''), /仅支持拖入|请从工作区文件/);
+  evidence.drop = { hint_visible: dropResult.hintVisible, attachment_chip: await chips().count() };
+  await chips().first().locator('.attachment-remove').click();
+  await page.waitForFunction(() => document.querySelectorAll('.attachment-chip').length === 0);
 
   // Plain text paste is not intercepted.
   await app.evaluate(({ clipboard }) => { clipboard.writeText('PLAIN_PASTE_TEXT'); });

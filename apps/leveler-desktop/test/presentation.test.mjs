@@ -200,6 +200,15 @@ test('leading slash names with unsupported arguments stay local while filesystem
  assert.equal(slashIntent('// comment',commands).kind,'message');
 });
 
+test('a command that takes an argument carries it as data, never as prose',async()=>{
+ const {slashIntent}=await import('../src/presentation.mjs');
+ const commands=[{id:'btw',label:'侧边提问',enabled:true,takesArgument:true},{id:'restore',label:'恢复',enabled:true}];
+ assert.deepEqual(slashIntent('/btw 为什么这里用队列',commands),{kind:'action',id:'btw',argument:'为什么这里用队列'});
+ // A command without the declared argument lane still refuses one.
+ assert.equal(slashIntent('/restore all',commands).kind,'blocked');
+ assert.equal(slashIntent('/btw ',commands).kind,'action');
+});
+
 test('/goal with an objective is a typed runtime command, never prose sent to the model',async()=>{
  const {slashIntent}=await import('../src/presentation.mjs');
  const commands=[{id:'goal',label:'目标',enabled:true}];

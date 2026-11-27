@@ -162,6 +162,16 @@ app.whenReady().then(async()=>{
     if(Object.keys(request).some(key=>!['sessionId','path'].includes(key)))throw new Error('Invalid file request');
     return withFileSlot(()=>workspaceFiles(request.sessionId).readImage(request.path));
   });
+  // Resolve one content-addressed image the runtime showed this client (a
+  // user attachment or a tool-returned picture). The page names a hash, never
+  // a path; the runtime's media store is the only reader, and the renderer
+  // decides how to display the returned bytes.
+  handle('desktop:fetch-image',request=>{
+    if(!request||typeof request!=='object'||Array.isArray(request))throw new Error('Invalid image request');
+    if(Object.keys(request).length!==1||!Object.hasOwn(request,'sha256'))throw new Error('Invalid image request');
+    if(typeof request.sha256!=='string'||!/^[a-f0-9]{64}$/.test(request.sha256))throw new Error('Invalid image request');
+    return bridge.request('fetch_attachment',{sha256:request.sha256});
+  });
   handle('desktop:copy-text',value=>copyText(value,clipboard));
   handle('desktop:open-external',async value=>{const url=new URL(text(value,'url'));if(!['http:','https:'].includes(url.protocol)||url.username||url.password)throw new Error('Invalid external URL');await shell.openExternal(url.href);return {ok:true};});
   handle('desktop:open-config',async()=>{const base=process.env.LEVELER_HOME??path.join(os.homedir(),'.leveler');const file=path.join(base,'config.toml');if(!existsSync(file))throw new Error('配置文件不存在');const error=await shell.openPath(file);if(error)throw new Error(error);return {ok:true};});
@@ -292,6 +302,23 @@ app.whenReady().then(async()=>{
   handle('desktop:agent-options-save',request=>bridge.request('agent_options_save',agentOptions(request)));
   handle('desktop:search-settings',()=>bridge.request('search_settings',{}));
   handle('desktop:search-save',request=>bridge.request('search_save',searchDraft(request)));
+  // The global Thinking default is a root config key. The renderer sends only
+  // a closed vocabulary value or null (meaning "no explicit default").
+  handle('desktop:thinking-settings',()=>bridge.request('thinking_settings',{}));
+  handle('desktop:thinking-settings-save',request=>{
+    if(!request||typeof request!=='object'||Array.isArray(request)||Object.keys(request).length!==1||!Object.hasOwn(request,'level'))throw new Error('Invalid Thinking setting');
+    const levels=['auto','off','minimal','low','medium','high','max'];
+    if(request.level!==null&&!levels.includes(request.level))throw new Error('Invalid Thinking setting');
+    return bridge.request('thinking_settings_save',{level:request.level});
+  });
+  // The Agent browser product is an open vocabulary owned by the runtime's
+  // BrowserProduct parser; Main bounds it to the four real ids.
+  handle('desktop:browser-settings',()=>bridge.request('browser_settings',{}));
+  handle('desktop:browser-settings-save',request=>{
+    if(!request||typeof request!=='object'||Array.isArray(request)||Object.keys(request).length!==1||!Object.hasOwn(request,'product'))throw new Error('Invalid browser setting');
+    if(request.product!==null&&!['safari','chrome','edge','chromium'].includes(request.product))throw new Error('Invalid browser setting');
+    return bridge.request('browser_settings_save',{product:request.product});
+  });
   handle('desktop:runtime-reload',()=>bridge.request('runtime_reload',{}));
   handle('desktop:connection-status',()=>bridge.status());
   handle('desktop:reconnect',()=>{bridge.retry();return {ok:true};});
