@@ -174,6 +174,33 @@ test('scheduled automation is session-scoped, bounded and forwarded as a structu
  for(const fields of [{requester_session_id:'s2'},{requester_session_id:''},{requester_session_id:' '},{query_id:''},{query_id:'a'.repeat(257)},{request:null},{request:[]},{request:'list'},{request:{}},{request:{action:'a'.repeat(33)}},{request:{action:'list',extra:'x'.repeat(200000)}},{path:'/private'},{expected_version:7}])assert.throws(()=>security.validateEnvelope(envelope({...valid,...fields})));
 });
 
+test('MCP management is session-scoped, exact and carries only environment names',()=>{
+ const stdio={name:'echo',transport:'stdio',command:'/usr/bin/python3',args:['-u','/tmp/echo.py'],env:[{key:'API_KEY',source:'API_KEY'}],enabled:true};
+ const http={name:'remote',transport:'streamable_http',url:'https://example.com/mcp',headers:[{key:'X-API-Key',source:'SERVICE_KEY'}],bearer_token_env:'SERVICE_TOKEN',enabled:false};
+ const request=r=>({type:'manage_mcp',requester_session_id:'s1',query_id:'q1',request:r});
+ for(const valid of [
+   {action:'list'},{action:'reload'},{action:'reconnect',server:'echo'},{action:'remove',server:'echo'},
+   {action:'set_enabled',server:'echo',enabled:false},{action:'add',spec:stdio},{action:'update',original_name:'echo',spec:http},
+ ])assert.doesNotThrow(()=>security.validateEnvelope(envelope(request(valid))));
+ for(const bad of [
+   request({action:'delete'}),
+   request({action:'list',extra:1}),
+   request({action:'reconnect',server:'../escape'}),
+   request({action:'set_enabled',server:'echo',enabled:'yes'}),
+   request({action:'add',spec:{...stdio,url:'https://example.com/mcp'}}),
+   request({action:'add',spec:{...stdio,command:'   '}}),
+   request({action:'add',spec:{...stdio,env:[{key:'API_KEY',source:'sk-live-secret'}]}}), // shape-valid; the runtime refuses the value
+   request({action:'add',spec:{...http,command:'npx'}}),
+   request({action:'add',spec:{...http,url:'ftp://example.com/mcp'}}),
+   request({action:'add',spec:{...http,url:'https://user:pass@example.com/mcp'}}),
+   request({action:'add',spec:{...http,url:'https://example.com/mcp?token=abc'}}),
+   request({action:'add',spec:{...stdio,token:'secret'}}),
+   {type:'manage_mcp',requester_session_id:'s2',query_id:'q1',request:{action:'list'}},
+   {...request({action:'list'}),path:'/private'},
+   {...request({action:'list'}),expected_version:7},
+ ])assert.throws(()=>security.validateEnvelope(envelope(bad)), undefined, JSON.stringify(bad));
+});
+
 test('desktop mode switching accepts only the three exact current-session axes',()=>{
  const command=(over={})=>({type:'set_product_axes',session_id:'s1',work_profile:'single',collaboration:'goal',...over});
  for(const collaboration of ['chat','plan','goal'])assert.doesNotThrow(()=>security.validateEnvelope(envelope(command({collaboration}))));

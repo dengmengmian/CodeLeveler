@@ -1,4 +1,5 @@
 //! JSONL desktop adapter; runtime host owns daemon lifetime and session truth.
+use leveler_client_protocol::mcp::{McpRequest, McpServerSpec, McpTransport};
 use leveler_client_protocol::schedule::{
     ScheduleActionWire, ScheduleDraft, SchedulePatch, ScheduleRequest, ScheduleTriggerWire,
 };
@@ -91,6 +92,16 @@ fn validate_command(session: &SessionId, command: &ClientCommand) -> anyhow::Res
         ClientCommand::ManageSchedule {
             query_id, request, ..
         } if valid_desktop_command_id(query_id) && valid_desktop_schedule_request(request) => {}
+        // MCP management is the runtime's one authority. The bridge bounds the
+        // declaration and binds it to the selected session; names, references,
+        // URLs and transport semantics are validated again by the runtime.
+        ClientCommand::ManageMcp {
+            requester_session_id,
+            query_id,
+            request,
+        } if requester_session_id == session
+            && valid_desktop_command_id(query_id)
+            && valid_desktop_mcp_request(request) => {}
         ClientCommand::QueryToolOutput {
             query_id,
             call_id,
@@ -204,6 +215,76 @@ fn valid_desktop_tool_call_id(call_id: &str) -> bool {
 
 fn valid_desktop_command_id(id: &leveler_core::CommandId) -> bool {
     !id.as_str().trim().is_empty() && id.as_str().len() <= 256
+}
+
+const MAX_DESKTOP_MCP_COMMAND: usize = 4096;
+const MAX_DESKTOP_MCP_ARG: usize = 8192;
+const MAX_DESKTOP_MCP_ARGS: usize = 256;
+const MAX_DESKTOP_MCP_REFS: usize = 64;
+const MAX_DESKTOP_MCP_REF: usize = 256;
+const MAX_DESKTOP_MCP_URL: usize = 2048;
+
+fn valid_desktop_mcp_name(name: &str) -> bool {
+    leveler_app::mcp_config::validate_name(name).is_ok()
+}
+
+fn valid_desktop_mcp_ref(reference: &leveler_client_protocol::mcp::McpNameRef) -> bool {
+    !reference.key.is_empty()
+        && reference.key.len() <= MAX_DESKTOP_MCP_REF
+        && !reference.source.is_empty()
+        && reference.source.len() <= MAX_DESKTOP_MCP_REF
+}
+
+fn valid_desktop_mcp_spec(spec: &McpServerSpec) -> bool {
+    if !valid_desktop_mcp_name(&spec.name) {
+        return false;
+    }
+    match spec.transport {
+        McpTransport::Stdio => {
+            spec.command.as_deref().is_some_and(|command| {
+                !command.trim().is_empty() && command.len() <= MAX_DESKTOP_MCP_COMMAND
+            }) && spec.args.len() <= MAX_DESKTOP_MCP_ARGS
+                && spec
+                    .args
+                    .iter()
+                    .all(|argument| argument.len() <= MAX_DESKTOP_MCP_ARG)
+                && spec.env.len() <= MAX_DESKTOP_MCP_REFS
+                && spec.env.iter().all(valid_desktop_mcp_ref)
+                && spec.url.is_none()
+                && spec.headers.is_empty()
+                && spec.bearer_token_env.is_none()
+        }
+        McpTransport::StreamableHttp => {
+            let url = spec.url.as_deref().unwrap_or("");
+            !url.trim().is_empty()
+                && url.len() <= MAX_DESKTOP_MCP_URL
+                && leveler_app::mcp_config::validate_streamable_http_url(url).is_ok()
+                && spec.command.is_none()
+                && spec.args.is_empty()
+                && spec.env.is_empty()
+                && spec.headers.len() <= MAX_DESKTOP_MCP_REFS
+                && spec.headers.iter().all(valid_desktop_mcp_ref)
+                && spec
+                    .bearer_token_env
+                    .as_ref()
+                    .is_none_or(|source| !source.is_empty() && source.len() <= MAX_DESKTOP_MCP_REF)
+        }
+    }
+}
+
+fn valid_desktop_mcp_request(request: &McpRequest) -> bool {
+    match request {
+        McpRequest::List | McpRequest::Reload => true,
+        McpRequest::Reconnect { server } | McpRequest::Remove { server } => {
+            valid_desktop_mcp_name(server)
+        }
+        McpRequest::SetEnabled { server, .. } => valid_desktop_mcp_name(server),
+        McpRequest::Add { spec } => valid_desktop_mcp_spec(spec),
+        McpRequest::Update {
+            original_name,
+            spec,
+        } => valid_desktop_mcp_name(original_name) && valid_desktop_mcp_spec(spec),
+    }
 }
 
 const MAX_DESKTOP_SCHEDULE_ID: usize = 256;
@@ -1758,6 +1839,131 @@ compatibility: { synthesize_tool_call_ids: true, drop_unsupported_fields: true }
                     path: "/arbitrary/path".into(),
                     name: None,
                 }
+            )
+            .is_err()
+        );
+    }
+
+    /// MCP management is the existing runtime command; the desktop adapter
+    /// only binds it to the selected session and bounds the declaration.
+    #[test]
+    fn desktop_mcp_management_is_session_scoped_and_bounded() {
+        let session = SessionId::new("desktop-mcp");
+        let command = |requester: &SessionId, request: McpRequest| ClientCommand::ManageMcp {
+            requester_session_id: requester.clone(),
+            query_id: leveler_core::CommandId::new("mcp-q1"),
+            request: Box::new(request),
+        };
+        let stdio = McpServerSpec {
+            name: "echo".into(),
+            transport: McpTransport::Stdio,
+            command: Some("/usr/bin/python3".into()),
+            args: vec!["-u".into(), "/tmp/echo.py".into()],
+            env: vec![leveler_client_protocol::mcp::McpNameRef {
+                key: "API_KEY".into(),
+                source: "API_KEY".into(),
+            }],
+            url: None,
+            headers: Vec::new(),
+            bearer_token_env: None,
+            enabled: true,
+        };
+        assert!(
+            validate_command(
+                &session,
+                &command(
+                    &session,
+                    McpRequest::Add {
+                        spec: stdio.clone()
+                    }
+                )
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_command(
+                &session,
+                &command(
+                    &SessionId::new("other"),
+                    McpRequest::Add {
+                        spec: stdio.clone()
+                    }
+                )
+            )
+            .is_err(),
+            "the request must name the envelope's session"
+        );
+        for request in [McpRequest::List, McpRequest::Reload] {
+            assert!(validate_command(&session, &command(&session, request)).is_ok());
+        }
+        for server in ["", "../escape", "bad name", &"a".repeat(65)] {
+            assert!(
+                validate_command(
+                    &session,
+                    &command(
+                        &session,
+                        McpRequest::Reconnect {
+                            server: server.into()
+                        }
+                    )
+                )
+                .is_err()
+            );
+        }
+        let mut mixed = stdio.clone();
+        mixed.url = Some("https://example.com/mcp".into());
+        assert!(
+            validate_command(
+                &session,
+                &command(&session, McpRequest::Add { spec: mixed })
+            )
+            .is_err()
+        );
+        let mut missing = stdio.clone();
+        missing.command = None;
+        assert!(
+            validate_command(
+                &session,
+                &command(&session, McpRequest::Add { spec: missing })
+            )
+            .is_err()
+        );
+        let http = McpServerSpec {
+            name: "remote".into(),
+            transport: McpTransport::StreamableHttp,
+            command: None,
+            args: Vec::new(),
+            env: Vec::new(),
+            url: Some("https://example.com/mcp".into()),
+            headers: vec![leveler_client_protocol::mcp::McpNameRef {
+                key: "X-API-Key".into(),
+                source: "SERVICE_API_KEY".into(),
+            }],
+            bearer_token_env: Some("SERVICE_TOKEN".into()),
+            enabled: true,
+        };
+        assert!(
+            validate_command(
+                &session,
+                &command(&session, McpRequest::Add { spec: http.clone() })
+            )
+            .is_ok()
+        );
+        let mut credentialed = http.clone();
+        credentialed.url = Some("https://user:secret@example.com/mcp".into());
+        assert!(
+            validate_command(
+                &session,
+                &command(&session, McpRequest::Add { spec: credentialed })
+            )
+            .is_err()
+        );
+        let mut with_command = http;
+        with_command.command = Some("npx".into());
+        assert!(
+            validate_command(
+                &session,
+                &command(&session, McpRequest::Add { spec: with_command })
             )
             .is_err()
         );

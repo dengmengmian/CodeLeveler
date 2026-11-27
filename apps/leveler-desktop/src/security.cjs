@@ -1,5 +1,5 @@
 const {SNAPSHOT_VERSIONED_COMMANDS}=require('./command-policy.gen.cjs');
-const allowed=new Set(['submit_message','submit_user_input','steer_current_turn','steer_user_input','cancel_current_turn','cancel_task','resume_task','approval_decision','answer_clarification','definition_trust_decision','capture_secret','revoke_secret','query_session_history','query_tool_output','request_diff','list_agents','get_agent','query_context','query_observability','select_model','set_permission_profile','set_product_axes','rename_session','archive_session','unarchive_session','fork_session','compact_context','cancel_background_task','manage_schedule']);
+const allowed=new Set(['submit_message','submit_user_input','steer_current_turn','steer_user_input','cancel_current_turn','cancel_task','resume_task','approval_decision','answer_clarification','definition_trust_decision','capture_secret','revoke_secret','query_session_history','query_tool_output','request_diff','list_agents','get_agent','query_context','query_observability','select_model','set_permission_profile','set_product_axes','rename_session','archive_session','unarchive_session','fork_session','compact_context','cancel_background_task','manage_schedule','manage_mcp']);
 const decisions=new Set(['approve_once','approve_session','approve_always','deny']);
 const {validRef}=require('./attachment-ingress.cjs');
 function string(value,max=256){return typeof value==='string'&&value.length>0&&value.length<=max;}
@@ -32,6 +32,61 @@ function validSecretInput(command){
   const ack=command.plaintext_secret_ack??false;
   if(ack&&!command.content)return false;
   return validCaptures(command.content,captures,ack);
+}
+// MCP declarations are structured data, never a resolved credential. A
+// reference names an environment variable; the runtime resolves it at launch.
+// These checks are the IPC shape boundary, not the authority: the runtime
+// validates names, URLs, transport exclusivity and references again.
+const MCP_ACTIONS=new Set(['list','reload','reconnect','add','update','remove','set_enabled']);
+function mcpName(value){return string(value,64)&&/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value);}
+function mcpRef(value){
+  return !!value&&typeof value==='object'&&!Array.isArray(value)&&exactKeys(value,['key','source'])
+    &&string(value.key,256)&&/^[A-Za-z0-9_][A-Za-z0-9_-]*$/.test(value.key)
+    &&string(value.source,256)&&/^[A-Z_][A-Z0-9_]*$/.test(value.source);
+}
+function mcpRefs(value){return Array.isArray(value)&&value.length<=64&&value.every(mcpRef);}
+function mcpUrl(value){
+  if(!string(value,2048)||!/^https?:\/\//.test(value)||/\s/.test(value))return false;
+  try{
+    const url=new URL(value);
+    return (url.protocol==='http:'||url.protocol==='https:')&&!url.username&&!url.password&&!url.search;
+  }catch{return false;}
+}
+function mcpSpec(value){
+  if(!value||typeof value!=='object'||Array.isArray(value))return false;
+  const keys=['name','transport','command','args','env','url','headers','bearer_token_env','enabled'];
+  if(Object.keys(value).some(key=>!keys.includes(key)))return false;
+  if(!mcpName(value.name)||!['stdio','streamable_http'].includes(value.transport))return false;
+  if(value.enabled!==undefined&&typeof value.enabled!=='boolean')return false;
+  if(value.args!==undefined&&(!Array.isArray(value.args)||value.args.length>256||value.args.some(arg=>!string(arg,8192))))return false;
+  const absent=v=>v===undefined||v===null;
+  if(value.transport==='stdio'){
+    if(!string(value.command,4096)||!value.command.trim())return false;
+    if(!absent(value.url))return false;
+    if(value.headers!==undefined&&(!Array.isArray(value.headers)||value.headers.length))return false;
+    if(!absent(value.bearer_token_env))return false;
+    if(value.env!==undefined&&!mcpRefs(value.env))return false;
+  }else{
+    if(!mcpUrl(value.url))return false;
+    if(!absent(value.command))return false;
+    if(value.args!==undefined&&(!Array.isArray(value.args)||value.args.length))return false;
+    if(value.env!==undefined&&(!Array.isArray(value.env)||value.env.length))return false;
+    if(value.headers!==undefined&&!mcpRefs(value.headers))return false;
+    if(!absent(value.bearer_token_env)&&!(string(value.bearer_token_env,256)&&/^[A-Z_][A-Z0-9_]*$/.test(value.bearer_token_env)))return false;
+  }
+  return true;
+}
+function validMcpRequest(request){
+  if(!request||typeof request!=='object'||Array.isArray(request)||!MCP_ACTIONS.has(request.action))return false;
+  if(JSON.stringify(request).length>200000)return false;
+  switch(request.action){
+    case 'list': case 'reload': return exactKeys(request,['action']);
+    case 'reconnect': case 'remove': return exactKeys(request,['action','server'])&&mcpName(request.server);
+    case 'set_enabled': return exactKeys(request,['action','server','enabled'])&&mcpName(request.server)&&typeof request.enabled==='boolean';
+    case 'add': return exactKeys(request,['action','spec'])&&mcpSpec(request.spec);
+    case 'update': return exactKeys(request,['action','original_name','spec'])&&mcpName(request.original_name)&&mcpSpec(request.spec);
+  }
+  return false;
 }
 function validateEnvelope(envelope,authorizeAttachment){
   if(!envelope||!string(envelope.command_id)||!string(envelope.session_id)||typeof envelope.issued_at!=='string'||!Number.isFinite(Date.parse(envelope.issued_at)))throw new Error('Invalid command envelope');
@@ -97,6 +152,12 @@ function validateEnvelope(envelope,authorizeAttachment){
   }
   if(command.type==='manage_schedule'){
     if(!exactKeys(command,['type','requester_session_id','query_id','request'])||!nonblank(command.requester_session_id)||command.requester_session_id!==envelope.session_id||!string(command.query_id,256)||!command.request||typeof command.request!=='object'||Array.isArray(command.request)||!string(command.request.action,32)||JSON.stringify(command.request).length>200000)throw new Error('Invalid schedule command');
+  }
+  if(command.type==='manage_mcp'){
+    // The runtime is the sole MCP authority. The renderer names the selected
+    // session and a structured request; it never supplies a resolved secret or
+    // a file path. A request for another session is not representable.
+    if(!exactKeys(command,['type','requester_session_id','query_id','request'])||!nonblank(command.requester_session_id)||command.requester_session_id!==envelope.session_id||!string(command.query_id,256)||!validMcpRequest(command.request))throw new Error('Invalid MCP management request');
   }
   if(command.type==='request_diff'&&(!exactKeys(command,Object.hasOwn(command,'query_id')?['type','session_id','query_id']:['type','session_id'])||!nonblank(command.session_id)||command.session_id!==envelope.session_id||(Object.hasOwn(command,'query_id')&&!nonblank(command.query_id))))throw new Error('Invalid diff query');
   if(command.type==='set_permission_profile'&&(!exactKeys(command,['type','session_id','mode'])||!nonblank(command.session_id)||command.session_id!==envelope.session_id||!['full_access','assisted','request_approval'].includes(command.mode)))throw new Error('Invalid permission selection');
