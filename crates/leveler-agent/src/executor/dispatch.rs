@@ -616,7 +616,22 @@ pub(crate) fn mark_external_content(tool_name: &str, content: String, is_error: 
         return content;
     }
     match external_content_marker(source_class(tool_name)) {
-        Some(marker) => format!("{marker}{content}"),
+        Some(marker) => {
+            // The registry's saved-reference line is a load-bearing FIRST line:
+            // the transcript reader accepts a complete-output reference only
+            // there, and the model is told to read that path. Prepending the
+            // marker would push it to line three and silently hide a truncated
+            // external result (an MCP tool returning more than the result
+            // budget). Keep the reference first and place the untrusted-data
+            // marker before the body it actually warns about.
+            if content.starts_with(leveler_model::tool_output::TOOL_OUTPUT_SAVED_PREFIX) {
+                if let Some((reference, rest)) = content.split_once('\n') {
+                    return format!("{reference}\n{marker}{rest}");
+                }
+                return format!("{content}\n{marker}");
+            }
+            format!("{marker}{content}")
+        }
         None => content,
     }
 }
@@ -773,6 +788,27 @@ mod mutation_ledger_tests {
         assert!(mcp.contains("source_class=mcp"), "{mcp}");
         let browser = mark_external_content("browser_inspect", body.to_string(), false);
         assert!(browser.contains("source_class=browser"), "{browser}");
+    }
+
+    /// A large external result arrives as a saved-reference line followed by a
+    /// bounded preview. The reference is only recognized as the first line, so
+    /// the untrusted-data marker must not displace it; the warning still sits
+    /// before the preview it describes.
+    #[test]
+    fn an_external_marker_keeps_the_saved_reference_first() {
+        let reference = leveler_model::tool_output::saved_reference(
+            "/state/artifacts/abcdef.txt",
+            "abcdef",
+            200_000,
+        );
+        let content = format!("{reference}\npreview body");
+        let marked = mark_external_content("mcp__srv__tool", content, false);
+        assert!(marked.starts_with(&reference), "{marked}");
+        let (first, rest) = marked.split_once('\n').unwrap();
+        assert_eq!(first, reference);
+        assert!(rest.starts_with("[EXTERNAL DATA"), "{marked}");
+        assert!(marked.ends_with("preview body"), "{marked}");
+        assert_eq!(marked.matches("[EXTERNAL DATA").count(), 1, "{marked}");
     }
 
     #[test]

@@ -6,8 +6,9 @@
 //! (never cleartext secret values). At runtime the app resolves each reference
 //! from the process environment.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use fs2::FileExt;
 use leveler_client_protocol::mcp::{McpServerSpec, McpTransport};
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value, value};
 
@@ -91,6 +92,8 @@ pub enum McpConfigError {
     MixedTransport,
     #[error("io error: {0}")]
     Io(String),
+    #[error("the configuration kept changing while it was being updated; nothing was written")]
+    ConcurrentModification,
 }
 
 /// The resident config path (`$LEVELER_HOME/config.toml` or `~/.leveler/config.toml`).
@@ -98,8 +101,15 @@ pub fn config_path() -> Result<PathBuf, McpConfigError> {
     GlobalConfig::path().ok_or(McpConfigError::NoPath)
 }
 
-fn document_at(path: &std::path::Path) -> Result<DocumentMut, McpConfigError> {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
+fn read_text(path: &Path) -> Result<String, McpConfigError> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(McpConfigError::Io(format!("{}: {error}", path.display()))),
+    }
+}
+
+fn parse_text(text: &str) -> Result<DocumentMut, McpConfigError> {
     text.parse::<DocumentMut>().map_err(|error| {
         McpConfigError::Parse(crate::global_config::safe_toml_parse_error(
             &text,
@@ -107,6 +117,67 @@ fn document_at(path: &std::path::Path) -> Result<DocumentMut, McpConfigError> {
             error.span(),
         ))
     })
+}
+
+fn document_at(path: &Path) -> Result<DocumentMut, McpConfigError> {
+    parse_text(&read_text(path)?)
+}
+
+/// How many read-compute-write rounds one edit may take before a still-changing
+/// file is reported as a conflict instead of overwriting someone else's write.
+const MAX_CONFIG_WRITE_ATTEMPTS: usize = 8;
+
+fn lock_path(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    name.push(".lock");
+    path.with_file_name(name)
+}
+
+/// Read-edit-write the global config under a process-shared advisory lock.
+///
+/// MCP management can be reached from several Desktop windows, the TUI and the
+/// CLI at once. The exclusive lock serializes them; the content check also
+/// catches a writer that does not take this lock (the provider editor and the
+/// first-run/login writer), so an edit computed from an older snapshot is
+/// recomputed instead of replacing the newer file.
+fn edit_document_at<T>(
+    path: &Path,
+    mut apply: impl FnMut(&mut DocumentMut) -> Result<T, McpConfigError>,
+) -> Result<T, McpConfigError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| McpConfigError::Io(format!("{}: {error}", parent.display())))?;
+        leveler_core::private_fs::restrict_dir(parent)
+            .map_err(|error| McpConfigError::Io(error.to_string()))?;
+    }
+    let lock_path = lock_path(path);
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|error| McpConfigError::Io(format!("{}: {error}", lock_path.display())))?;
+    lock.lock_exclusive()
+        .map_err(|error| McpConfigError::Io(format!("{}: {error}", lock_path.display())))?;
+    let result = (|| {
+        for _ in 0..MAX_CONFIG_WRITE_ATTEMPTS {
+            let text = read_text(path)?;
+            let mut doc = parse_text(&text)?;
+            let out = apply(&mut doc)?;
+            if read_text(path)? != text {
+                continue;
+            }
+            write_document(path, &doc)?;
+            return Ok(out);
+        }
+        Err(McpConfigError::ConcurrentModification)
+    })();
+    let _ = FileExt::unlock(&lock);
+    result
 }
 
 /// List configured MCP servers.
@@ -242,45 +313,44 @@ pub fn add_at(
     args: &[String],
     env: &[(String, String)],
 ) -> Result<PathBuf, McpConfigError> {
-    let mut doc = document_at(path)?;
-
-    // Ensure the array-of-tables exists.
-    if !doc.contains_key("mcp_servers") {
-        doc["mcp_servers"] = Item::ArrayOfTables(toml_edit::ArrayOfTables::new());
-    }
-    let servers = doc["mcp_servers"]
-        .as_array_of_tables_mut()
-        .ok_or_else(|| McpConfigError::Parse("`mcp_servers` is not an array of tables".into()))?;
-
-    if servers
-        .iter()
-        .any(|t| t.get("name").and_then(|v| v.as_str()) == Some(name))
-    {
-        return Err(McpConfigError::Exists(name.to_string()));
-    }
-
-    let mut table = Table::new();
-    table["name"] = value(name);
-    table["command"] = value(command);
-    let mut arg_arr = Array::new();
-    for a in args {
-        arg_arr.push(a.as_str());
-    }
-    table["args"] = value(arg_arr);
-    if !env.is_empty() {
-        let mut env_tab = InlineTable::new();
-        for (k, v) in env {
-            if !is_env_name_ref(k) {
-                return Err(McpConfigError::InvalidKey(k.clone()));
-            }
-            let source = normalize_env_ref(k, v)?;
-            env_tab.insert(k, Value::from(source.as_str()));
+    edit_document_at(path, |doc| {
+        // Ensure the array-of-tables exists.
+        if !doc.contains_key("mcp_servers") {
+            doc["mcp_servers"] = Item::ArrayOfTables(toml_edit::ArrayOfTables::new());
         }
-        table["env"] = value(env_tab);
-    }
-    servers.push(table);
+        let servers = doc["mcp_servers"].as_array_of_tables_mut().ok_or_else(|| {
+            McpConfigError::Parse("`mcp_servers` is not an array of tables".into())
+        })?;
 
-    write_document(path, &doc)?;
+        if servers
+            .iter()
+            .any(|t| t.get("name").and_then(|v| v.as_str()) == Some(name))
+        {
+            return Err(McpConfigError::Exists(name.to_string()));
+        }
+
+        let mut table = Table::new();
+        table["name"] = value(name);
+        table["command"] = value(command);
+        let mut arg_arr = Array::new();
+        for a in args {
+            arg_arr.push(a.as_str());
+        }
+        table["args"] = value(arg_arr);
+        if !env.is_empty() {
+            let mut env_tab = InlineTable::new();
+            for (k, v) in env {
+                if !is_env_name_ref(k) {
+                    return Err(McpConfigError::InvalidKey(k.clone()));
+                }
+                let source = normalize_env_ref(k, v)?;
+                env_tab.insert(k, Value::from(source.as_str()));
+            }
+            table["env"] = value(env_tab);
+        }
+        servers.push(table);
+        Ok(())
+    })?;
     Ok(path.to_path_buf())
 }
 
@@ -305,43 +375,44 @@ pub fn add_streamable_http_at(
     bearer_env: Option<&str>,
 ) -> Result<PathBuf, McpConfigError> {
     leveler_tools::mcp::validate_streamable_http_url(url).map_err(McpConfigError::InvalidUrl)?;
-    let mut doc = document_at(path)?;
-    if !doc.contains_key("mcp_servers") {
-        doc["mcp_servers"] = Item::ArrayOfTables(toml_edit::ArrayOfTables::new());
-    }
-    let servers = doc["mcp_servers"]
-        .as_array_of_tables_mut()
-        .ok_or_else(|| McpConfigError::Parse("`mcp_servers` is not an array of tables".into()))?;
-    if servers
-        .iter()
-        .any(|t| t.get("name").and_then(|v| v.as_str()) == Some(name))
-    {
-        return Err(McpConfigError::Exists(name.to_string()));
-    }
-    let mut table = Table::new();
-    table["name"] = value(name);
-    table["transport"] = value("streamable_http");
-    table["url"] = value(url);
-    if !headers.is_empty() {
-        let mut header_tab = InlineTable::new();
-        for (key, raw) in headers {
-            if key.eq_ignore_ascii_case("authorization") {
-                return Err(McpConfigError::AuthorizationHeader);
-            }
-            if !is_header_name(key) {
-                return Err(McpConfigError::InvalidKey(key.clone()));
-            }
-            let source = normalize_env_ref(key, raw)?;
-            header_tab.insert(key, Value::from(source.as_str()));
+    edit_document_at(path, |doc| {
+        if !doc.contains_key("mcp_servers") {
+            doc["mcp_servers"] = Item::ArrayOfTables(toml_edit::ArrayOfTables::new());
         }
-        table["headers"] = value(header_tab);
-    }
-    if let Some(raw) = bearer_env {
-        let source = normalize_env_ref("bearer_token_env", raw)?;
-        table["bearer_token_env"] = value(source.as_str());
-    }
-    servers.push(table);
-    write_document(path, &doc)?;
+        let servers = doc["mcp_servers"].as_array_of_tables_mut().ok_or_else(|| {
+            McpConfigError::Parse("`mcp_servers` is not an array of tables".into())
+        })?;
+        if servers
+            .iter()
+            .any(|t| t.get("name").and_then(|v| v.as_str()) == Some(name))
+        {
+            return Err(McpConfigError::Exists(name.to_string()));
+        }
+        let mut table = Table::new();
+        table["name"] = value(name);
+        table["transport"] = value("streamable_http");
+        table["url"] = value(url);
+        if !headers.is_empty() {
+            let mut header_tab = InlineTable::new();
+            for (key, raw) in headers {
+                if key.eq_ignore_ascii_case("authorization") {
+                    return Err(McpConfigError::AuthorizationHeader);
+                }
+                if !is_header_name(key) {
+                    return Err(McpConfigError::InvalidKey(key.clone()));
+                }
+                let source = normalize_env_ref(key, raw)?;
+                header_tab.insert(key, Value::from(source.as_str()));
+            }
+            table["headers"] = value(header_tab);
+        }
+        if let Some(raw) = bearer_env {
+            let source = normalize_env_ref("bearer_token_env", raw)?;
+            table["bearer_token_env"] = value(source.as_str());
+        }
+        servers.push(table);
+        Ok(())
+    })?;
     Ok(path.to_path_buf())
 }
 
@@ -359,29 +430,27 @@ pub fn remove(name: &str) -> Result<PathBuf, McpConfigError> {
 
 /// Remove a server from a specific config file.
 pub fn remove_at(path: &std::path::Path, name: &str) -> Result<PathBuf, McpConfigError> {
-    let mut doc = document_at(path)?;
-    let servers = doc
-        .get_mut("mcp_servers")
-        .and_then(Item::as_array_of_tables_mut)
-        .ok_or_else(|| McpConfigError::NotFound(name.to_string()))?;
+    edit_document_at(path, |doc| {
+        let servers = doc
+            .get_mut("mcp_servers")
+            .and_then(Item::as_array_of_tables_mut)
+            .ok_or_else(|| McpConfigError::NotFound(name.to_string()))?;
 
-    let before = servers.len();
-    servers.retain(|t| t.get("name").and_then(|v| v.as_str()) != Some(name));
-    if servers.len() == before {
-        return Err(McpConfigError::NotFound(name.to_string()));
-    }
-    write_document(path, &doc)?;
+        let before = servers.len();
+        servers.retain(|t| t.get("name").and_then(|v| v.as_str()) != Some(name));
+        if servers.len() == before {
+            return Err(McpConfigError::NotFound(name.to_string()));
+        }
+        Ok(())
+    })?;
     Ok(path.to_path_buf())
 }
 
 fn write_document(path: &std::path::Path, doc: &DocumentMut) -> Result<(), McpConfigError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| McpConfigError::Io(e.to_string()))?;
-    }
-    std::fs::write(path, doc.to_string()).map_err(|e| McpConfigError::Io(e.to_string()))?;
-    // MCP environment blocks can carry credentials; the resident config is
-    // owner-only like the rest of the private home.
-    leveler_core::private_fs::restrict_file(path).map_err(|e| McpConfigError::Io(e.to_string()))
+    // The shared atomic writer stages a uniquely named sibling and renames it;
+    // a reader (config watcher, doctor, another client) never sees a half file.
+    crate::global_config::write_global_config_atomic(path, &doc.to_string())
+        .map_err(|error| McpConfigError::Io(error.to_string()))
 }
 
 /// A server name a runtime and a client can both address unambiguously.
@@ -411,6 +480,12 @@ pub fn validate_name(name: &str) -> Result<(), String> {
         return Err("a server name may contain only letters, digits, `-`, `_` and `.`".into());
     }
     Ok(())
+}
+
+/// The runtime's one Streamable HTTP URL rule, exposed so a client boundary
+/// can refuse an invalid endpoint before forwarding it.
+pub fn validate_streamable_http_url(url: &str) -> Result<(), String> {
+    leveler_tools::mcp::validate_streamable_http_url(url)
 }
 
 /// Build one `[[mcp_servers]]` table from a protocol spec.
@@ -503,22 +578,23 @@ pub fn add_spec_at(
     path: &std::path::Path,
     spec: &McpServerSpec,
 ) -> Result<PathBuf, McpConfigError> {
-    let table = spec_table(spec)?;
-    let mut doc = document_at(path)?;
-    if !doc.contains_key("mcp_servers") {
-        doc["mcp_servers"] = Item::ArrayOfTables(toml_edit::ArrayOfTables::new());
-    }
-    let servers = doc["mcp_servers"]
-        .as_array_of_tables_mut()
-        .ok_or_else(|| McpConfigError::Parse("`mcp_servers` is not an array of tables".into()))?;
-    if servers
-        .iter()
-        .any(|t| t.get("name").and_then(|v| v.as_str()) == Some(spec.name.trim()))
-    {
-        return Err(McpConfigError::Exists(spec.name.clone()));
-    }
-    servers.push(table);
-    write_document(path, &doc)?;
+    edit_document_at(path, |doc| {
+        let table = spec_table(spec)?;
+        if !doc.contains_key("mcp_servers") {
+            doc["mcp_servers"] = Item::ArrayOfTables(toml_edit::ArrayOfTables::new());
+        }
+        let servers = doc["mcp_servers"].as_array_of_tables_mut().ok_or_else(|| {
+            McpConfigError::Parse("`mcp_servers` is not an array of tables".into())
+        })?;
+        if servers
+            .iter()
+            .any(|t| t.get("name").and_then(|v| v.as_str()) == Some(spec.name.trim()))
+        {
+            return Err(McpConfigError::Exists(spec.name.clone()));
+        }
+        servers.push(table);
+        Ok(())
+    })?;
     Ok(path.to_path_buf())
 }
 
@@ -528,27 +604,28 @@ pub fn update_spec_at(
     original_name: &str,
     spec: &McpServerSpec,
 ) -> Result<PathBuf, McpConfigError> {
-    let table = spec_table(spec)?;
-    let mut doc = document_at(path)?;
-    let servers = doc
-        .get_mut("mcp_servers")
-        .and_then(Item::as_array_of_tables_mut)
-        .ok_or_else(|| McpConfigError::NotFound(original_name.to_string()))?;
-    let index = servers
-        .iter()
-        .position(|t| t.get("name").and_then(|v| v.as_str()) == Some(original_name))
-        .ok_or_else(|| McpConfigError::NotFound(original_name.to_string()))?;
-    if spec.name.trim() != original_name
-        && servers
+    edit_document_at(path, |doc| {
+        let table = spec_table(spec)?;
+        let servers = doc
+            .get_mut("mcp_servers")
+            .and_then(Item::as_array_of_tables_mut)
+            .ok_or_else(|| McpConfigError::NotFound(original_name.to_string()))?;
+        let index = servers
             .iter()
-            .any(|t| t.get("name").and_then(|v| v.as_str()) == Some(spec.name.trim()))
-    {
-        return Err(McpConfigError::Exists(spec.name.clone()));
-    }
-    if let Some(slot) = servers.get_mut(index) {
-        *slot = table;
-    }
-    write_document(path, &doc)?;
+            .position(|t| t.get("name").and_then(|v| v.as_str()) == Some(original_name))
+            .ok_or_else(|| McpConfigError::NotFound(original_name.to_string()))?;
+        if spec.name.trim() != original_name
+            && servers
+                .iter()
+                .any(|t| t.get("name").and_then(|v| v.as_str()) == Some(spec.name.trim()))
+        {
+            return Err(McpConfigError::Exists(spec.name.clone()));
+        }
+        if let Some(slot) = servers.get_mut(index) {
+            *slot = table;
+        }
+        Ok(())
+    })?;
     Ok(path.to_path_buf())
 }
 
@@ -561,21 +638,22 @@ pub fn set_enabled_at(
     name: &str,
     enabled: bool,
 ) -> Result<PathBuf, McpConfigError> {
-    let mut doc = document_at(path)?;
-    let servers = doc
-        .get_mut("mcp_servers")
-        .and_then(Item::as_array_of_tables_mut)
-        .ok_or_else(|| McpConfigError::NotFound(name.to_string()))?;
-    let table = servers
-        .iter_mut()
-        .find(|t| t.get("name").and_then(|v| v.as_str()) == Some(name))
-        .ok_or_else(|| McpConfigError::NotFound(name.to_string()))?;
-    if enabled {
-        table.remove("enabled");
-    } else {
-        table.insert("enabled", value(false));
-    }
-    write_document(path, &doc)?;
+    edit_document_at(path, |doc| {
+        let servers = doc
+            .get_mut("mcp_servers")
+            .and_then(Item::as_array_of_tables_mut)
+            .ok_or_else(|| McpConfigError::NotFound(name.to_string()))?;
+        let table = servers
+            .iter_mut()
+            .find(|t| t.get("name").and_then(|v| v.as_str()) == Some(name))
+            .ok_or_else(|| McpConfigError::NotFound(name.to_string()))?;
+        if enabled {
+            table.remove("enabled");
+        } else {
+            table.insert("enabled", value(false));
+        }
+        Ok(())
+    })?;
     Ok(path.to_path_buf())
 }
 
@@ -1136,6 +1214,67 @@ env = {{ GITHUB_TOKEN = "{secret}" }}
             add_spec_at(&cfg, &spec),
             Err(McpConfigError::AuthorizationHeader)
         ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn concurrent_mcp_edits_do_not_lose_a_server() {
+        let (dir, cfg) = spec_dir("concurrent");
+        std::thread::scope(|scope| {
+            for index in 0..8 {
+                let cfg = cfg.clone();
+                scope.spawn(move || {
+                    add_spec_at(&cfg, &stdio_spec(&format!("server-{index}"))).unwrap();
+                });
+            }
+        });
+        let listed = list_at(&cfg).unwrap();
+        assert_eq!(
+            listed.len(),
+            8,
+            "every concurrent edit survived: {listed:?}"
+        );
+        let names: std::collections::BTreeSet<_> =
+            listed.into_iter().map(|entry| entry.name).collect();
+        for index in 0..8 {
+            assert!(names.contains(&format!("server-{index}")));
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_mcp_writer_waits_for_the_configuration_lock() {
+        let (dir, cfg) = spec_dir("lock");
+        let path = lock_path(&cfg);
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+        FileExt::lock_exclusive(&lock).unwrap();
+        let (done, finished) = std::sync::mpsc::channel();
+        let writer_path = cfg.clone();
+        let writer = std::thread::spawn(move || {
+            let result = add_spec_at(&writer_path, &stdio_spec("waited"));
+            done.send(result.is_ok()).unwrap();
+        });
+        assert!(
+            finished
+                .recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "the writer must not edit the file while another process holds the lock"
+        );
+        FileExt::unlock(&lock).unwrap();
+        assert!(
+            finished
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap(),
+            "the writer proceeds after the lock is released"
+        );
+        writer.join().unwrap();
+        assert_eq!(list_at(&cfg).unwrap().len(), 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

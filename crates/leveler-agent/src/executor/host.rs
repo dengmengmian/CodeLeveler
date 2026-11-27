@@ -3959,6 +3959,33 @@ mod authorize_tests {
         }
     }
 
+    /// Plan is a read-only turn: an MCP call is network-risk, so it cannot ride
+    /// the ordinary Auto admission. It asks for this exact call, and a denied
+    /// approval never reaches the execution boundary.
+    #[tokio::test]
+    async fn a_read_only_plan_turn_requires_approval_for_mcp_and_a_denial_stops_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::Deny));
+        let mut exec = effect_auto_with_mcp(dir.path(), approver.clone());
+        exec.tool_context = exec.tool_context.clone().with_read_only(true);
+        let ordinary = call("mcp__lab__read", serde_json::json!({}));
+        assert!(
+            matches!(resolve(&exec, &ordinary).await, PolicyResolution::Ask(_)),
+            "a read-only plan turn must ask before an MCP call"
+        );
+        let denied = exec
+            .admit(
+                ordinary,
+                exec.tool_context.clone(),
+                false,
+                &mut HashSet::new(),
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(denied.is_err(), "a denied MCP call is not admitted");
+        assert_eq!(approver.asks(), 1);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn auto_approved_exact_call_executes_outside_workspace_without_second_refusal() {

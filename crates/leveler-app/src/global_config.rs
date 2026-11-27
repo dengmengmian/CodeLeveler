@@ -57,6 +57,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -69,6 +70,9 @@ use leveler_model::{
 use leveler_provider::{ModelConfigFile, ProviderConfig};
 use leveler_tools::mcp::McpServerConfig;
 use leveler_tools::search::SearchProviderKind;
+
+/// Distinguishes the staging files of concurrent writers in this process.
+static CONFIG_STAGE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// A parser message without the source line. TOML errors otherwise quote the
 /// offending line, which can contain a credential in a config the user is
@@ -1148,8 +1152,11 @@ pub(crate) fn write_global_config_atomic(
             .map_err(|e| GlobalConfigError::Write(format!("{}: {e}", parent.display())))?;
     }
     // Write a sibling file and rename it over the target: the watcher (and any
-    // other reader) must never observe a half-written configuration.
-    let staged = path.with_extension("toml.tmp");
+    // other reader) must never observe a half-written configuration. The
+    // staging name is unique per writer so two processes replacing the file at
+    // the same time cannot overwrite each other's half-written staging file.
+    let sequence = CONFIG_STAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let staged = path.with_extension(format!("toml.{}.{sequence}.tmp", std::process::id()));
     std::fs::write(&staged, text)
         .map_err(|e| GlobalConfigError::Write(format!("{}: {e}", staged.display())))?;
     // Set the owner-only mode on the staged file so the rename publishes both
