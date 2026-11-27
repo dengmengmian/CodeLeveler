@@ -322,7 +322,10 @@ fn valid_desktop_review_scope(scope: &leveler_client_protocol::UiReviewScope) ->
 /// option or free prose.
 fn valid_desktop_rev(rev: &str) -> bool {
     let rev = rev.trim();
-    !rev.is_empty() && rev.len() <= 200 && !rev.starts_with('-') && !rev.chars().any(char::is_control)
+    !rev.is_empty()
+        && rev.len() <= 200
+        && !rev.starts_with('-')
+        && !rev.chars().any(char::is_control)
 }
 
 const MAX_DESKTOP_MCP_COMMAND: usize = 4096;
@@ -1571,11 +1574,19 @@ compatibility: { synthesize_tool_call_ids: true, drop_unsupported_fields: true }
             );
         }
         assert!(
-            validate_command(&session, &review(&"a".repeat(8 * 1024 + 1), UiReviewScope::Workspace))
-                .is_err()
+            validate_command(
+                &session,
+                &review(&"a".repeat(8 * 1024 + 1), UiReviewScope::Workspace)
+            )
+            .is_err()
         );
         // A review id is the runtime's identity, not client-chosen prose.
-        for id in ["", "review-", "attack", &format!("review-{}", "x".repeat(200))] {
+        for id in [
+            "",
+            "review-",
+            "attack",
+            &format!("review-{}", "x".repeat(200)),
+        ] {
             assert!(
                 validate_command(
                     &session,
