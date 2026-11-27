@@ -2868,3 +2868,37 @@ body.blank-session .view-tabs, body.home .view-tabs { display: none; }
   resize: vertical; font-family: var(--font-code); font-size: 12px;
 }
 .schedule-chip.tone-muted { background: var(--bg-module); color: var(--text-tertiary); }
+
+/* ----------------------------------------------------------- Skill settings */
+
+.skill-page-head { margin-top: 4px; }
+.skill-section { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+.skill-section-head { display: flex; align-items: center; gap: 8px; }
+.skill-section-label { font-size: 12px; line-height: 18px; font-weight: 600; color: var(--text-secondary); }
+.skill-card-head { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.skill-name { font-size: 14px; line-height: 22px; font-weight: 500; font-family: var(--font-code); overflow-wrap: anywhere; }
+.skill-state { width: 8px; height: 8px; border-radius: 50%; background: var(--text-caption); flex: none; }
+.skill-state.ok { background: var(--success, #1a7f37); }
+.skill-state.danger { background: var(--error); }
+.skill-state.warn { background: var(--warning, #9a6700); }
+.skill-state.muted { background: var(--text-caption); }
+.skill-state-label { font-size: 12px; line-height: 18px; color: var(--text-secondary); }
+.skill-state-label.ok { color: var(--success, #1a7f37); }
+.skill-state-label.danger { color: var(--error); }
+.skill-state-label.warn { color: var(--warning, #9a6700); }
+.skill-description { color: var(--text-secondary); font-size: 12px; line-height: 18px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.skill-status-detail { color: var(--text-tertiary); font-size: 12px; line-height: 18px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.skill-location { color: var(--text-caption); font-size: 11px; line-height: 16px; font-family: var(--font-code); overflow-wrap: anywhere; }
+.skill-flag { font-size: 11px; }
+.skill-detail {
+  display: flex; flex-direction: column; gap: 10px; padding-top: 10px;
+  margin-top: 2px; border-top: .5px solid var(--border-l2);
+}
+.skill-body {
+  max-height: 360px; overflow: auto; margin: 0; padding: 10px 12px;
+  border-radius: 8px; background: var(--bg-module); color: var(--text-secondary);
+  font-family: var(--font-code); font-size: 11px; line-height: 16px;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.skill-problem .skill-name { font-size: 12px; color: var(--text-secondary); }
+.settings-subhead { margin: 10px 0 0; font-size: 12px; line-height: 18px; font-weight: 600; color: var(--text-secondary); }

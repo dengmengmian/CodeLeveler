@@ -1,4 +1,5 @@
 import {SNAPSHOT_VERSIONED_COMMANDS} from './command-policy.gen.mjs';
+import {skillDeliveryNotice} from './skills-settings.mjs';
 // Presentation only: snapshots and events come from the Rust client protocol.
 //
 // Execution semantics live in `presentation.mjs` (Contract v1); this module
@@ -243,6 +244,18 @@ export function applyEvent(state,event) {
     // reopened session must still say where the context was re-based. The row
     // is runtime-authored, never something the person typed.
     next.messages=next.messages.some(m=>m.id===`compact-${event.from}-${event.to}`)?next.messages:[...next.messages,{id:`compact-${event.from}-${event.to}`,role:'user',kind:'runtime_notice',text:`上下文已压缩 ${event.from} → ${event.to} 条`,seq:event.seq??next.nextSeq++}];
+  }
+  if(event.type==='skill_delivery'){
+    // The runtime emits this only when a turn's Skill selection needs saying:
+    // an explicit `/name` loaded, a selection was refused, or delivery was
+    // blocked. The row is a runtime fact, not the model's text, and the
+    // engine's own event is what a reopened session replays.
+    const text=skillDeliveryNotice(event.delivery);
+    if(text){
+      const seq=event.seq??next.nextSeq++;
+      const id=`skill-delivery-${seq}`;
+      if(!next.messages.some(m=>m.id===id)) next.messages=[...next.messages,{id,role:'user',kind:'runtime_notice',text,seq}];
+    }
   }
   if(event.type==='diff_updated'){next.diff=event.diff;next.diffError=null;if(event.query_id)next.diffQuery={id:event.query_id,status:'confirmed',error:null};}
   if(event.type==='diff_failed'){next.diff=null;next.diffError=event.message;if(event.query_id)next.diffQuery={id:event.query_id,status:'failed',error:event.message};}

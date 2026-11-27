@@ -45,6 +45,11 @@ import {
   specFromForm, formFromSpec, mcpIntentLabel, mcpAnswer, mcpRows, mcpResponseError,
   mcpListAnswerIsCurrent, mcpServerByName,
 } from './mcp-settings.mjs';
+import {
+  skillStatusView, skillStatusDetail, skillScopeLabel, skillSourceLabel,
+  skillSlashName, skillSlashState, skillCommandEntries, skillDeliveryNotice,
+  skillListAnswer, skillDetailAnswer, skillSections, skillBundledFiles, skillFlags,
+} from './skills-settings.mjs';
 
 const api = window.desktop;
 const $ = id => document.getElementById(id);
@@ -125,6 +130,11 @@ let providerBusy = null;
 let providerSetupSignature = '';
 let providerModelDiscovery = null;
 let agentsRead = null;
+// Skills projection: the runtime registry is the only row source. The same
+// answer feeds the settings page and the composer's slash catalog, so a Skill
+// offered in `/` and one listed in settings cannot disagree.
+let skillRead = null;
+let skillDetail = null;
 let scheduleBoard = emptyScheduleView();
 const schedulePending = new Map();
 let scheduleMutation = null;
@@ -387,7 +397,14 @@ function controls() {
   for (const button of document.querySelectorAll('#workspace-list .session-row, #workspace-list .group-new, .pane-tab, .add-tab')) {
     button.disabled = loading || !!uncertain || uploads;
   }
-  for (const button of document.querySelectorAll('.takeover button')) button.disabled = loading || !!uncertain;
+  // A definition-trust answer is the exception: an explicit `/skill` send is
+  // itself waiting on that answer, so the submit action's `loading` flag is
+  // true by construction. The card disables its own buttons when one is
+  // clicked; the global in-flight flag must not deadlock the waiter it awaits.
+  for (const button of document.querySelectorAll('.takeover button')) {
+    if (button.closest('.definition-trust-card')) continue;
+    button.disabled = loading || !!uncertain;
+  }
   $('conversation-status').textContent = loading ? '连接 Runtime…'
     : current ? (current.approvals.length || current.clarifications.length || (current.definitionTrust?.length ?? 0)
       ? '等待你处理' : current.activity || LABELS[current.status] || current.status) : '';
@@ -398,8 +415,18 @@ function applyConnection(frame) {
   connectionState = { ...frame };
   // An MCP request that was in flight when the stream dropped has an unknown
   // outcome. Release its latch and say so; reconnecting reads the authority.
-  if (frame.state !== 'connected') mcpTransportLost();
-  else if (settingsSection === 'mcp' && $('settings-dialog').open) refreshMcp();
+  if (frame.state !== 'connected') {
+    mcpTransportLost();
+    if (skillRead?.status === 'pending') {
+      skillRead = { ...skillRead, status: 'unknown', error: 'Runtime 连接中断；技能状态未确认。重新连接后会重新读取。' };
+      paintSkills();
+    }
+  } else {
+    if (settingsSection === 'mcp' && $('settings-dialog').open) refreshMcp();
+    // A reconnect invalidates every in-flight answer; re-read the registry
+    // rather than leaving a stale list or an unanswered query.
+    if (current) requestSkills({ force: true });
+  }
   // Old drafts are rescanned only once the host bridge answers; retry on a
   // later connection instead of leaving them permanently unpersisted.
   if (frame.state === 'connected' && legacyDrafts.size) void migrateLegacyDrafts();
@@ -3288,7 +3315,7 @@ function updateScrollBottom() {
 const TRAJECTORY_LIVE_ONLY = new Set([
   'token_usage', 'context_usage', 'context_loaded', 'agent_activity', 'command_progress',
   'notification', 'session_opened', 'session_updated', 'session_history_loaded',
-  'agents_loaded', 'agent_loaded', 'agent_mutated', 'global_tasks_loaded',
+  'agents_loaded', 'agent_loaded', 'agent_mutated', 'skills_loaded', 'skill_loaded', 'global_tasks_loaded',
   'observability_loaded', 'session_list', 'runtime_ready', 'model_retrying',
   'turn_finalizing', 'plan_updated', 'diff_updated', 'diff_failed', 'attachment_added',
   'attachment_processing_failed', 'prompt_suggestion', 'away_summary', 'project_rules_loaded',
@@ -4029,15 +4056,18 @@ function renderInteractions() {
     cards.push(card);
   }
   for (const request of current?.definitionTrust ?? []) {
+    const skillRequest = request.kind === 'skill';
     const card = el('div', 'interaction-card definition-trust-card');
     card.dataset.requestId = request.id;
-    card.append(el('h3', undefined, '需要信任一个定义'));
-    card.append(el('p', undefined, '运行时已暂停一个工具调用，直到你决定是否允许下面的定义内容进入执行上下文。'));
+    card.append(el('h3', undefined, skillRequest ? `需要信任技能 ${request.display}` : '需要信任一个定义'));
+    card.append(el('p', undefined, skillRequest
+      ? 'Runtime 已暂停当前任务，直到你决定是否允许这个技能的定义内容进入执行上下文。批准前它的正文不会发给模型。'
+      : '运行时已暂停一个工具调用，直到你决定是否允许下面的定义内容进入执行上下文。'));
     const meta = el('dl', 'definition-trust-meta');
     const stateLabels = { unapproved: '未批准', changed: '内容已变更', store_unavailable: '信任存储不可用', other: '其他状态' };
     for (const [label, value] of [
-      ['定义', request.display],
-      ['类型', request.kind],
+      [skillRequest ? '技能' : '定义', request.display],
+      ['类型', skillRequest ? `技能（${request.kind}）` : request.kind],
       ['范围', request.scope],
       ['来源', request.source],
       ['位置', request.location],
@@ -4072,13 +4102,22 @@ function renderInteractions() {
       const button = el('button', `button ${decision === 'deny' ? 'secondary' : 'primary'}`, label);
       button.type = 'button';
       button.title = title;
-      button.addEventListener('click', () => action(async () => {
+      button.addEventListener('click', () => {
         // The card is not removed optimistically: it disappears only when the
         // Runtime resolves the waiter and the next snapshot (or event) says so.
         for (const item of buttons) item.disabled = true;
-        await deliver({ type: 'definition_trust_decision', request_id: request.id, decision, session_id: current.session.id });
-        await refreshMetadata();
-      }));
+        action(async () => {
+          await deliver({ type: 'definition_trust_decision', request_id: request.id, decision, session_id: current.session.id });
+          await refreshMetadata();
+          // A persistent approval changes what the registry admits; the
+          // settings page must not keep showing the previous trust state.
+          requestSkills({ force: true });
+        }).finally(() => {
+          // A failed decision leaves the waiter live; let the person retry
+          // instead of stranding a disabled card.
+          for (const item of buttons) if (item.isConnected) item.disabled = false;
+        });
+      });
       buttons.push(button);
     }
     actions.append(...buttons);
@@ -4544,6 +4583,12 @@ function applyCollaboration(axis) {
 }
 
 
+function skillRowsForSession() {
+  const sessionId = current?.session.id;
+  if (!sessionId || skillRead?.owner !== sessionId || skillRead.status !== 'confirmed') return [];
+  return skillRead.data?.skills ?? [];
+}
+
 function commandCatalog() {
   const frozen = loading || !!uncertain || uploadPending();
   const session = !!current;
@@ -4559,11 +4604,23 @@ function commandCatalog() {
     ['commands', 'model', '模型', session, 'layers', null, null],
     ['commands', 'export', '下载日志', false, 'download', '未接入', 'Runtime 未提供 Session 打包导出接口'],
   ];
-  return entries.map(([group, id, label, available, icon, badge, reason]) => ({
+  const base = entries.map(([group, id, label, available, icon, badge, reason]) => ({
     group, id, label, icon, badge,
     enabled: available && !frozen,
     reason: frozen ? '请先处理当前未完成操作' : reason ?? '请先选择或新建会话',
   }));
+  // Skills come from the Runtime's own registry. A disabled Skill keeps its
+  // reason so a typed `/name` is refused with the fact that made it unusable,
+  // never with a generic "unknown command".
+  const owned = new Set(base.map(entry => entry.id));
+  const skills = skillCommandEntries(skillRowsForSession(), owned).map(skill => ({
+    ...skill,
+    // The composer is frozen while another send is unresolved, exactly like
+    // every product command; the Runtime still re-resolves on submit.
+    enabled: skill.enabled && !frozen,
+    reason: frozen ? '请先处理当前未完成操作' : skill.reason,
+  }));
+  return [...base, ...skills];
 }
 
 function openCommandMenu(candidates = commandCatalog()) {
@@ -4577,7 +4634,7 @@ function openCommandMenu(candidates = commandCatalog()) {
   for (const command of candidates) {
     if (command.group !== group) {
       group = command.group;
-      node.append(el('div', 'menu-heading', group === 'add' ? '添加' : '指令'));
+      node.append(el('div', 'menu-heading', group === 'add' ? '添加' : group === 'skills' ? '技能' : '指令'));
     }
     const button = el('button', 'menu-item');
     button.type = 'button';
@@ -4607,9 +4664,13 @@ function openCommandMenu(candidates = commandCatalog()) {
 
 function openSlashMenu() {
   const value = $('message').value;
-  const candidates = /^\/[a-z-]*$/.test(value.trim())
+  const candidates = /^\/[A-Za-z0-9._:-]*$/.test(value.trim())
     ? commandCandidates(value, commandCatalog())
     : [];
+  // Discovery is the runtime's, but opening the menu is the moment a newly
+  // added package should become reachable. Refresh in the background; the
+  // menu is rebuilt from the answer and no send waits for it.
+  requestSkills({ quiet: true });
   openCommandMenu(candidates);
 }
 
@@ -4630,6 +4691,14 @@ async function executeCommand(id) {
   const command = commandCatalog().find(item => item.id === id);
   if (!command?.enabled) { composerError(command?.reason ?? '命令当前不可用'); return; }
   closeComposerPopovers();
+  if (command.kind === 'skill') {
+    // A Skill takes optional arguments; insert the command and let the person
+    // finish the instruction instead of sending a bare `/name` immediately.
+    $('message').value = `/${id} `;
+    $('message').focus();
+    controls();
+    return;
+  }
   if (id === 'file') { composerError(''); controls(); uploadAttachment(); return; }
   if (id === 'reference') { openRightbarTab('files'); return; }
   if (id === 'secret') { openSecretPaste(); return; }
@@ -4679,6 +4748,8 @@ async function newSession() {
   stashDraft();
   selection = null;
   current = null;
+  skillRead = null;
+  skillDetail = null;
   history = [];
   uncertain = null;
   pendingSubmit = false;
@@ -4718,6 +4789,7 @@ async function createTask() {
   current = attachExtras(projectSnapshot(result.session), result.session);
   resetScheduleProjection();
   resetMcpForSessionChange();
+  resetSkillsForSessionChange();
   lastEventSeq = result.session.last_sequence ?? 0;
   activeView = 'chat';
   liveTrajectory = [];
@@ -4780,6 +4852,7 @@ async function openTask(task) {
   current = attachExtras(projectSnapshot(result.session), result.session);
   resetScheduleProjection();
   resetMcpForSessionChange();
+  resetSkillsForSessionChange();
   lastEventSeq = result.session.last_sequence ?? 0;
   activeView = 'chat';
   liveTrajectory = [];
@@ -8136,6 +8209,98 @@ function openAddModelDialog(provider) {
   });
 }
 
+/* --------------------------------------------------------------- skills */
+
+// The Skills projection is one runtime answer per selected session. Both the
+// settings page and the composer's slash catalog read it, so the two surfaces
+// cannot disagree about what exists or whether it is usable.
+
+function emptySkillRead(owner) {
+  return { owner, status: 'idle', data: null, error: null, id: null, at: 0 };
+}
+
+const SKILL_QUIET_REFRESH_MS = 5000;
+
+function requestSkills({ quiet = false, force = false } = {}) {
+  if (!current) return;
+  const owner = current.session.id;
+  if (skillRead?.owner !== owner) skillRead = emptySkillRead(owner);
+  if (!force && skillRead.status === 'pending' && skillRead.id) return;
+  // A failed read is not retried by every repaint; the page's 刷新 button and
+  // the next explicit action ask again.
+  if (!force && skillRead.status === 'unknown') return;
+  if (quiet && !force && skillRead.status === 'confirmed' && Date.now() - skillRead.at < SKILL_QUIET_REFRESH_MS) return;
+  const id = crypto.randomUUID();
+  skillRead = { ...skillRead, status: 'pending', id, error: null };
+  if ($('settings-dialog').open && settingsSection === 'presets') paintSkills();
+  api.deliver(commandEnvelope(owner, { type: 'list_skills', session_id: owner, query_id: id }, current.session.last_sequence ?? 0))
+    .then(result => {
+      if (!result?.ok) throw new Error(result?.error?.message ?? 'Runtime 拒绝了技能查询');
+    })
+    .catch(error => {
+      if (skillRead?.owner !== owner || skillRead?.id !== id) return;
+      skillRead = { ...skillRead, status: 'unknown', error: error.message };
+      paintSkills();
+    });
+}
+
+function selectSkill(name) {
+  const owner = current?.session.id;
+  if (!owner) return;
+  const id = crypto.randomUUID();
+  skillDetail = { owner, name, id, status: 'pending', data: null, error: null };
+  paintSkills();
+  api.deliver(commandEnvelope(owner, { type: 'get_skill', session_id: owner, name, query_id: id }, current.session.last_sequence ?? 0))
+    .then(result => {
+      if (!result?.ok) throw new Error(result?.error?.message ?? 'Runtime 拒绝了技能详情查询');
+    })
+    .catch(error => {
+      if (skillDetail?.owner !== owner || skillDetail?.id !== id) return;
+      skillDetail = { ...skillDetail, status: 'failed', error: error.message };
+      paintSkills();
+    });
+}
+
+function consumeSkillEvent(frame) {
+  const owner = current?.session.id;
+  if (!owner) return false;
+  const list = skillListAnswer(frame, owner);
+  if (list && skillRead?.owner === owner && skillRead.id === list.queryId) {
+    skillRead = { ...skillRead, status: 'confirmed', data: list, error: null, at: Date.now() };
+    paintSkills();
+    // The menu may be open while discovery finishes; rebuild its candidates
+    // from the same answer instead of leaving a stale empty list.
+    if ($('command-popover') && $('message').value.trim().startsWith('/')) {
+      openCommandMenu(commandCandidates($('message').value, commandCatalog()));
+    }
+    return true;
+  }
+  const detail = skillDetailAnswer(frame, owner);
+  if (detail && skillDetail?.owner === owner && skillDetail.id === detail.queryId) {
+    skillDetail = {
+      ...skillDetail,
+      status: detail.error ? 'failed' : 'confirmed',
+      data: detail.skill,
+      error: detail.error,
+    };
+    paintSkills();
+    return true;
+  }
+  return false;
+}
+
+function paintSkills() {
+  if ($('settings-dialog').open && settingsSection === 'presets') renderSettings();
+}
+
+/** A session change invalidates every projected row: a Skill is resolved for
+ *  one workspace and one trust store view, never carried across. */
+function resetSkillsForSessionChange() {
+  skillRead = null;
+  skillDetail = null;
+  if (current) requestSkills({ quiet: true });
+}
+
 function renderPresetSettings(content) {
   content.append(el('h2', 'settings-title-large', 'Agent 与技能'));
   content.append(el('p', 'settings-note', '当前会话使用 Runtime 的默认模式；模式切换接口尚未接入桌面。每个 Agent 定义自带技能列表，可在“查看配置”中确认。'));
@@ -8144,7 +8309,11 @@ function renderPresetSettings(content) {
   head.append(el('span', 'preset-name', '默认模式'), el('span', 'preset-tag', '当前'));
   standard.append(head, el('div', 'preset-desc', '使用 Runtime 默认的工具与执行方式；模型会按任务需要选择检索、编辑和终端能力。'));
   content.append(standard);
-  if (!current) { content.append(el('div', 'settings-note', '打开会话后可读取 Runtime 的 Agent 定义。')); return; }
+  if (!current) {
+    content.append(el('div', 'settings-note', '打开会话后可读取 Runtime 的 Agent 定义。'));
+    renderSkillsSettings(content);
+    return;
+  }
   if (!agentsRead || agentsRead.owner !== current.session.id) {
     agentsRead = { owner: current.session.id, status: 'pending', data: null, error: null, id: crypto.randomUUID() };
     api.deliver(commandEnvelope(current.session.id, { type: 'list_agents', session_id: current.session.id, query_id: agentsRead.id }, current.session.last_sequence ?? 0))
@@ -8173,7 +8342,170 @@ function renderPresetSettings(content) {
     content.append(card);
   }
   for (const problem of agentsRead.data?.problems ?? []) content.append(el('div', 'settings-note', `${problem.source}: ${problem.error}`));
+  renderSkillsSettings(content);
 }
+
+/** The Skills half of "Agent 与技能". The Runtime registry is the only row
+ *  source; this section adds presentation, one refresh, and a read-only
+ *  inspector. It never approves a definition: authorization happens only when
+ *  an Agent's turn actually needs an untrusted package. */
+function renderSkillsSettings(content) {
+  content.append(el('h3', undefined, '技能'));
+  content.append(el(
+    'p',
+    'settings-note',
+    '技能来自 Runtime 的同一份注册表：项目、用户与内置来源按优先级解析，名称冲突会被遮蔽。未信任的技能会出现在这里，但只有 Agent 实际使用它时才会请求授权；未使用时不会打断你。',
+  ));
+  if (!current) {
+    content.append(el('div', 'settings-note', '打开会话后可读取 Runtime 的 Skills。'));
+    return;
+  }
+  requestSkills({ quiet: true });
+  if (skillRead?.owner !== current.session.id || skillRead.status === 'idle' || skillRead.status === 'pending') {
+    content.append(el('div', 'settings-note', '正在从 Runtime 读取技能…'));
+    return;
+  }
+  if (skillRead.status === 'unknown') {
+    content.append(el('div', 'settings-note', skillRead.error ?? '技能读取失败'));
+    const retry = el('button', 'button ghost small', '重试');
+    retry.type = 'button';
+    retry.addEventListener('click', () => requestSkills({ force: true }));
+    content.append(retry);
+    return;
+  }
+  const rows = skillRead.data?.skills ?? [];
+  const problems = skillRead.data?.problems ?? [];
+  const head = el('div', 'provider-page-head skill-page-head');
+  const counts = skillCounts(rows);
+  head.append(el('div', 'provider-config-meta', `可用 ${counts.available} · 未信任 ${counts.untrusted} · 已禁用 ${counts.disabled} · 无效 ${counts.invalid}`));
+  const refresh = el('button', 'button ghost small', '刷新');
+  refresh.type = 'button';
+  refresh.addEventListener('click', () => {
+    skillDetail = null;
+    requestSkills({ force: true });
+  });
+  head.append(refresh);
+  content.append(head);
+  if (!rows.length && !problems.length) {
+    const empty = el('div', 'settings-card');
+    empty.append(
+      el('h3', undefined, '还没有发现的技能'),
+      el('p', undefined, 'Runtime 没有在项目或用户技能目录中发现 Skill。技能文件由你自行管理；这里不会自动安装或下载。'),
+    );
+    content.append(empty);
+  }
+  for (const section of skillSections(rows)) {
+    const group = el('div', 'skill-section');
+    const label = el('div', 'skill-section-head');
+    label.append(el('span', `skill-state ${section.tone}`), el('span', 'skill-section-label', `${section.label}（${section.rows.length}）`));
+    group.append(label);
+    for (const skill of section.rows) group.append(skillCard(skill));
+    content.append(group);
+  }
+  if (problems.length) {
+    content.append(el('h4', 'settings-subhead', '无法读取的目录'));
+    for (const problem of problems) {
+      const card = el('div', 'settings-card skill-problem');
+      card.append(el('div', 'skill-name', problem.location));
+      card.append(el('div', 'settings-note', `${skillScopeLabel(problem.scope)} · ${skillSourceLabel(problem.source)}：${problem.error}`));
+      content.append(card);
+    }
+  }
+}
+
+function skillCounts(rows) {
+  return {
+    available: rows.filter(skill => skill.status === 'available').length,
+    untrusted: rows.filter(skill => skill.status === 'untrusted').length,
+    disabled: rows.filter(skill => skill.status === 'disabled').length,
+    invalid: rows.filter(skill => skill.status === 'invalid').length,
+  };
+}
+
+function skillCard(skill) {
+  const card = el('div', 'settings-card skill-card');
+  card.dataset.skill = skill.name;
+  const view = skillStatusView(skill);
+  const head = el('div', 'skill-card-head');
+  head.append(el('span', `skill-state ${view.tone}`), el('span', 'skill-name', skill.name));
+  head.append(el('span', 'provider-tag', skillSourceLabel(skill.source)));
+  head.append(el('span', 'provider-tag', skillScopeLabel(skill.scope)));
+  head.append(el('span', `skill-state-label ${view.tone}`, view.label));
+  card.append(head);
+  if (skill.description) card.append(el('div', 'skill-description', skill.description));
+  card.append(el('div', 'skill-status-detail', skillStatusDetail(skill)));
+  if (skill.location) card.append(el('div', 'skill-location', `位置：${skill.location}`));
+  for (const flag of skillFlags(skill)) card.append(el('span', 'provider-tag skill-flag', flag));
+  if (skill.shadowed?.length) {
+    const shadowed = el('div', 'settings-note');
+    shadowed.textContent = `遮蔽了：${skill.shadowed.map(item => `${skillScopeLabel(item.scope)} · ${skillSourceLabel(item.source)}${item.error ? `（${item.error}）` : ''}`).join('，')}`;
+    card.append(shadowed);
+  }
+  const actions = el('div', 'settings-actions provider-actions');
+  const sameDetail = skillDetail?.name === skill.name;
+  const inspect = el('button', 'button ghost small', sameDetail
+    ? (skillDetail.status === 'failed' ? '重试' : '收起详情')
+    : '查看详情');
+  inspect.type = 'button';
+  inspect.addEventListener('click', () => {
+    if (sameDetail && skillDetail.status !== 'failed') {
+      skillDetail = null;
+      paintSkills();
+      return;
+    }
+    selectSkill(skill.name);
+  });
+  actions.append(inspect);
+  card.append(actions);
+  if (skillDetail?.name === skill.name) card.append(skillDetailPanel());
+  return card;
+}
+
+function skillDetailPanel() {
+  const panel = el('div', 'skill-detail');
+  if (skillDetail.status === 'pending') {
+    panel.append(el('div', 'settings-note', '正在读取技能内容…'));
+    return panel;
+  }
+  if (skillDetail.status === 'failed') {
+    panel.append(el('div', 'schedule-banner error', skillDetail.error ?? '技能内容读取失败'));
+    return panel;
+  }
+  const detail = skillDetail.data;
+  if (!detail) {
+    panel.append(el('div', 'settings-note', 'Runtime 没有返回技能详情。'));
+    return panel;
+  }
+  const entry = detail.entry ?? {};
+  const view = skillStatusView(entry);
+  const facts = el('div', 'provider-facts');
+  const ownedSlashIds = new Set(commandCatalog().filter(command => command.kind !== 'skill').map(command => command.id));
+  for (const [label, value] of [
+    ['来源', skillSourceLabel(entry.source)],
+    ['范围', skillScopeLabel(entry.scope)],
+    ['位置', entry.location],
+    ['状态', view.label],
+    ['斜杠调用', `/${skillSlashName(entry, ownedSlashIds)}`],
+  ]) if (value) facts.append(el('span', 'provider-fact', `${label}：${value}`));
+  panel.append(facts);
+  if (entry.status === 'untrusted') {
+    panel.append(el('div', 'schedule-banner notice', '此技能尚未被信任：下面是当前定义的预览，仅供你审阅，不会进入模型上下文。授权只会在 Agent 实际使用它时请求。'));
+  }
+  if (detail.body) {
+    const body = el('pre', 'skill-body');
+    body.textContent = detail.body;
+    panel.append(body);
+  } else {
+    panel.append(el('div', 'settings-note', entry.reason ?? 'Runtime 没有提供技能正文。'));
+  }
+  if (detail.body_truncated) panel.append(el('div', 'settings-note', '预览已被截断；授权请求会展示其覆盖的完整定义内容。'));
+  for (const group of skillBundledFiles(detail)) {
+    const line = el('div', 'settings-note', `${group.label}：${group.rows.join('、')}`);
+    panel.append(line);
+  }
+  return panel;
+}
+
 
 function openPresetDialog(agent, mode) {
   const dialog = el('dialog', 'modal preset-dialog');
@@ -9829,6 +10161,7 @@ function consumeSettingsEvent(frame) {
 api.onEvent(frame => {
   if (consumeMcpEvent(frame)) return;
   if (consumeScheduleEvent(frame)) return;
+  if (consumeSkillEvent(frame)) return;
   consumeSettingsEvent(frame);
   if (frame.event === 'connection') { applyConnection(frame); return; }
   if (frame.event === 'restored') {
@@ -9841,7 +10174,8 @@ api.onEvent(frame => {
     history = [];
     current = attachExtras(projectSnapshot(session, history), session);
     resetScheduleProjection();
-  resetMcpForSessionChange();
+    resetMcpForSessionChange();
+    resetSkillsForSessionChange();
     lastEventSeq = session.last_sequence ?? 0;
     activeView = 'chat';
     liveTrajectory = [];
@@ -9956,6 +10290,7 @@ api.onEvent(frame => {
     current = attachExtras(projectSnapshot(event.session, history), event.session);
     current.contextUsage = priorContext;
     resetMcpForSessionChange();
+  resetSkillsForSessionChange();
     liveTrajectory = [];
     liveTurnStartAt = null;
     liveTurnClosed = false;
@@ -10074,6 +10409,18 @@ api.onEvent(frame => {
   if ((event.type === 'tool_call_started' || event.type === 'tool_call_completed') && event.duration_ms !== undefined) {
     const tool = current.tools.find(item => item.id === event.id);
     if (tool) tool.durationMs = event.duration_ms;
+  }
+  if (event.type === 'tool_call_completed') {
+    // These two tools change the Skill registry on disk. The next list answer
+    // is the authority; this only asks for it while the change is fresh.
+    const tool = current.tools.find(item => item.id === event.id);
+    if (tool && ['save_skill', 'delete_skill'].includes(tool.name)) requestSkills({ force: true });
+  }
+  if (event.type === 'definition_trust_resolved') {
+    // The resolved event arrives for every client; the decision may have
+    // written a persistent approval. Re-read the registry instead of guessing
+    // from the decision.
+    if (current) requestSkills({ force: true });
   }
   if (['diff_updated', 'diff_failed'].includes(event.type) && current.diffQuery
     && event.query_id === current.diffQuery.id
@@ -10302,7 +10649,7 @@ function boot() {
     drafts.set(draftKey(), value);
     saveDrafts();
     queueDraftScan(draftKey(), value);
-    if (/^\/[a-z-]*$/.test(value.trim())) openSlashMenu(); else $('command-popover')?.remove();
+    if (/^\/[A-Za-z0-9._:-]*$/.test(value.trim())) openSlashMenu(); else $('command-popover')?.remove();
   });
   $('message').addEventListener('keydown', event => {
     if (event.isComposing || event.keyCode === 229) return;
@@ -10349,6 +10696,32 @@ function boot() {
       && !document.querySelector('dialog[open], .menu')
       && !event.target.closest('button,a,input,textarea,select,[contenteditable="true"]')
       && !event.metaKey && !event.ctrlKey && !event.altKey && !event.isComposing;
+    // Dismissing a definition-trust prompt is a refusal, exactly as in the
+    // terminal overlay. It is never an approval, and it must not be confused
+    // with stopping a running turn: an explicit `/skill` submission has not
+    // started a turn yet.
+    const trustRequest = current?.definitionTrust?.[0];
+    const trustDismissKey = trustRequest && document.body.classList.contains('composer-takeover')
+      && !document.querySelector('dialog[open], .menu')
+      // A focused Send button is not a text field: dismissing the prompt must
+      // still work after the click that raised it.
+      && !event.target.closest('input,textarea,select,[contenteditable="true"]')
+      // A running turn keeps its established double-Escape stop. This path is
+      // for the pre-turn waiter an explicit `/skill` submission creates: no
+      // turn is running yet, so a single Escape must refuse the request
+      // instead of silently doing nothing.
+      && !['running', 'waiting_user'].includes(current?.status)
+      && !event.metaKey && !event.ctrlKey && !event.altKey && !event.isComposing;
+    if (trustDismissKey && event.key === 'Escape') {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      action(async () => {
+        await deliver({ type: 'definition_trust_decision', request_id: trustRequest.id, decision: 'deny', session_id: current.session.id });
+        await refreshMetadata();
+        requestSkills({ force: true });
+      });
+      return;
+    }
     if (approvalKey && event.key === 'Enter') {
       event.preventDefault(); event.stopImmediatePropagation();
       action(async () => {

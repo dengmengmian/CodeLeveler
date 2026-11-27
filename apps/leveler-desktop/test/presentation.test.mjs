@@ -207,6 +207,25 @@ test('/goal with an objective is runtime-owned: it is sent as text, never answer
  assert.equal(slashIntent('/goal status',commands).kind,'message');
 });
 
+test('a resolved Skill is sent as a message, takes arguments, and a refused one keeps its reason',async()=>{
+ const {slashIntent,commandCandidates}=await import('../src/presentation.mjs');
+ const commands=[
+   {id:'deploy',label:'deploy',enabled:true,kind:'skill'},
+   {id:'off',label:'off',enabled:false,kind:'skill',reason:'技能已禁用'},
+   {id:'pdf2',label:'pdf2',enabled:true,kind:'skill'},
+ ];
+ assert.equal(slashIntent('/deploy',commands).kind,'skill');
+ assert.equal(slashIntent('/deploy staging',commands).kind,'skill');
+ assert.equal(slashIntent('/off',commands).kind,'blocked');
+ assert.equal(slashIntent('/off',commands).reason,'技能已禁用');
+ assert.equal(slashIntent('/unknown',commands).kind,'blocked');
+ // Names outside the product-command alphabet never become a client action;
+ // the Runtime resolves a real Skill there and unchanged prose stays prose.
+ assert.equal(slashIntent('/pdf2 report.pdf',commands).kind,'message');
+ assert.equal(commandCandidates('/pdf2',commands).length,1);
+ assert.equal(commandCandidates('/project:help',[{id:'project:help',label:'help',enabled:true,kind:'skill'}]).length,1);
+});
+
 test('the public Settings shortcut opens once and respects composition and an existing modal without replacing its focus',async()=>{
  const {activateSettingsShortcut}=await import('../src/presentation.mjs');let opens=0;const open=()=>opens++;
  assert.equal(activateSettingsShortcut({composing:false,modalOpen:false,settingsOpen:false},open),true);

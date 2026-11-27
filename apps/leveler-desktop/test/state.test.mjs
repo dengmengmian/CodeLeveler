@@ -401,3 +401,28 @@ test('an omitted owed goal in a SessionUpdated clears the previous projection', 
   assert.equal(settled.session.execution_task, undefined);
   assert.equal(settled.session.collaboration, 'chat');
 });
+
+test('skill delivery is a runtime notice, deduplicated by sequence, and never a model answer', () => {
+  let state = projectSnapshot({ id: 's', messages: [], task_status: 'running', pending_interactions: [], active_tools: [] });
+  state = applyEvent(state, {
+    type: 'skill_delivery',
+    seq: 3,
+    delivery: { entries: [{ name: 'deploy', requested_as: '/deploy', bytes: 42 }] },
+  });
+  assert.equal(state.messages.at(-1).kind, 'runtime_notice');
+  assert.equal(state.messages.at(-1).text, '已加载技能 /deploy');
+  assert.equal(state.messages.at(-1).seq, 3);
+  const duplicate = applyEvent(state, {
+    type: 'skill_delivery',
+    seq: 3,
+    delivery: { entries: [{ name: 'deploy', requested_as: '/deploy', bytes: 42 }] },
+  });
+  assert.equal(duplicate.messages.filter(message => message.id === 'skill-delivery-3').length, 1);
+  const refused = applyEvent(state, {
+    type: 'skill_delivery',
+    seq: 4,
+    delivery: { entries: [{ name: 'off', requested_as: '/off', bytes: 0, failure: 'disabled' }] },
+  });
+  assert.equal(refused.messages.at(-1).text, '技能 /off 未加载：技能已禁用');
+  assert.equal(conversationItems(refused).some(item => item.role === 'assistant'), false);
+});
