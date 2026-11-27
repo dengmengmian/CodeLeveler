@@ -1,5 +1,5 @@
 const {SNAPSHOT_VERSIONED_COMMANDS}=require('./command-policy.gen.cjs');
-const allowed=new Set(['submit_message','submit_user_input','steer_current_turn','steer_user_input','cancel_current_turn','cancel_task','resume_task','approval_decision','answer_clarification','definition_trust_decision','capture_secret','revoke_secret','query_session_history','query_tool_output','request_diff','list_agents','get_agent','list_skills','get_skill','query_context','query_observability','select_model','set_permission_profile','set_product_axes','rename_session','archive_session','unarchive_session','fork_session','compact_context','cancel_background_task','manage_schedule','manage_mcp']);
+const allowed=new Set(['submit_message','submit_user_input','steer_current_turn','steer_user_input','cancel_current_turn','cancel_task','resume_task','approval_decision','answer_clarification','definition_trust_decision','capture_secret','revoke_secret','query_session_history','query_tool_output','request_diff','list_agents','get_agent','list_skills','get_skill','query_context','query_observability','select_model','set_permission_profile','set_product_axes','rename_session','archive_session','unarchive_session','fork_session','compact_context','cancel_background_task','manage_schedule','manage_mcp','run_review','cancel_review','query_review_report','list_reviews','query_review_scopes']);
 const decisions=new Set(['approve_once','approve_session','approve_always','deny']);
 const {validRef}=require('./attachment-ingress.cjs');
 function string(value,max=256){return typeof value==='string'&&value.length>0&&value.length<=max;}
@@ -88,6 +88,31 @@ function validMcpRequest(request){
   }
   return false;
 }
+const REVIEW_SCOPE_KINDS=new Set(['auto','current_task','workspace','project','session','commit','branch','paths']);
+// The runtime's durable review identity (`review-<uuid>`). The renderer only
+// echoes an id it received; the boundary refuses a name of its own choosing.
+function reviewId(value){return typeof value==='string'&&value.length>7&&value.length<=128&&value.startsWith('review-')&&/^[A-Za-z0-9._:-]+$/.test(value);}
+function reviewRev(value){return typeof value==='string'&&value.trim().length>0&&value.length<=200&&!value.startsWith('-')&&!/[\u0000-\u001f\u007f]/.test(value);}
+// The runtime bounds the focus in UTF-8 bytes; counting code units here would
+// admit a multi-byte focus the runtime then refuses.
+function utf8Bytes(value){let bytes=0;for(const char of String(value??'')){const code=char.codePointAt(0);bytes+=code<=0x7f?1:code<=0x7ff?2:code<=0xffff?3:4;}return bytes;}
+// The object a review may name. Shapes mirror the Rust `UiReviewScope` wire
+// form; a Desktop client can only review the selected session, so a named
+// session id is not representable. Paths stay workspace-relative.
+function reviewScope(value){
+  if(!value||typeof value!=='object'||Array.isArray(value)||!REVIEW_SCOPE_KINDS.has(value.kind))return false;
+  switch(value.kind){
+    case 'auto': case 'current_task': case 'workspace': case 'project': return exactKeys(value,['kind']);
+    case 'session': return exactKeys(value,['kind'])||(exactKeys(value,['kind','session_id'])&&value.session_id===null);
+    case 'commit': return exactKeys(value,['kind','rev'])&&reviewRev(value.rev);
+    case 'branch': return exactKeys(value,['kind','base'])&&reviewRev(value.base);
+    case 'paths': {
+      if(!exactKeys(value,['kind','paths'])||!Array.isArray(value.paths)||value.paths.length<1||value.paths.length>50)return false;
+      return value.paths.every(path=>typeof path==='string'&&path.length>0&&path.length<=500&&!path.startsWith('/')&&!path.startsWith('\\')&&!path.includes('\0')&&!path.split('/').includes('..'));
+    }
+  }
+  return false;
+}
 function validateEnvelope(envelope,authorizeAttachment){
   if(!envelope||!string(envelope.command_id)||!string(envelope.session_id)||typeof envelope.issued_at!=='string'||!Number.isFinite(Date.parse(envelope.issued_at)))throw new Error('Invalid command envelope');
   const command=envelope.command;
@@ -162,6 +187,25 @@ function validateEnvelope(envelope,authorizeAttachment){
     // session and a structured request; it never supplies a resolved secret or
     // a file path. A request for another session is not representable.
     if(!exactKeys(command,['type','requester_session_id','query_id','request'])||!nonblank(command.requester_session_id)||command.requester_session_id!==envelope.session_id||!string(command.query_id,256)||!validMcpRequest(command.request))throw new Error('Invalid MCP management request');
+  }
+  if(command.type==='run_review'){
+    // Review is an explicit, read-only investigation. The renderer names one
+    // object the selected session can already see plus the words the person
+    // typed; it never names another session, a path outside the workspace or
+    // a resolved credential. The Rust bridge and the runtime revalidate the
+    // same facts before anything starts.
+    const keys=['type','session_id','focus','scope',...(Object.hasOwn(command,'model')?['model']:[])];
+    if(!exactKeys(command,keys)||!nonblank(command.session_id)||command.session_id!==envelope.session_id||typeof command.focus!=='string'||utf8Bytes(command.focus)>8*1024||!reviewScope(command.scope))throw new Error('Invalid review request');
+    if(Object.hasOwn(command,'model')&&(!exactKeys(command.model,['provider','model'])||!nonblank(command.model.provider)||command.model.provider.length>256||!nonblank(command.model.model)||command.model.model.length>256))throw new Error('Invalid review model');
+  }
+  if(command.type==='cancel_review'){
+    if(!exactKeys(command,['type','session_id','review_id'])||!nonblank(command.session_id)||command.session_id!==envelope.session_id||!reviewId(command.review_id))throw new Error('Invalid review cancellation');
+  }
+  if(command.type==='query_review_report'){
+    if(!exactKeys(command,['type','session_id','review_id','query_id'])||!nonblank(command.session_id)||command.session_id!==envelope.session_id||!reviewId(command.review_id)||!string(command.query_id,256))throw new Error('Invalid review report query');
+  }
+  if(command.type==='list_reviews'||command.type==='query_review_scopes'){
+    if(!exactKeys(command,['type','session_id','query_id'])||!nonblank(command.session_id)||command.session_id!==envelope.session_id||!string(command.query_id,256))throw new Error('Invalid review history query');
   }
   if(command.type==='request_diff'&&(!exactKeys(command,Object.hasOwn(command,'query_id')?['type','session_id','query_id']:['type','session_id'])||!nonblank(command.session_id)||command.session_id!==envelope.session_id||(Object.hasOwn(command,'query_id')&&!nonblank(command.query_id))))throw new Error('Invalid diff query');
   if(command.type==='set_permission_profile'&&(!exactKeys(command,['type','session_id','mode'])||!nonblank(command.session_id)||command.session_id!==envelope.session_id||!['full_access','assisted','request_approval'].includes(command.mode)))throw new Error('Invalid permission selection');

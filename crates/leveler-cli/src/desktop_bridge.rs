@@ -183,6 +183,29 @@ fn validate_command(session: &SessionId, command: &ClientCommand) -> anyhow::Res
         } if !work_profile.is_empty()
             && work_profile.len() <= 64
             && matches!(collaboration.as_str(), "chat" | "plan" | "goal") => {}
+        // Review is the one manual, read-only investigation. The bridge admits
+        // the object the selected session can actually name; the runtime
+        // resolves files, diff and revision and revalidates the focus, the
+        // paths and the revision. A review of a DIFFERENT stored session is
+        // refused here: its workspace must be this runtime's workspace, and a
+        // Desktop client only ever presents the selected session.
+        ClientCommand::RunReview {
+            focus,
+            scope,
+            model,
+            ..
+        } if focus.len() <= MAX_DESKTOP_REVIEW_FOCUS_BYTES
+            && valid_desktop_review_scope(scope)
+            && model.as_ref().is_none_or(valid_desktop_model_ref) => {}
+        ClientCommand::CancelReview { review_id, .. } if valid_desktop_review_id(review_id) => {}
+        ClientCommand::QueryReviewReport {
+            review_id,
+            query_id,
+            ..
+        } if valid_desktop_review_id(review_id) && valid_desktop_query_id(query_id) => {}
+        ClientCommand::ListReviews { query_id, .. }
+        | ClientCommand::QueryReviewScopes { query_id, .. }
+            if valid_desktop_query_id(query_id) => {}
         ClientCommand::SteerCurrentTurn { .. }
         | ClientCommand::CancelCurrentTurn { .. }
         | ClientCommand::CancelTask { .. }
@@ -234,6 +257,72 @@ fn valid_desktop_tool_call_id(call_id: &str) -> bool {
 
 fn valid_desktop_command_id(id: &leveler_core::CommandId) -> bool {
     !id.as_str().trim().is_empty() && id.as_str().len() <= 256
+}
+
+/// The runtime's own focus bound (`FOCUS_MAX_BYTES`). The Desktop composer is
+/// the only producer; refusing an over-long focus here means the refusal names
+/// the field instead of failing after scope resolution has already run.
+const MAX_DESKTOP_REVIEW_FOCUS_BYTES: usize = 8 * 1024;
+
+/// A review id is the runtime's durable identity (`review-<uuid>`). Desktop
+/// only echoes ids it received; the boundary refuses a name of the client's
+/// own choosing without duplicating the runtime's exact generator.
+fn valid_desktop_review_id(id: &str) -> bool {
+    id.len() <= 128
+        && id.len() > "review-".len()
+        && id.starts_with("review-")
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
+}
+
+/// A model override names one configured model; the runtime resolves it and
+/// fails if it is unknown. The boundary only refuses an unaddressable shape.
+fn valid_desktop_model_ref(model: &leveler_model::ModelRef) -> bool {
+    !model.provider.trim().is_empty()
+        && model.provider.len() <= 256
+        && !model.model.trim().is_empty()
+        && model.model.len() <= 256
+}
+
+/// The review objects a Desktop client may request.
+///
+/// `Session { session_id: Some(..) }` is deliberately excluded: reviewing
+/// another stored session requires that session's workspace to be this
+/// runtime's workspace, and the Desktop only presents the selected session.
+/// Paths stay workspace-relative; the runtime canonicalizes and revalidates
+/// them, and `..` is refused here so a traversal is never even representable.
+fn valid_desktop_review_scope(scope: &leveler_client_protocol::UiReviewScope) -> bool {
+    use leveler_client_protocol::UiReviewScope;
+    match scope {
+        UiReviewScope::Auto
+        | UiReviewScope::CurrentTask
+        | UiReviewScope::Workspace
+        | UiReviewScope::Project => true,
+        UiReviewScope::Session { session_id } => session_id.is_none(),
+        UiReviewScope::Commit { rev } | UiReviewScope::Branch { base: rev } => {
+            valid_desktop_rev(rev)
+        }
+        UiReviewScope::Paths { paths } => {
+            !paths.is_empty()
+                && paths.len() <= 50
+                && paths.iter().all(|path| {
+                    !path.is_empty()
+                        && path.len() <= 500
+                        && !path.starts_with('/')
+                        && !path.starts_with('\\')
+                        && !path.contains('\0')
+                        && !path.split('/').any(|part| part == "..")
+                })
+        }
+    }
+}
+
+/// Mirrors the runtime's revision boundary: a rev is a Git name, never an
+/// option or free prose.
+fn valid_desktop_rev(rev: &str) -> bool {
+    let rev = rev.trim();
+    !rev.is_empty() && rev.len() <= 200 && !rev.starts_with('-') && !rev.chars().any(char::is_control)
 }
 
 const MAX_DESKTOP_MCP_COMMAND: usize = 4096;
@@ -1386,6 +1475,124 @@ compatibility: { synthesize_tool_call_ids: true, drop_unsupported_fields: true }
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn desktop_review_commands_admit_only_the_selected_sessions_own_objects() {
+        use leveler_client_protocol::UiReviewScope;
+        let session = SessionId::new("desktop-review");
+        let review = |focus: &str, scope: UiReviewScope| ClientCommand::RunReview {
+            session_id: session.clone(),
+            focus: focus.to_string(),
+            scope,
+            model: None,
+        };
+        let query = Some("query-1".into());
+        for scope in [
+            UiReviewScope::Auto,
+            UiReviewScope::CurrentTask,
+            UiReviewScope::Workspace,
+            UiReviewScope::Project,
+            UiReviewScope::Session { session_id: None },
+            UiReviewScope::Commit {
+                rev: "HEAD~1".into(),
+            },
+            UiReviewScope::Branch {
+                base: "origin/main".into(),
+            },
+            UiReviewScope::Paths {
+                paths: vec!["src/lib.rs".into()],
+            },
+        ] {
+            assert!(
+                validate_command(&session, &review("检查这份改动", scope.clone())).is_ok(),
+                "{scope:?}"
+            );
+        }
+        for command in [
+            ClientCommand::ListReviews {
+                session_id: session.clone(),
+                query_id: query.clone(),
+            },
+            ClientCommand::QueryReviewScopes {
+                session_id: session.clone(),
+                query_id: query.clone(),
+            },
+            ClientCommand::QueryReviewReport {
+                session_id: session.clone(),
+                review_id: "review-01234567-89ab-cdef-0123-456789abcdef".into(),
+                query_id: query.clone(),
+            },
+            ClientCommand::CancelReview {
+                session_id: session.clone(),
+                review_id: "review-01234567-89ab-cdef-0123-456789abcdef".into(),
+            },
+        ] {
+            assert!(validate_command(&session, &command).is_ok(), "{command:?}");
+        }
+
+        // Another stored session is not an object this client can name.
+        assert!(
+            validate_command(
+                &session,
+                &review(
+                    "检查",
+                    UiReviewScope::Session {
+                        session_id: Some(SessionId::new("other-session")),
+                    }
+                )
+            )
+            .is_err()
+        );
+        // A path that escapes the workspace, an option-shaped rev, an
+        // unbounded path list and an over-long focus are refused before the
+        // runtime resolves anything.
+        for bad in [
+            UiReviewScope::Paths {
+                paths: vec!["../etc/passwd".into()],
+            },
+            UiReviewScope::Paths {
+                paths: vec!["/etc/passwd".into()],
+            },
+            UiReviewScope::Paths { paths: Vec::new() },
+            UiReviewScope::Paths {
+                paths: vec!["a".into(); 51],
+            },
+            UiReviewScope::Commit {
+                rev: "--upload-pack=x".into(),
+            },
+            UiReviewScope::Branch {
+                base: String::new(),
+            },
+        ] {
+            assert!(
+                validate_command(&session, &review("检查", bad.clone())).is_err(),
+                "{bad:?}"
+            );
+        }
+        assert!(
+            validate_command(&session, &review(&"a".repeat(8 * 1024 + 1), UiReviewScope::Workspace))
+                .is_err()
+        );
+        // A review id is the runtime's identity, not client-chosen prose.
+        for id in ["", "review-", "attack", &format!("review-{}", "x".repeat(200))] {
+            assert!(
+                validate_command(
+                    &session,
+                    &ClientCommand::CancelReview {
+                        session_id: session.clone(),
+                        review_id: id.to_string(),
+                    }
+                )
+                .is_err(),
+                "{id}"
+            );
+        }
+        let mut other = review("检查", UiReviewScope::Workspace);
+        if let ClientCommand::RunReview { session_id, .. } = &mut other {
+            *session_id = SessionId::new("another");
+        }
+        assert!(validate_command(&session, &other).is_err());
     }
 
     #[test]

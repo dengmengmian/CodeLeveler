@@ -218,3 +218,45 @@ test('Skill reads are session-bound, exact and bounded',()=>{
  for(const name of ['deploy','pdf2','my_skill','a.b-c_1'])assert.doesNotThrow(()=>security.validateEnvelope(envelope(get({name}))));
  for(const over of [{name:''},{name:null},{name:'.hidden'},{name:'../escape'},{name:'a/b'},{name:'a b'},{name:'a'.repeat(65)},{session_id:'s2'},{query_id:''},{extra:1}])assert.throws(()=>security.validateEnvelope(envelope(get(over))),undefined,JSON.stringify(over));
 });
+
+test('Review requests name one selected-session object and nothing else',()=>{
+ const run=over=>({type:'run_review',session_id:'s1',focus:'检查并发',scope:{kind:'workspace'},...over});
+ for(const scope of [
+   {kind:'auto'},{kind:'current_task'},{kind:'workspace'},{kind:'project'},{kind:'session'},
+   {kind:'commit',rev:'HEAD~1'},{kind:'branch',base:'origin/main'},{kind:'paths',paths:['src/lib.rs']},
+ ])assert.doesNotThrow(()=>security.validateEnvelope(envelope(run({scope}))),undefined,JSON.stringify(scope));
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope(run({model:{provider:'p',model:'m'}}))));
+ // Another stored session is not an object this client can name.
+ assert.throws(()=>security.validateEnvelope(envelope(run({scope:{kind:'session',session_id:'s2'}}))));
+ for(const over of [
+   {session_id:'s2'},{focus:null},{focus:'中'.repeat(3000)},
+   {scope:{kind:'nope'}},{scope:null},{scope:{kind:'workspace',extra:1}},
+   {scope:{kind:'commit',rev:'--upload-pack=x'}},{scope:{kind:'commit',rev:''}},
+   {scope:{kind:'branch',base:'-x'}},
+   {scope:{kind:'paths',paths:[]}},{scope:{kind:'paths',paths:['../etc/passwd']}},
+   {scope:{kind:'paths',paths:['/etc/passwd']}},{scope:{kind:'paths',paths:['a','b','c','d','e','f','g','h','i','j','k','l','m','n','o','p','q','r','s','t','u','v','w','x','y','z','1','2','3','4','5','6','7','8','9','10','11','12','13','14','15','16','17','18','19','20','21','22','23','24','25']}},
+   {model:{provider:'',model:'m'}},{model:{provider:'p',model:'',}},{model:{provider:'p',model:'m',extra:1}},
+   {unexpected:true},
+ ])assert.throws(()=>security.validateEnvelope(envelope(run(over))),undefined,JSON.stringify(over));
+});
+
+test('Review queries and cancellation are session-bound and id-shaped',()=>{
+ const review='review-01234567-89ab-cdef-0123-456789abcdef';
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'cancel_review',session_id:'s1',review_id:review})));
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'query_review_report',session_id:'s1',review_id:review,query_id:'q1'})));
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'list_reviews',session_id:'s1',query_id:'q1'})));
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'query_review_scopes',session_id:'s1',query_id:'q1'})));
+ for(const bad of [
+   {type:'cancel_review',session_id:'s2',review_id:review},
+   {type:'cancel_review',session_id:'s1',review_id:'attack'},
+   {type:'cancel_review',session_id:'s1',review_id:''},
+   {type:'cancel_review',session_id:'s1',review_id:`review-${'x'.repeat(200)}`},
+   {type:'query_review_report',session_id:'s1',review_id:review,query_id:''},
+   {type:'query_review_report',session_id:'s1',review_id:'review-',query_id:'q1'},
+   {type:'query_review_report',session_id:'s2',review_id:review,query_id:'q1'},
+   {type:'list_reviews',session_id:'s1'},
+   {type:'list_reviews',session_id:'s2',query_id:'q1'},
+   {type:'list_reviews',session_id:'s1',query_id:'q1',review_id:review},
+   {type:'query_review_scopes',session_id:'s1',query_id:'q1',scope:{kind:'workspace'}},
+ ])assert.throws(()=>security.validateEnvelope(envelope(bad)),undefined,JSON.stringify(bad));
+});
