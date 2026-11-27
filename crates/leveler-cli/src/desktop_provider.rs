@@ -11,7 +11,6 @@
 //! with the runtime's own assembly before it lands, and an attached runtime is
 //! asked to reload so the next turn cannot start on the previous generation.
 
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -132,7 +131,7 @@ pub(crate) async fn save(
         Some("edit") => provider_config::UpsertMode::Edit,
         _ => anyhow::bail!("mode must be `add` or `edit`"),
     };
-    let mut draft = parse_draft(
+    let draft = parse_draft(
         params
             .get("provider")
             .ok_or_else(|| anyhow::anyhow!("provider must describe the provider to save"))?,
@@ -160,26 +159,35 @@ pub(crate) async fn save(
             }
         }
     }
-    let path = provider_config::global_config_path(&layout);
-    let existing = read_config_text(&path)?;
-    if draft.base_url.trim().is_empty() {
-        // The form omits a base URL it did not change; resolve the stored one
-        // rather than replacing it with a display value.
-        draft.base_url = provider_config::global_provider_field(&existing, &draft.id, "base_url")?
-            .ok_or_else(|| {
-                anyhow::anyhow!("provider `{}` has no stored base URL to keep", draft.id)
-            })?;
-        provider_config::validate_surface(
-            &draft.id,
-            &draft.protocol,
-            &draft.base_url,
-            draft.api_key_env.as_deref(),
-            draft.api_key.as_deref(),
-            false,
-        )?;
-    }
-    let next = provider_config::apply_upsert(&existing, &draft, mode)?;
-    provider_config::commit(&layout, &next)?;
+    // The read, edit and validation happen while the shared config lock is
+    // held, so an MCP or search edit committed meanwhile is not overwritten
+    // from this form's older view.
+    let draft_template = draft.clone();
+    provider_config::update(&layout, |existing| {
+        let mut draft = draft_template.clone();
+        if draft.base_url.trim().is_empty() {
+            // The form omits a base URL it did not change; resolve the stored
+            // one rather than replacing it with a display value.
+            draft.base_url =
+                provider_config::global_provider_field(existing, &draft.id, "base_url")?
+                    .ok_or_else(|| {
+                        provider_config::ProviderConfigError::Invalid(format!(
+                            "provider `{}` has no stored base URL to keep",
+                            draft.id
+                        ))
+                    })?;
+            provider_config::validate_surface(
+                &draft.id,
+                &draft.protocol,
+                &draft.base_url,
+                draft.api_key_env.as_deref(),
+                draft.api_key.as_deref(),
+                false,
+            )?;
+        }
+        let next = provider_config::apply_upsert(existing, &draft, mode)?;
+        Ok(((), next))
+    })?;
     let reloaded = reload(client).await;
     let mut payload = view(layout, client, installed).await?;
     payload["runtime_reload"] = reloaded;
@@ -205,10 +213,10 @@ pub(crate) async fn remove(
             references.models.len()
         );
     }
-    let path = provider_config::global_config_path(&layout);
-    let existing = read_config_text(&path)?;
-    let removal = provider_config::remove_provider(&existing, id)?;
-    provider_config::commit(&layout, &removal.text)?;
+    let removal = provider_config::update(&layout, |existing| {
+        let removal = provider_config::remove_provider(existing, id)?;
+        Ok((removal.clone(), removal.text.clone()))
+    })?;
     let reloaded = reload(client).await;
     let mut payload = view(layout, client, installed).await?;
     payload["removed_models"] = json!(removal.removed_models);
@@ -238,10 +246,10 @@ pub(crate) async fn set_default_model(
     {
         anyhow::bail!("model `{model}` is not configured");
     }
-    let path = provider_config::global_config_path(&layout);
-    let existing = read_config_text(&path)?;
-    let next = provider_config::set_default_model_text(&existing, &model)?;
-    provider_config::commit(&layout, &next)?;
+    provider_config::update(&layout, |existing| {
+        let next = provider_config::set_default_model_text(existing, &model)?;
+        Ok(((), next))
+    })?;
     let reloaded = reload(client).await;
     let mut payload = view(layout, client, installed).await?;
     payload["runtime_reload"] = reloaded;
@@ -627,14 +635,6 @@ fn optional_string(value: &Value, key: &str) -> anyhow::Result<Option<String>> {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(text)) => Ok(Some(text.clone())),
         Some(_) => anyhow::bail!("{key} must be a string"),
-    }
-}
-
-fn read_config_text(path: &Path) -> anyhow::Result<String> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => Ok(text),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-        Err(error) => Err(anyhow::anyhow!("cannot read {}: {error}", path.display())),
     }
 }
 

@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
 use fs2::FileExt;
 use leveler_client_protocol::mcp::{McpServerSpec, McpTransport};
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value, value};
@@ -123,10 +124,7 @@ fn document_at(path: &Path) -> Result<DocumentMut, McpConfigError> {
     parse_text(&read_text(path)?)
 }
 
-/// How many read-compute-write rounds one edit may take before a still-changing
-/// file is reported as a conflict instead of overwriting someone else's write.
-const MAX_CONFIG_WRITE_ATTEMPTS: usize = 8;
-
+#[cfg(test)]
 fn lock_path(path: &Path) -> PathBuf {
     let mut name = path
         .file_name()
@@ -139,45 +137,25 @@ fn lock_path(path: &Path) -> PathBuf {
 /// Read-edit-write the global config under a process-shared advisory lock.
 ///
 /// MCP management can be reached from several Desktop windows, the TUI and the
-/// CLI at once. The exclusive lock serializes them; the content check also
-/// catches a writer that does not take this lock (the provider editor and the
-/// first-run/login writer), so an edit computed from an older snapshot is
-/// recomputed instead of replacing the newer file.
+/// CLI at once. The shared [`crate::config_edit`] path serializes them and
+/// catches a writer that bypassed the lock by re-reading the file before the
+/// atomic replace.
 fn edit_document_at<T>(
     path: &Path,
-    mut apply: impl FnMut(&mut DocumentMut) -> Result<T, McpConfigError>,
+    apply: impl FnMut(&mut DocumentMut) -> Result<T, McpConfigError>,
 ) -> Result<T, McpConfigError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| McpConfigError::Io(format!("{}: {error}", parent.display())))?;
-        leveler_core::private_fs::restrict_dir(parent)
-            .map_err(|error| McpConfigError::Io(error.to_string()))?;
-    }
-    let lock_path = lock_path(path);
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)
-        .map_err(|error| McpConfigError::Io(format!("{}: {error}", lock_path.display())))?;
-    lock.lock_exclusive()
-        .map_err(|error| McpConfigError::Io(format!("{}: {error}", lock_path.display())))?;
-    let result = (|| {
-        for _ in 0..MAX_CONFIG_WRITE_ATTEMPTS {
-            let text = read_text(path)?;
-            let mut doc = parse_text(&text)?;
-            let out = apply(&mut doc)?;
-            if read_text(path)? != text {
-                continue;
-            }
-            write_document(path, &doc)?;
-            return Ok(out);
+    match crate::config_edit::edit(path, apply, |_| Ok(())) {
+        Ok(out) => Ok(out),
+        Err(crate::config_edit::EditError::Apply(error)) => Err(error),
+        Err(crate::config_edit::EditError::Parse(message)) => Err(McpConfigError::Parse(message)),
+        Err(crate::config_edit::EditError::Io(message)) => Err(McpConfigError::Io(message)),
+        Err(crate::config_edit::EditError::Validate(_)) => {
+            unreachable!("MCP edits have no separate validation step")
         }
-        Err(McpConfigError::ConcurrentModification)
-    })();
-    let _ = FileExt::unlock(&lock);
-    result
+        Err(crate::config_edit::EditError::ConcurrentModification) => {
+            Err(McpConfigError::ConcurrentModification)
+        }
+    }
 }
 
 /// List configured MCP servers.
@@ -444,13 +422,6 @@ pub fn remove_at(path: &std::path::Path, name: &str) -> Result<PathBuf, McpConfi
         Ok(())
     })?;
     Ok(path.to_path_buf())
-}
-
-fn write_document(path: &std::path::Path, doc: &DocumentMut) -> Result<(), McpConfigError> {
-    // The shared atomic writer stages a uniquely named sibling and renames it;
-    // a reader (config watcher, doctor, another client) never sees a half file.
-    crate::global_config::write_global_config_atomic(path, &doc.to_string())
-        .map_err(|error| McpConfigError::Io(error.to_string()))
 }
 
 /// A server name a runtime and a client can both address unambiguously.

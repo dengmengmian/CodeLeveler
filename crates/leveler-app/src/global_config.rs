@@ -745,19 +745,39 @@ impl GlobalConfig {
         path: &std::path::Path,
         model: &leveler_model::ModelRef,
     ) -> Result<(), GlobalConfigError> {
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(e) => return Err(GlobalConfigError::Write(format!("{}: {e}", path.display()))),
-        };
-        let mut doc: DocumentMut = if text.trim().is_empty() {
-            DocumentMut::new()
-        } else {
-            text.parse()
-                .map_err(|e| GlobalConfigError::Write(format!("{}: {e}", path.display())))?
-        };
-        doc["default_model"] = value(model.to_string());
-        write_global_config_atomic(path, &doc.to_string())
+        // The default-model edit shares the config lock with MCP, provider and
+        // search writes; the candidate is validated before it replaces the
+        // file, so another writer cannot be half-overwritten.
+        let model = model.to_string();
+        let result = crate::config_edit::edit(
+            path,
+            |doc| {
+                doc["default_model"] = value(model.clone());
+                Ok(())
+            },
+            |candidate| {
+                Self::from_toml_str(candidate)
+                    .map(|_| ())
+                    .map_err(|error| GlobalConfigError::Write(error.to_string()))
+            },
+        );
+        match result {
+            Ok(()) => Ok(()),
+            Err(crate::config_edit::EditError::Apply(error)
+            | crate::config_edit::EditError::Validate(error)) => Err(error),
+            Err(crate::config_edit::EditError::Parse(message)) => {
+                Err(GlobalConfigError::Write(format!("config is not valid TOML: {message}")))
+            }
+            Err(crate::config_edit::EditError::Io(error)) => {
+                Err(GlobalConfigError::Write(error))
+            }
+            Err(crate::config_edit::EditError::ConcurrentModification) => {
+                Err(GlobalConfigError::Write(
+                    "the configuration kept changing while it was being updated; nothing was written"
+                        .into(),
+                ))
+            }
+        }
     }
 
     /// Load the global config, or an empty one if the file is absent. A present

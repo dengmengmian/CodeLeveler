@@ -133,6 +133,19 @@ let providerTest = null;
 let providerBusy = null;
 let providerSetupSignature = '';
 let providerModelDiscovery = null;
+// Search settings are global user config, not session state. The form keeps
+// only what the person typed (never a stored key) and is re-seeded from the
+// host's display-safe projection.
+let searchState = { status: 'idle', data: null, error: null, request: 0 };
+let searchForm = null;
+let searchSaving = false;
+let searchSaveNote = null;
+// Live global options shown alongside Agent definitions. Saved with the same
+// config transaction as search; nothing here is a per-session preference.
+let agentOptionsState = { status: 'idle', data: null, error: null, request: 0 };
+let agentOptionsForm = null;
+let agentOptionsSaving = false;
+let agentOptionsNote = null;
 let agentsRead = null;
 // Skills projection: the runtime registry is the only row source. The same
 // answer feeds the settings page and the composer's slash catalog, so a Skill
@@ -7790,6 +7803,7 @@ function closeNarrowSidebar() {
 function openSettings(section = 'general') {
   settingsSection = section;
   if (section === 'models') void refreshProviders({ quiet: true });
+  if (section === 'search') { searchForm = null; searchSaveNote = null; void refreshSearchSettings(); }
   if (section === 'mcp') openMcpPage();
   else stopMcpPolling();
   renderSettings();
@@ -7851,6 +7865,7 @@ function settingsNav() {
   nav.replaceChildren();
   for (const [id, label, icon] of [
     ['general', '通用设置', 'settings'], ['models', '模型与 Provider', 'layers'],
+    ['search', '搜索', 'search'],
     ['mcp', 'MCP 服务', 'plugins'],
     ['presets', 'Agent 与技能', 'bot'],
   ]) {
@@ -7862,6 +7877,8 @@ function settingsNav() {
       settingsSection = id;
       if (id === 'mcp') openMcpPage();
       else stopMcpPolling();
+      if (id === 'search') { searchForm = null; searchSaveNote = null; void refreshSearchSettings(); }
+      if (id === 'presets') { agentOptionsForm = null; agentOptionsNote = null; void refreshAgentOptions(); }
       renderSettings();
     });
     nav.append(button);
@@ -7877,6 +7894,7 @@ function renderSettings() {
   content.dataset.section = settingsSection;
   if (settingsSection === 'general') renderGeneralSettings(content);
   else if (settingsSection === 'models') renderModelSettings(content);
+  else if (settingsSection === 'search') renderSearchSettings(content);
   else if (settingsSection === 'mcp') renderMcpSettings(content);
   else renderPresetSettings(content);
   content.scrollTop = sameSection ? priorScroll : 0;
@@ -8961,6 +8979,289 @@ function resetSkillsForSessionChange() {
   if (current) requestSkills({ quiet: true });
 }
 
+function searchFormFromData(data) {
+  return {
+    enabled: data.configured ? true : false,
+    provider: data.provider ?? 'deepseek',
+    apiKey: '',
+    clearApiKey: false,
+    apiKeyEnv: data.api_key_env ?? '',
+    baseUrl: data.base_url ?? '',
+    maxResults: data.max_results ?? 5,
+    timeoutMs: data.timeout_ms ?? 15000,
+  };
+}
+
+async function refreshSearchSettings() {
+  const request = ++searchState.request;
+  searchState = { ...searchState, status: 'loading', error: null, request };
+  try {
+    const data = await api.searchSettings();
+    if (request !== searchState.request) return;
+    searchState = { status: 'ready', data, error: null, request };
+    if (!searchForm) searchForm = searchFormFromData(data);
+  } catch (error) {
+    if (request !== searchState.request) return;
+    searchState = { status: 'error', data: null, error: error?.message ?? '无法读取搜索设置', request };
+  }
+  if ($('settings-dialog').open && settingsSection === 'search') renderSettings();
+}
+
+function searchKeyState(data) {
+  if (searchForm?.clearApiKey) return '保存后将清除已存储的 Key';
+  if (data.api_key_configured) return '已在配置文件中保存（不会回显）';
+  if (data.env_present) return `使用环境变量 ${data.api_key_env}`;
+  return '尚未配置 Key；搜索调用会失败';
+}
+
+function searchNumberInput(value, min, max, label, onChange) {
+  const input = el('input', 'settings-input search-number');
+  input.type = 'number';
+  input.min = String(min);
+  input.max = String(max);
+  input.step = '1';
+  input.value = String(value);
+  input.setAttribute('aria-label', label);
+  input.addEventListener('change', () => {
+    const number = Number(input.value);
+    if (!Number.isInteger(number) || number < min || number > max) {
+      toast(`${label}必须在 ${min}–${max} 之间`, { tone: 'error', holdMs: 3200 });
+      input.value = String(value);
+      return;
+    }
+    onChange(number);
+  });
+  return input;
+}
+
+function renderSearchSettings(content) {
+  content.append(el('h2', 'settings-title-large', '搜索'));
+  content.append(el(
+    'p',
+    'settings-note',
+    '网页搜索独立于对话模型：未启用时 Agent 没有 web_search 工具；启用后，搜索请求会直接发送到你选择的服务。配置写在全局 config.toml，保存时会校验并通知正在运行的 Runtime 重新加载。',
+  ));
+  if (searchState.status !== 'ready') {
+    if (searchState.status === 'error') {
+      content.append(el('div', 'settings-note', `读取搜索设置失败：${searchState.error}`));
+      const retry = el('button', 'button ghost small', '重试');
+      retry.type = 'button';
+      retry.addEventListener('click', () => refreshSearchSettings());
+      content.append(retry);
+    } else {
+      content.append(el('div', 'settings-note', '正在读取搜索设置…'));
+      if (searchState.status === 'idle') void refreshSearchSettings();
+    }
+    return;
+  }
+  const data = searchState.data;
+  if (!searchForm) searchForm = searchFormFromData(data);
+  const form = searchForm;
+  const group = el('div', 'settings-group');
+  group.append(settingRow(
+    '启用网页搜索',
+    '关闭会从配置中移除 [web.search]，Agent 将不再获得 web_search 工具。',
+    switchControl(form.enabled, value => {
+      form.enabled = value;
+      renderSettings();
+    }),
+  ));
+  const providerOptions = data.defaults.map(item => ({ value: item.id, label: item.label }));
+  group.append(settingRow(
+    '搜索服务',
+    '搜索端点与对话模型无关；切换到另一个服务需要填写对应的 Key。',
+    menuControl(form.provider, providerOptions, value => {
+      form.provider = value;
+      renderSettings();
+    }, { disabled: !form.enabled, label: '搜索服务' }),
+  ));
+  const keyWrap = el('div', 'search-key');
+  const keyInput = el('input', 'settings-input');
+  keyInput.type = 'password';
+  keyInput.autocomplete = 'off';
+  keyInput.spellcheck = false;
+  keyInput.maxLength = 16384;
+  keyInput.placeholder = data.api_key_configured || data.env_present ? '输入新 Key 以替换' : '输入 API Key';
+  keyInput.disabled = !form.enabled || form.clearApiKey;
+  keyInput.value = form.apiKey;
+  keyInput.setAttribute('aria-label', '搜索 API Key');
+  keyInput.addEventListener('input', () => { form.apiKey = keyInput.value; });
+  keyWrap.append(keyInput);
+  if (data.api_key_configured && !form.clearApiKey) {
+    const clear = el('button', 'button ghost small', '清除已保存的 Key');
+    clear.type = 'button';
+    clear.disabled = !form.enabled;
+    clear.addEventListener('click', () => {
+      form.clearApiKey = true;
+      form.apiKey = '';
+      renderSettings();
+    });
+    keyWrap.append(clear);
+  }
+  group.append(settingRow('API Key', searchKeyState(data), keyWrap));
+  const advanced = el('details', 'search-advanced');
+  if (form.advancedOpen) advanced.open = true;
+  advanced.addEventListener('toggle', () => { form.advancedOpen = advanced.open; });
+  advanced.append(el('summary', undefined, '高级设置'));
+  advanced.append(settingRow('Key 环境变量', '留空使用所选服务的默认变量；保存在配置里的 Key 优先于环境变量。', (() => {
+    const input = el('input', 'settings-input');
+    input.value = form.apiKeyEnv;
+    input.maxLength = 256;
+    input.disabled = !form.enabled;
+    input.setAttribute('aria-label', 'Key 环境变量');
+    input.addEventListener('input', () => { form.apiKeyEnv = input.value.trim(); });
+    return input;
+  })()));
+  advanced.append(settingRow('API 地址', '留空使用所选服务的默认地址；只接受 http(s) URL。', (() => {
+    const input = el('input', 'settings-input');
+    input.value = form.baseUrl;
+    input.maxLength = 2048;
+    input.disabled = !form.enabled;
+    input.placeholder = data.defaults.find(item => item.id === form.provider)?.base_url ?? '';
+    input.setAttribute('aria-label', 'API 地址');
+    input.addEventListener('input', () => { form.baseUrl = input.value.trim(); });
+    return input;
+  })()));
+  advanced.append(settingRow('结果数量', '每次搜索最多返回的来源数（1–50）。', searchNumberInput(form.maxResults, 1, 50, '结果数量', value => { form.maxResults = value; })));
+  advanced.append(settingRow('超时（毫秒）', '单次搜索请求的超时（1–600000）。', searchNumberInput(form.timeoutMs, 1, 600000, '超时', value => { form.timeoutMs = value; })));
+  group.append(advanced);
+  const saveRow = el('div', 'search-save-row');
+  if (searchSaveNote) saveRow.append(el('span', `search-save-note ${searchSaveNote.tone ?? ''}`, searchSaveNote.text));
+  const save = el('button', 'button primary', searchSaving ? '正在保存…' : '保存搜索设置');
+  save.type = 'button';
+  save.disabled = searchSaving;
+  save.addEventListener('click', () => saveSearchSettings());
+  saveRow.append(save);
+  group.append(saveRow);
+  content.append(group);
+}
+
+async function saveSearchSettings() {
+  if (searchSaving || !searchForm) return;
+  const form = searchForm;
+  if (form.enabled && !form.provider) { toast('请选择搜索服务', { tone: 'error', holdMs: 3000 }); return; }
+  if (form.enabled && !form.apiKey && !form.clearApiKey && !form.apiKeyEnv && !searchState.data?.api_key_configured && !searchState.data?.env_present) {
+    toast('请填写 API Key 或 Key 环境变量', { tone: 'error', holdMs: 3600 });
+    return;
+  }
+  searchSaving = true;
+  searchSaveNote = { text: '正在写入配置…', tone: '' };
+  renderSettings();
+  try {
+    const payload = { enabled: form.enabled };
+    if (form.enabled) {
+      payload.provider = form.provider;
+      payload.api_key = form.apiKey ? form.apiKey : null;
+      payload.clear_api_key = form.clearApiKey;
+      payload.api_key_env = form.apiKeyEnv;
+      payload.base_url = form.baseUrl;
+      payload.max_results = form.maxResults;
+      payload.timeout_ms = form.timeoutMs;
+    }
+    const result = await api.saveSearch(payload);
+    searchState = { status: 'ready', data: result, error: null, request: searchState.request };
+    searchForm = searchFormFromData(result);
+    searchForm.advancedOpen = form.advancedOpen;
+    const reload = result.runtime_reload ?? {};
+    if (reload.requested) searchSaveNote = { text: '已保存，Runtime 已请求重新加载；下一回合生效。', tone: 'ok' };
+    else if (reload.reason === 'no_runtime') searchSaveNote = { text: '已保存；当前没有运行中的 Runtime，下次启动时生效。', tone: 'ok' };
+    else if (reload.reason === 'request_failed') searchSaveNote = { text: `已保存；Runtime 重载请求失败：${reload.message ?? '未知原因'}`, tone: 'error' };
+    else searchSaveNote = { text: '已保存。', tone: 'ok' };
+    toast('搜索设置已保存', { tone: 'success', holdMs: 1800 });
+  } catch (error) {
+    searchSaveNote = { text: `保存失败：${error?.message ?? '未知错误'}`, tone: 'error' };
+    toast('搜索设置保存失败', { tone: 'error', holdMs: 3800 });
+  } finally {
+    searchSaving = false;
+    if ($('settings-dialog').open && settingsSection === 'search') renderSettings();
+  }
+}
+
+async function refreshAgentOptions() {
+  const request = ++agentOptionsState.request;
+  agentOptionsState = { ...agentOptionsState, status: 'loading', error: null, request };
+  try {
+    const data = await api.agentOptions();
+    if (request !== agentOptionsState.request) return;
+    agentOptionsState = { status: 'ready', data, error: null, request };
+    if (!agentOptionsForm) agentOptionsForm = { ...data };
+  } catch (error) {
+    if (request !== agentOptionsState.request) return;
+    agentOptionsState = { status: 'error', data: null, error: error?.message ?? '无法读取执行选项', request };
+  }
+  if ($('settings-dialog').open && settingsSection === 'presets') renderSettings();
+}
+
+async function saveAgentOptions() {
+  if (agentOptionsSaving || !agentOptionsForm) return;
+  agentOptionsSaving = true;
+  agentOptionsNote = { text: '正在保存…', tone: '' };
+  renderSettings();
+  try {
+    const result = await api.saveAgentOptions({ ...agentOptionsForm });
+    agentOptionsState = { status: 'ready', data: result, error: null, request: agentOptionsState.request };
+    agentOptionsForm = {
+      delegation: result.delegation,
+      co_author: result.co_author,
+      prompt_suggestions: result.prompt_suggestions,
+      away_summary: result.away_summary,
+    };
+    const reload = result.runtime_reload ?? {};
+    if (reload.requested) agentOptionsNote = { text: '已保存，Runtime 已请求重新加载；下一回合生效。', tone: 'ok' };
+    else if (reload.reason === 'no_runtime') agentOptionsNote = { text: '已保存；当前没有运行中的 Runtime，下次启动时生效。', tone: 'ok' };
+    else if (reload.reason === 'request_failed') agentOptionsNote = { text: `已保存；Runtime 重载请求失败：${reload.message ?? '未知原因'}`, tone: 'error' };
+    else agentOptionsNote = { text: '已保存。', tone: 'ok' };
+    toast('执行选项已保存', { tone: 'success', holdMs: 1600 });
+  } catch (error) {
+    agentOptionsNote = { text: `保存失败：${error?.message ?? '未知错误'}`, tone: 'error' };
+  } finally {
+    agentOptionsSaving = false;
+    if ($('settings-dialog').open && settingsSection === 'presets') renderSettings();
+  }
+}
+
+function renderAgentOptions(content) {
+  content.append(el('h3', undefined, '执行与协作'));
+  content.append(el(
+    'p',
+    'settings-note',
+    '这些选项作用于 Runtime 的后续回合：是否允许委派子智能体、Git 提交是否追加署名，以及两次空闲时的模型辅助调用。修改会写入全局 config.toml。',
+  ));
+  if (agentOptionsState.status !== 'ready') {
+    if (agentOptionsState.status === 'error') {
+      content.append(el('div', 'settings-note', `读取执行选项失败：${agentOptionsState.error}`));
+      const retry = el('button', 'button ghost small', '重试');
+      retry.type = 'button';
+      retry.addEventListener('click', () => refreshAgentOptions());
+      content.append(retry);
+    } else {
+      content.append(el('div', 'settings-note', '正在读取执行选项…'));
+      if (agentOptionsState.status === 'idle') void refreshAgentOptions();
+    }
+    return;
+  }
+  if (!agentOptionsForm) agentOptionsForm = { ...agentOptionsState.data };
+  const form = agentOptionsForm;
+  const group = el('div', 'settings-group');
+  const toggle = (key, label, desc) => group.append(settingRow(label, desc, switchControl(form[key], value => {
+    form[key] = value;
+    renderSettings();
+  })));
+  toggle('delegation', '允许委派子智能体', '关闭后模型不再获得 spawn_agent，已有子任务不受影响。');
+  toggle('co_author', 'Git 提交署名', 'Agent 提交时追加 CodeLeveler 与模型署名；关闭后只保留提交者。');
+  toggle('prompt_suggestions', '空闲输入建议', '空闲时用模型预测下一条输入；关闭后不再发起该调用。');
+  toggle('away_summary', '回合后摘要', '每回合结束后生成一行回顾；关闭后不再发起该调用。');
+  const row = el('div', 'search-save-row');
+  if (agentOptionsNote) row.append(el('span', `search-save-note ${agentOptionsNote.tone ?? ''}`, agentOptionsNote.text));
+  const save = el('button', 'button primary', agentOptionsSaving ? '正在保存…' : '保存执行选项');
+  save.type = 'button';
+  save.disabled = agentOptionsSaving;
+  save.addEventListener('click', () => saveAgentOptions());
+  row.append(save);
+  group.append(row);
+  content.append(group);
+}
+
 function renderPresetSettings(content) {
   content.append(el('h2', 'settings-title-large', 'Agent 与技能'));
   content.append(el('p', 'settings-note', '当前会话使用 Runtime 的默认模式；模式切换接口尚未接入桌面。每个 Agent 定义自带技能列表，可在“查看配置”中确认。'));
@@ -8969,6 +9270,7 @@ function renderPresetSettings(content) {
   head.append(el('span', 'preset-name', '默认模式'), el('span', 'preset-tag', '当前'));
   standard.append(head, el('div', 'preset-desc', '使用 Runtime 默认的工具与执行方式；模型会按任务需要选择检索、编辑和终端能力。'));
   content.append(standard);
+  renderAgentOptions(content);
   if (!current) {
     content.append(el('div', 'settings-note', '打开会话后可读取 Runtime 的 Agent 定义。'));
     renderSkillsSettings(content);

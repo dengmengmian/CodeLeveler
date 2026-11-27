@@ -139,6 +139,26 @@ pub(crate) fn set_provider_field(
     )?)
 }
 
+/// A key edit shares the config lock with MCP, the Desktop provider editor
+/// and the Desktop search editor. The candidate is parsed before it replaces
+/// the file, so a login can never install an invalid document.
+fn update_config_at<T>(
+    path: &std::path::Path,
+    mutate: impl FnMut(&str) -> Result<(T, String), leveler_app::provider_config::ProviderConfigError>,
+) -> anyhow::Result<T> {
+    Ok(leveler_app::provider_config::update_at(
+        path,
+        mutate,
+        |candidate| {
+            leveler_app::GlobalConfig::from_toml_str(candidate)
+                .map(|_| ())
+                .map_err(|error| {
+                    leveler_app::provider_config::ProviderConfigError::Rejected(error.to_string())
+                })
+        },
+    )?)
+}
+
 fn set_config_language(config: &str, language: FirstRunLanguage) -> anyhow::Result<String> {
     let mut doc: DocumentMut = config.parse().context("global config is not valid TOML")?;
     doc["lang"] = value(language.code());
@@ -220,9 +240,13 @@ pub(crate) async fn cmd_login(provider: Option<String>) -> anyhow::Result<std::p
         return Ok(std::process::ExitCode::from(1));
     }
 
-    let updated = upsert_api_key(&existing, &provider_id, &key)?;
-    leveler_app::provider_config::write_global_atomic(&path, &updated)
-        .with_context(|| format!("write {}", path.display()))?;
+    update_config_at(&path, |current| {
+        let next = upsert_api_key(current, &provider_id, &key).map_err(|error| {
+            leveler_app::provider_config::ProviderConfigError::Rejected(error.to_string())
+        })?;
+        Ok(((), next))
+    })
+    .with_context(|| format!("write {}", path.display()))?;
 
     println!("{}", Line::ok(&format!("Saved key for {provider_id}")));
     println!("  {} (owner-only)", path.display());
@@ -541,22 +565,27 @@ fn read_secret(label: &str) -> anyhow::Result<String> {
 pub(crate) fn cmd_logout(provider: String) -> anyhow::Result<std::process::ExitCode> {
     let path = leveler_app::GlobalConfig::path()
         .context("cannot resolve a home directory for the global config")?;
-    let existing =
-        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    match remove_api_key(&existing, &provider)? {
-        Some(updated) => {
-            leveler_app::provider_config::write_global_atomic(&path, &updated)
-                .with_context(|| format!("write {}", path.display()))?;
-            println!("{}", Line::ok(&format!("Removed key for {provider}")));
-            Ok(std::process::ExitCode::SUCCESS)
+    // The read and the conditional write share the config lock, so a
+    // concurrent login/provider/search edit cannot be silently replaced.
+    let removed = update_config_at(&path, |current| {
+        let updated = remove_api_key(current, &provider).map_err(|error| {
+            leveler_app::provider_config::ProviderConfigError::Rejected(error.to_string())
+        })?;
+        match updated {
+            Some(text) => Ok((true, text)),
+            None => Ok((false, current.to_string())),
         }
-        None => {
-            println!(
-                "{}",
-                Line::warn(&format!("No stored key for `{provider}` — nothing to do."))
-            );
-            Ok(std::process::ExitCode::from(1))
-        }
+    })
+    .with_context(|| format!("write {}", path.display()))?;
+    if removed {
+        println!("{}", Line::ok(&format!("Removed key for {provider}")));
+        Ok(std::process::ExitCode::SUCCESS)
+    } else {
+        println!(
+            "{}",
+            Line::warn(&format!("No stored key for `{provider}` — nothing to do."))
+        );
+        Ok(std::process::ExitCode::from(1))
     }
 }
 

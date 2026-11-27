@@ -7,10 +7,12 @@
 #![forbid(unsafe_code)]
 
 mod active_turns;
+pub mod agent_options;
 pub mod agents;
 mod checkpoints;
 mod children;
 mod collaboration;
+pub mod config_edit;
 pub mod config_manager;
 pub mod contribution_query;
 mod definition_trust_bridge;
@@ -40,6 +42,7 @@ mod review_live;
 pub mod runtime_boot;
 mod runtime_identity;
 mod schedule_tools;
+pub mod search_config;
 pub mod secret_input;
 mod session;
 pub mod session_history;

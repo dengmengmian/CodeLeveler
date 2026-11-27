@@ -405,14 +405,76 @@ pub fn project_models(
 /// `load_config_with_global` merges the candidate with the project sources and
 /// the registry build applies every model/route invariant, so a save can never
 /// install a generation the next runtime would refuse to start with.
-pub fn commit(layout: &leveler_project::Layout, text: &str) -> Result<(), ProviderConfigError> {
+pub fn validate_candidate(
+    layout: &leveler_project::Layout,
+    text: &str,
+) -> Result<(), ProviderConfigError> {
     let global = GlobalConfig::from_toml_str(text)
         .map_err(|error| ProviderConfigError::Rejected(error.to_string()))?;
     let loaded = crate::load_config_with_global(layout, global)
         .map_err(|error| ProviderConfigError::Rejected(error.to_string()))?;
     crate::config_manager::assemble_registry(&loaded)
         .map_err(|error| ProviderConfigError::Rejected(error.to_string()))?;
-    write_global_atomic(&layout.home().config_file(), text)
+    Ok(())
+}
+
+/// Read-edit-validate-write the global config under the shared lock.
+///
+/// `mutate` sees the current text and returns the caller's result plus the
+/// complete next text. The candidate is validated with the runtime's own
+/// assembly before it may replace the file, and the locked read means a
+/// concurrent provider, MCP or search edit is never overwritten from a stale
+/// snapshot.
+pub fn update<T>(
+    layout: &leveler_project::Layout,
+    mutate: impl FnMut(&str) -> Result<(T, String), ProviderConfigError>,
+) -> Result<T, ProviderConfigError> {
+    update_at(&layout.home().config_file(), mutate, |candidate| {
+        validate_candidate(layout, candidate)
+    })
+}
+
+/// [`update`] against an explicit path with a caller-supplied validator.
+pub fn update_at<T>(
+    path: &std::path::Path,
+    mut mutate: impl FnMut(&str) -> Result<(T, String), ProviderConfigError>,
+    mut validate: impl FnMut(&str) -> Result<(), ProviderConfigError>,
+) -> Result<T, ProviderConfigError> {
+    let result = crate::config_edit::edit(
+        path,
+        |doc| {
+            let (out, next) = mutate(&doc.to_string())?;
+            *doc = next.parse().map_err(|error: toml_edit::TomlError| {
+                ProviderConfigError::Rejected(crate::global_config::safe_toml_parse_error(
+                    &next,
+                    error.message(),
+                    error.span(),
+                ))
+            })?;
+            Ok(out)
+        },
+        &mut validate,
+    );
+    match result {
+        Ok(out) => Ok(out),
+        Err(
+            crate::config_edit::EditError::Apply(error)
+            | crate::config_edit::EditError::Validate(error),
+        ) => Err(error),
+        Err(crate::config_edit::EditError::Parse(message)) => Err(ProviderConfigError::Rejected(
+            format!("config is not valid TOML: {message}"),
+        )),
+        Err(crate::config_edit::EditError::Io(error)) => Err(ProviderConfigError::Write {
+            path: path.display().to_string(),
+            error,
+        }),
+        Err(crate::config_edit::EditError::ConcurrentModification) => {
+            Err(ProviderConfigError::Rejected(
+                "the configuration kept changing while it was being updated; nothing was written"
+                    .into(),
+            ))
+        }
+    }
 }
 
 /// The atomic, owner-only write used for every global-config replacement.
@@ -1175,7 +1237,7 @@ provider = "p"
         std::fs::create_dir_all(&workspace).unwrap();
         let layout = leveler_project::Layout::ephemeral(workspace, None, &dir.path().join("home"));
         let good = apply_upsert("", &draft("p"), UpsertMode::Add).unwrap();
-        commit(&layout, &good).unwrap();
+        update(&layout, |_| Ok(((), good.clone()))).unwrap();
         let path = global_config_path(&layout);
         let before = std::fs::read_to_string(&path).unwrap();
 
@@ -1183,7 +1245,8 @@ provider = "p"
         // invariant, so the loader refuses this generation.
         let mut bad_doc: DocumentMut = good.parse().unwrap();
         bad_doc["models"]["example-model"]["reliable_context"] = value(200_000);
-        let error = commit(&layout, &bad_doc.to_string()).unwrap_err();
+        let bad = bad_doc.to_string();
+        let error = update(&layout, |_| Ok(((), bad.clone()))).unwrap_err();
         assert!(
             matches!(error, ProviderConfigError::Rejected(_)),
             "{error:?}"

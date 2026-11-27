@@ -1550,6 +1550,16 @@ body.rightbar-overlay #floating-right-toggle, body.rightbar-overlay .header-acti
 .switch input:checked + .switch-track::after { transform: translateX(16px); background: var(--bg-layer-2); }
 .switch input:disabled + .switch-track { opacity: .5; }
 .settings-note { padding: 12px 0; color: var(--text-tertiary); font-size: 14px; line-height: 22px; }
+.search-key { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.search-key .settings-input { min-width: 220px; }
+.search-advanced { margin: 8px 0; border-top: .5px solid var(--border-l2); }
+.search-advanced summary { padding: 10px 0 4px; color: var(--text-secondary); font-size: 13px; line-height: 20px; cursor: pointer; list-style: none; }
+.search-advanced summary::-webkit-details-marker { display: none; }
+.search-save-row { display: flex; align-items: center; justify-content: flex-end; gap: 12px; padding: 12px 0 4px; }
+.search-save-note { color: var(--text-tertiary); font-size: 12px; line-height: 18px; }
+.search-save-note.error { color: var(--error); }
+.search-save-note.ok { color: var(--text-secondary); }
+.search-number { width: 120px; }
 .settings-footer { padding: 16px 0; color: var(--text-primary); font-size: 14px; line-height: 22px; }
 .settings-card {
   display: flex; flex-direction: column; gap: 10px;

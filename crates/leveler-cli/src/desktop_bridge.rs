@@ -929,6 +929,17 @@ impl Bridge {
             }
             // Explicit apply of the current files to the attached runtime.
             "runtime_reload" => Ok(crate::desktop_provider::reload(self.client.as_ref()).await),
+            // Search is a global user setting independent of the session's
+            // model. The renderer only ever receives masked facts; a key it
+            // sends is written through the shared config transaction.
+            "agent_options" => crate::desktop_options::view(&self.home),
+            "agent_options_save" => {
+                crate::desktop_options::save(&self.home, self.client.as_ref(), &params).await
+            }
+            "search_settings" => crate::desktop_search::view(&self.home),
+            "search_save" => {
+                crate::desktop_search::save(&self.home, self.client.as_ref(), &params).await
+            }
             "list_tasks" => Ok(serde_json::to_value(
                 leveler_app::global_task_index::query_global_tasks(
                     &self.home,

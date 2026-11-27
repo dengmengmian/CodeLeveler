@@ -258,6 +258,31 @@ app.whenReady().then(async()=>{
     if(!model||typeof model!=='object'||Array.isArray(model)||Object.keys(model).length!==2||typeof model.provider!=='string'||!model.provider||model.provider.length>256||typeof model.model!=='string'||!model.model||model.model.length>256)throw new Error('Invalid provider model');
     return bridge.request('default_model_set',{workspace,model:{provider:model.provider,model:model.model}});
   });
+  // Search settings are global, so they carry no workspace context. The
+  // shape is bounded here and validated again by the bridge and the config
+  // parser; a key is forwarded once and never returned.
+  const searchDraft=value=>{
+    if(!value||typeof value!=='object'||Array.isArray(value))throw new Error('Invalid search settings');
+    const allowed=['enabled','provider','api_key','clear_api_key','api_key_env','base_url','max_results','timeout_ms'];
+    if(Object.keys(value).some(key=>!allowed.includes(key)))throw new Error('Invalid search settings');
+    if(typeof value.enabled!=='boolean')throw new Error('Invalid search settings');
+    for(const [key,max] of [['provider',64],['api_key',16384],['api_key_env',256],['base_url',2048]])if(value[key]!==undefined&&value[key]!==null&&(typeof value[key]!=='string'||value[key].length>max))throw new Error('Invalid search settings');
+    if(value.clear_api_key!==undefined&&typeof value.clear_api_key!=='boolean')throw new Error('Invalid search settings');
+    for(const [key,min,max] of [['max_results',1,50],['timeout_ms',1,600000]])if(value[key]!==undefined&&value[key]!==null&&(!Number.isInteger(value[key])||value[key]<min||value[key]>max))throw new Error('Invalid search settings');
+    return value;
+  };
+  // Global live options: delegation, Git attribution and the idle assists.
+  // The shape is exactly four booleans; everything else is refused here.
+  const agentOptions=value=>{
+    if(!value||typeof value!=='object'||Array.isArray(value))throw new Error('Invalid agent options');
+    const keys=['delegation','co_author','prompt_suggestions','away_summary'];
+    if(Object.keys(value).length!==keys.length||keys.some(key=>!Object.hasOwn(value,key)||typeof value[key]!=='boolean'))throw new Error('Invalid agent options');
+    return value;
+  };
+  handle('desktop:agent-options',()=>bridge.request('agent_options',{}));
+  handle('desktop:agent-options-save',request=>bridge.request('agent_options_save',agentOptions(request)));
+  handle('desktop:search-settings',()=>bridge.request('search_settings',{}));
+  handle('desktop:search-save',request=>bridge.request('search_save',searchDraft(request)));
   handle('desktop:runtime-reload',()=>bridge.request('runtime_reload',{}));
   handle('desktop:connection-status',()=>bridge.status());
   handle('desktop:reconnect',()=>{bridge.retry();return {ok:true};});
