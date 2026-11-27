@@ -93,11 +93,14 @@ try {
   // The catalog states each command's real status.
   const catalog = await openCatalog();
   const byId = Object.fromEntries(catalog.map(entry => [entry.id, entry]));
-  for (const id of ['btw', 'recap', 'restore', 'recover', 'doctor', 'jump', 'trust', 'permission-contract']) {
+  for (const id of ['btw', 'recap', 'restore', 'recover', 'doctor', 'jump', 'trust', 'permission-contract', 'memory', 'remember', 'dream', 'flush']) {
     assert.equal(byId[id]?.disabled, false, `${id} must be usable`);
     assert.equal(byId[id]?.badge, null, `${id} must not claim an unavailable badge`);
   }
-  for (const [id, badge] of [['clean', '终端专属'], ['update', '终端专属'], ['exit', '等效入口'], ['memory', '未接入'], ['resume-claude', '未接入']]) {
+  // Memory moved from a stated gap to a real surface after R5; its four
+  // commands are expected to be usable now (R6), so only the commands that
+  // still have no Desktop surface carry a badge.
+  for (const [id, badge] of [['clean', '终端专属'], ['update', '终端专属'], ['exit', '等效入口'], ['resume-claude', '未接入']]) {
     assert.equal(byId[id]?.disabled, true, `${id} stays unavailable`);
     assert.equal(byId[id]?.badge, badge, `${id} names its real status`);
   }

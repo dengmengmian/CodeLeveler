@@ -3034,6 +3034,38 @@ button.message-image-tile:hover { border-color: var(--border-l3); }
 .checkpoint-ordinal, .recovery-state { color: var(--text-tertiary); font-size: 10px; }
 .recovery-call { color: var(--text-tertiary); font-family: var(--mono, monospace); font-size: 10px; }
 
+/* Cross-session memory page: a runtime projection, never a store browser. */
+.memory-dialog .modal-card {
+  width: min(920px, calc(100vw - 32px)); max-height: calc(100vh - 48px);
+  display: flex; flex-direction: column;
+}
+.memory-body { display: flex; flex-direction: column; gap: 10px; min-height: 0; }
+.memory-summary { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 14px; font-size: 12px; color: var(--text-secondary); }
+.memory-rollout { font-family: var(--mono, monospace); font-size: 11px; }
+.memory-state { font-weight: 600; }
+.memory-activity { color: var(--warning, var(--text-secondary)); font-size: 11px; }
+.memory-note { color: var(--text-tertiary); font-size: 11px; line-height: 16px; }
+.memory-panes { display: grid; grid-template-columns: minmax(240px, 38%) 1fr; gap: 12px; min-height: 0; }
+.memory-list { display: flex; flex-direction: column; gap: 12px; max-height: 52vh; overflow: auto; padding-right: 2px; }
+.memory-scope { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.memory-scope-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; font-size: 12px; font-weight: 600; }
+.memory-scope-root { min-width: 0; max-width: 62%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-tertiary); font-family: var(--mono, monospace); font-size: 10px; font-weight: 400; }
+.memory-counters { color: var(--text-tertiary); font-size: 10px; line-height: 14px; }
+.memory-scope-error { color: var(--danger); font-size: 11px; overflow-wrap: anywhere; }
+.memory-kind { margin-top: 5px; color: var(--text-tertiary); font-size: 10px; letter-spacing: .04em; }
+.memory-file { display: flex; align-items: baseline; gap: 8px; width: 100%; padding: 5px 8px; border-radius: 8px; text-align: left; font-size: 12px; }
+.memory-file:hover { background: var(--hover); }
+.memory-file[aria-selected="true"] { background: var(--bg-layer-3); box-shadow: inset 0 0 0 .5px var(--border-l3); }
+.memory-file-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.memory-file-meta { color: var(--text-tertiary); font-size: 10px; }
+.memory-preview { display: flex; flex-direction: column; gap: 8px; min-width: 0; min-height: 240px; padding: 10px; border: .5px solid var(--border-l2); border-radius: 10px; }
+.memory-preview-head { font-size: 12px; font-weight: 600; overflow-wrap: anywhere; }
+.memory-content { flex: 1; min-height: 0; max-height: 52vh; margin: 0; overflow: auto; white-space: pre-wrap; word-break: break-word; font-family: var(--mono, monospace); font-size: 11px; line-height: 17px; color: var(--text-secondary); }
+.memory-empty { color: var(--text-tertiary); font-size: 12px; line-height: 18px; }
+.memory-error { color: var(--danger); font-size: 12px; overflow-wrap: anywhere; }
+.memory-notice { color: var(--text-secondary); font-size: 12px; line-height: 18px; overflow-wrap: anywhere; }
+.memory-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+
 /* Finder drag target: the composer itself is the drop zone. */
 .composer-card { position: relative; }
 .composer-card.drop-target { outline: 2px dashed var(--accent, #5b7cfa); outline-offset: 2px; }

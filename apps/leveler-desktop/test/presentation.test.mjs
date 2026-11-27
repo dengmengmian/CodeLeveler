@@ -393,3 +393,23 @@ test('the product collaboration axis names, encodes and confirms only Runtime va
   // An older runtime omits the field; an interactive session is chat.
   assert.equal(collaborationConfirmed({ session: { id: 's1' } }, 's1', 'chat'), true);
 });
+
+test('memory commands keep their real argument vocabulary local until the runtime answers', async () => {
+  const { slashIntent } = await import('../src/presentation.mjs');
+  const commands = [
+    { id: 'memory', enabled: true },
+    { id: 'remember', enabled: true, takesArgument: true },
+    { id: 'dream', enabled: true, takesArgument: true },
+    { id: 'flush', enabled: true },
+  ];
+  assert.deepEqual(slashIntent('/memory', commands), { kind: 'action', id: 'memory' });
+  assert.deepEqual(slashIntent('/remember 使用 pnpm，不要用 npm', commands), { kind: 'action', id: 'remember', argument: '使用 pnpm，不要用 npm' });
+  assert.deepEqual(slashIntent('/remember 第一行\n第二行', commands), { kind: 'action', id: 'remember', argument: '第一行\n第二行' });
+  assert.equal(slashIntent('/memory extra', commands).kind, 'blocked');
+  assert.deepEqual(slashIntent('/dream batch', commands), { kind: 'action', id: 'dream', argument: 'batch' });
+  assert.deepEqual(slashIntent('/flush', commands), { kind: 'action', id: 'flush' });
+  assert.equal(slashIntent('/flush now', commands).kind, 'blocked');
+  assert.equal(slashIntent('/remember', commands).kind, 'action');
+  const disabled = [{ id: 'memory', enabled: false, reason: '请先选择或新建会话' }];
+  assert.deepEqual(slashIntent('/memory', disabled), { kind: 'blocked', reason: '请先选择或新建会话' });
+});

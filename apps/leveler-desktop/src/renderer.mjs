@@ -178,6 +178,23 @@ let mcpPollTimer = null;
 // The last list answer's row projection. A poll that changed nothing must not
 // rebuild the page and steal focus from the row the reader is using.
 let mcpRowsSignature = null;
+// Cross-session memory projection. Every row, counter, preview and outcome is
+// the runtime's own answer (`QueryMemory` / `ReadMemoryFile` /
+// `MemoryActionFinished`); the dialog never opens the store or invents a state.
+// `action` is the one management request this client is waiting on.
+function emptyMemoryView() {
+  return {
+    dialog: null, status: null, loading: false, error: null,
+    selected: null, preview: null, previewLoading: false, previewError: null,
+    notice: null,
+    statusQuery: null, statusTimer: null, previewQuery: null, pollTimer: null,
+    paintSignature: null,
+  };
+}
+let memoryView = emptyMemoryView();
+// The one management request this client is waiting on. It lives outside the
+// dialog so closing the page does not forget an outcome the runtime still owes.
+let memoryActionPending = null; // { queryId, label, timer }
 let headerSubagentButton = null;
 let headerJobsButton = null;
 let wideSidebarCollapsed = false;
@@ -446,6 +463,15 @@ function applyConnection(frame) {
   // outcome. Release its latch and say so; reconnecting reads the authority.
   if (frame.state !== 'connected') {
     mcpTransportLost();
+    // A memory request in flight when the stream dropped has an unknown
+    // outcome; releasing its latch says so instead of leaving a false "pending".
+    if (memoryActionPending) {
+      clearTimeout(memoryActionPending.timer);
+      const label = memoryActionPending.label;
+      memoryActionPending = null;
+      toast(`连接中断：${label}的结果未知；重新连接后请刷新记忆状态。`, { tone: 'warning', holdMs: 6000 });
+      if (memoryView.dialog) { memoryView.error = '连接中断；上个记忆操作结果未知。'; paintMemoryDialog(); }
+    }
     if (skillRead?.status === 'pending') {
       skillRead = { ...skillRead, status: 'unknown', error: 'Runtime 连接中断；技能状态未确认。重新连接后会重新读取。' };
       paintSkills();
@@ -455,6 +481,7 @@ function applyConnection(frame) {
     // A reconnect invalidates every in-flight answer; re-read the registry
     // rather than leaving a stale list or an unanswered query.
     if (current) requestSkills({ force: true });
+    if (memoryView.dialog) requestMemoryStatus({ silent: true });
   }
   // Old drafts are rescanned only once the host bridge answers; retry on a
   // later connection instead of leaving them permanently unpersisted.
@@ -3594,6 +3621,514 @@ function openRecoveryDialog() {
   dialog.showModal();
 }
 
+/* ------------------------------------------------------- cross-session memory */
+
+const MEMORY_SCOPE_LABELS = { global: '全局', workspace: '工作区' };
+const MEMORY_KIND_LABELS = { manifest: '索引', topic: '主题', observation: '观察', archive: '归档', other: '文件' };
+const MEMORY_ACTIVITY_LABELS = { idle: '空闲', capturing: '正在捕获', dreaming: '正在整理', failed: '上次记忆任务失败' };
+/** The runtime answers a memory query immediately; a missed answer is unknown. */
+const MEMORY_STATUS_TIMEOUT_MS = 15000;
+/**
+ * A batch Dream may run for the store's 30-minute budget. Past this bound the
+ * command's outcome is unknown, never silently promoted to a success.
+ */
+const MEMORY_ACTION_SETTLE_MS = 35 * 60 * 1000;
+const MEMORY_POLL_INTERVAL_MS = 4000;
+
+function memorySessionId() {
+  return current?.session?.id ?? null;
+}
+
+function memoryFileFor(scope, path) {
+  const status = memoryView.status;
+  const bucket = status ? (scope === 'global' ? status.global : status.workspace) : null;
+  return bucket?.files?.find(file => file.scope === scope && file.path === path) ?? null;
+}
+
+function clearMemoryTimers() {
+  if (memoryView.statusTimer) { clearTimeout(memoryView.statusTimer); memoryView.statusTimer = null; }
+}
+
+function stopMemoryPolling() {
+  if (!memoryView.pollTimer) return;
+  clearInterval(memoryView.pollTimer);
+  memoryView.pollTimer = null;
+}
+
+/**
+ * Drop the projection when the selected session changes. A memory answer is
+ * bound to one session's stream, so it cannot paint another session's page.
+ */
+function resetMemoryForSessionChange() {
+  stopMemoryPolling();
+  clearMemoryTimers();
+  if (memoryActionPending) {
+    // The outcome arrives on the old session's stream; this page can no longer
+    // observe it, so it is unknown here rather than assumed to have finished.
+    clearTimeout(memoryActionPending.timer);
+    memoryActionPending = null;
+    toast('已切换会话；上一个记忆操作的结果未在本页确认。', { tone: 'warning', holdMs: 5000 });
+  }
+  if (memoryView.dialog) {
+    const dialog = memoryView.dialog;
+    dialog.close();
+    // The close event lands on a later task; clear the projection now so a
+    // stale answer cannot paint a dialog that belongs to the old session.
+    memoryView = emptyMemoryView();
+    dialog.remove();
+    return;
+  }
+  memoryView = emptyMemoryView();
+}
+
+function openMemoryDialog() {
+  if (!memorySessionId()) { composerError('请先选择或新建会话'); return; }
+  if (memoryView.dialog) { requestMemoryStatus({ silent: true }); return; }
+  const dialog = el('dialog', 'modal memory-dialog');
+  dialog.id = 'memory-dialog';
+  const card = el('div', 'modal-card');
+  const head = el('div', 'modal-head');
+  head.append(el('h2', undefined, '跨会话记忆'));
+  const close = iconButton('close', '关闭记忆', { size: 16, tooltip: '关闭' });
+  head.append(close);
+  const body = el('div', 'memory-body');
+  const actions = el('div', 'memory-actions');
+  card.append(head, body, actions);
+  dialog.append(card);
+  document.body.append(dialog);
+  memoryView.dialog = dialog;
+  close.addEventListener('click', () => dialog.close());
+  dialog.addEventListener('close', () => {
+    dialog.remove();
+    // A session switch may already have replaced this projection; only the
+    // dialog that still owns it may reset its state.
+    if (memoryView.dialog !== dialog) return;
+    stopMemoryPolling();
+    clearMemoryTimers();
+    memoryView = emptyMemoryView();
+  }, { once: true });
+  memoryView.loading = true;
+  paintMemoryDialog({ force: true });
+  dialog.showModal();
+  requestMemoryStatus();
+  startMemoryPolling();
+}
+
+function startMemoryPolling() {
+  if (memoryView.pollTimer) return;
+  memoryView.pollTimer = setInterval(() => {
+    // Capture and Dream advance asynchronously. The runtime is the only
+    // authority for both, so the open page re-reads its projection instead of
+    // extrapolating from an earlier answer.
+    if (!memoryView.dialog || document.hidden || memoryView.statusQuery) return;
+    requestMemoryStatus({ silent: true });
+  }, MEMORY_POLL_INTERVAL_MS);
+}
+
+function requestMemoryStatus({ silent = false } = {}) {
+  const sessionId = memorySessionId();
+  if (!sessionId || !memoryView.dialog || memoryView.statusQuery) return;
+  const queryId = crypto.randomUUID();
+  memoryView.statusQuery = queryId;
+  if (!silent) {
+    memoryView.loading = true;
+    memoryView.error = null;
+    paintMemoryDialog();
+  }
+  memoryView.statusTimer = setTimeout(() => {
+    if (memoryView.statusQuery !== queryId) return;
+    memoryView.statusQuery = null;
+    memoryView.statusTimer = null;
+    memoryView.loading = false;
+    memoryView.error = '15 秒内没有收到运行时记忆状态。';
+    paintMemoryDialog();
+  }, MEMORY_STATUS_TIMEOUT_MS);
+  deliver({ type: 'query_memory', session_id: sessionId, query_id: queryId }).catch(error => {
+    if (memoryView.statusQuery !== queryId) return;
+    clearTimeout(memoryView.statusTimer);
+    memoryView.statusTimer = null;
+    memoryView.statusQuery = null;
+    memoryView.loading = false;
+    memoryView.error = error.message;
+    paintMemoryDialog();
+  });
+}
+
+function onMemoryLoaded(queryId, status) {
+  if (memoryView.statusQuery !== queryId) return; // a stale answer never paints
+  clearTimeout(memoryView.statusTimer);
+  memoryView.statusTimer = null;
+  memoryView.statusQuery = null;
+  memoryView.status = status ?? null;
+  memoryView.loading = false;
+  // An action's failure detail outlives this poll; only a refresh or the next
+  // action clears it. Painting a successful status must not erase it.
+  // A file the new listing no longer has cannot stay selected or previewed.
+  if (memoryView.selected && !memoryFileFor(memoryView.selected.scope, memoryView.selected.path)) {
+    memoryView.selected = null;
+    memoryView.preview = null;
+    memoryView.previewLoading = false;
+    memoryView.previewError = null;
+    memoryView.previewQuery = null;
+  }
+  paintMemoryDialog();
+}
+
+function readMemoryPreview(scope, path) {
+  const sessionId = memorySessionId();
+  if (!sessionId) return;
+  memoryView.selected = { scope, path };
+  memoryView.preview = null;
+  memoryView.previewLoading = true;
+  memoryView.previewError = null;
+  paintMemoryDialog();
+  const queryId = crypto.randomUUID();
+  memoryView.previewQuery = queryId;
+  deliver({
+    type: 'read_memory_file',
+    session_id: sessionId,
+    query_id: queryId,
+    scope,
+    path,
+  }).catch(error => {
+    if (memoryView.previewQuery !== queryId) return;
+    memoryView.previewQuery = null;
+    memoryView.previewLoading = false;
+    memoryView.previewError = error.message;
+    paintMemoryDialog();
+  });
+}
+
+function onMemoryFileLoaded(queryId, file) {
+  if (memoryView.previewQuery !== queryId) return; // a stale read never paints
+  memoryView.previewQuery = null;
+  memoryView.previewLoading = false;
+  if (memoryView.selected?.scope !== file.scope || memoryView.selected?.path !== file.path) return;
+  memoryView.preview = file.error ? null : file;
+  memoryView.previewError = file.error ?? null;
+  paintMemoryDialog();
+}
+
+/**
+ * Send one typed management command. The runtime's `MemoryActionFinished` is
+ * the only outcome; the pending label never states that the work succeeded.
+ */
+function sendMemoryAction(command, label) {
+  const sessionId = memorySessionId();
+  if (!sessionId) { composerError('请先选择或新建会话'); return; }
+  if (memoryActionPending) {
+    const busy = '上一个记忆操作仍在进行，请稍候。';
+    memoryView.error = busy;
+    if (memoryView.dialog) paintMemoryDialog(); else composerError(busy);
+    return;
+  }
+  const queryId = crypto.randomUUID();
+  memoryActionPending = {
+    queryId,
+    label,
+    timer: setTimeout(() => {
+      if (memoryActionPending?.queryId !== queryId) return;
+      memoryActionPending = null;
+      const unknown = '长时间未收到运行结果，结果未知。请刷新记忆状态确认。';
+      if (memoryView.dialog) { memoryView.notice = null; memoryView.error = unknown; paintMemoryDialog(); }
+      toast(unknown, { tone: 'warning', holdMs: 6000 });
+    }, MEMORY_ACTION_SETTLE_MS),
+  };
+  toast(`已提交${label}，等待运行时结果…`, { tone: 'info', holdMs: 2600 });
+  if (memoryView.dialog) paintMemoryDialog();
+  deliver({ ...command, session_id: sessionId, query_id: queryId }).catch(error => {
+    if (memoryActionPending?.queryId !== queryId) return;
+    clearTimeout(memoryActionPending.timer);
+    memoryActionPending = null;
+    toast(`记忆操作未送达：${error.message}`, { tone: 'error', holdMs: 5000 });
+    if (memoryView.dialog) { memoryView.notice = null; memoryView.error = error.message; paintMemoryDialog(); }
+  });
+}
+
+function onMemoryActionFinished(queryId, result) {
+  const pending = memoryActionPending?.queryId === queryId ? memoryActionPending : null;
+  if (pending) {
+    clearTimeout(pending.timer);
+    memoryActionPending = null;
+  }
+  const label = pending?.label ?? '记忆操作';
+  const message = `${label}${result.ok ? '完成' : '失败'} · ${result.message}`;
+  toast(message, { tone: result.ok ? 'success' : 'error', holdMs: result.ok ? 3800 : 6500 });
+  if (!memoryView.dialog) return;
+  // Every management action can rewrite the files around the selection; drop
+  // the preview so the page paints the store's current bytes instead of the
+  // copy it read before the action settled.
+  memoryView.preview = null;
+  memoryView.previewLoading = false;
+  memoryView.previewError = null;
+  memoryView.selected = null;
+  memoryView.error = result.ok ? null : result.message;
+  memoryView.notice = result.ok ? message : null;
+  requestMemoryStatus({ silent: true });
+  paintMemoryDialog();
+}
+
+function consumeMemoryEvent(frame) {
+  if (frame?.event !== 'runtime') return false;
+  const type = String(frame.data?.type ?? '');
+  if (!type.startsWith('memory_')) return false;
+  // A memory answer belongs to the session whose stream carried it. Another
+  // session's answer is still not conversation state; consume it either way.
+  if (frame.session_id !== memorySessionId()) return true;
+  const data = frame.data;
+  if (type === 'memory_loaded') { onMemoryLoaded(data.query_id, data.status); return true; }
+  if (type === 'memory_file_loaded') { onMemoryFileLoaded(data.query_id, data.file); return true; }
+  if (type === 'memory_action_finished') { onMemoryActionFinished(data.query_id, data.result); return true; }
+  return true;
+}
+
+function toggleMemorySession() {
+  const status = memoryView.status;
+  if (!status) return;
+  if (status.rollout === 'off') {
+    memoryView.error = `记忆已被配置关闭（rollout = "off"）。配置文件：${status.config_path}`;
+    paintMemoryDialog();
+    return;
+  }
+  sendMemoryAction({ type: 'toggle_memory', enabled: !status.enabled }, status.enabled ? '暂停记忆' : '恢复记忆');
+}
+
+function runMemoryDreamNow(batch) {
+  const status = memoryView.status;
+  if (!status?.enabled) {
+    memoryView.error = '记忆当前未启用，无法执行该操作。';
+    paintMemoryDialog();
+    return;
+  }
+  sendMemoryAction({ type: 'run_memory_dream', batch }, batch ? '批量记忆整理' : '记忆整理');
+}
+
+function flushMemoryNow() {
+  const status = memoryView.status;
+  if (!status?.enabled) {
+    memoryView.error = '记忆当前未启用，无法执行该操作。';
+    paintMemoryDialog();
+    return;
+  }
+  sendMemoryAction({ type: 'flush_memory' }, '记忆捕获刷新');
+}
+
+function forgetMemoryFile() {
+  const selected = memoryView.selected;
+  const preview = memoryView.preview;
+  const file = selected ? memoryFileFor(selected.scope, selected.path) : null;
+  if (!file || !file.deletable) {
+    memoryView.error = '这个文件不能在此遗忘：索引与受保护文件只能由运行时维护。';
+    paintMemoryDialog();
+    return;
+  }
+  if (!preview || preview.error || preview.truncated || !preview.content_hash) {
+    memoryView.error = '请先完整读取所选文件再遗忘。';
+    paintMemoryDialog();
+    return;
+  }
+  void (async () => {
+    const ok = await confirmDialog({
+      title: '遗忘记忆文件',
+      body: `将从${MEMORY_SCOPE_LABELS[file.scope] ?? file.scope}作用域遗忘「${file.path}」。运行时先写入遗忘记录再移除文件；已提交的内容无法恢复。`,
+      confirm: '遗忘', danger: true,
+    });
+    if (!ok) return;
+    // The digest binds the tombstone to exactly the bytes that were shown; a
+    // file that changed since then is refused by the store instead of deleted.
+    sendMemoryAction({
+      type: 'forget_memory',
+      scope: file.scope,
+      path: file.path,
+      content_hash: preview.content_hash,
+    }, '遗忘');
+  })();
+}
+
+function memoryButton(label, onClick, { disabled = false, title } = {}) {
+  const button = el('button', 'button secondary small', label);
+  button.type = 'button';
+  button.disabled = !!disabled;
+  if (title) button.title = title;
+  if (!disabled) button.addEventListener('click', onClick);
+  return button;
+}
+
+function memoryScopesText(scope) {
+  return [
+    `待捕获 ${scope.pending_capture_jobs}`,
+    `运行 ${scope.running_capture_jobs}`,
+    `重试 ${scope.retry_capture_jobs}`,
+    `失败 ${scope.failed_capture_jobs}`,
+    `已完成 ${scope.completed_capture_jobs}`,
+    `待整理 ${scope.pending_observations}`,
+    `归档 ${scope.archive_count}`,
+    `已遗忘 ${scope.tombstone_count}`,
+    `Dream ${scope.dream_lease}`,
+  ].join(' · ');
+}
+
+/**
+ * The inputs the page renders from. Polling repaints only when one of them
+ * changed, so a quiet store does not reset the reader's preview scroll every
+ * four seconds.
+ */
+function currentMemorySignature() {
+  const view = memoryView;
+  return JSON.stringify({
+    status: view.status,
+    loading: view.loading,
+    error: view.error,
+    notice: view.notice,
+    selected: view.selected,
+    preview: view.preview ? {
+      scope: view.preview.scope,
+      path: view.preview.path,
+      hash: view.preview.content_hash,
+      truncated: view.preview.truncated,
+      total: view.preview.total_bytes,
+    } : null,
+    previewLoading: view.previewLoading,
+    previewError: view.previewError,
+    action: memoryActionPending?.queryId ?? null,
+  });
+}
+
+function paintMemoryDialog({ force = false } = {}) {
+  const dialog = memoryView.dialog;
+  if (!dialog) return;
+  const signature = currentMemorySignature();
+  if (!force && signature === memoryView.paintSignature) return;
+  memoryView.paintSignature = signature;
+  const body = dialog.querySelector('.memory-body');
+  const actions = dialog.querySelector('.memory-actions');
+  const status = memoryView.status;
+  body.replaceChildren();
+  actions.replaceChildren();
+
+  if (!status) {
+    body.append(el('div', 'memory-empty', memoryView.loading ? '正在读取记忆…' : '尚未取得运行时记忆状态。'));
+  } else {
+    const summary = el('div', 'memory-summary');
+    summary.append(el('span', 'memory-rollout', `rollout: ${status.rollout}`));
+    summary.append(el('span', 'memory-state', status.enabled ? '本会话已开启' : (status.rollout === 'off' ? '配置已关闭' : '本会话已暂停')));
+    summary.append(el('span', 'memory-note', `捕获 ${status.capture_enabled ? '开' : '关'} · 自动整理 ${status.automatic_dream_enabled ? '开' : '关'} · 手动整理 ${status.manual_dream_enabled ? '开' : '关'} · 批量整理 ${status.batch_dream_enabled ? '开' : '关'}`));
+    if (status.activity?.active) {
+      summary.append(el('span', 'memory-activity', MEMORY_ACTIVITY_LABELS[status.activity.kind] ?? status.activity.kind));
+    }
+    if (status.activity?.last_error) {
+      summary.append(el('span', 'memory-error', `上次记忆任务失败：${status.activity.last_error}`));
+    }
+    if (status.workspace_ephemeral) summary.append(el('span', 'memory-note', '临时工作目录不保存工作区记忆。'));
+    if (status.session) {
+      summary.append(el('span', 'memory-note', `本会话：已捕获 ${status.session.captured} · 待处理 ${status.session.pending} · 失败 ${status.session.failed}`));
+    }
+    body.append(summary);
+
+    const panes = el('div', 'memory-panes');
+    const list = el('div', 'memory-list');
+    for (const scope of [status.global, status.workspace]) {
+      const group = el('div', 'memory-scope');
+      const heading = el('div', 'memory-scope-head');
+      heading.append(
+        el('span', undefined, MEMORY_SCOPE_LABELS[scope.scope] ?? scope.scope),
+        el('span', 'memory-scope-root', scope.root),
+      );
+      group.append(heading);
+      group.append(el('div', 'memory-counters', memoryScopesText(scope)));
+      if (scope.error) {
+        group.append(el('div', 'memory-scope-error', `无法读取该作用域：${scope.error}`));
+      } else if (!scope.files.length) {
+        group.append(el('div', 'memory-empty', '暂无记忆'));
+      }
+      let lastKind = null;
+      for (const file of scope.files) {
+        if (file.kind !== lastKind) {
+          lastKind = file.kind;
+          group.append(el('div', 'memory-kind', MEMORY_KIND_LABELS[file.kind] ?? file.kind));
+        }
+        const button = el('button', 'memory-file');
+        button.type = 'button';
+        const selected = memoryView.selected?.scope === file.scope && memoryView.selected?.path === file.path;
+        button.setAttribute('aria-selected', String(selected));
+        button.append(
+          el('span', 'memory-file-path', file.path),
+          el('span', 'memory-file-meta', `${file.bytes} B`),
+        );
+        button.title = `${file.scope} · ${file.path}`;
+        button.addEventListener('click', () => { if (!selected) readMemoryPreview(file.scope, file.path); });
+        group.append(button);
+      }
+      list.append(group);
+    }
+    const previewPane = el('div', 'memory-preview');
+    paintMemoryPreview(previewPane);
+    panes.append(list, previewPane);
+    body.append(panes);
+  }
+
+  if (memoryView.error) body.append(el('div', 'memory-error', memoryView.error));
+  else if (memoryView.notice) body.append(el('div', 'memory-notice', memoryView.notice));
+  if (memoryActionPending) body.append(el('div', 'memory-notice', `正在等待运行时完成${memoryActionPending.label}…`));
+
+  const busy = !!memoryActionPending;
+  const statusKnown = !!status;
+  const canAct = !!status?.enabled && !busy;
+  const refresh = memoryButton('刷新', () => requestMemoryStatus(), { disabled: memoryView.loading || busy });
+  const dream = memoryButton('整理', () => runMemoryDreamNow(false), {
+    disabled: !canAct || !status?.manual_dream_enabled,
+    title: !status?.manual_dream_enabled ? '当前配置未启用手动整理' : '运行一次 Dream 整理',
+  });
+  const batch = memoryButton('批量整理', () => runMemoryDreamNow(true), {
+    disabled: !canAct || !status?.batch_dream_enabled,
+    title: status && !status.batch_dream_enabled ? '当前配置未启用批量整理' : '运行有界的批量 Dream',
+  });
+  const flush = memoryButton('立即捕获', () => flushMemoryNow(), {
+    disabled: !canAct || !status?.capture_enabled,
+    title: status && !status.capture_enabled ? '当前配置未启用自动捕获' : '立即捕获本会话已结算的回合',
+  });
+  const toggle = memoryButton(status?.enabled ? '暂停本会话记忆' : '恢复本会话记忆', () => toggleMemorySession(), {
+    disabled: !statusKnown || busy || status?.rollout === 'off',
+    title: status?.rollout === 'off' ? `记忆已被配置关闭；修改 ${status?.config_path ?? 'config.toml'} 后运行 /reload` : undefined,
+  });
+  const close = memoryButton('关闭', () => memoryView.dialog?.close());
+  actions.append(refresh, dream, batch, flush, toggle, close);
+  if (status) actions.title = `配置文件：${status.config_path}`;
+}
+
+function paintMemoryPreview(host) {
+  const selected = memoryView.selected;
+  host.append(el('div', 'memory-preview-head', selected ? `${MEMORY_SCOPE_LABELS[selected.scope] ?? selected.scope} · ${selected.path}` : '记忆内容'));
+  if (!selected) {
+    host.append(el('div', 'memory-empty', '选择一个记忆查看内容。记忆文件是普通 Markdown；运行时只读取当前作用域内的文件。'));
+    return;
+  }
+  if (memoryView.previewLoading) {
+    host.append(el('div', 'memory-empty', '正在读取…'));
+    return;
+  }
+  if (memoryView.previewError) {
+    host.append(el('div', 'memory-error', memoryView.previewError));
+    return;
+  }
+  const preview = memoryView.preview;
+  if (!preview) {
+    host.append(el('div', 'memory-empty', '尚未读取该文件。'));
+    return;
+  }
+  // Memory content is untrusted input. It is painted as text, never parsed as
+  // HTML or promoted to a control instruction.
+  host.append(el('pre', 'memory-content', preview.content));
+  if (preview.truncated) {
+    host.append(el('div', 'memory-note', `文件较大（${preview.total_bytes} 字节），仅显示前一部分；截断的预览不能用于遗忘。`));
+  }
+  const file = memoryFileFor(selected.scope, selected.path);
+  if (file?.deletable && !preview.truncated && preview.content_hash) {
+    const forget = memoryButton('遗忘此文件', () => forgetMemoryFile(), { disabled: !!memoryActionPending });
+    host.append(forget);
+  }
+}
+
 async function confirmPermissionContract() {
   const ok = await confirmDialog({
     title: '迁移到权限契约 V2',
@@ -5000,10 +5535,14 @@ function commandCatalog() {
     ['system', 'doctor', '诊断', true, 'stethoscope', null, null, false],
     ['system', 'clean', '清理本地存储', false, 'trash', '终端专属', '清理由 leveler clean 在终端执行；桌面端不直接删除本地存储', false],
     ['system', 'trust', '定义信任', true, 'shield', null, null, false],
-    ['system', 'memory', '记忆', false, 'book', '未接入', '桌面端尚未提供记忆管理页', false],
-    ['session', 'remember', '记住一条', false, 'book', '未接入', '桌面端尚未提供记忆写入入口', false],
-    ['session', 'dream', '记忆整理', false, 'book', '未接入', '桌面端尚未提供记忆整理入口', false],
-    ['session', 'flush', '记忆写入', false, 'book', '未接入', '桌面端尚未提供记忆写入入口', false],
+    // Cross-session memory. The runtime owns the store, the capture queue and
+    // Dream; this page only projects its answers and sends typed management
+    // commands. They are listed under a bare `/` because the same four typed
+    // forms are part of the product contract.
+    ['view', 'memory', '跨会话记忆', session, 'book', null, '请先选择或新建会话', true],
+    ['session', 'remember', '记住一条笔记', session, 'book', null, '请先选择或新建会话', true, [], true],
+    ['session', 'dream', '立即整理记忆', session, 'book', null, '请先选择或新建会话', true, [], true],
+    ['session', 'flush', '刷新记忆索引', session, 'book', null, '请先选择或新建会话', true],
     ['system', 'update', '更新运行时', false, 'download', '终端专属', '桌面端只检查更新；安装请运行 leveler update', false, ['upgrade']],
     ['system', 'jump', '跳转回合', true, 'arrow', null, '用法：/jump <轮次>', false, [], true],
     ['system', 'resume-claude', '继续 Claude 会话', false, 'download', '未接入', '外部会话导入目前是终端能力；桌面端本轮未提供', false],
@@ -5226,6 +5765,41 @@ async function executeCommand(id, argument = '') {
     }, { onError: composerError, clearGlobal: false });
     return;
   }
+  // Cross-session memory: one read-only page plus the runtime's typed
+  // management commands. None of these becomes a message to the model.
+  if (id === 'memory') { openMemoryDialog(); return; }
+  if (id === 'remember') {
+    if (!current) { composerError('请先选择或新建会话'); return; }
+    const note = String(argument ?? '').trim();
+    if (!note) {
+      // A bare `/remember` primes the composer; the argument is the note.
+      $('message').value = '/remember ';
+      $('message').focus();
+      controls();
+      return;
+    }
+    if (new TextEncoder().encode(note).length > 64 * 1024) { composerError('内容超过 64 KiB 上限'); return; }
+    sendMemoryAction({ type: 'remember_memory', content: note }, '记忆写入');
+    return;
+  }
+  if (id === 'dream') {
+    if (!current) { composerError('请先选择或新建会话'); return; }
+    if (['running', 'waiting_user'].includes(current.status)) { composerError('回合运行中不能运行记忆整理，请先等待或停止'); return; }
+    const mode = String(argument ?? '').trim().toLowerCase();
+    if (mode && mode !== 'batch') { composerError('用法：/dream 或 /dream batch'); return; }
+    if (mode === 'batch' && memoryView.status && !memoryView.status.batch_dream_enabled) {
+      composerError('当前配置未启用批量整理');
+      return;
+    }
+    sendMemoryAction({ type: 'run_memory_dream', batch: mode === 'batch' }, mode === 'batch' ? '批量记忆整理' : '记忆整理');
+    return;
+  }
+  if (id === 'flush') {
+    if (!current) { composerError('请先选择或新建会话'); return; }
+    if (['running', 'waiting_user'].includes(current.status)) { composerError('回合运行中不能刷新记忆索引，请先等待或停止'); return; }
+    sendMemoryAction({ type: 'flush_memory' }, '记忆捕获刷新');
+    return;
+  }
   if (id === 'trust') { openSettings('presets'); return; }
   if (id === 'jump') {
     const turn = Number.parseInt(String(argument ?? '').trim(), 10);
@@ -5355,6 +5929,7 @@ async function newSession() {
   dismissPage();
   resetScheduleProjection();
   resetMcpForSessionChange();
+  resetMemoryForSessionChange();
   stashDraft();
   selection = null;
   current = null;
@@ -5399,6 +5974,7 @@ async function createTask() {
   current = attachExtras(projectSnapshot(result.session), result.session);
   resetScheduleProjection();
   resetMcpForSessionChange();
+  resetMemoryForSessionChange();
   resetSkillsForSessionChange();
   lastEventSeq = result.session.last_sequence ?? 0;
   activeView = 'chat';
@@ -5462,6 +6038,7 @@ async function openTask(task) {
   current = attachExtras(projectSnapshot(result.session), result.session);
   resetScheduleProjection();
   resetMcpForSessionChange();
+  resetMemoryForSessionChange();
   resetSkillsForSessionChange();
   lastEventSeq = result.session.last_sequence ?? 0;
   activeView = 'chat';
@@ -12047,6 +12624,7 @@ api.onEvent(frame => {
   if (consumeMcpEvent(frame)) return;
   if (consumeScheduleEvent(frame)) return;
   if (consumeSkillEvent(frame)) return;
+  if (consumeMemoryEvent(frame)) return;
   if (consumeReviewEvent(frame)) return;
   consumeSettingsEvent(frame);
   if (frame.event === 'connection') { applyConnection(frame); return; }
@@ -12061,6 +12639,7 @@ api.onEvent(frame => {
     current = attachExtras(projectSnapshot(session, history), session);
     resetScheduleProjection();
     resetMcpForSessionChange();
+    resetMemoryForSessionChange();
     resetSkillsForSessionChange();
     lastEventSeq = session.last_sequence ?? 0;
     activeView = 'chat';
@@ -12189,7 +12768,8 @@ api.onEvent(frame => {
     current = attachExtras(projectSnapshot(event.session, history), event.session);
     current.contextUsage = priorContext;
     resetMcpForSessionChange();
-  resetSkillsForSessionChange();
+    resetMemoryForSessionChange();
+    resetSkillsForSessionChange();
     liveTrajectory = [];
     liveTurnStartAt = null;
     liveTurnClosed = false;
