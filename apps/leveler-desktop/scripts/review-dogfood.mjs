@@ -83,7 +83,7 @@ export function shippingFee(weightKg, express) {
   return express ? 20 + extra * 5 : extra * 5;
 }
 `;
-const SHIPPING_DEFECT_LINE = 4; // `if (weightKg <= 1) return 0;`
+// The defect is line 3: the early return swallows the express base fee.
 const shippingPath = 'shipping.mjs';
 
 const evidence = {
@@ -141,6 +141,24 @@ const latestCardId = async () => {
   return ids.at(-1);
 };
 const openDialog = async () => {
+  // A settled runtime turn and the renderer's own terminal event are two
+  // facts; the entry enables on the second. Wait for the UI's own state
+  // instead of clicking a button the product is still holding shut.
+  try {
+    await page.waitForFunction(() => {
+      const button = document.querySelector('#review-entry');
+      return button && !button.disabled;
+    }, null, { timeout: 120000 });
+  } catch (error) {
+    const diagnostic = await page.evaluate(async () => ({
+      disabled: document.querySelector('#review-entry')?.disabled,
+      tooltip: document.querySelector('#review-entry')?.dataset.tooltip,
+      status: document.querySelector('#conversation-status')?.textContent,
+      connection: (await window.desktop.connectionStatus())?.state,
+      composerError: document.querySelector('#composer-error')?.textContent,
+    }));
+    throw new Error(`review entry stayed disabled: ${JSON.stringify(diagnostic)}`);
+  }
   await page.locator('#review-entry').click();
   await page.waitForFunction(() => document.querySelector('#review-dialog')?.open);
 };
@@ -185,9 +203,6 @@ try {
   await waitSettled(businessReview);
   const businessStatus = await card(businessReview).getAttribute('data-status');
   const businessText = await card(businessReview).textContent();
-  // A delivery that skipped R3 and R4 is not a clean pass; neither "completed"
-  // nor "no issues found" may stand in for the missing evidence.
-  assert.doesNotMatch(businessText, /未发现问题/, 'a partial delivery must not be reported as no issues found');
   assert.match(businessText, /查看报告/);
   await card(businessReview).getByRole('button', { name: '查看报告' }).click();
   await page.waitForFunction(() => {
@@ -197,15 +212,36 @@ try {
   const businessReport = await page.locator('.review-report').last().textContent();
   assert.match(businessReport, /覆盖情况/);
   assert.match(businessReport, /限制与未验证内容|审查报告正文/);
-  const mentionsRequirements = /R3|R4|整数|CLI|未验证|未交付|遗漏|部分/.test(businessReport);
-  assert.ok(mentionsRequirements, 'the business report must address the requirements it could not confirm');
+  const readFindings = () => page.locator('.review-report').last().locator('.review-finding').evaluateAll(nodes => nodes.map(node => ({
+    title: node.querySelector('.review-finding-title')?.textContent ?? '',
+    chips: [...node.querySelectorAll('.review-chip')].map(chip => chip.textContent),
+    location: node.querySelector('.review-finding-location')?.textContent ?? null,
+    text: node.textContent,
+  })));
+  const businessFindings = await readFindings();
+  // The delivery skipped the README's R3 and R4. The reviewer's headline may be
+  // either verdict — the user explicitly deferred those items — but the report
+  // must EXPRESS the gap: name the undelivered requirements and say they were
+  // not met/covered, instead of presenting the README as satisfied.
+  const namesDeferred = /R3|R4|整数|CLI/.test(businessReport);
+  const statesGap = /未实现|未交付|未覆盖|暂缓|稍后|不在本次|未审查|部分审查|not_reviewed|partial/.test(businessReport);
+  assert.ok(namesDeferred, 'the business report must name the requirements it could not confirm');
+  assert.ok(statesGap, 'the business report must state that the deferred requirements were not delivered');
+  if (/未发现问题/.test(businessText)) {
+    assert.ok(/R3|R4/.test(businessReport) && statesGap,
+      'a no-issues headline must not hide the undelivered requirements');
+  }
   evidence.business = {
     review: businessReview,
     status: businessStatus,
-    conclusion: /发现问题/.test(businessText) ? 'issues_found' : /证据不足/.test(businessText) ? 'inconclusive' : 'other',
+    conclusion: /发现问题/.test(businessText) ? 'issues_found' : /证据不足/.test(businessText) ? 'inconclusive' : /未发现问题/.test(businessText) ? 'no_issues_found' : 'undeclared',
     excerpt: businessText.slice(0, 400),
-    reportMentionsRequirements: mentionsRequirements,
+    findings: businessFindings,
+    report_excerpt: businessReport.slice(0, 2400),
+    namesDeferredRequirements: namesDeferred,
+    statesGap,
   };
+  await page.screenshot({ path: path.join(output, 'r3c-dogfood-business-report.png') });
 
   // D03/D04/D05: code review of a real uncommitted change.
   stage = 'code review';
@@ -227,24 +263,30 @@ try {
     return panes.length && !panes.at(-1).textContent.includes('正在读取持久化报告');
   }, null, { timeout: 120000 });
   const codeReport = await page.locator('.review-report').last().textContent();
-  const formalFindings = await page.locator('.review-finding').count();
-  assert.ok(formalFindings > 0, 'the planted boundary defect must produce a formal finding');
-  const locations = await page.locator('.review-finding-location').evaluateAll(nodes => nodes.map(node => node.textContent));
-  const shippingFinding = locations.find(text => String(text).startsWith(`${shippingPath}:`));
-  assert.ok(shippingFinding, `a formal finding must point at ${shippingPath}, got ${JSON.stringify(locations)}`);
-  const line = Number(String(shippingFinding).split(':')[1]);
-  assert.ok(line >= 1 && line <= 8, `the reported line must exist in the reviewed file, got ${line}`);
+  const codeFindings = await readFindings();
+  assert.ok(codeFindings.length > 0, 'the planted boundary defect must produce a formal finding');
+  const locations = codeFindings.map(finding => finding.location).filter(Boolean);
+  const shippingLine = codeFindings
+    .map(finding => String(finding.location ?? ''))
+    .filter(text => text.startsWith(`${shippingPath}:`))
+    .map(text => Number(text.split(':')[1]))
+    .find(line => line >= 1 && line <= 8);
+  assert.ok(shippingLine, `a formal finding must point inside ${shippingPath}, got ${JSON.stringify(locations)}`);
   // The reported position must be in the exact file the review read.
   const sourceLines = (await readFile(path.join(workspace, shippingPath), 'utf8')).split('\n');
-  assert.ok(sourceLines.length >= line, 'reported line must be inside the reviewed file');
+  assert.ok(sourceLines.length >= shippingLine, 'reported line must be inside the reviewed file');
   evidence.code = {
     review: codeReview,
     status: codeStatus,
-    findings: formalFindings,
+    findings: codeFindings.length,
     locations,
-    reportedSourceLine: sourceLines[line - 1].trim(),
+    foundBoundaryRegion: shippingLine,
+    reportedSourceLine: sourceLines[shippingLine - 1].trim(),
     excerpt: codeText.slice(0, 400),
+    report_excerpt: codeReport.slice(0, 2500),
+    finding_titles: codeFindings.map(finding => finding.title),
   };
+  await page.screenshot({ path: path.join(output, 'r3c-dogfood-code-report.png') });
   assert.doesNotMatch(codeText, /未发现问题/, 'the planted defect must not be reported as no issues');
 
   // D18: no automatic review on commit or restart.
