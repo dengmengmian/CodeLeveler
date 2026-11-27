@@ -315,7 +315,9 @@ try {
   await startReview();
   await page.waitForFunction(() => document.querySelector('.review-card'));
   const codeReview = await latestCardId();
-  await waitCard(codeReview, 'running');
+  // A fixture reviewer can finish before the first frame is observed; the
+  // card's existence is the fact, not a guaranteed 'running' snapshot.
+  await page.waitForFunction(id => !!document.querySelector(`.review-card[data-review-id="${id}"]`), codeReview, { timeout: 90000 });
   record('D03', { review: codeReview, scope: 'workspace' });
   await settleCard(180000);
   await waitCard(codeReview, 'completed');

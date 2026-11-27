@@ -5363,6 +5363,10 @@ function paintReviewDialog() {
     radio.addEventListener('change', () => {
       if (!option.enabled) return;
       reviewDraft.selection = option.id;
+      // The branch option names the runtime's recorded upstream; prefill it so
+      // the recommended choice is startable without retyping a ref the person
+      // did not choose.
+      if (option.id === 'branch' && !reviewDraft.base) reviewDraft.base = option.scope?.base ?? '';
       reviewDraft.error = null;
       paintReviewDialog();
     });
@@ -10859,6 +10863,8 @@ api.onEvent(frame => {
     render();
     applyConnection({ event: 'connection', state: 'connected', resumed: true });
     reloadHistory();
+    // A reconnect is where a settlement this client missed becomes visible.
+    requestReviews();
     refreshTasks();
     return;
   }
@@ -10947,10 +10953,6 @@ api.onEvent(frame => {
     renderConversation();
     if (rightbarOpen) renderRightbar();
     if (activeView === 'trajectory') renderTrajectory();
-    // The replay places settled reviews by their conversation notices. The
-    // durable list is the index that also carries a row written before that
-    // mechanism, so a reopened session reaches every review it owns.
-    requestReviews();
     return;
   }
   if (event.type === 'session_opened') {
@@ -10969,6 +10971,11 @@ api.onEvent(frame => {
     liveTurnClosed = false;
     render();
     reloadHistory();
+    // A session's durable review index is read when the session is opened:
+    // the replay carries the reviews its notices name, and this list also
+    // reaches a row written before that mechanism. Terminal-time history
+    // reloads do not repeat it.
+    requestReviews();
     refreshTasks();
     return;
   }
