@@ -1268,6 +1268,7 @@ fn a_short_conversation_starts_at_the_viewport_top() {
                 ordinal: None,
                 kind: None,
                 images: 0,
+                image_refs: Vec::new(),
             },
         }),
     );
@@ -1320,6 +1321,7 @@ fn a_silent_tool_group_leaves_no_hole() {
                 ordinal: None,
                 kind: None,
                 images: 0,
+                image_refs: Vec::new(),
             },
         }),
     );
@@ -1400,6 +1402,7 @@ fn a_narrow_terminal_keeps_the_answer_and_the_composer() {
                     ordinal: None,
                     kind: None,
                     images: 0,
+                    image_refs: Vec::new(),
                 },
             }),
         );
@@ -1441,6 +1444,7 @@ fn no_rendered_line_exceeds_the_terminal_width() {
                 ordinal: None,
                 kind: None,
                 images: 0,
+                image_refs: Vec::new(),
             },
         }),
     );
@@ -1473,6 +1477,7 @@ fn the_approval_overlay_sits_where_the_composer_was() {
                 ordinal: None,
                 kind: None,
                 images: 0,
+                image_refs: Vec::new(),
             },
         }),
     );

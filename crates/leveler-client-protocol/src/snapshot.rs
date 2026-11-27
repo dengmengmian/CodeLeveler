@@ -332,6 +332,13 @@ pub struct UiMessage {
     /// runtimes and on every message that carried none.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub images: usize,
+    /// The stored images this message carried, in send order. Each ref names a
+    /// content-addressed object in the runtime's media store; a client asks the
+    /// runtime for the bytes and never receives a path or an encoded copy.
+    /// Additive: empty on old runtimes and on messages without images, while
+    /// `images` stays the count older clients understand.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_refs: Vec<leveler_model::StoredImageRef>,
 }
 
 fn is_zero(n: &usize) -> bool {

@@ -56,6 +56,7 @@ fn snapshot() -> UiSessionSnapshot {
                 ordinal: None,
                 kind: None,
                 images: 0,
+                image_refs: Vec::new(),
             },
             UiMessage {
                 id: MessageId::new("m_assistant_1"),
@@ -64,6 +65,7 @@ fn snapshot() -> UiSessionSnapshot {
                 ordinal: None,
                 kind: None,
                 images: 0,
+                image_refs: Vec::new(),
             },
         ],
         pending_interactions: vec![UiPendingInteraction::Approval(UiApprovalRequest {
@@ -116,6 +118,7 @@ fn turn() -> Vec<RuntimeEvent> {
                 ordinal: None,
                 kind: None,
                 images: 0,
+                image_refs: Vec::new(),
             },
         },
         RuntimeEvent::AgentActivity {

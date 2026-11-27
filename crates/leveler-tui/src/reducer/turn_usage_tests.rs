@@ -136,6 +136,7 @@ fn a_late_booked_usage_never_lands_on_the_next_turn() {
                 ordinal: None,
                 kind: None,
                 images: 0,
+                image_refs: Vec::new(),
             },
         }),
     );

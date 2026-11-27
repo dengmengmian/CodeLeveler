@@ -4560,7 +4560,7 @@ impl InProcessRuntimeClient {
         session_id: &SessionId,
         text: &str,
         retitle: bool,
-        images: usize,
+        image_refs: Vec<leveler_model::StoredImageRef>,
         message_id: Option<MessageId>,
         seed_input_id: Option<String>,
     ) -> Result<crate::active_turns::TurnLease, ClientError> {
@@ -4604,7 +4604,8 @@ impl InProcessRuntimeClient {
                     text: text.to_string(),
                     ordinal: None,
                     kind,
-                    images,
+                    images: image_refs.len(),
+                    image_refs,
                 },
             });
         Ok(admission)
@@ -4642,6 +4643,7 @@ impl InProcessRuntimeClient {
                     ordinal: None,
                     kind: Some(UiMessageKind::PendingInput),
                     images: 0,
+                    image_refs: Vec::new(),
                 },
             });
     }
@@ -5922,7 +5924,7 @@ impl InProcessRuntimeClient {
         let config = self.runtime_config(&session_id).await?;
         let model = require_model(&config, &session_id)?;
         let cancel = self
-            .stage_turn(&session_id, &content, true, 0, None, None)
+            .stage_turn(&session_id, &content, true, Vec::new(), None, None)
             .await?;
         if plaintext_secret_ack {
             self.grant_seed_plaintext(&session_id, &content);
@@ -6117,7 +6119,7 @@ impl InProcessRuntimeClient {
                 &session_id,
                 &content,
                 true,
-                image_count(&attachments),
+                attachment_image_refs(&attachments),
                 seed_message_id,
                 seed_input_id,
             )
@@ -6218,7 +6220,7 @@ impl InProcessRuntimeClient {
             .as_str()
             .to_string();
         let cancel = self
-            .stage_turn(&session_id, &content, false, 0, None, None)
+            .stage_turn(&session_id, &content, false, Vec::new(), None, None)
             .await?;
         // A resume continues the execution whose model is on the session row,
         // not the current default: a configuration reload must not silently
@@ -8482,7 +8484,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 let model = require_model(&config, &session_id)?;
                 self.persist_goal_declaration(&session_id, &goal).await?;
                 let cancel = self
-                    .stage_turn(&session_id, &goal, false, 0, None, None)
+                    .stage_turn(&session_id, &goal, false, Vec::new(), None, None)
                     .await?;
                 let accepted = self.spawn_goal_turn(session_id, goal, cancel, config, model);
                 await_turn_acceptance(accepted).await
@@ -10061,6 +10063,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 ordinal: None,
                 kind: Some(kind),
                 images: 0,
+                image_refs: Vec::new(),
             });
         }
 
@@ -11998,13 +12001,21 @@ fn ui_message(payload: &str) -> Option<UiMessage> {
 /// `ordinal` is the persisted append position of this payload in the message
 /// log — carried on snapshots so a client can interleave durable goal recaps
 /// at the transcript position their checkpoint represents (long-goal P3).
-/// How many images a set of attachments carries — the only kind a message can
-/// show, and what a client needs to name them.
-fn image_count(attachments: &[AttachmentRef]) -> usize {
+/// The image attachments of one message, as the content-addressed refs a
+/// client reopens. The stored image is the runtime-normalized PNG the model
+/// was sent, so the ref's hash is the attachment's own store key.
+fn attachment_image_refs(attachments: &[AttachmentRef]) -> Vec<leveler_model::StoredImageRef> {
     attachments
         .iter()
         .filter(|a| a.kind == AttachmentKind::Image)
-        .count()
+        .map(|a| leveler_model::StoredImageRef {
+            sha256: a.sha256.clone(),
+            mime_type: a.mime_type.clone(),
+            width: a.width,
+            height: a.height,
+            name: Some(a.name.clone()),
+        })
+        .collect()
 }
 
 /// The durable source identity of an imported session, for a client snapshot.
@@ -12074,6 +12085,7 @@ fn ui_message_at(payload: &str, ordinal: Option<u64>, input_id: Option<&str>) ->
         Role::Tool => UiRole::Tool,
     };
     let text = message.text_content();
+    let image_refs = crate::session_projection::stored_image_refs(&message);
     let images = message
         .content
         .iter()
@@ -12112,6 +12124,7 @@ fn ui_message_at(payload: &str, ordinal: Option<u64>, input_id: Option<&str>) ->
         ordinal,
         kind,
         images,
+        image_refs,
     })
 }
 

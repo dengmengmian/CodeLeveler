@@ -67,10 +67,10 @@ pub(crate) fn cmd_init() -> anyhow::Result<std::process::ExitCode> {
 
     let text = render_config(&provider, &base_url, &key_env, &model, context_window)?;
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    std::fs::write(&path, &text).with_context(|| format!("write {}", path.display()))?;
+    // The starter document is created under the shared config lock and never
+    // replaces a configuration another process already wrote.
+    leveler_app::config_edit::create_new(&path, &text)
+        .with_context(|| format!("write {}", path.display()))?;
 
     println!();
     println!("{}", Line::ok(&format!("Wrote {}", path.display())));

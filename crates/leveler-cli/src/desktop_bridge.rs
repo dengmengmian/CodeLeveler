@@ -210,6 +210,29 @@ fn validate_command(session: &SessionId, command: &ClientCommand) -> anyhow::Res
         // lifecycle. `require_new_turn` is a typed flag, never inferred.
         ClientCommand::RunGoal { content, .. }
             if !content.trim().is_empty() && content.len() <= 100_000 => {}
+        // The side question runs beside the main turn. Its text is user text;
+        // the runtime owns the read-only surface and the answer lifecycle.
+        ClientCommand::Btw { question, .. }
+            if !question.trim().is_empty() && question.chars().count() <= 100_000 => {}
+        ClientCommand::CancelBtw { .. } => {}
+        ClientCommand::Recap { .. } => {}
+        ClientCommand::RestoreCheckpoint { checkpoint_id, .. }
+            if !checkpoint_id.as_str().trim().is_empty() && checkpoint_id.as_str().len() <= 256 => {
+        }
+        ClientCommand::AcknowledgeCrashWindow { .. } => {}
+        // A diagnostics request names the session it is asked from and a query
+        // id the answer echoes. The runtime composes the report; the bridge
+        // only bounds the request.
+        ClientCommand::QueryDiagnostics {
+            requester_session_id,
+            query_id,
+            locale,
+        } if requester_session_id == session
+            && !query_id.as_str().trim().is_empty()
+            && query_id.as_str().len() <= 256
+            && locale
+                .as_ref()
+                .is_none_or(|locale| matches!(locale.as_str(), "zh" | "en")) => {}
         ClientCommand::SteerCurrentTurn { .. }
         | ClientCommand::CancelCurrentTurn { .. }
         | ClientCommand::CancelTask { .. }
@@ -945,6 +968,18 @@ impl Bridge {
             "search_save" => {
                 crate::desktop_search::save(&self.home, self.client.as_ref(), &params).await
             }
+            // The global Thinking default and the Agent browser product are
+            // host config facts. A save goes through the one locked config
+            // transaction and reports whether the runtime was asked to reload;
+            // the browser adds its real restart scope.
+            "thinking_settings" => crate::desktop_thinking::view(&self.home),
+            "thinking_settings_save" => {
+                crate::desktop_thinking::save(&self.home, self.client.as_ref(), &params).await
+            }
+            "browser_settings" => crate::desktop_browser::view(&self.home),
+            "browser_settings_save" => {
+                crate::desktop_browser::save(&self.home, self.client.as_ref(), &params).await
+            }
             "list_tasks" => Ok(serde_json::to_value(
                 leveler_app::global_task_index::query_global_tasks(
                     &self.home,
@@ -1109,6 +1144,26 @@ impl Bridge {
             "runtime_info" => Ok(serde_json::to_value(
                 LocalRuntimeService::runtime_info(self.client()?.as_ref()).await?,
             )?),
+            // Resolve a content-addressed image the client was shown a ref for
+            // (a user attachment or a tool-returned image). The renderer never
+            // receives a path; the runtime's media store owns the bytes, and a
+            // malformed key is refused before it touches disk.
+            "fetch_attachment" => {
+                use base64::Engine as _;
+                let sha256 = required_string(&params, "sha256")?;
+                anyhow::ensure!(
+                    sha256.len() == 64
+                        && sha256
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                    "sha256 must be 64 lowercase hex characters"
+                );
+                let blob = self.client()?.fetch_attachment(sha256).await?;
+                Ok(json!({
+                    "mime_type": blob.mime_type,
+                    "data_base64": base64::engine::general_purpose::STANDARD.encode(&blob.bytes),
+                }))
+            }
             _ => anyhow::bail!("unknown desktop method: {method}"),
         }
     }
@@ -1652,6 +1707,91 @@ compatibility: { synthesize_tool_call_ids: true, drop_unsupported_fields: true }
                 &ClientCommand::SetDefaultModel {
                     session_id: session.clone(),
                     model: leveler_model::ModelRef::new("fixture", "model"),
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn desktop_recovery_and_diagnostics_commands_are_session_scoped() {
+        let session = SessionId::new("desktop-recovery");
+        let commands = vec![
+            ClientCommand::Btw {
+                session_id: session.clone(),
+                question: "为什么这里用队列？".into(),
+            },
+            ClientCommand::CancelBtw {
+                session_id: session.clone(),
+            },
+            ClientCommand::Recap {
+                session_id: session.clone(),
+            },
+            ClientCommand::RestoreCheckpoint {
+                session_id: session.clone(),
+                checkpoint_id: leveler_core::CheckpointId::new("chk-1"),
+            },
+            ClientCommand::AcknowledgeCrashWindow {
+                session_id: session.clone(),
+            },
+        ];
+        for command in &commands {
+            assert!(validate_command(&session, command).is_ok());
+        }
+        let other = SessionId::new("other");
+        for command in [
+            ClientCommand::Btw {
+                session_id: other.clone(),
+                question: "x".into(),
+            },
+            ClientCommand::CancelBtw {
+                session_id: other.clone(),
+            },
+            ClientCommand::Recap {
+                session_id: other.clone(),
+            },
+            ClientCommand::RestoreCheckpoint {
+                session_id: other.clone(),
+                checkpoint_id: leveler_core::CheckpointId::new("chk-1"),
+            },
+            ClientCommand::AcknowledgeCrashWindow { session_id: other },
+        ] {
+            assert!(validate_command(&session, &command).is_err());
+        }
+        assert!(
+            validate_command(
+                &session,
+                &ClientCommand::Btw {
+                    session_id: session.clone(),
+                    question: "   ".into(),
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            validate_command(
+                &session,
+                &ClientCommand::RestoreCheckpoint {
+                    session_id: session.clone(),
+                    checkpoint_id: leveler_core::CheckpointId::new(""),
+                }
+            )
+            .is_err()
+        );
+        let query = ClientCommand::QueryDiagnostics {
+            requester_session_id: session.clone(),
+            query_id: leveler_client_protocol::CommandId::new("q1"),
+            locale: Some("zh".into()),
+        };
+        assert!(validate_command(&session, &query).is_ok());
+        assert!(validate_command(&SessionId::new("other"), &query).is_err());
+        assert!(
+            validate_command(
+                &session,
+                &ClientCommand::QueryDiagnostics {
+                    requester_session_id: session.clone(),
+                    query_id: leveler_client_protocol::CommandId::new("q1"),
+                    locale: Some("fr".into()),
                 }
             )
             .is_err()

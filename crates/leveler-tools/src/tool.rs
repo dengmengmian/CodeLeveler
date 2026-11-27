@@ -116,6 +116,10 @@ pub struct ExecutionResources {
     /// when no runtime owns a vault (eval, standalone tool tests), in which
     /// case the broker tools refuse rather than inventing a store.
     pub secret_vault: Option<Arc<leveler_execution::secret_vault::SecretVault>>,
+    /// The runtime's content-addressed image store. The executor archives
+    /// images a tool returned here, so the bytes a client reopens are the same
+    /// ones the model saw. `None` on surfaces with no client to show them.
+    pub media_store: Option<Arc<leveler_media::MediaStore>>,
 }
 
 /// Compare two filesystem names after resolving an existing file or its
@@ -516,6 +520,7 @@ impl ToolContext {
                 memory: None,
                 memory_index: None,
                 secret_vault: None,
+                media_store: None,
             },
             policy: ToolPolicy {
                 permission_profile: SharedPermissionProfile::new(mode),
@@ -882,6 +887,21 @@ impl ToolContext {
     pub fn with_memory(mut self, memory: leveler_memory::MemoryAccessResource) -> Self {
         self.execution.memory = Some(memory);
         self
+    }
+
+    /// Attach the runtime's content-addressed image store. Tool-returned
+    /// images are archived here so a client can reopen them by hash; a context
+    /// without one still lets the model see an image, it just cannot show it
+    /// back to a person later.
+    pub fn with_media_store(mut self, store: Arc<leveler_media::MediaStore>) -> Self {
+        self.execution.media_store = Some(store);
+        self
+    }
+
+    /// The image store this execution archives tool images into, when one was
+    /// attached.
+    pub fn media_store(&self) -> Option<&Arc<leveler_media::MediaStore>> {
+        self.execution.media_store.as_ref()
     }
 
     /// Attach the pre-rendered memory index for this turn's prompt.

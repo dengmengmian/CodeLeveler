@@ -253,6 +253,16 @@ pub enum AgentEvent {
         /// intentionally unaffected.
         execution_status: Option<leveler_execution::ToolExecutionStatus>,
     },
+    /// Images a tool result carried, archived so a client can show the same
+    /// bytes the model saw. Emitted immediately after the matching
+    /// [`AgentEvent::ToolResult`]; the refs are content hashes, never bytes.
+    ToolImages {
+        id: String,
+        images: Vec<leveler_model::StoredImageRef>,
+        /// Why reported images could not be archived. `None` when they were,
+        /// or when the call carried none.
+        error: Option<String>,
+    },
     /// A tool call's outcome could not be established after a process crash.
     ///
     /// The call may have run and produced a side effect before the runtime

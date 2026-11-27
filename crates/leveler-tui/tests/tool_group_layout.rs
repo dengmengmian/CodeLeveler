@@ -194,6 +194,7 @@ fn a_running_stage_keeps_its_geometry_from_first_call_to_close() {
                 ordinal: None,
                 kind: None,
                 images: 0,
+                image_refs: Vec::new(),
             },
         }),
     );
@@ -288,6 +289,7 @@ fn the_painted_screen_does_not_shift_when_the_group_closes() {
                 ordinal: None,
                 kind: None,
                 images: 0,
+                image_refs: Vec::new(),
             },
         }),
     );

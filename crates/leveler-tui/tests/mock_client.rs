@@ -31,6 +31,7 @@ async fn records_commands_and_broadcasts_events() {
             ordinal: None,
             kind: None,
             images: 0,
+            image_refs: Vec::new(),
         },
     });
     let event = rx.recv().await.unwrap();

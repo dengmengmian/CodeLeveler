@@ -178,6 +178,7 @@ fn ui_user(i: usize) -> UiMessage {
         ordinal: None,
         kind: None,
         images: 0,
+        image_refs: Vec::new(),
     }
 }
 

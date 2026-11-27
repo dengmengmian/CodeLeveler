@@ -55,6 +55,51 @@ fn write_document(path: &Path, doc: &DocumentMut) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+/// A first-run configuration write. It is the same lock and validator as
+/// [`edit`], but it refuses to replace a configuration that another process
+/// created while the user was answering the setup prompts.
+#[derive(Debug, thiserror::Error)]
+pub enum CreateNewError {
+    #[error("a configuration was created by another process; nothing was overwritten")]
+    AlreadyExists,
+    #[error("{0}")]
+    Invalid(String),
+    #[error("io error: {0}")]
+    Io(String),
+}
+
+/// Write a complete starter document only if the file is absent or empty.
+///
+/// An empty document holds no configuration, so replacing it cannot lose a
+/// user's setting; a non-empty one is another writer's result and is never
+/// overwritten. The advisory lock serializes this with every [`edit`] caller.
+pub fn create_new(path: &Path, text: &str) -> Result<(), CreateNewError> {
+    let starter = text
+        .parse::<DocumentMut>()
+        .map_err(|error| CreateNewError::Invalid(error.to_string()))?;
+    match edit(
+        path,
+        |doc| {
+            if !doc.is_empty() {
+                return Err(CreateNewError::AlreadyExists);
+            }
+            *doc = starter.clone();
+            Ok(())
+        },
+        |candidate| {
+            crate::global_config::GlobalConfig::from_toml_str(candidate)
+                .map(|_| ())
+                .map_err(|error| CreateNewError::Invalid(error.to_string()))
+        },
+    ) {
+        Ok(()) => Ok(()),
+        Err(EditError::Apply(error) | EditError::Validate(error)) => Err(error),
+        Err(EditError::Parse(message)) => Err(CreateNewError::Invalid(message)),
+        Err(EditError::Io(message)) => Err(CreateNewError::Io(message)),
+        Err(EditError::ConcurrentModification) => Err(CreateNewError::AlreadyExists),
+    }
+}
+
 /// Read, edit and validate the document under the process-shared lock.
 ///
 /// `validate` runs against the candidate text with the same lock held; it is
@@ -103,6 +148,69 @@ pub fn edit<T, E>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_first_run_write_never_replaces_an_existing_configuration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        assert!(matches!(
+            create_new(&path, "default_model = \"a/m\"\n"),
+            Ok(())
+        ));
+        assert!(matches!(
+            create_new(&path, "default_model = \"b/m\"\n"),
+            Err(CreateNewError::AlreadyExists)
+        ));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("a/m") && !text.contains("b/m"), "{text}");
+    }
+
+    /// Two processes racing to create the same first-run file: the lock makes
+    /// exactly one win and the other reports `AlreadyExists`; the winner's
+    /// document is what remains, never a blend or a last-writer overwrite.
+    #[test]
+    fn two_concurrent_first_run_writes_produce_one_configuration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let results = std::thread::scope(|scope| {
+            let first = {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    create_new(&path, "default_model = \"a/m\"\n")
+                })
+            };
+            let second = {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    create_new(&path, "default_model = \"b/m\"\n")
+                })
+            };
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        let wins = [results.0.is_ok(), results.1.is_ok()]
+            .into_iter()
+            .filter(|won| *won)
+            .count();
+        let refusals = [
+            matches!(&results.0, Err(CreateNewError::AlreadyExists)),
+            matches!(&results.1, Err(CreateNewError::AlreadyExists)),
+        ]
+        .into_iter()
+        .filter(|refused| *refused)
+        .count();
+        assert_eq!((wins, refusals), (1, 1), "{results:?}");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            (text.contains("a/m") && !text.contains("b/m"))
+                || (text.contains("b/m") && !text.contains("a/m")),
+            "{text}"
+        );
+    }
 
     #[test]
     fn a_writer_that_bypasses_the_lock_is_not_overwritten() {

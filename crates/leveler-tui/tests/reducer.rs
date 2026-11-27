@@ -603,6 +603,7 @@ fn user_message_added_appends_user_block() {
                 ordinal: None,
                 kind: None,
                 images: 0,
+                image_refs: Vec::new(),
             },
         }),
     );
@@ -1720,6 +1721,7 @@ fn runtime_user_echo_does_not_duplicate_local_echo() {
                 ordinal: None,
                 kind: None,
                 images: 0,
+                image_refs: Vec::new(),
             },
         }),
     );
@@ -3990,6 +3992,7 @@ fn slash_new_starts_a_fresh_session() {
                 ordinal: None,
                 kind: None,
                 images: 0,
+                image_refs: Vec::new(),
             },
         }),
     );
@@ -4436,6 +4439,7 @@ fn compaction_summary_renders_as_summary_not_user_message() {
         ordinal: None,
         kind: None,
         images: 0,
+        image_refs: Vec::new(),
     }];
     reduce(
         &mut s,
@@ -5039,6 +5043,7 @@ fn open_session_rebuilds_transcript() {
                 ordinal: None,
                 kind: None,
                 images: 0,
+                image_refs: Vec::new(),
             },
         }),
     );
@@ -5051,6 +5056,7 @@ fn open_session_rebuilds_transcript() {
         ordinal: None,
         kind: None,
         images: 0,
+        image_refs: Vec::new(),
     }];
     reduce(
         &mut s,
@@ -9226,6 +9232,7 @@ fn steered_text_appears_in_the_conversation_once_settled() {
                 ordinal: None,
                 kind: Some(leveler_client_protocol::UiMessageKind::PendingInput),
                 images: 0,
+                image_refs: Vec::new(),
             },
         }),
     );
@@ -9439,6 +9446,7 @@ fn a_submission_confirmed_after_reconnect_syncs_runtime_state_without_resending(
         ordinal: Some(0),
         kind: None,
         images: 0,
+        image_refs: Vec::new(),
     }];
     let effects = reduce(
         &mut s,
@@ -11290,6 +11298,7 @@ fn session_snapshot_interleaves_goal_recaps_by_ordinal() {
             ordinal: Some(0),
             kind: None,
             images: 0,
+            image_refs: Vec::new(),
         },
         UiMessage {
             id: MessageId::new("m1"),
@@ -11298,6 +11307,7 @@ fn session_snapshot_interleaves_goal_recaps_by_ordinal() {
             ordinal: Some(1),
             kind: None,
             images: 0,
+            image_refs: Vec::new(),
         },
         UiMessage {
             id: MessageId::new("m2"),
@@ -11306,6 +11316,7 @@ fn session_snapshot_interleaves_goal_recaps_by_ordinal() {
             ordinal: Some(2),
             kind: None,
             images: 0,
+            image_refs: Vec::new(),
         },
     ];
     snap.recaps = vec![goal_recap("cp-mid", Some(2))];
@@ -11567,6 +11578,7 @@ fn a_long_turn_shows_every_message_in_full() {
                 ordinal: None,
                 kind: None,
                 images: 0,
+                image_refs: Vec::new(),
             },
         }),
     );
@@ -11615,6 +11627,7 @@ fn a_replayed_session_shows_every_message_in_full() {
             ordinal: Some(1),
             kind: None,
             images: 0,
+            image_refs: Vec::new(),
         },
         UiMessage {
             id: MessageId::new("m1"),
@@ -11623,6 +11636,7 @@ fn a_replayed_session_shows_every_message_in_full() {
             ordinal: Some(2),
             kind: None,
             images: 0,
+            image_refs: Vec::new(),
         },
         UiMessage {
             id: MessageId::new("m2"),
@@ -11631,6 +11645,7 @@ fn a_replayed_session_shows_every_message_in_full() {
             ordinal: Some(3),
             kind: None,
             images: 0,
+            image_refs: Vec::new(),
         },
     ];
     reduce(
@@ -11801,6 +11816,7 @@ fn a_runtime_notice_in_history_is_not_rendered_as_user_input() {
         ordinal: Some(0),
         kind: Some(leveler_client_protocol::UiMessageKind::RuntimeNotice),
         images: 0,
+        image_refs: Vec::new(),
     }];
     reduce(
         &mut s,
@@ -13201,6 +13217,7 @@ fn a_replayed_message_keeps_the_names_the_user_wrote() {
                 ordinal: None,
                 kind: None,
                 images: 2,
+                image_refs: Vec::new(),
             },
         }),
     );
@@ -13226,6 +13243,7 @@ fn a_message_of_pictures_alone_still_shows_them() {
                 ordinal: None,
                 kind: None,
                 images: 2,
+                image_refs: Vec::new(),
             },
         }),
     );
@@ -16343,6 +16361,7 @@ fn a_settled_review_delivers_a_new_result_where_it_finished() {
                 ordinal: None,
                 kind: None,
                 images: 0,
+                image_refs: Vec::new(),
             },
         }),
     );
@@ -16708,6 +16727,7 @@ fn two_reviews_deliver_their_results_in_settlement_order() {
                 ordinal: None,
                 kind: None,
                 images: 0,
+                image_refs: Vec::new(),
             },
         }),
     );
@@ -17035,6 +17055,7 @@ fn a_refused_history_replay_still_applies_its_review_results() {
                             ordinal: None,
                             kind: None,
                             images: 0,
+                            image_refs: Vec::new(),
                         },
                     },
                 },
@@ -17084,6 +17105,7 @@ fn a_busy_reconnect_replays_a_settled_review_at_its_durable_position() {
                         ordinal: None,
                         kind: None,
                         images: 0,
+                        image_refs: Vec::new(),
                     },
                 },
             },
@@ -17116,6 +17138,7 @@ fn a_busy_reconnect_replays_a_settled_review_at_its_durable_position() {
                         ordinal: None,
                         kind: None,
                         images: 0,
+                        image_refs: Vec::new(),
                     },
                 },
             },
@@ -17233,6 +17256,7 @@ fn an_idle_reconnect_asks_for_history_before_review_rows() {
         ordinal: Some(0),
         kind: None,
         images: 0,
+        image_refs: Vec::new(),
     }];
     let effects = reduce(
         &mut s,

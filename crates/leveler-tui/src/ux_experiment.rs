@@ -105,6 +105,7 @@ fn opened(goal: &str) -> AppState {
                 ordinal: None,
                 kind: None,
                 images: 0,
+                image_refs: Vec::new(),
             },
         }),
     );

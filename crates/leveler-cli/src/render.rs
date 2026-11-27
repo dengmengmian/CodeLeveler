@@ -30,6 +30,9 @@ fn render_event_text(event: AgentEvent) {
                 console::style("[network]").dim()
             );
         }
+        // Archived tool images are a graphical surface; the terminal shows
+        // the call's text result, which already says the image loaded.
+        AgentEvent::ToolImages { .. } => {}
         // A durable accounting row, intercepted by the drive loop. The child's
         // running totals reach the screen as SubAgentProgress instead.
         AgentEvent::SubAgentModelRequest { .. } => {}
@@ -288,6 +291,14 @@ fn event_jsonl(event: AgentEvent) -> serde_json::Value {
             "attempt": attempt,
             "max_attempts": max_attempts,
             "delay_ms": delay_ms,
+        }),
+        // Content hashes, not bytes: a telemetry consumer can see that a call
+        // produced an image without receiving the picture itself.
+        AgentEvent::ToolImages { id, images, error } => serde_json::json!({
+            "type": "tool_images",
+            "call_id": id,
+            "images": images,
+            "error": error,
         }),
         AgentEvent::BackgroundTaskStarted {
             call_id,

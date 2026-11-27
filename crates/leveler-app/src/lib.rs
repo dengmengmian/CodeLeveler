@@ -9,6 +9,7 @@
 mod active_turns;
 pub mod agent_options;
 pub mod agents;
+pub mod browser_config;
 mod checkpoints;
 mod children;
 mod collaboration;
@@ -51,6 +52,7 @@ pub mod settings_service;
 mod side_question;
 pub mod skills;
 mod startup_recovery;
+pub mod thinking_config;
 mod tool_output;
 pub mod usage;
 mod user_shell;
@@ -2041,6 +2043,12 @@ impl Application {
         .with_policy_limits(max_files)
         .with_secret_vault(self.secret_vault.clone())
         .with_sandbox(sandbox)
+        // One media store for the whole process: attachments and tool-returned
+        // images share the same content-addressed root, so a client resolves
+        // either through the same fetch path.
+        .with_media_store(std::sync::Arc::new(leveler_media::MediaStore::new(
+            self.layout.state_dir.join("media"),
+        )))
         .with_deny_env(provider_secret_env_names(
             &snapshot.loaded.providers,
             snapshot.loaded.web_search.as_ref(),

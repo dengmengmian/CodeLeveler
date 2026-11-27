@@ -1075,6 +1075,17 @@ impl EventBridge {
                     }),
                 });
             }
+            EngineEvent::ToolCallImages {
+                call_id,
+                images,
+                error,
+            } => {
+                let _ = self.events.send(RuntimeEvent::ToolCallImages {
+                    id: ToolCallId::new(call_id),
+                    images,
+                    error,
+                });
+            }
             EngineEvent::ToolCallOutput {
                 call_id,
                 stream,

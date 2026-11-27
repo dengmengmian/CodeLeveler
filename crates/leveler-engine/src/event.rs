@@ -448,6 +448,20 @@ pub enum EngineEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stop: Option<leveler_execution::CommandStop>,
     },
+    /// Images a tool call returned, archived in the runtime's media store.
+    ///
+    /// The durable record is the content hash, not the bytes: the transcript
+    /// already carries the model-visible image in its own message row, and a
+    /// client reopens the picture by asking the runtime for this hash.
+    ToolCallImages {
+        call_id: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<leveler_model::StoredImageRef>,
+        /// Why reported images could not be archived for display. Absent when
+        /// every image was stored (or the call had none).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     /// TRANSIENT: live output chunk from a running command tool call.
     /// `stream` is `stdout` or `stderr`. Never persisted — the call's
     /// finished preview is the durable record.
@@ -1185,6 +1199,9 @@ impl EngineEvent {
             | EngineEvent::BackgroundTaskFinished { .. }
             // Raw command output — local-sensitive like the user shell's.
             | EngineEvent::ToolCallOutput { .. }
+            // Image identities point at user-visible content held by this
+            // machine; keep them on this machine like the images themselves.
+            | EngineEvent::ToolCallImages { .. }
             | EngineEvent::TaskCancelRequested { .. }
             | EngineEvent::SessionMetadataChanged { .. } => LocalOnly,
         }
@@ -1354,6 +1371,7 @@ impl EngineEvent {
             | EngineEvent::BackgroundTaskStarted { .. }
             | EngineEvent::BackgroundTaskFinished { .. }
             | EngineEvent::ToolCallOutput { .. }
+            | EngineEvent::ToolCallImages { .. }
             | EngineEvent::ModelRetrying { .. }
             | EngineEvent::CommandProgress { .. }
             | EngineEvent::RetiredMemory { .. }

@@ -189,6 +189,7 @@ fn user(s: &mut AppState, text: &str) {
                 ordinal: None,
                 kind: None,
                 images: 0,
+                image_refs: Vec::new(),
             },
         }),
     );

@@ -147,6 +147,7 @@ fn reopened_with_history() -> AppState {
         ordinal: None,
         kind: None,
         images: 0,
+        image_refs: Vec::new(),
     });
     let effects = reduce(
         &mut s,
@@ -267,6 +268,7 @@ fn a_replayed_review_is_projected_once_and_not_requested_again() {
                         ordinal: None,
                         kind: None,
                         images: 0,
+                        image_refs: Vec::new(),
                     },
                 },
             },
@@ -2016,6 +2018,7 @@ fn acceptance_ghost_frame_then_accepted_frame_then_one_send() {
                 ordinal: None,
                 kind: None,
                 images: 0,
+                image_refs: Vec::new(),
             },
         }),
     );
@@ -2238,6 +2241,7 @@ fn a_turn_that_already_has_a_recap_is_not_regenerated_after_trailing_rows() {
                         ordinal: None,
                         kind: None,
                         images: 0,
+                        image_refs: Vec::new(),
                     },
                 },
             },
@@ -2335,6 +2339,7 @@ fn reopening_a_non_successful_last_turn_does_not_generate_a_recap() {
                             ordinal: None,
                             kind: None,
                             images: 0,
+                            image_refs: Vec::new(),
                         },
                     },
                 },
@@ -2420,6 +2425,7 @@ fn replaying_a_goal_terminal_rebuilds_the_same_recap_once() {
                         ordinal: None,
                         kind: None,
                         images: 0,
+                        image_refs: Vec::new(),
                     },
                 },
             },

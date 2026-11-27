@@ -1303,6 +1303,7 @@ fn reply_copy_replays_goal_delivery_and_prior_replies_independently() {
             ordinal: None,
             kind: None,
             images: 0,
+            image_refs: Vec::new(),
         },
     };
     let mut events = vec![user("u1", "First request")];

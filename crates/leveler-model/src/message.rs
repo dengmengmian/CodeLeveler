@@ -188,6 +188,30 @@ pub enum ImageSource {
     Base64 { media_type: String, data: String },
 }
 
+/// A content-addressed reference to an image held by the runtime's media store.
+///
+/// The bytes never travel through transcripts, events or snapshots: this is the
+/// key a client asks the runtime to resolve. `width`/`height` come from the
+/// stored bytes, never from a filename or from what a model or tool claimed.
+/// An unresolvable ref is an honest "image unavailable", not a blank tile
+/// standing in for bytes nobody has.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct StoredImageRef {
+    /// SHA-256 (hex) of the stored bytes — the media store key.
+    pub sha256: String,
+    /// The stored object's real MIME type.
+    pub mime_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    /// The user-visible filename when one exists (an attachment); absent for a
+    /// tool-produced image, which has no user-chosen name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
 /// A tool the model may call.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolDefinition {

@@ -26,7 +26,7 @@ use super::closeout::{
     stalled_detail,
 };
 use super::dispatch::{
-    collect_modified, compact_json, deny_call, extract_applied_diff, extract_image, extract_plan,
+    collect_modified, compact_json, deny_call, extract_applied_diff, extract_images, extract_plan,
     newly_modified_paths, note_tool_side_effects, preview,
 };
 use super::host::AdmitError;
@@ -3848,8 +3848,23 @@ impl Drive<'_> {
                         &mut *self.observer,
                     );
                 }
-                if let Some(part) = extract_image(&metadata) {
-                    pending_images.push(part);
+                pending_images.extend(extract_images(&metadata));
+                if executor.depth == 0
+                    && let Some(archive) =
+                        super::dispatch::archive_images(&executor.tool_context, &metadata)
+                {
+                    match archive {
+                        Ok(refs) => (self.observer)(AgentEvent::ToolImages {
+                            id: job.admitted.call.id.as_str().to_string(),
+                            images: refs,
+                            error: None,
+                        }),
+                        Err(error) => (self.observer)(AgentEvent::ToolImages {
+                            id: job.admitted.call.id.as_str().to_string(),
+                            images: Vec::new(),
+                            error: Some(error),
+                        }),
+                    }
                 }
                 if let Some(task_id) = facts.terminal_task_id.as_ref() {
                     observed_terminal_tasks.push(task_id.clone());
@@ -7736,7 +7751,8 @@ impl AgentHarness for Drive<'_> {
             let (
                 content,
                 is_error,
-                image,
+                images,
+                image_refs,
                 workspace_snapshot,
                 plan,
                 newly_modified,
@@ -7831,7 +7847,8 @@ impl AgentHarness for Drive<'_> {
                     let (
                         content,
                         is_error,
-                        image,
+                        images,
+                        image_refs,
                         workspace_snapshot,
                         plan,
                         call_files,
@@ -7927,7 +7944,7 @@ impl AgentHarness for Drive<'_> {
                         // A stopped command's result is only "cancelled"; the
                         // output the user already watched is what tells the
                         // model how far it got.
-                        if result.8.stop.is_some()
+                        if result.9.stop.is_some()
                             && let Some(tail) = lines.stopped_tail()
                         {
                             result.0.push_str(&format!(
@@ -7947,7 +7964,8 @@ impl AgentHarness for Drive<'_> {
                     (
                         content,
                         is_error,
-                        image,
+                        images,
+                        image_refs,
                         workspace_snapshot,
                         plan,
                         newly,
@@ -7979,6 +7997,7 @@ impl AgentHarness for Drive<'_> {
                     (
                         format!("action not permitted: {reason}"),
                         true,
+                        Vec::new(),
                         None,
                         None,
                         None,
@@ -8002,8 +8021,26 @@ impl AgentHarness for Drive<'_> {
                     snapshot,
                 });
             }
-            if let Some(part) = image {
-                pending_images.push(part);
+            pending_images.extend(images);
+            // Only the top-level agent's calls have a client surface. A child's
+            // image still reaches its own model context, but projecting its
+            // content key onto the parent stream would create a tool row the
+            // parent never had.
+            if self.executor.depth == 0
+                && let Some(archive) = image_refs
+            {
+                match archive {
+                    Ok(refs) => (self.observer)(AgentEvent::ToolImages {
+                        id: call.id.as_str().to_string(),
+                        images: refs,
+                        error: None,
+                    }),
+                    Err(error) => (self.observer)(AgentEvent::ToolImages {
+                        id: call.id.as_str().to_string(),
+                        images: Vec::new(),
+                        error: Some(error),
+                    }),
+                }
             }
 
             // A plan update is the model's declaration: the host mirror takes

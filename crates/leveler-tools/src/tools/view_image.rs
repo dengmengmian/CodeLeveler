@@ -23,14 +23,96 @@ use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 /// ~33% and providers cap the request size, so this is tighter than the
 /// attachment store's own ceiling.
 const MAX_BYTES: usize = 5 * 1024 * 1024;
+/// A single call may load several pictures; each is bounded on its own.
+const MAX_IMAGES: usize = 8;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct Input {
-    /// Path to the image file, relative to the repository root.
-    path: String,
+    /// Path to one image file, relative to the repository root.
+    #[serde(default)]
+    path: Option<String>,
+    /// Paths to several image files, relative to the repository root. Use
+    /// either this or `path`, not both.
+    #[serde(default)]
+    paths: Option<Vec<String>>,
 }
 
 pub struct ViewImageTool;
+
+struct LoadedImage {
+    path: String,
+    png: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+impl ViewImageTool {
+    /// Read and normalize one source image.
+    ///
+    /// The bytes are opened under the workspace's confinement decision, so
+    /// what is read is what was authorised even if the path is swapped after
+    /// resolution. The size check happens before the read so a huge file is
+    /// rejected rather than pulled into memory first.
+    async fn load_one(&self, path: &str, context: &ToolContext) -> Result<LoadedImage, String> {
+        if let Some(reason) = context.security_control_read_denied(path) {
+            return Err(reason);
+        }
+        if let Some(reason) = context.skill_content_read_denied(path) {
+            return Err(reason);
+        }
+        let workspace = match context.execution_workspace() {
+            Ok(workspace) => workspace,
+            Err(error) => return Err(format!("读取图片失败:{error}")),
+        };
+        let (_path, file) = match workspace.open_read(path) {
+            Ok(opened) => opened,
+            Err(leveler_execution::WorkspaceError::ReadOpen {
+                kind: std::io::ErrorKind::NotFound,
+                message,
+                ..
+            }) => {
+                return Err(format!("读取图片失败:{message}"));
+            }
+            Err(error) => return Err(format!("读取图片失败:{error}")),
+        };
+        let file = tokio::fs::File::from_std(file);
+        match file.metadata().await {
+            Ok(meta) if meta.len() > MAX_BYTES as u64 => {
+                return Err(format!(
+                    "图片过大({} KB),上限 {} KB。",
+                    meta.len() / 1024,
+                    MAX_BYTES / 1024
+                ));
+            }
+            Ok(_) => {}
+            Err(e) => return Err(format!("读取图片失败:{e}")),
+        }
+        let bytes = {
+            use tokio::io::AsyncReadExt;
+            let mut bytes = Vec::new();
+            let mut file = file;
+            file.read_to_end(&mut bytes)
+                .await
+                .map_err(|e| format!("读取图片失败:{e}"))?;
+            bytes
+        };
+        let processed = match leveler_media::process_image(&bytes) {
+            Ok(processed) => processed,
+            Err(leveler_media::MediaError::Unsupported(kind)) => {
+                return Err(format!(
+                    "不支持的图片格式({kind};支持 png/jpg/jpeg/gif/webp)。"
+                ));
+            }
+            Err(error) => return Err(format!("读取图片失败:{error}")),
+        };
+        Ok(LoadedImage {
+            path: path.to_string(),
+            png: processed.png,
+            width: processed.width,
+            height: processed.height,
+        })
+    }
+}
 
 #[async_trait]
 impl Tool for ViewImageTool {
@@ -39,9 +121,10 @@ impl Tool for ViewImageTool {
     }
 
     fn description(&self) -> &'static str {
-        "Load an image file from the workspace into the conversation so you can \
-         see it (screenshots, diagrams, mockups). Provide a path relative to the \
-         repository root. Supports png/jpg/gif/webp."
+        "Load image files from the workspace into the conversation so you can \
+         see them (screenshots, diagrams, mockups). Provide `path` for one image \
+         or `paths` for several, relative to the repository root. Supports \
+         png/jpg/gif/webp."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -59,8 +142,20 @@ impl Tool for ViewImageTool {
     }
 
     fn approval_reason(&self, input: &serde_json::Value, context: &ToolContext) -> Option<String> {
-        let path = input.get("path")?.as_str()?;
-        crate::workspace::path_approval_reason(context, path, false)
+        let paths: Vec<&str> = input
+            .get("paths")
+            .and_then(serde_json::Value::as_array)
+            .map(|list| list.iter().filter_map(serde_json::Value::as_str).collect())
+            .unwrap_or_else(|| {
+                input
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .into_iter()
+                    .collect()
+            });
+        paths
+            .into_iter()
+            .find_map(|path| crate::workspace::path_approval_reason(context, path, false))
     }
 
     async fn execute(
@@ -70,72 +165,54 @@ impl Tool for ViewImageTool {
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
-        if let Some(reason) = context.security_control_read_denied(&input.path) {
-            return Ok(ToolOutput::error(reason));
-        }
-        if let Some(reason) = context.skill_content_read_denied(&input.path) {
-            return Ok(ToolOutput::error(reason));
-        }
-        // Open under the workspace's confinement decision so the bytes read
-        // are the bytes that were authorised, even if a path is swapped after
-        // resolution.
-        let (_path, file) = match context.execution_workspace()?.open_read(&input.path) {
-            Ok(opened) => opened,
-            Err(leveler_execution::WorkspaceError::ReadOpen {
-                kind: std::io::ErrorKind::NotFound,
-                message,
-                ..
-            }) => {
-                return Ok(ToolOutput::error(format!("读取图片失败:{message}")));
-            }
-            Err(error) => return Err(ToolError::Io(error.to_string())),
-        };
-        let file = tokio::fs::File::from_std(file);
-        // Check the size before reading, so a huge file is rejected instead of
-        // pulled fully into memory first.
-        match file.metadata().await {
-            Ok(meta) if meta.len() > MAX_BYTES as u64 => {
-                return Ok(ToolOutput::error(format!(
-                    "图片过大({} KB),上限 {} KB。",
-                    meta.len() / 1024,
-                    MAX_BYTES / 1024
-                )));
-            }
-            Ok(_) => {}
-            Err(e) => return Ok(ToolOutput::error(format!("读取图片失败:{e}"))),
-        }
-        let bytes = {
-            use tokio::io::AsyncReadExt;
-            let mut bytes = Vec::new();
-            let mut file = file;
-            match file.read_to_end(&mut bytes).await {
-                Ok(_) => bytes,
-                Err(e) => return Ok(ToolOutput::error(format!("读取图片失败:{e}"))),
+        let requested: Vec<String> = match (input.path, input.paths) {
+            (Some(path), None) => vec![path],
+            (None, Some(paths)) if !paths.is_empty() => paths,
+            _ => {
+                return Ok(ToolOutput::error(
+                    "请提供 path(单个图片)或 paths(多个图片)之一。".to_string(),
+                ));
             }
         };
-        let processed = match leveler_media::process_image(&bytes) {
-            Ok(processed) => processed,
-            Err(leveler_media::MediaError::Unsupported(kind)) => {
-                return Ok(ToolOutput::error(format!(
-                    "不支持的图片格式({kind};支持 png/jpg/jpeg/gif/webp)。"
-                )));
+        if requested.len() > MAX_IMAGES {
+            return Ok(ToolOutput::error(format!(
+                "一次最多加载 {MAX_IMAGES} 张图片。"
+            )));
+        }
+        let mut loaded = Vec::with_capacity(requested.len());
+        for path in &requested {
+            match self.load_one(path, &context).await {
+                Ok(image) => loaded.push(image),
+                Err(reason) => return Ok(ToolOutput::error(reason)),
             }
-            Err(error) => return Ok(ToolOutput::error(format!("读取图片失败:{error}"))),
-        };
-        let data = base64::engine::general_purpose::STANDARD.encode(&processed.png);
-        Ok(ToolOutput::ok(format!(
-            "已加载图片 {} ({}×{}, {} KB)。",
-            input.path,
-            processed.width,
-            processed.height,
-            processed.png.len() / 1024
-        ))
-        .with_metadata(serde_json::json!({
-            "image": {
+        }
+        let summary = loaded
+            .iter()
+            .map(|image| {
+                format!(
+                    "{} ({}×{}, {} KB)",
+                    image.path,
+                    image.width,
+                    image.height,
+                    image.png.len() / 1024
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let mut metadata_images = Vec::with_capacity(loaded.len());
+        for image in &loaded {
+            metadata_images.push(serde_json::json!({
                 "media_type": leveler_media::PROCESSED_MIME,
-                "data": data,
-            }
-        })))
+                "data": base64::engine::general_purpose::STANDARD.encode(&image.png),
+            }));
+        }
+        let mut metadata = serde_json::json!({ "images": metadata_images });
+        // Older consumers read the singular key. One image keeps both shapes;
+        // several are only expressible as the list.
+        if loaded.len() == 1 {
+            metadata["image"] = metadata_images[0].clone();
+        }
+        Ok(ToolOutput::ok(format!("已加载图片 {summary}。")).with_metadata(metadata))
     }
 }
 
@@ -206,6 +283,49 @@ mod tests {
             "the extension said jpeg; the bytes say png: {:?}",
             out.metadata
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Several pictures in one call are one result with an ordered list; the
+    /// executor hands every one to the model and archives every one.
+    #[tokio::test]
+    async fn loads_several_images_in_one_call() {
+        let dir = scratch("many");
+        std::fs::write(dir.join("a.png"), tiny_png()).unwrap();
+        std::fs::write(dir.join("b.png"), tiny_png()).unwrap();
+        let out = ViewImageTool
+            .execute(
+                serde_json::json!({"paths": ["a.png", "b.png"]}),
+                ctx_in(&dir),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("a.png") && out.content.contains("b.png"));
+        let images = out
+            .metadata
+            .get("images")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert_eq!(images.len(), 2);
+        assert!(images[0].get("data").and_then(|v| v.as_str()).is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn refuses_a_call_that_names_no_image() {
+        let dir = scratch("empty");
+        let out = ViewImageTool
+            .execute(
+                serde_json::json!({}),
+                ctx_in(&dir),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(out.content.contains("请提供"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

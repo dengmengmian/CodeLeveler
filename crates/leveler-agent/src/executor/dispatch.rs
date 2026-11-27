@@ -14,11 +14,82 @@ pub(crate) fn extract_plan(metadata: &serde_json::Value) -> Option<Vec<PlanStep>
 /// part, so the executor can show it to a vision model on the next request.
 pub(crate) fn extract_image(metadata: &serde_json::Value) -> Option<ContentPart> {
     let img = metadata.get("image")?;
+    image_part(img)
+}
+
+/// Every image a tool exposed, in order.
+///
+/// A tool that returns one image uses `metadata.image` (the long-standing
+/// shape); a tool that returns several uses `metadata.images`. Both are read
+/// here so a multi-image result is one general fact, not a special case keyed
+/// on a tool name.
+pub(crate) fn extract_images(metadata: &serde_json::Value) -> Vec<ContentPart> {
+    if let Some(list) = metadata.get("images").and_then(serde_json::Value::as_array) {
+        return list.iter().filter_map(image_part).collect();
+    }
+    extract_image(metadata).into_iter().collect()
+}
+
+fn image_part(img: &serde_json::Value) -> Option<ContentPart> {
     let media_type = img.get("media_type")?.as_str()?.to_string();
     let data = img.get("data")?.as_str()?.to_string();
     Some(ContentPart::Image {
         source: ImageSource::Base64 { media_type, data },
     })
+}
+
+/// The raw image payloads a tool result exposed, as `(declared_media_type,
+/// base64)` pairs. The executor archives them through the media store, which
+/// re-derives the real type and bounds from the bytes; the declaration is a
+/// hint only.
+pub(crate) fn extract_image_payloads(metadata: &serde_json::Value) -> Vec<(String, String)> {
+    let values: Vec<&serde_json::Value> = metadata
+        .get("images")
+        .and_then(serde_json::Value::as_array)
+        .map(|list| list.iter().collect())
+        .unwrap_or_else(|| metadata.get("image").into_iter().collect());
+    values
+        .into_iter()
+        .filter_map(|img| {
+            Some((
+                img.get("media_type")?.as_str()?.to_string(),
+                img.get("data")?.as_str()?.to_string(),
+            ))
+        })
+        .collect()
+}
+
+/// Archive the images a tool result carried into the runtime's media store.
+///
+/// `None` means the call exposed no image, or this execution has no store to
+/// show one back from (eval, unit tests). `Some(Err(..))` means an image
+/// existed and the store refused it: the model may still have seen it, but the
+/// client cannot, and that must be said rather than drawn as an empty result.
+pub(crate) fn archive_images(
+    context: &leveler_tools::ToolContext,
+    metadata: &serde_json::Value,
+) -> Option<Result<Vec<leveler_model::StoredImageRef>, String>> {
+    let payloads = extract_image_payloads(metadata);
+    if payloads.is_empty() {
+        return None;
+    }
+    let store = context.media_store()?;
+    let mut refs = Vec::with_capacity(payloads.len());
+    for (_declared, data) in payloads {
+        match store.import_base64(&data) {
+            Ok(stored) => refs.push(leveler_model::StoredImageRef {
+                sha256: stored.sha256,
+                mime_type: stored.mime_type,
+                width: Some(stored.width),
+                height: Some(stored.height),
+                name: None,
+            }),
+            Err(error) => {
+                return Some(Err(format!("图片无法保存到本地存储: {error}")));
+            }
+        }
+    }
+    Some(Ok(refs))
 }
 
 /// The commands a tool reported as actually executed (`metadata.executed_commands`).
@@ -1133,5 +1204,81 @@ mod background_result_tests {
                 .is_none(),
             "a cancelled task is not a result"
         );
+    }
+}
+
+#[cfg(test)]
+mod image_archive_tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+    use std::sync::Arc;
+
+    const TINY_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+    fn context(tag: &str, with_store: bool) -> (leveler_tools::ToolContext, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "leveler-tool-image-{tag}-{}",
+            leveler_core::new_uuid_string()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let workspace = leveler_execution::Workspace::new(&dir).unwrap();
+        let mut ctx = leveler_tools::ToolContext::new(
+            workspace,
+            leveler_execution::PermissionProfile::RequestApproval,
+        );
+        if with_store {
+            ctx = ctx.with_media_store(Arc::new(leveler_media::MediaStore::new(dir.join("media"))));
+        }
+        (ctx, dir)
+    }
+
+    /// The archived bytes are the store's own object: the ref's key is the
+    /// SHA-256 of what `load_bytes` returns, not of what the tool claimed.
+    #[test]
+    fn tool_images_are_archived_under_their_content_hash() {
+        let (ctx, dir) = context("archive", true);
+        let metadata = serde_json::json!({
+            "images": [
+                { "media_type": "image/png", "data": TINY_PNG_BASE64 },
+            ],
+        });
+        let refs = archive_images(&ctx, &metadata)
+            .expect("a store is attached")
+            .expect("the image is valid");
+        assert_eq!(refs.len(), 1);
+        assert_eq!((refs[0].width, refs[0].height), (Some(1), Some(1)));
+        let (mime, bytes) = ctx
+            .media_store()
+            .unwrap()
+            .load_bytes(&refs[0].sha256)
+            .unwrap();
+        assert_eq!(mime, "image/png");
+        assert_eq!(format!("{:x}", Sha256::digest(&bytes)), refs[0].sha256);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// No store is not a failure: headless surfaces still show the image to
+    /// the model, they just have no client to show it back to.
+    #[test]
+    fn a_context_without_a_store_reports_no_archive() {
+        let (ctx, dir) = context("no-store", false);
+        let metadata = serde_json::json!({
+            "image": { "media_type": "image/png", "data": TINY_PNG_BASE64 },
+        });
+        assert!(archive_images(&ctx, &metadata).is_none());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A payload that is not a decodable image is refused rather than stored
+    /// as whatever it claimed to be.
+    #[test]
+    fn a_broken_image_is_reported_not_archived() {
+        let (ctx, dir) = context("broken", true);
+        let metadata = serde_json::json!({
+            "image": { "media_type": "image/png", "data": "bm90IGFuIGltYWdl" },
+        });
+        let result = archive_images(&ctx, &metadata).expect("the payload exists");
+        assert!(result.is_err());
+        std::fs::remove_dir_all(dir).ok();
     }
 }

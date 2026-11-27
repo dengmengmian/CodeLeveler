@@ -725,6 +725,7 @@ fn a_queued_message_continues_as_the_next_turn_when_the_runtime_is_ready() {
                 ordinal: None,
                 kind: None,
                 images: 0,
+                image_refs: Vec::new(),
             },
         }),
     );
@@ -798,6 +799,7 @@ fn a_queued_message_continues_as_the_next_turn_when_the_runtime_is_ready() {
                 ordinal: None,
                 kind: None,
                 images: 0,
+                image_refs: Vec::new(),
             },
         }),
     );

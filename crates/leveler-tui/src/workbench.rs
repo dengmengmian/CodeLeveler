@@ -1765,6 +1765,7 @@ mod tests {
                     ordinal: None,
                     kind: Some(UiMessageKind::PendingInput),
                     images: 0,
+                    image_refs: Vec::new(),
                 },
             }),
         );

@@ -1,7 +1,54 @@
 //! One status projection for live snapshots, restored sessions and the task directory.
+use base64::Engine as _;
 use leveler_client_protocol::{ClientError, UiTaskStatus, UiTaskTerminal};
 use leveler_core::{BootId, BootLiveness, BootLivenessProbe};
+use leveler_model::{ContentPart, Message, StoredImageRef};
 use leveler_storage::SessionFacts;
+use sha2::{Digest, Sha256};
+
+/// The stored-image refs a persisted message carries, in content order.
+///
+/// An image part's media type is the runtime's own normalized type; the key is
+/// the SHA-256 of the exact bytes, which is the media store's key. A part that
+/// cannot be decoded contributes no ref while the count still reports it, so a
+/// corrupt row degrades to "image unavailable" instead of failing the whole
+/// transcript.
+pub fn stored_image_refs(message: &Message) -> Vec<StoredImageRef> {
+    message
+        .content
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::Image {
+                source: leveler_model::ImageSource::Base64 { media_type, data },
+            } => {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .ok()?;
+                let (width, height) = png_dimensions(&bytes);
+                Some(StoredImageRef {
+                    sha256: format!("{:x}", Sha256::digest(&bytes)),
+                    mime_type: media_type.clone(),
+                    width,
+                    height,
+                    name: None,
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Width and height from a PNG's IHDR, without decoding the pixels. Anything
+/// that is not a PNG has unknown dimensions; the store still serves its bytes.
+fn png_dimensions(bytes: &[u8]) -> (Option<u32>, Option<u32>) {
+    if bytes.len() >= 24 && bytes.starts_with(b"\x89PNG\r\n\x1a\n") && &bytes[12..16] == b"IHDR" {
+        let width = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+        let height = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+        (Some(width), Some(height))
+    } else {
+        (None, None)
+    }
+}
 
 /// Project a title using the same first-message policy as interactive sessions.
 pub fn project_title(title: Option<&str>, goal: &str, first_user_text: Option<&str>) -> String {
@@ -252,6 +299,46 @@ mod tests {
             user_paused_at: paused.then(leveler_core::now),
             pause_boundary: None,
         }
+    }
+
+    /// A stored image part is projected to its content key, in order, with
+    /// the geometry read from the stored PNG header rather than guessed.
+    #[test]
+    fn stored_images_project_to_ordered_refs_with_real_geometry() {
+        let png = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
+            .unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
+        let message = Message::from_parts(
+            leveler_model::Role::User,
+            vec![
+                ContentPart::Text {
+                    text: "两张图".into(),
+                },
+                ContentPart::Image {
+                    source: leveler_model::ImageSource::Base64 {
+                        media_type: "image/png".into(),
+                        data: encoded.clone(),
+                    },
+                },
+                ContentPart::Image {
+                    source: leveler_model::ImageSource::Base64 {
+                        media_type: "image/png".into(),
+                        data: encoded,
+                    },
+                },
+            ],
+            Some(leveler_model::TranscriptOrigin::UserInput),
+        );
+        let refs = stored_image_refs(&message);
+        assert_eq!(refs.len(), 2);
+        assert_eq!(
+            refs[0].sha256,
+            format!("{:x}", Sha256::digest(&png)),
+            "the key is the bytes' own hash"
+        );
+        assert_eq!((refs[0].width, refs[0].height), (Some(1), Some(1)));
+        assert_eq!(refs[0].mime_type, "image/png");
     }
 
     /// The goal a client shows is the one the LIVE turn serves.

@@ -697,6 +697,10 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             clear_activity(state);
             seal_analysis_segment(state);
         }
+        // Archived tool images are a graphical surface. The terminal already
+        // says the image loaded in the call's text result; there is no cell
+        // renderer that could show pixels, so this fact stays unrendered here.
+        RuntimeEvent::ToolCallImages { .. } => {}
         RuntimeEvent::ToolCallOutput { id, chunk, .. } => {
             // Already sanitized by the runtime; strip again like every other
             // terminal text this client paints.

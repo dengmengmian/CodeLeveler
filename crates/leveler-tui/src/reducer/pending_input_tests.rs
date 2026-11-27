@@ -86,6 +86,7 @@ fn a_late_input_admission_preserves_its_terminal_state() {
             ordinal: None,
             kind: Some(UiMessageKind::PendingInput),
             images: 0,
+            image_refs: Vec::new(),
         };
         reduce(
             &mut s,
@@ -131,6 +132,7 @@ fn an_input_admission_resolves_an_unknown_submission() {
                 ordinal: None,
                 kind: Some(UiMessageKind::PendingInput),
                 images: 0,
+                image_refs: Vec::new(),
             },
         }),
     );
@@ -441,6 +443,7 @@ fn any_item_can_be_sent_and_it_stays_until_the_runtime_admits_it() {
                 ordinal: None,
                 kind: Some(leveler_client_protocol::UiMessageKind::PendingInput),
                 images: 0,
+                image_refs: Vec::new(),
             },
         }),
     );
@@ -486,6 +489,7 @@ fn a_steer_that_became_a_new_turn_is_shown_once() {
                 ordinal: None,
                 kind: Some(leveler_client_protocol::UiMessageKind::PendingInput),
                 images: 0,
+                image_refs: Vec::new(),
             },
         }),
     );
@@ -521,6 +525,7 @@ fn an_unanswered_send_stays_and_says_its_outcome_is_unknown() {
                 ordinal: None,
                 kind: Some(leveler_client_protocol::UiMessageKind::PendingInput),
                 images: 0,
+                image_refs: Vec::new(),
             },
         }),
     );
@@ -925,6 +930,7 @@ fn admitted_message(text: &str) -> RuntimeEvent {
             ordinal: None,
             kind: None,
             images: 0,
+            image_refs: Vec::new(),
         },
     }
 }
@@ -1219,6 +1225,7 @@ fn a_snapshot_keeps_its_pending_input_across_history_replacement() {
             ordinal,
             kind,
             images: 0,
+            image_refs: Vec::new(),
         };
     let mut snapshot = idle_snapshot();
     snapshot.messages = vec![
@@ -1268,6 +1275,7 @@ fn a_history_answer_does_not_erase_a_newer_pending_input() {
         ordinal: None,
         kind: Some(leveler_client_protocol::UiMessageKind::PendingInput),
         images: 0,
+        image_refs: Vec::new(),
     }];
     let effects = reduce(
         &mut s,
@@ -1303,6 +1311,7 @@ fn a_history_answer_does_not_erase_a_newer_pending_input() {
                         ordinal: Some(0),
                         kind: None,
                         images: 0,
+                        image_refs: Vec::new(),
                     },
                 },
             }],

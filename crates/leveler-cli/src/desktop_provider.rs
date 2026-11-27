@@ -54,6 +54,14 @@ pub(crate) async fn view(
             "model": model.model,
             "thinking": model.thinking,
             "default": model.default,
+            // Read-only facts from the profile the runtime uses. The editor
+            // displays them; it never writes capability or price claims.
+            "vision": model.vision,
+            "reasoning": model.reasoning,
+            "context_window": model.context_window,
+            "reliable_context": model.reliable_context,
+            "max_output_tokens": model.max_output_tokens,
+            "pricing": model.pricing,
         })).collect::<Vec<_>>(),
         "configuration_complete": described.configuration_complete,
         "issues": described.issues,

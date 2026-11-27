@@ -2928,6 +2928,19 @@ completion_judge_timeout_seconds = 180
     }
 
     #[test]
+    fn a_configured_browser_reaches_the_resolved_bundle_and_unset_stays_automatic() {
+        let configured = GlobalConfig::from_toml_str("[browser]\ndefault = \"chrome\"\n")
+            .unwrap()
+            .into_bundle();
+        assert_eq!(
+            configured.browser_default,
+            Some(leveler_browser::BrowserProduct::Chrome)
+        );
+        let automatic = GlobalConfig::from_toml_str("").unwrap().into_bundle();
+        assert_eq!(automatic.browser_default, None);
+    }
+
+    #[test]
     fn unknown_browser_is_rejected_instead_of_selecting_another_product() {
         let err = GlobalConfig::from_toml_str("[browser]\ndefault = \"chorome\"\n")
             .expect_err("a browser typo must be an error");

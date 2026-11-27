@@ -45,6 +45,7 @@ fn message(id: &str, role: UiRole, text: &str) -> UiMessage {
         ordinal: None,
         kind: None,
         images: 0,
+        image_refs: Vec::new(),
     }
 }
 

@@ -29,9 +29,15 @@ pub const HISTORY_TURNS_MAX: usize = 100;
 /// One durable fact in time order: an engine event or a message the user sent.
 enum Fact {
     Event(Box<EngineEvent>),
-    /// A user message: its text, how many images it carried, and the accepted
-    /// input identity the runtime admitted it under (an append), if any.
-    User(String, usize, Option<MessageId>),
+    /// A user message: its text, how many images it carried, the stored image
+    /// refs a client can reopen, and the accepted input identity the runtime
+    /// admitted it under (an append), if any.
+    User(
+        String,
+        usize,
+        Vec<leveler_model::StoredImageRef>,
+        Option<MessageId>,
+    ),
     /// A runtime notice with no event equivalent that must stay visible when
     /// the session is reopened (the imported-session briefing).
     Notice(String),
@@ -314,8 +320,8 @@ pub async fn load_session_history(
         };
         facts.push((at, Fact::Event(Box::new(event))));
         if let Some(message) = rebuilt {
-            let (text, images) = user_input(&message);
-            facts.push((at, Fact::User(text, images, None)));
+            let (text, images, image_refs) = user_input(&message);
+            facts.push((at, Fact::User(text, images, image_refs, None)));
         }
     }
     facts.extend(messages);
@@ -423,23 +429,27 @@ fn replay_turn(turn: Vec<(Option<Timestamp>, Fact)>, entries: &mut Vec<UiHistory
             _ => 0,
         };
         let produced = match fact {
-            Fact::User(text, images, input_id) => vec![RuntimeEvent::UserMessageAdded {
-                message: UiMessage {
-                    // An accepted append keeps the identity its admission
-                    // answered with. A seed submit has no journal identity and
-                    // keeps the historical fresh id.
-                    id: input_id
-                        .clone()
-                        .unwrap_or_else(|| MessageId::new(leveler_core::new_uuid_string())),
-                    role: UiRole::User,
-                    text,
-                    ordinal: None,
-                    // The transcript row proves the input was consumed, which
-                    // is the delivery state a reopened client must see.
-                    kind: input_id.map(|_| leveler_client_protocol::UiMessageKind::DeliveredInput),
-                    images,
-                },
-            }],
+            Fact::User(text, images, image_refs, input_id) => {
+                vec![RuntimeEvent::UserMessageAdded {
+                    message: UiMessage {
+                        // An accepted append keeps the identity its admission
+                        // answered with. A seed submit has no journal identity and
+                        // keeps the historical fresh id.
+                        id: input_id
+                            .clone()
+                            .unwrap_or_else(|| MessageId::new(leveler_core::new_uuid_string())),
+                        role: UiRole::User,
+                        text,
+                        ordinal: None,
+                        // The transcript row proves the input was consumed, which
+                        // is the delivery state a reopened client must see.
+                        kind: input_id
+                            .map(|_| leveler_client_protocol::UiMessageKind::DeliveredInput),
+                        images,
+                        image_refs,
+                    },
+                }]
+            }
             Fact::Notice(text) => vec![RuntimeEvent::UserMessageAdded {
                 message: UiMessage {
                     id: MessageId::new(leveler_core::new_uuid_string()),
@@ -448,6 +458,7 @@ fn replay_turn(turn: Vec<(Option<Timestamp>, Fact)>, entries: &mut Vec<UiHistory
                     ordinal: None,
                     kind: Some(leveler_client_protocol::UiMessageKind::RuntimeNotice),
                     images: 0,
+                    image_refs: Vec::new(),
                 },
             }],
             Fact::Recap(text) => vec![RuntimeEvent::AwaySummary { text }],
@@ -555,8 +566,13 @@ fn transcript_fact(payload: &str, id: MessageId, input_id: Option<&str>) -> Opti
     if let Some((review_id, notice)) = review_notice(payload) {
         return Some(Fact::ReviewNotice(review_id, notice));
     }
-    if let Some((text, images)) = user_text(payload) {
-        return Some(Fact::User(text, images, input_id.map(MessageId::new)));
+    if let Some((text, images, image_refs)) = user_text(payload) {
+        return Some(Fact::User(
+            text,
+            images,
+            image_refs,
+            input_id.map(MessageId::new),
+        ));
     }
     if let Some(text) = import_briefing_text(payload) {
         return Some(Fact::Notice(text));
@@ -625,7 +641,7 @@ fn review_notice(payload: &str) -> Option<(String, RuntimeNoticeKind)> {
 /// The text of a message the user sent. Runtime notices and compaction
 /// summaries are user-role context the runtime wrote; the events already
 /// show what they describe.
-fn user_text(payload: &str) -> Option<(String, usize)> {
+fn user_text(payload: &str) -> Option<(String, usize, Vec<leveler_model::StoredImageRef>)> {
     let message: leveler_model::Message = serde_json::from_str(payload).ok()?;
     if message.role != leveler_model::Role::User {
         return None;
@@ -654,7 +670,7 @@ fn user_text(payload: &str) -> Option<(String, usize)> {
     ) {
         return None;
     }
-    let (text, images) = user_input(&message);
+    let (text, images, image_refs) = user_input(&message);
     let first = text.lines().next().unwrap_or("").trim_end();
     // A message that was only a picture has no text; replaying it as nothing
     // is how a reopened session lost the turn.
@@ -664,7 +680,7 @@ fn user_text(payload: &str) -> Option<(String, usize)> {
     {
         return None;
     }
-    Some((text, images))
+    Some((text, images, image_refs))
 }
 
 /// The imported-session briefing, which has no event that describes it: the
@@ -688,13 +704,17 @@ fn import_briefing_text(payload: &str) -> Option<String> {
 }
 
 /// What a user-authored message carries: its text and how many images.
-fn user_input(message: &Message) -> (String, usize) {
+fn user_input(message: &Message) -> (String, usize, Vec<leveler_model::StoredImageRef>) {
     let images = message
         .content
         .iter()
         .filter(|part| matches!(part, ContentPart::Image { .. }))
         .count();
-    (message.text_content(), images)
+    (
+        message.text_content(),
+        images,
+        crate::session_projection::stored_image_refs(message),
+    )
 }
 
 /// Which positions in the durable log a reopen rebuilds from the write-ahead
@@ -833,6 +853,7 @@ fn parse_time(text: &str) -> Option<Timestamp> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use leveler_client_protocol::UiCommandStop;
     use leveler_core::{Timestamp, TurnId, now};
     use leveler_engine::{EngineEvent, TurnKind};
@@ -842,6 +863,7 @@ mod tests {
         EventRepository, EventStore, MessageRepository, NewReview, ReviewFinish, ReviewRepository,
         SessionRecord, SessionRepository, TurnRepository,
     };
+    use sha2::Digest;
 
     #[tokio::test]
     async fn a_legacy_turn_terminal_rebuilds_usage_from_the_request_ledger() {
@@ -2402,6 +2424,77 @@ mod tests {
         assert!(
             result.is_ok(),
             "omitted payloads must not be read: {result:?}"
+        );
+    }
+
+    /// A reopened conversation must be able to show the picture the person
+    /// attached, by the same content key the media store already uses.
+    #[tokio::test]
+    async fn a_user_image_replays_with_its_stored_ref() {
+        let (db, sid) = session().await;
+        let t0 = now();
+        event(
+            &db,
+            &sid,
+            t0,
+            EngineEvent::TurnStarted {
+                turn_id: TurnId::generate(),
+                kind: TurnKind::Chat,
+            },
+        )
+        .await;
+        let png = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
+            .unwrap();
+        let message = Message::from_parts(
+            Role::User,
+            vec![
+                leveler_model::ContentPart::Text {
+                    text: "看图".into(),
+                },
+                leveler_model::ContentPart::Image {
+                    source: leveler_model::ImageSource::Base64 {
+                        media_type: "image/png".into(),
+                        data: base64::engine::general_purpose::STANDARD.encode(&png),
+                    },
+                },
+            ],
+            Some(TranscriptOrigin::UserInput),
+        );
+        message_row(&db, &sid, t0 + ms(10), &message).await;
+        event(
+            &db,
+            &sid,
+            t0 + ms(1500),
+            EngineEvent::TaskFinished {
+                outcome: TaskOutcome::Completed,
+                reason: None,
+                failure: None,
+                stop: Some(StopReason::Answered),
+                warnings: Vec::new(),
+                verification: None,
+            },
+        )
+        .await;
+        let (entries, _) = load_session_history(&db, &sid).await.unwrap();
+        let message = entries
+            .iter()
+            .find_map(|entry| match &entry.event {
+                RuntimeEvent::UserMessageAdded { message } if message.text == "看图" => {
+                    Some(message.clone())
+                }
+                _ => None,
+            })
+            .expect("the user's message replays");
+        assert_eq!(message.images, 1);
+        assert_eq!(message.image_refs.len(), 1);
+        assert_eq!(
+            message.image_refs[0].sha256,
+            format!("{:x}", sha2::Sha256::digest(&png))
+        );
+        assert_eq!(
+            (message.image_refs[0].width, message.image_refs[0].height),
+            (Some(1), Some(1))
         );
     }
 

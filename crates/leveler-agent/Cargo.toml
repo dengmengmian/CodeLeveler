@@ -41,6 +41,7 @@ sha2 = { workspace = true }
 tempfile = "3"
 
 [dev-dependencies]
+leveler-media = { workspace = true }
 leveler-tools = { workspace = true, features = ["test-support"] }
 leveler-definition-trust = { workspace = true, features = ["test-support"] }
 leveler-test-support = { workspace = true }

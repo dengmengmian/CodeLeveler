@@ -537,6 +537,20 @@ pub enum RuntimeEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stop: Option<UiCommandStop>,
     },
+    /// Images a tool call returned, archived in the runtime's one media store
+    /// so a client can show the same bytes the model saw.
+    ///
+    /// The image payload never rides this event: each ref is a content hash a
+    /// client resolves through the runtime. A tool that reported images but
+    /// could not have them archived (no store, disk failure) reports `error`
+    /// with no refs instead of pretending the call had no image.
+    ToolCallImages {
+        id: ToolCallId,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<leveler_model::StoredImageRef>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     /// Live output from a running command tool call. `stream` is `stdout` or
     /// `stderr`; `chunk` is one or more whole, sanitized lines. Transient:
     /// clients keep a bounded buffer and the completed preview is the record.
@@ -1316,6 +1330,7 @@ mod tests {
                 ordinal: None,
                 kind: None,
                 images: 0,
+                image_refs: Vec::new(),
             }],
             pending_interactions: vec![],
             available_models: vec![ModelRef::new("openai", "gpt-4o-mini")],
@@ -1624,6 +1639,7 @@ mod tests {
                     ordinal: None,
                     kind: None,
                     images: 0,
+                    image_refs: Vec::new(),
                 },
             },
             "user_message_added",

@@ -82,6 +82,11 @@ impl From<AgentEvent> for EngineEvent {
                 exit_code,
                 stop,
             },
+            A::ToolImages { id, images, error } => EngineEvent::ToolCallImages {
+                call_id: id,
+                images,
+                error,
+            },
             // Only the reverse projection (durable history → renderer) produces
             // this variant. Mapping it back preserves the marker's one durable
             // spelling instead of inventing a second encoding.

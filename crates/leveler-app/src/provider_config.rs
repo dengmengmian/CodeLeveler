@@ -524,15 +524,25 @@ pub struct ProviderView {
     pub editable: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelView {
     pub provider: String,
     pub model: String,
     pub thinking: Option<String>,
     pub default: bool,
+    /// Read-only capability/limit/pricing facts from the profile the runtime
+    /// actually uses. A client displays them; it never edits them as ordinary
+    /// settings, because a wrong `vision` or `pricing` changes what the runtime
+    /// advertises and what a cost cap may admit.
+    pub vision: bool,
+    pub reasoning: bool,
+    pub context_window: u32,
+    pub reliable_context: u32,
+    pub max_output_tokens: u32,
+    pub pricing: Option<leveler_model::ModelPricing>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ConfigView {
     pub config_path: String,
     pub config_exists: bool,
@@ -633,6 +643,12 @@ pub fn describe(layout: &leveler_project::Layout, loaded: &LoadedConfig) -> Conf
             default: default_ref.as_ref().is_some_and(|reference| {
                 reference.provider == model.profile.provider && reference.model == model.profile.id
             }),
+            vision: model.profile.capabilities.vision,
+            reasoning: model.profile.capabilities.reasoning,
+            context_window: model.profile.limits.context_window,
+            reliable_context: model.profile.limits.reliable_context,
+            max_output_tokens: model.profile.limits.max_output_tokens,
+            pricing: model.profile.pricing,
         })
         .collect();
     models.sort_by(|left, right| {

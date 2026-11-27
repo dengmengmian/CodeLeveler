@@ -141,6 +141,7 @@ fn snapshot(session: &str) -> UiSessionSnapshot {
             ordinal: None,
             kind: None,
             images: 0,
+            image_refs: Vec::new(),
         }],
         pending_interactions: Vec::new(),
         available_models: Vec::new(),

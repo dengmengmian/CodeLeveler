@@ -352,6 +352,7 @@ pub(super) async fn start(
                 ordinal: None,
                 kind: None,
                 images: 0,
+                image_refs: Vec::new(),
             },
         },
     );

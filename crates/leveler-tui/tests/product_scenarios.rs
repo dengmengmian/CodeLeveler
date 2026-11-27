@@ -117,6 +117,7 @@ fn opened(goal: &str) -> AppState {
                 ordinal: None,
                 kind: None,
                 images: 0,
+                image_refs: Vec::new(),
             },
         }),
     );
@@ -728,6 +729,7 @@ fn s10_resume() {
                 ordinal: Some(1),
                 kind: None,
                 images: 0,
+                image_refs: Vec::new(),
             },
             UiMessage {
                 id: MessageId::new("a1"),
@@ -736,6 +738,7 @@ fn s10_resume() {
                 ordinal: Some(2),
                 kind: None,
                 images: 0,
+                image_refs: Vec::new(),
             },
         ],
         pending_interactions: Vec::new(),

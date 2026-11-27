@@ -363,8 +363,27 @@ async fn first_run_setup(
     let with_proto = starter_config(chosen, &model)?;
     let with_language = set_config_language(&with_proto, language)?;
     let with_key = upsert_api_key(&with_language, chosen.id, &key)?;
-    leveler_app::provider_config::write_global_atomic(path, &with_key)
-        .with_context(|| format!("write {}", path.display()))?;
+    // First-run setup writes a complete document, but a concurrent writer may
+    // have created the file while the prompts were answered. It goes through
+    // the same lock and refuses to replace that work instead of last-writer
+    // winning.
+    match leveler_app::config_edit::create_new(path, &with_key) {
+        Ok(()) => {}
+        Err(leveler_app::config_edit::CreateNewError::AlreadyExists) => {
+            println!(
+                "{}",
+                Line::warn(language.pick(
+                    "The configuration was created by another process; nothing was overwritten. Run `leveler login` again.",
+                    "配置文件已被另一个进程创建；本次未覆盖。请重新运行 leveler login。"
+                ))
+            );
+            return Ok(std::process::ExitCode::from(1));
+        }
+        Err(error) => {
+            return Err(anyhow::Error::new(error))
+                .with_context(|| format!("write {}", path.display()));
+        }
+    }
 
     println!();
     println!(

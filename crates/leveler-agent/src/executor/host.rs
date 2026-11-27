@@ -28,7 +28,7 @@ use leveler_model::{ContentPart, ToolCall};
 use leveler_tools::{ParallelClass, ToolContext, ToolError, ToolRegistry};
 
 use super::dispatch::{
-    collect_modified, extract_applied_diff, extract_executed_commands, extract_image, extract_plan,
+    collect_modified, extract_applied_diff, extract_executed_commands, extract_images, extract_plan,
 };
 use super::web_latency::WebPhase;
 use super::{AgentError, Executor};
@@ -1571,12 +1571,17 @@ impl Executor {
             .extend(leveler_execution::PermissionRuleSet::from_rules(rules));
     }
 
-    /// Execute one admitted call, returning `(content, is_error, image,
-    /// workspace_snapshot, plan, modified paths, executed commands, applied
-    /// diff)` to feed
+    /// Execute one admitted call, returning `(content, is_error, images,
+    /// image_refs, workspace_snapshot, plan, modified paths, executed commands,
+    /// applied diff)` to feed
     /// back to the model. Infrastructure errors are converted to model-visible
     /// text so the model can react rather than the loop aborting. Also records
     /// any files the tool modified and the commands it actually ran.
+    ///
+    /// `image_refs` is the archive half of the image: the model gets the parts
+    /// directly, and the client reopens them by content hash. It is `Some` only
+    /// when the result carried an image this execution has a store for; an
+    /// `Err` says the image could not be stored and must surface as such.
     pub(crate) async fn dispatch(
         &self,
         admitted: &AdmittedCall,
@@ -1586,7 +1591,8 @@ impl Executor {
     ) -> (
         String,
         bool,
-        Option<ContentPart>,
+        Vec<ContentPart>,
+        Option<Result<Vec<leveler_model::StoredImageRef>, String>>,
         Option<String>,
         Option<Vec<PlanStep>>,
         Vec<String>,
@@ -1607,7 +1613,8 @@ impl Executor {
                 modified_files.push(path.clone());
             }
         }
-        let image = extract_image(&metadata);
+        let images = extract_images(&metadata);
+        let image_refs = super::dispatch::archive_images(&self.tool_context, &metadata);
         let snapshot = metadata
             .get("workspace_snapshot")
             .and_then(serde_json::Value::as_str)
@@ -1619,7 +1626,8 @@ impl Executor {
         (
             content,
             is_error,
-            image,
+            images,
+            image_refs,
             snapshot,
             plan,
             call_files,

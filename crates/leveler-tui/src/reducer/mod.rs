@@ -4479,6 +4479,7 @@ mod disclosure_tests {
                     ordinal: None,
                     kind: Some(UiMessageKind::RuntimeNotice),
                     images: 0,
+                    image_refs: Vec::new(),
                 },
             }),
         );

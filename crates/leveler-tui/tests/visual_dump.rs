@@ -112,6 +112,7 @@ fn visual_inspect() {
                 ordinal: None,
                 kind: None,
                 images: 0,
+                image_refs: Vec::new(),
             },
         }),
     );
@@ -692,6 +693,7 @@ fn visual_interaction_cards() {
                     ordinal: None,
                     kind: None,
                     images: 0,
+                    image_refs: Vec::new(),
                 },
             }),
         );
