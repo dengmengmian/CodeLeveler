@@ -1245,6 +1245,9 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.agent_detail_query = None;
             crate::agents_view::apply_detail(state, &name, agent, error);
         }
+        // The terminal's `/skills` page reads the registry directly; it sends
+        // neither query, so an answer here belongs to another client.
+        RuntimeEvent::SkillsLoaded { .. } | RuntimeEvent::SkillLoaded { .. } => {}
         // The TUI has no agent mutation command. These acknowledgements belong
         // to the Web form that issued them, despite sharing the session stream.
         RuntimeEvent::AgentMutated { .. } => {}

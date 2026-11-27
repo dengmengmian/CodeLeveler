@@ -196,24 +196,87 @@ impl Application {
 
     /// Every entry with its status here, plus the directory entries that are not
     /// skills at all.
+    ///
+    /// Untrusted packages are included as `Untrusted` entries so a client can
+    /// show what exists before anyone decides to use it. They carry no
+    /// description and no invocation flags read from unapproved metadata; the
+    /// name, provenance, location and trust state are the facts a person (or a
+    /// later authorization request) needs. A trusted entry with the same name
+    /// wins, exactly as it does in resolution.
     pub fn list_skills(&self) -> (Vec<UiSkillEntry>, Vec<UiSkillProblem>) {
         let registry = self.skill_registry();
-        let entries = registry.entries().iter().map(ui_entry).collect();
-        let problems = registry.problems().iter().map(ui_problem).collect();
+        let mut entries: Vec<UiSkillEntry> = registry.entries().iter().map(ui_entry).collect();
+        let mut seen: std::collections::HashSet<&str> = registry
+            .entries()
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        let untrusted_locations: std::collections::HashSet<&std::path::Path> = registry
+            .untrusted_skills()
+            .iter()
+            .map(|package| package.location.as_path())
+            .collect();
+        for package in registry.untrusted_skills() {
+            if !seen.insert(package.name.as_str()) {
+                continue;
+            }
+            entries.push(untrusted_entry(package));
+        }
+        entries.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then(scope_rank(left.scope).cmp(&scope_rank(right.scope)))
+        });
+        // The registry also reports a refused package as "not loaded" so no
+        // caller mistakes it for usable. The list already carries it with its
+        // own state; showing the same directory again as a scan problem would
+        // present trust as a parse failure.
+        let problems = registry
+            .problems()
+            .iter()
+            .filter(|problem| !untrusted_locations.contains(problem.location.as_path()))
+            .map(ui_problem)
+            .collect();
         (entries, problems)
     }
 
     /// One skill with its body and bundled files. An invalid skill still
     /// resolves to a detail record that explains why.
+    ///
+    /// An untrusted package is an inspection record, not an admission: the
+    /// exact current package is returned as a bounded preview so the person
+    /// can review what they are being asked to trust. The model path never
+    /// reads this function; a turn still goes through the trust gate.
     pub fn get_skill(&self, name: &str) -> Result<UiSkillDetail, String> {
         let registry = self.skill_registry();
         let requested = name.trim();
-        let Some(entry) = registry.get(requested) else {
-            return Err(format!(
-                "Skill \"{requested}\" not found. Available skills: {}.",
-                registry.available_names().join(", ")
-            ));
-        };
+        if registry.get(requested).is_none() {
+            let Some(package) = registry.untrusted_skill(requested) else {
+                return Err(format!(
+                    "Skill \"{requested}\" not found. Available skills: {}.",
+                    registry.available_names().join(", ")
+                ));
+            };
+            let (body, _, truncated) = leveler_tools::definition_trust::skill_package_preview(
+                &package.location,
+            )
+            .map_err(|error| {
+                format!(
+                    "Skill \"{requested}\" is present but not trusted ({}), and its current \
+                             content could not be read for review: {error}",
+                    package.state()
+                )
+            })?;
+            return Ok(UiSkillDetail {
+                entry: untrusted_entry(package),
+                body: Some(body),
+                body_truncated: truncated,
+                scripts: Vec::new(),
+                references: Vec::new(),
+                other_files: Vec::new(),
+            });
+        }
+        let entry = registry.get(requested).expect("checked above");
         let loaded = match registry.load_skill_for_inspection(requested) {
             Ok(detail) => Some(detail),
             Err(SkillLookupError::Invalid { .. } | SkillLookupError::Disabled { .. }) => None,
@@ -222,6 +285,7 @@ impl Application {
         Ok(UiSkillDetail {
             entry: ui_entry(entry),
             body: loaded.as_ref().map(|d| d.body.clone()),
+            body_truncated: false,
             scripts: loaded
                 .as_ref()
                 .map(|d| d.scripts.clone())
@@ -356,6 +420,7 @@ fn ui_entry(entry: &SkillEntry) -> UiSkillEntry {
         argument_hint: entry.argument_hint.clone(),
         user_invocable: entry.user_invocable,
         disable_model_invocation: entry.disable_model_invocation,
+        slash_reserved: leveler_skills::is_reserved_slash_name(&entry.name),
         shadowed: entry
             .shadowed
             .iter()
@@ -366,6 +431,35 @@ fn ui_entry(entry: &SkillEntry) -> UiSkillEntry {
                 error: s.error.clone(),
             })
             .collect(),
+    }
+}
+
+/// The inspectable record of a package the trust gate refused. Invocation
+/// flags are not read from unapproved metadata; the entry says what is true
+/// without them: the package exists and its bytes are not admitted.
+fn untrusted_entry(package: &leveler_skills::UntrustedSkill) -> UiSkillEntry {
+    UiSkillEntry {
+        name: package.name.clone(),
+        scope: ui_scope(package.scope),
+        source: ui_source(package.source),
+        location: Some(package.location.display().to_string()),
+        status: UiSkillStatus::Untrusted,
+        reason: Some(package.state().to_string()),
+        description: None,
+        argument_hint: None,
+        user_invocable: true,
+        disable_model_invocation: false,
+        slash_reserved: leveler_skills::is_reserved_slash_name(&package.name),
+        shadowed: Vec::new(),
+    }
+}
+
+/// Project first, then user, then builtin: the registry's precedence order.
+fn scope_rank(scope: UiSkillScope) -> u8 {
+    match scope {
+        UiSkillScope::Project => 0,
+        UiSkillScope::User => 1,
+        UiSkillScope::Builtin => 2,
     }
 }
 

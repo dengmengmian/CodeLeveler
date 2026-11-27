@@ -2181,11 +2181,11 @@ mod transport {
                         | ClientCommand::QuerySettings { .. }
                         | ClientCommand::ManageMcp { .. }
                         | ClientCommand::ManageSchedule { .. }
+                        | ClientCommand::ListSkills { .. }
+                        | ClientCommand::GetSkill { .. }
                 )
             {
-                return Err(ClientError::Runtime(
-                    "global tasks and diagnostics are local-only".into(),
-                ));
+                return Err(ClientError::Runtime("this command is local-only".into()));
             }
             if let ClientCommand::OpenSession { session_id }
             | ClientCommand::OpenSessionFor { session_id, .. } = &command
@@ -2217,11 +2217,11 @@ mod transport {
                         | ClientCommand::QuerySettings { .. }
                         | ClientCommand::ManageMcp { .. }
                         | ClientCommand::ManageSchedule { .. }
+                        | ClientCommand::ListSkills { .. }
+                        | ClientCommand::GetSkill { .. }
                 )
             {
-                return Err(ClientError::Runtime(
-                    "global tasks and diagnostics are local-only".into(),
-                ));
+                return Err(ClientError::Runtime("this command is local-only".into()));
             }
             let protected = envelope
                 .command
@@ -6109,6 +6109,67 @@ mod tests {
             *runtime.last_approval.lock().unwrap(),
             Some(ApprovalPolicy::AutoApprove),
             "trusted-local auto-approve must reach the runtime as AutoApprove"
+        );
+        shutdown.cancel();
+    }
+
+    /// The Skill read model names workspace paths and can return unapproved
+    /// package content for human inspection. Only a trusted local client may
+    /// ask for it; a remote transport is refused before the runtime sees it.
+    #[tokio::test]
+    async fn remote_client_cannot_read_the_skill_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt.sock");
+        let runtime = Arc::new(TestRuntime::new());
+        let server = LocalSocketServer::bind(&path, runtime.clone())
+            .await
+            .unwrap();
+        let shutdown = CancellationToken::new();
+        tokio::spawn(server.serve(shutdown.clone()));
+        let session = SessionId::new("s1");
+
+        let remote = LocalSocketRuntimeClient::connect_as(&path, ClientKind::Remote)
+            .await
+            .unwrap();
+        for command in [
+            ClientCommand::ListSkills {
+                session_id: session.clone(),
+                query_id: None,
+            },
+            ClientCommand::GetSkill {
+                session_id: session.clone(),
+                name: "demo".into(),
+                query_id: None,
+            },
+        ] {
+            let error = remote
+                .send(command)
+                .await
+                .expect_err("remote must be refused");
+            assert!(error.to_string().contains("local-only"), "{error}");
+        }
+        assert!(
+            runtime.commands.lock().unwrap().is_empty(),
+            "a refused read never reaches the runtime"
+        );
+
+        let local = LocalSocketRuntimeClient::connect_as(&path, ClientKind::LocalInteractive)
+            .await
+            .unwrap();
+        local
+            .send(ClientCommand::ListSkills {
+                session_id: session.clone(),
+                query_id: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            runtime
+                .commands
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|command| matches!(command, ClientCommand::ListSkills { .. }))
         );
         shutdown.cancel();
     }

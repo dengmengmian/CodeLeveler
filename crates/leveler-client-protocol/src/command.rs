@@ -789,6 +789,31 @@ pub enum ClientCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         query_id: Option<CommandId>,
     },
+    /// List the Skills the session's workspace resolves.
+    ///
+    /// Read-only and local: the runtime answers from the same
+    /// [`leveler_skills`] registry the model index, `$mention`, `load_skill`
+    /// and explicit `/name` use, so a client can never disagree with what a
+    /// turn would load. Untrusted packages are listed with their trust state;
+    /// their descriptions and bodies are not treated as usable metadata.
+    /// Answered by [`crate::RuntimeEvent::SkillsLoaded`].
+    ListSkills {
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+    },
+    /// One Skill with its body and bundled files for human inspection.
+    ///
+    /// An untrusted package returns a bounded preview of its exact package and
+    /// its trust state; that preview is for the person reviewing it and never
+    /// enters the model's context. Answered by
+    /// [`crate::RuntimeEvent::SkillLoaded`].
+    GetSkill {
+        session_id: SessionId,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+    },
     /// Write a new agent definition. The user's own command is the
     /// authorization; the runtime validates and writes atomically, and answers
     /// with [`crate::RuntimeEvent::AgentMutated`].
@@ -935,6 +960,8 @@ impl ClientCommand {
             | ClientCommand::QueryToolOutput { session_id, .. }
             | ClientCommand::ListAgents { session_id, .. }
             | ClientCommand::GetAgent { session_id, .. }
+            | ClientCommand::ListSkills { session_id, .. }
+            | ClientCommand::GetSkill { session_id, .. }
             | ClientCommand::CreateAgent { session_id, .. }
             | ClientCommand::UpdateAgent { session_id, .. }
             | ClientCommand::DeleteAgent { session_id, .. }

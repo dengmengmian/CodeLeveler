@@ -927,6 +927,25 @@ pub enum RuntimeEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent: Option<crate::UiAgentEntry>,
     },
+    /// Result of [`crate::ClientCommand::ListSkills`].
+    SkillsLoaded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<leveler_core::CommandId>,
+        skills: Vec<crate::UiSkillEntry>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        problems: Vec<crate::UiSkillProblem>,
+    },
+    /// Result of [`crate::ClientCommand::GetSkill`]. `skill` is `None` and
+    /// `error` says why when the name does not resolve.
+    SkillLoaded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<leveler_core::CommandId>,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        skill: Option<crate::UiSkillDetail>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     /// A manual review was admitted and is now running. The summary is the
     /// durable row's projection at start; later progress and the terminal
     /// update the same card by `id`.
@@ -2318,6 +2337,48 @@ mod tests {
                 },
             },
             "skill_delivery",
+        );
+    }
+
+    #[test]
+    fn skill_registry_queries_roundtrip() {
+        let entry = crate::UiSkillEntry {
+            name: "deploy".to_string(),
+            scope: crate::UiSkillScope::Project,
+            source: crate::UiSkillSource::Native,
+            location: Some("/repo/.leveler/skills/deploy".to_string()),
+            status: crate::UiSkillStatus::Untrusted,
+            reason: Some("unapproved".to_string()),
+            description: None,
+            argument_hint: None,
+            user_invocable: true,
+            disable_model_invocation: false,
+            slash_reserved: false,
+            shadowed: Vec::new(),
+        };
+        roundtrip(
+            RuntimeEvent::SkillsLoaded {
+                query_id: Some(leveler_core::CommandId::new("q1")),
+                skills: vec![entry.clone()],
+                problems: Vec::new(),
+            },
+            "skills_loaded",
+        );
+        roundtrip(
+            RuntimeEvent::SkillLoaded {
+                query_id: Some(leveler_core::CommandId::new("q2")),
+                name: "deploy".to_string(),
+                skill: Some(crate::UiSkillDetail {
+                    entry,
+                    body: Some("--- SKILL.md ---\ndeploy\n".to_string()),
+                    body_truncated: true,
+                    scripts: vec!["scripts/run.sh".to_string()],
+                    references: Vec::new(),
+                    other_files: Vec::new(),
+                }),
+                error: None,
+            },
+            "skill_loaded",
         );
     }
 

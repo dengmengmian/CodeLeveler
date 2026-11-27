@@ -9588,6 +9588,46 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     });
                 Ok(())
             }
+            ClientCommand::ListSkills {
+                session_id,
+                query_id,
+            } => {
+                // The same registry the turn will read. A list answer is a
+                // read of the current files and store, deliberately not a
+                // cached projection: a client that reopens this page sees an
+                // edited or deleted package on the next query.
+                let (skills, problems) = self.app.list_skills();
+                let _ = self
+                    .events_for(&session_id)
+                    .send(RuntimeEvent::SkillsLoaded {
+                        query_id,
+                        skills,
+                        problems,
+                    });
+                Ok(())
+            }
+            ClientCommand::GetSkill {
+                session_id,
+                name,
+                query_id,
+            } => {
+                // Inspection only. Untrusted content returned here is framed
+                // for the person reviewing it; it is never admitted to a turn
+                // by this command.
+                let (skill, error) = match self.app.get_skill(&name) {
+                    Ok(detail) => (Some(detail), None),
+                    Err(error) => (None, Some(error)),
+                };
+                let _ = self
+                    .events_for(&session_id)
+                    .send(RuntimeEvent::SkillLoaded {
+                        query_id,
+                        name,
+                        skill,
+                        error,
+                    });
+                Ok(())
+            }
             ClientCommand::CreateAgent {
                 session_id,
                 scope,
@@ -10980,6 +11020,7 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
         // its stderr is a log file nobody reads).
         let substitution_notice =
             substitution_notice.or_else(|| self.app.take_default_model_notice());
+        let identified = request.request_id.is_some();
         let (session_id, inserted) = if let Some(request_id) = request.request_id.as_ref() {
             let db = self
                 .app
@@ -11037,6 +11078,21 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
                 true,
             )
         };
+        if inserted && identified {
+            // The Desktop creates sessions through the identified-receipt
+            // path, which inserts the durable row without passing through
+            // `Application::create_session_*`. Capture the same creation
+            // baseline here: without it a later switch to FullAccess has no
+            // pre-session bytes to adopt and refuses every project skill.
+            // A receipt replay (`inserted == false`) must not recapture —
+            // the agent may already have run in that session.
+            self.app
+                .register_created_definition_session(
+                    session_id.as_str(),
+                    execution_mode(request.mode),
+                )
+                .await;
+        }
         if inserted {
             let config = SessionRuntimeConfig {
                 model: model.clone(),

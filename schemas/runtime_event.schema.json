@@ -1956,6 +1956,21 @@
       }
     },
     {
+      "description": "The turn ended because its owning runtime or process stopped before a normal terminal. The durable `turn_finished` outcome is `interrupted`, not a user cancellation; a client must show that difference.",
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "turn_interrupted"
+          ]
+        }
+      }
+    },
+    {
       "description": "The logical task was explicitly cancelled by the user. Terminal: unlike [`Self::TurnCancelled`] a continuation must not reopen it.",
       "type": "object",
       "required": [
@@ -2419,6 +2434,89 @@
       }
     },
     {
+      "description": "Result of [`crate::ClientCommand::ListSkills`].",
+      "type": "object",
+      "required": [
+        "skills",
+        "type"
+      ],
+      "properties": {
+        "problems": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiSkillProblem"
+          }
+        },
+        "query_id": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "skills": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiSkillEntry"
+          }
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "skills_loaded"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Result of [`crate::ClientCommand::GetSkill`]. `skill` is `None` and `error` says why when the name does not resolve.",
+      "type": "object",
+      "required": [
+        "name",
+        "type"
+      ],
+      "properties": {
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "query_id": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "skill": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiSkillDetail"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "skill_loaded"
+          ]
+        }
+      }
+    },
+    {
       "description": "A manual review was admitted and is now running. The summary is the durable row's projection at start; later progress and the terminal update the same card by `id`.",
       "type": "object",
       "required": [
@@ -2679,6 +2777,25 @@
           "type": "string",
           "enum": [
             "notification"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Start-up recovery settled after this client's first snapshot.\n\nThe snapshot already carries the same structure; this event exists so a failure that happens later is not silent until the next reconnect. The runtime sends it to the session streams that are already attached. A client that never saw the snapshot's `running` state can treat it as the same fact and deduplicate by stage + message.",
+      "type": "object",
+      "required": [
+        "recovery",
+        "type"
+      ],
+      "properties": {
+        "recovery": {
+          "$ref": "#/definitions/UiStartupRecovery"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "startup_recovery"
           ]
         }
       }
@@ -7056,6 +7173,21 @@
           }
         },
         {
+          "description": "The turn ended because its owning runtime or process stopped before a normal terminal. The durable `turn_finished` outcome is `interrupted`, not a user cancellation; a client must show that difference.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "turn_interrupted"
+              ]
+            }
+          }
+        },
+        {
           "description": "The logical task was explicitly cancelled by the user. Terminal: unlike [`Self::TurnCancelled`] a continuation must not reopen it.",
           "type": "object",
           "required": [
@@ -7519,6 +7651,89 @@
           }
         },
         {
+          "description": "Result of [`crate::ClientCommand::ListSkills`].",
+          "type": "object",
+          "required": [
+            "skills",
+            "type"
+          ],
+          "properties": {
+            "problems": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/UiSkillProblem"
+              }
+            },
+            "query_id": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CommandId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "skills": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/UiSkillEntry"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "skills_loaded"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Result of [`crate::ClientCommand::GetSkill`]. `skill` is `None` and `error` says why when the name does not resolve.",
+          "type": "object",
+          "required": [
+            "name",
+            "type"
+          ],
+          "properties": {
+            "error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "name": {
+              "type": "string"
+            },
+            "query_id": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CommandId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "skill": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/UiSkillDetail"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "skill_loaded"
+              ]
+            }
+          }
+        },
+        {
           "description": "A manual review was admitted and is now running. The summary is the durable row's projection at start; later progress and the terminal update the same card by `id`.",
           "type": "object",
           "required": [
@@ -7779,6 +7994,25 @@
               "type": "string",
               "enum": [
                 "notification"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Start-up recovery settled after this client's first snapshot.\n\nThe snapshot already carries the same structure; this event exists so a failure that happens later is not silent until the next reconnect. The runtime sends it to the session streams that are already attached. A client that never saw the snapshot's `running` state can treat it as the same fact and deduplicate by stage + message.",
+          "type": "object",
+          "required": [
+            "recovery",
+            "type"
+          ],
+          "properties": {
+            "recovery": {
+              "$ref": "#/definitions/UiStartupRecovery"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "startup_recovery"
               ]
             }
           }
@@ -13584,6 +13818,17 @@
             "null"
           ]
         },
+        "startup_recovery": {
+          "description": "Recovery work the runtime does AFTER it can serve clients. Absent on a runtime that never started one (headless, tests, an older peer). While `running` is true, facts that only the Execution Host can answer are not yet refreshed; a client must not present them as settled.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiStartupRecovery"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "status": {
           "description": "Persisted status string (e.g. \"running\", \"completed\").",
           "type": "string"
@@ -13898,6 +14143,35 @@
         }
       }
     },
+    "UiShadowedSkill": {
+      "description": "A lower-precedence skill the active one hides.",
+      "type": "object",
+      "required": [
+        "scope",
+        "source"
+      ],
+      "properties": {
+        "error": {
+          "description": "The reason that definition is unusable, when it is.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "location": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "scope": {
+          "$ref": "#/definitions/UiSkillScope"
+        },
+        "source": {
+          "$ref": "#/definitions/UiSkillSource"
+        }
+      }
+    },
     "UiSkillDelivery": {
       "description": "The live projection of a turn's skill delivery. The durable audit is the engine event; this is the compact fact a client shows while the turn runs. It carries no procedure body.",
       "type": "object",
@@ -13991,6 +14265,145 @@
         "capability_unavailable"
       ]
     },
+    "UiSkillDetail": {
+      "description": "One skill with its full body and bundled files, for an inspector.",
+      "type": "object",
+      "required": [
+        "entry"
+      ],
+      "properties": {
+        "body": {
+          "description": "`None` for an invalid entry. For an untrusted entry this is a bounded preview of the exact package, for human inspection only: the runtime never delivers it to the model before a trust decision.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "body_truncated": {
+          "description": "Whether `body` omitted any package content. A truncated preview must not be presented as the complete definition.",
+          "default": false,
+          "type": "boolean"
+        },
+        "entry": {
+          "$ref": "#/definitions/UiSkillEntry"
+        },
+        "other_files": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "references": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "scripts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "UiSkillEntry": {
+      "description": "One resolvable skill name, as the registry resolves it.",
+      "type": "object",
+      "required": [
+        "name",
+        "scope",
+        "source",
+        "status"
+      ],
+      "properties": {
+        "argument_hint": {
+          "description": "Display-only argument shape from `SKILL.md` frontmatter.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "description": {
+          "description": "Present only for an available entry.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "disable_model_invocation": {
+          "description": "Whether the model index and `load_skill` may use this Skill.",
+          "default": false,
+          "type": "boolean"
+        },
+        "location": {
+          "description": "The package directory; `None` for built-ins.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "reason": {
+          "description": "Why it is disabled or invalid.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "scope": {
+          "$ref": "#/definitions/UiSkillScope"
+        },
+        "shadowed": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiShadowedSkill"
+          }
+        },
+        "slash_reserved": {
+          "description": "Whether the bare `/name` form is owned by a product command, so the Skill's slash identity is the qualified `/<scope>:<name>`.",
+          "default": false,
+          "type": "boolean"
+        },
+        "source": {
+          "$ref": "#/definitions/UiSkillSource"
+        },
+        "status": {
+          "$ref": "#/definitions/UiSkillStatus"
+        },
+        "user_invocable": {
+          "description": "Whether `/` and `$` may invoke this Skill.",
+          "default": true,
+          "type": "boolean"
+        }
+      }
+    },
+    "UiSkillProblem": {
+      "description": "Something under a skills directory that is not a loadable skill at all.",
+      "type": "object",
+      "required": [
+        "error",
+        "location",
+        "scope",
+        "source"
+      ],
+      "properties": {
+        "error": {
+          "type": "string"
+        },
+        "location": {
+          "type": "string"
+        },
+        "scope": {
+          "$ref": "#/definitions/UiSkillScope"
+        },
+        "source": {
+          "$ref": "#/definitions/UiSkillSource"
+        }
+      }
+    },
     "UiSkillScope": {
       "description": "Where a skill lives.",
       "type": "string",
@@ -14010,6 +14423,87 @@
         "claude",
         "builtin"
       ]
+    },
+    "UiSkillStatus": {
+      "description": "Whether an entry can be loaded.",
+      "oneOf": [
+        {
+          "description": "Valid, trusted, and enabled: the entry can be loaded.",
+          "type": "string",
+          "enum": [
+            "available"
+          ]
+        },
+        {
+          "description": "Valid and trusted, but the user disabled it; the package stays listed so it can be re-enabled.",
+          "type": "string",
+          "enum": [
+            "disabled"
+          ]
+        },
+        {
+          "description": "The definition is broken; it cannot be loaded anywhere.",
+          "type": "string",
+          "enum": [
+            "invalid"
+          ]
+        },
+        {
+          "description": "A package exists but its exact bytes have no human approval (or the approved version differs). It is listed so the user can inspect it, but it is never loaded without a decision. Carries no description: unapproved metadata must not be presented as usable instruction.",
+          "type": "string",
+          "enum": [
+            "untrusted"
+          ]
+        }
+      ]
+    },
+    "UiStartupRecovery": {
+      "description": "Runtime recovery that must never delay the first client frame.\n\nThe runtime binds its endpoint and serves canonical durable state first, then reconciles background services and owed continuations. This projection is the authority for whether that work finished, is still running, or failed: a failed stage is a real, typed fact (not a silent absence of tasks), and a client shows it instead of claiming the runtime is healthy.",
+      "type": "object",
+      "properties": {
+        "failures": {
+          "description": "Stages that failed. The runtime keeps serving; their facts stay unknown until the underlying problem is resolved.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiStartupRecoveryFailure"
+          }
+        },
+        "recovered_tasks": {
+          "description": "Background tasks whose controlling Execution Host was already gone and that recovery converged on OS evidence. Never a success claim: the task is not running under this runtime and its exit may be unrecorded.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "running": {
+          "description": "At least one recovery stage is still in flight.",
+          "default": false,
+          "type": "boolean"
+        },
+        "unresolved_intents": {
+          "description": "Spawn intents whose launch could not be proven. Records are kept.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "UiStartupRecoveryFailure": {
+      "description": "One recovery stage that failed.",
+      "type": "object",
+      "required": [
+        "message",
+        "stage"
+      ],
+      "properties": {
+        "message": {
+          "description": "The runtime's own error text. Diagnostics only; never an authority.",
+          "type": "string"
+        },
+        "stage": {
+          "description": "Stable stage name (`execution_services`, `owed_continuations`).",
+          "type": "string"
+        }
+      }
     },
     "UiTaskDeclaration": {
       "description": "A task's own terminal declaration, projected from its durable TaskFinished stop. This is not verification evidence and does not replace session lifecycle.",

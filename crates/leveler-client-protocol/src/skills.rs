@@ -41,6 +41,11 @@ pub enum UiSkillStatus {
     Disabled,
     /// The definition is broken; it cannot be loaded anywhere.
     Invalid,
+    /// A package exists but its exact bytes have no human approval (or the
+    /// approved version differs). It is listed so the user can inspect it,
+    /// but it is never loaded without a decision. Carries no description:
+    /// unapproved metadata must not be presented as usable instruction.
+    Untrusted,
 }
 
 /// A lower-precedence skill the active one hides.
@@ -82,6 +87,10 @@ pub struct UiSkillEntry {
     /// Whether the model index and `load_skill` may use this Skill.
     #[serde(default)]
     pub disable_model_invocation: bool,
+    /// Whether the bare `/name` form is owned by a product command, so the
+    /// Skill's slash identity is the qualified `/<scope>:<name>`.
+    #[serde(default)]
+    pub slash_reserved: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shadowed: Vec<UiShadowedSkill>,
 }
@@ -105,9 +114,15 @@ pub struct UiSkillProblem {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UiSkillDetail {
     pub entry: UiSkillEntry,
-    /// `None` for an invalid entry.
+    /// `None` for an invalid entry. For an untrusted entry this is a bounded
+    /// preview of the exact package, for human inspection only: the runtime
+    /// never delivers it to the model before a trust decision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
+    /// Whether `body` omitted any package content. A truncated preview must
+    /// not be presented as the complete definition.
+    #[serde(default)]
+    pub body_truncated: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scripts: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
