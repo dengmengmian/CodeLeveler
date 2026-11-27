@@ -805,7 +805,7 @@ export function executionStatusLabel(view) {
  * array. Classification (final vs narration, edit vs tools, receipt status)
  * happens here, never in the renderer.
  *
- * @param {{messages?:ProjectionMessage[],tools?:ExecutionToolRow[],thoughts?:any[],reasoning?:string,turnTerminals?:any[],turnErrors?:any[],approvals?:any[],streamingMessageId?:string|null,status?:string}} state
+ * @param {{messages?:ProjectionMessage[],tools?:ExecutionToolRow[],thoughts?:any[],reviews?:any[],reasoning?:string,turnTerminals?:any[],turnErrors?:any[],approvals?:any[],streamingMessageId?:string|null,status?:string}} state
  */
 export function conversationItems(state) {
   /** @param {{seq?:number}|null|undefined} entry @param {number} index @returns {number} */
@@ -819,6 +819,11 @@ export function conversationItems(state) {
     .sort((a, b) => a.seq - b.seq);
   const terminals = (state.turnTerminals ?? [])
     .map((terminal, index) => ({ ...terminal, seq: seqOf(terminal, index) }))
+    .sort((a, b) => a.seq - b.seq);
+  // Review cards are their own durable entries. They keep the log position the
+  // runtime gave them and are never folded into a turn's execution rows.
+  const reviews = (state.reviews ?? [])
+    .map((review, index) => ({ ...review, seq: seqOf(review, index) }))
     .sort((a, b) => a.seq - b.seq);
   const approvalIds = new Set((state.approvals ?? []).map(request => String(request.call_id ?? '')));
   const userSeqs = messages.filter(message => messageKind(message) === 'user').map(message => message.seq);
@@ -867,6 +872,11 @@ export function conversationItems(state) {
       // The runtime's reasoning stays in the model's record and in Trajectory;
       // a settled Thought paints no conversation row (the TUI's own rule).
       items.push({ kind: 'thought', seq: thought.seq, thought, visible: false });
+    }
+    // A review is not a turn: its card sits where the runtime recorded it and
+    // carries its own status, regardless of the turn around it.
+    for (const review of reviews) {
+      if (inSegment(review)) items.push({ kind: 'review', seq: review.seq, review });
     }
     for (const block of turnBlocks([], /** @type {any[]} */ (rounds))) {
       if (block.kind !== 'round' && block.kind !== 'receipt') continue;

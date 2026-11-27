@@ -1,4 +1,8 @@
 import {SNAPSHOT_VERSIONED_COMMANDS} from './command-policy.gen.mjs';
+import {
+  applyReviewEvent,
+  reconcileReviewHistory,
+} from './review.mjs';
 import {skillDeliveryNotice} from './skills-settings.mjs';
 // Presentation only: snapshots and events come from the Rust client protocol.
 //
@@ -11,7 +15,7 @@ import {
 } from './presentation.mjs';
 
 export function projectSnapshot(snapshot, history = []) {
-  let state = {session:snapshot, messages:[], nextSeq:0, status:snapshot.task_status ?? snapshot.status ?? 'unknown', tools:[], thoughts:[], reasoning:'', reasoningSuperseded:false, approvals:[], clarifications:[], definitionTrust:[], activity:'', activityElapsedMs:null, plan:snapshot.plan??null,diff:snapshot.diff??null,diffError:null,streamingMessageId:null,lastTerminal:null,turnErrors:[],turnTerminals:[],turnStartedAt:null};
+  let state = {session:snapshot, messages:[], reviews:[], nextSeq:0, status:snapshot.task_status ?? snapshot.status ?? 'unknown', tools:[], thoughts:[], reasoning:'', reasoningSuperseded:false, approvals:[], clarifications:[], definitionTrust:[], activity:'', activityElapsedMs:null, plan:snapshot.plan??null,diff:snapshot.diff??null,diffError:null,streamingMessageId:null,lastTerminal:null,turnErrors:[],turnTerminals:[],turnStartedAt:null};
   if (history.length > 0) {
     // The durable log is the conversation; the snapshot's `messages` are the
     // ACTIVE MODEL CONTEXT (`/compact` leaves one summary row there). Replaying
@@ -193,6 +197,25 @@ export function mergeRestoredConversation(restored, live) {
   for (const thought of (live.thoughts ?? []).filter(item => !thoughtIds.has(item.id))) {
     thoughts.push(adopt(thought));
   }
+  // Review cards are durable facts with their own ids. The replay places them
+  // where they belong; a live card the replay did not carry (a review that
+  // started or settled while the query was in flight) is appended once. A
+  // live PROGRESS snapshot never replaces a durable terminal.
+  const liveReviews = new Map((live.reviews ?? []).map(review => [review.id, review]));
+  const reviews = (restored.reviews ?? []).map(review => {
+    const current = liveReviews.get(review.id);
+    if (!current) return review;
+    const settled = current.summary && ['completed', 'incomplete', 'cancelled', 'failed'].includes(current.summary.status);
+    return settled && !review.report && current.report
+      ? { ...review, summary: current.summary, report: current.report }
+      : { ...review, live: review.live ?? current.live };
+  });
+  const restoredReviewIds = new Set((restored.reviews ?? []).map(review => review.id));
+  for (const review of (live.reviews ?? [])
+    .filter(item => !restoredReviewIds.has(item.id))
+    .sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0))) {
+    reviews.push(adopt(review));
+  }
   const turnTerminals = [...restored.turnTerminals];
   for (const terminal of (live.turnTerminals ?? []).slice(turnTerminals.length)) {
     turnTerminals.push(adopt(terminal));
@@ -205,6 +228,7 @@ export function mergeRestoredConversation(restored, live) {
     messages,
     tools,
     thoughts,
+    reviews,
     turnTerminals,
     turnErrors,
     nextSeq,
@@ -214,6 +238,10 @@ export function mergeRestoredConversation(restored, live) {
   };
 }
 export function applyEvent(state,event) {
+  // Review cards are their own conversation entries, keyed by the runtime's
+  // durable review id. They are not turns, messages or tools, so they take
+  // their own branch before the transcript mapping below.
+  if(typeof event?.type==='string'&&event.type.startsWith('review_'))return event.type==='review_history_loaded'?reconcileReviewHistory(state,event):(applyReviewEvent(state,event)??state);
   if(['diff_updated','diff_failed'].includes(event.type)&&event.query_id&&(state.diffQuery?.id!==event.query_id||!['pending','unknown'].includes(state.diffQuery.status)))return state;
   let next=applyToolEvent(state,event);
   next.messages=state.messages.map(m=>({...m}));

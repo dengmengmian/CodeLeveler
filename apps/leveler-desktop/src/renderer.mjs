@@ -50,6 +50,12 @@ import {
   skillSlashName, skillSlashState, skillCommandEntries, skillDeliveryNotice,
   skillListAnswer, skillDetailAnswer, skillSections, skillBundledFiles, skillFlags,
 } from './skills-settings.mjs';
+import {
+  REVIEW_FOCUS_MAX_BYTES, reviewFocusBytes, reviewStatusView, reviewScopeText,
+  reviewScopeDetail, reviewCardModel, reviewScopeOptions, recommendedScopeOption,
+  reviewScopeFromSelection, reviewRequest, reviewEntryState, reviewReportView,
+  reviewDimensionLabel, reviewCountsText,
+} from './review.mjs';
 
 const api = window.desktop;
 const $ = id => document.getElementById(id);
@@ -69,7 +75,7 @@ const LABELS = {
 const TAB_ICON = {
   start: 'compass', files: 'folder', preview: 'file', terminal: 'terminal',
   browser: 'globe', changes: 'diff', plan: 'list', subagent: 'bot',
-  'tool-output': 'terminal',
+  review: 'search', 'tool-output': 'terminal',
 };
 const PERMISSION_MODES = [
   ['full_access', '完全权限'],
@@ -388,6 +394,7 @@ function controls() {
   $('model-picker').disabled = frozen;
   $('mode-picker').disabled = frozen;
   $('permission-picker').disabled = frozen;
+  paintReviewEntry();
   $('workspace-picker').disabled = frozen;
   $('new-session').disabled = loading || uploads || offline;
   $('leading-new').disabled = $('new-session').disabled;
@@ -3138,6 +3145,9 @@ function renderConversation() {
       nodes.push(node);
     } else if (item.kind === 'notice' || item.kind === 'summary') {
       nodes.push(runtimeNoticeNode(existing, item));
+    } else if (item.kind === 'review') {
+      // The runtime's own review card. It is not a turn and owns no receipt.
+      nodes.push(reviewCardNode(existing, item));
     } else if (item.kind === 'execution') {
       // Model steps do not create reader-visible headers: consecutive blocks of
       // one run paint as a single process row, like the reference transcript.
@@ -4599,6 +4609,9 @@ function commandCatalog() {
     ['commands', 'goal', '目标', true, 'compass', null, null],
     ['commands', 'feedback', '反馈', true, 'feedback', null, null],
     ['commands', 'diff', '工作区变更', !!current?.session.repository, 'diff', null, '当前会话没有工作区'],
+    // Review is manual only; this is the same entry as the composer's 审查
+    // button, named here so a typed `/review` reaches it too.
+    ['commands', 'review', '审查', !!current, 'search', null, '请先选择或新建会话'],
     ['commands', 'compact', '压缩', session, 'archive', null, null],
     ['commands', 'permission', '权限', session, 'shield', null, null],
     ['commands', 'model', '模型', session, 'layers', null, null],
@@ -4713,6 +4726,7 @@ async function executeCommand(id) {
     requestDiff();
     return;
   }
+  if (id === 'review') { openReviewDialog(); return; }
   if (id === 'permission') { openPermissionMenu($('permission-picker')); return; }
   if (id === 'model') { openModelMenu($('model-picker')); return; }
   if (id === 'compact') {
@@ -5214,6 +5228,615 @@ function openHistoryMenu(anchor) {
   });
 }
 
+/* ----------------------------------------------------------------- review */
+// Manual review is a user action, never an automatic one. This section only
+// forwards the person's explicit choice to the runtime, paints the runtime's
+// own facts, and opens the durable report. It never decides that a review is
+// warranted, never infers a verdict from prose and never substitutes a local
+// state for the runtime's.
+
+// The scope facts a bare `/review` picker offers. Read-only and unfetched;
+// unknown Git state stays unknown instead of being drawn as "clean".
+let reviewFacts = null; // {owner, id, status:'pending'|'confirmed'|'unknown', facts, error, timer}
+let reviewDraft = null; // {owner, selection, focus, rev, base, pathsText, error}
+let reviewSubmitting = false;
+let reviewHistoryQueryId = null;
+const reviewReportQueries = new Map(); // query_id -> {owner, reviewId, timer}
+const REVIEW_QUERY_TIMEOUT_MS = 20000;
+
+function reviewCardById(id) {
+  return (current?.reviews ?? []).find(review => review.id === id) ?? null;
+}
+
+// The entry is the ONE review action in the workbench. It is enabled only when
+// the runtime can actually accept one; the runtime refuses a running turn on
+// its own and that refusal is shown verbatim if this projection is stale.
+function reviewEntry() {
+  return reviewEntryState({
+    session: current?.session ?? null,
+    status: current?.status ?? null,
+    uncertain,
+    submitting: reviewSubmitting,
+  });
+}
+
+function openReviewDialog({ focus = '' } = {}) {
+  if (!current?.session?.id) { composerError('请先选择或新建会话'); return; }
+  if (uncertain) { composerError('上一个操作结果未知，请先刷新确认'); return; }
+  closeReviewDialog();
+  reviewDraft = {
+    owner: current.session.id,
+    selection: null,
+    focus,
+    rev: '',
+    base: '',
+    pathsText: '',
+    error: null,
+  };
+  const dialog = el('dialog', 'modal review-dialog');
+  dialog.id = 'review-dialog';
+  const card = el('div', 'modal-card');
+  const head = el('div', 'modal-head');
+  head.append(el('h2', undefined, '发起审查'));
+  const close = iconButton('close', '关闭审查对话框', { size: 16, tooltip: '关闭' });
+  head.append(close);
+  const body = el('div', 'review-dialog-body');
+  const actions = el('div', 'modal-actions');
+  card.append(head, body, actions);
+  dialog.append(card);
+  document.body.append(dialog);
+  close.addEventListener('click', () => dialog.close());
+  dialog.addEventListener('close', () => {
+    dialog.remove();
+    if (reviewFacts?.timer) clearTimeout(reviewFacts.timer);
+    reviewFacts = null;
+    reviewDraft = null;
+  }, { once: true });
+  dialog.addEventListener('cancel', () => { /* Esc closes; the dialog owns nothing durable */ });
+  paintReviewDialog();
+  dialog.showModal();
+  requestReviewFacts();
+}
+
+function closeReviewDialog() {
+  const dialog = $('review-dialog');
+  if (dialog) dialog.close();
+}
+
+function reviewDraftAlive() {
+  return !!reviewDraft && reviewDraft.owner === current?.session?.id;
+}
+
+function paintReviewDialog() {
+  const dialog = $('review-dialog');
+  if (!dialog || !reviewDraft) return;
+  const body = dialog.querySelector('.review-dialog-body');
+  const actions = dialog.querySelector('.modal-actions');
+  const draft = reviewDraft;
+  body.replaceChildren();
+  actions.replaceChildren();
+
+  const intro = el('p', 'settings-note',
+    '审查由 Runtime 以只读方式独立执行：读取工作区与会话记录，生成结构化问题与证据，不修改代码、不提交、不推送。');
+  body.append(intro);
+
+  const facts = reviewFacts;
+  if (!facts || facts.status === 'pending') {
+    body.append(el('div', 'settings-note', '正在读取仓库状态…'));
+  } else if (facts.status === 'unknown' || !facts.facts) {
+    body.append(el('div', 'settings-note error', facts.error ?? '未能读取审查对象状态。'));
+  } else {
+    const summary = el('div', 'review-facts');
+    const add = (label, value) => {
+      const row = el('div', 'provider-fact');
+      row.append(el('span', undefined, label), el('span', undefined, value));
+      summary.append(row);
+    };
+    add('工作区', facts.facts.workspace ? '可读取' : '不可读取');
+    add('Git', facts.facts.git ? `分支 ${facts.facts.branch ?? '（游离 HEAD）'}` : '不可用');
+    if (facts.facts.upstream) add('上游', `${facts.facts.upstream}（领先 ${facts.facts.ahead} 个提交）`);
+    if (facts.facts.detail) summary.append(el('div', 'settings-note', facts.facts.detail));
+    body.append(summary);
+  }
+
+  const options = reviewScopeOptions(facts?.facts ?? {});
+  const recommended = recommendedScopeOption(options);
+  if (!draft.selection) draft.selection = recommended ?? options.find(option => option.enabled)?.id ?? null;
+  const group = el('div', 'review-options');
+  group.setAttribute('role', 'radiogroup');
+  let heading = null;
+  for (const option of options) {
+    if (option.group !== heading) {
+      heading = option.group;
+      group.append(el('div', 'settings-subhead', heading));
+    }
+    const row = el('label', 'review-option');
+    row.dataset.scope = option.id;
+    row.dataset.enabled = String(option.enabled);
+    row.dataset.selected = String(option.id === draft.selection);
+    const radio = el('input');
+    radio.type = 'radio';
+    radio.name = 'review-scope';
+    radio.value = option.id;
+    radio.checked = option.id === draft.selection;
+    radio.disabled = !option.enabled;
+    radio.addEventListener('change', () => {
+      if (!option.enabled) return;
+      reviewDraft.selection = option.id;
+      reviewDraft.error = null;
+      paintReviewDialog();
+    });
+    const copy = el('div', 'review-option-copy');
+    const title = el('span', 'review-option-label', option.label);
+    if (option.recommended) title.append(el('span', 'review-chip', 'Runtime 推荐'));
+    copy.append(title, el('span', 'review-option-desc', option.description));
+    if (!option.enabled && option.reason) copy.append(el('span', 'review-option-reason', option.reason));
+    if (option.id === draft.selection && option.enabled) copy.append(el('span', 'review-option-detail', reviewScopeDetail(option.scope)));
+    row.append(radio, copy);
+    group.append(row);
+  }
+  body.append(group);
+
+  if (draft.selection === 'commit' || draft.selection === 'branch') {
+    const field = el('div', 'review-field');
+    const label = el('label', undefined, draft.selection === 'commit' ? '提交引用' : '比较基线');
+    const input = el('input', 'review-input');
+    input.type = 'text';
+    input.id = draft.selection === 'commit' ? 'review-rev' : 'review-base';
+    input.placeholder = draft.selection === 'commit' ? '例如 HEAD~1 或完整 SHA' : '例如 origin/main';
+    input.value = draft.selection === 'commit' ? draft.rev : draft.base;
+    input.addEventListener('input', () => {
+      if (draft.selection === 'commit') draft.rev = input.value;
+      else draft.base = input.value;
+      draft.error = null;
+    });
+    field.append(label, input);
+    body.append(field);
+  }
+  if (draft.selection === 'paths') {
+    const field = el('div', 'review-field');
+    const label = el('label', undefined, '路径（逗号或换行分隔）');
+    const input = el('textarea', 'review-input');
+    input.id = 'review-paths';
+    input.rows = 2;
+    input.placeholder = '例如 src/lib.rs, crates/leveler-app/src';
+    input.value = draft.pathsText;
+    input.addEventListener('input', () => { draft.pathsText = input.value; draft.error = null; });
+    field.append(label, input);
+    body.append(field);
+  }
+
+  const focusField = el('div', 'review-field');
+  const focusLabel = el('label', undefined, '审查重点（可选，直接写给审查者）');
+  const focus = el('textarea', 'review-input');
+  focus.id = 'review-focus';
+  focus.rows = 3;
+  focus.placeholder = '例如：重点检查并发、错误处理与边界条件；留空则全面审查所选范围。';
+  focus.value = draft.focus;
+  focusLabel.setAttribute('for', 'review-focus');
+  const counter = el('span', 'review-focus-count');
+  const paintCounter = () => {
+    const size = reviewFocusBytes(focus.value);
+    counter.textContent = `${size} / ${REVIEW_FOCUS_MAX_BYTES} 字节`;
+    counter.dataset.over = String(size > REVIEW_FOCUS_MAX_BYTES);
+  };
+  paintCounter();
+  focus.addEventListener('input', () => {
+    draft.focus = focus.value;
+    draft.error = null;
+    paintCounter();
+    submit.disabled = submitDisabled();
+  });
+  focusField.append(focusLabel, focus, counter);
+  body.append(focusField);
+
+  const modelText = current?.session?.model ? ` · 模型 ${current.session.model}` : '';
+  body.append(el('div', 'settings-note',
+    `开始后会产生真实模型调用${modelText}。审查不会修改工作区；发现的问题需要你另行决定是否修复。`));
+  if (draft.error) body.append(el('p', 'review-dialog-error', draft.error));
+
+  const submitDisabled = () => reviewSubmitting
+    || !draft.selection
+    || facts?.status !== 'confirmed'
+    || reviewFocusBytes(draft.focus) > REVIEW_FOCUS_MAX_BYTES
+    || !!reviewEntry().reason;
+  const cancel = el('button', 'button secondary', '取消');
+  cancel.type = 'button';
+  cancel.addEventListener('click', closeReviewDialog);
+  const submit = el('button', 'button primary', reviewSubmitting ? '正在提交…' : '开始审查');
+  submit.type = 'button';
+  submit.id = 'review-submit';
+  submit.disabled = submitDisabled();
+  submit.addEventListener('click', () => { void submitReview(); });
+  actions.append(cancel, submit);
+}
+
+function requestReviewFacts() {
+  if (!reviewDraft) return;
+  const owner = reviewDraft.owner;
+  const id = crypto.randomUUID();
+  reviewFacts = { owner, id, status: 'pending', facts: null, error: null, timer: null };
+  reviewFacts.timer = setTimeout(() => {
+    if (reviewFacts?.id !== id) return;
+    reviewFacts = { ...reviewFacts, status: 'unknown', timer: null, error: '20 秒内未收到仓库状态；请关闭后重试。' };
+    paintReviewDialog();
+  }, REVIEW_QUERY_TIMEOUT_MS);
+  paintReviewDialog();
+  deliver({ type: 'query_review_scopes', session_id: owner, query_id: id })
+    .catch(error => {
+      if (reviewFacts?.id !== id) return;
+      if (reviewFacts.timer) clearTimeout(reviewFacts.timer);
+      reviewFacts = { ...reviewFacts, status: 'unknown', timer: null, error: `无法确认仓库状态：${error.message}` };
+      paintReviewDialog();
+    });
+}
+
+async function submitReview() {
+  const draft = reviewDraft;
+  if (!draft || reviewSubmitting) return;
+  if (!reviewDraftAlive()) { draft.error = '会话已切换，请重新发起审查'; paintReviewDialog(); return; }
+  let scope;
+  try {
+    if (!draft.selection) throw new Error('请选择审查对象');
+    scope = reviewScopeFromSelection({
+      kind: draft.selection, rev: draft.rev, base: draft.base, pathsText: draft.pathsText,
+    });
+  } catch (error) {
+    draft.error = error.message;
+    paintReviewDialog();
+    return;
+  }
+  const command = reviewRequest({ sessionId: draft.owner, focus: draft.focus, scope });
+  reviewSubmitting = true;
+  draft.error = null;
+  paintReviewDialog();
+  try {
+    // Success means the runtime accepted the command. The card is painted only
+    // from the runtime's own ReviewStarted event, never from this answer.
+    await deliver(command);
+    closeReviewDialog();
+  } catch (error) {
+    if (reviewDraft) {
+      reviewDraft.error = error.message;
+      paintReviewDialog();
+    }
+  } finally {
+    reviewSubmitting = false;
+  }
+}
+
+function requestCancelReview(reviewId) {
+  const owner = current?.session?.id;
+  if (!owner) return;
+  action(async () => {
+    await deliver({ type: 'cancel_review', session_id: owner, review_id: reviewId });
+    // The card keeps saying 审查中 until the runtime settles it. Cancellation
+    // is a request; the terminal is the runtime's.
+    toast('已请求取消审查；状态以 Runtime 的终态为准', { tone: 'info', holdMs: 2600 });
+  }, { onError: composerError, clearGlobal: false });
+}
+
+function openReviewReport(reviewId) {
+  const card = reviewCardById(reviewId);
+  const tab = openRightbarTab('review', {
+    reviewId,
+    title: '审查报告',
+    focus: card?.summary?.scope ? reviewScopeText(card.summary.scope) : null,
+  });
+  ensureReviewReport(reviewId);
+  return tab;
+}
+
+function ensureReviewReport(reviewId) {
+  const owner = current?.session?.id;
+  const card = reviewCardById(reviewId);
+  if (!owner || !card) return;
+  if (!reviewStatusView(card.summary?.status).settled) return;
+  if (card.report) return;
+  if ([...reviewReportQueries.values()].some(item => item.reviewId === reviewId && item.owner === owner)) return;
+  const queryId = crypto.randomUUID();
+  const entry = { owner, reviewId, timer: null };
+  entry.timer = setTimeout(() => {
+    if (reviewReportQueries.get(queryId) !== entry) return;
+    reviewReportQueries.delete(queryId);
+    if (rightbarOpen) renderRightbar();
+  }, REVIEW_QUERY_TIMEOUT_MS);
+  reviewReportQueries.set(queryId, entry);
+  deliver({ type: 'query_review_report', session_id: owner, review_id: reviewId, query_id: queryId })
+    .catch(() => {
+      if (reviewReportQueries.get(queryId) !== entry) return;
+      clearTimeout(entry.timer);
+      reviewReportQueries.delete(queryId);
+      if (rightbarOpen) renderRightbar();
+    });
+}
+
+// On open and on replace, read this session's durable review list. The
+// conversation replay already places settled reviews; the list is the index
+// that also carries a row whose conversation notice never reached this client.
+function requestReviews() {
+  const owner = current?.session?.id;
+  if (!owner) return;
+  const queryId = crypto.randomUUID();
+  reviewHistoryQueryId = queryId;
+  deliver({ type: 'list_reviews', session_id: owner, query_id: queryId })
+    .catch(() => {
+      if (reviewHistoryQueryId === queryId) reviewHistoryQueryId = null;
+      /* the conversation replay and reconnect remain available */
+    });
+}
+
+function paintReviewEntry() {
+  const button = $('review-entry');
+  if (!button) return;
+  const state = reviewEntry();
+  button.disabled = state.enabled ? (loading || connectionState.state !== 'connected') : true;
+  button.dataset.tooltip = state.reason ?? '发起审查（只读，手动触发）';
+}
+
+function reviewCardNode(existing, item) {
+  const review = item.review;
+  const model = reviewCardModel(review.summary, review.live);
+  const key = `review:${model.id}`;
+  let node = existing.get(key);
+  if (!node) {
+    node = el('article', 'review-card');
+    node.dataset.key = key;
+    node.dataset.reviewId = model.id;
+    node.append(
+      el('header', 'review-card-head'),
+      el('div', 'review-card-body'),
+      el('footer', 'review-card-actions'),
+    );
+  }
+  node.dataset.status = review.summary?.status ?? 'unknown';
+  node.dataset.tone = model.status.tone;
+  const signature = JSON.stringify([
+    review.summary?.status, review.summary?.conclusion, review.summary?.counts,
+    review.summary?.finished_at, review.summary?.failure, review.summary?.stop_detail,
+    review.summary?.object_changed, review.summary?.modified_source, review.summary?.report_stale,
+    review.summary?.report_source, review.live, model.hasFormalReport,
+  ]);
+  if (node.dataset.signature === signature) return node;
+  node.dataset.signature = signature;
+
+  const head = node.querySelector('.review-card-head');
+  head.replaceChildren();
+  const state = el('span', `review-state tone-${model.status.tone}`, model.status.label);
+  const title = el('span', 'review-card-title', `审查 · ${model.scopeText}`);
+  head.append(state, title);
+  if (model.model) head.append(el('span', 'review-card-model', model.model));
+  if (model.canCancel) {
+    const cancel = el('button', 'button secondary small', '取消审查');
+    cancel.type = 'button';
+    cancel.addEventListener('click', event => {
+      event.stopPropagation();
+      cancel.disabled = true;
+      requestCancelReview(model.id);
+    });
+    head.append(cancel);
+  }
+
+  const body = node.querySelector('.review-card-body');
+  body.replaceChildren();
+  if (model.focus) body.append(el('p', 'review-card-focus', model.focus));
+  const facts = el('div', 'review-card-facts');
+  if (model.conclusion) {
+    const chip = el('span', `review-chip tone-${model.conclusion.tone}`, model.conclusion.label);
+    facts.append(chip);
+    if (model.conclusion.tone !== 'ok') facts.append(el('span', 'review-card-note', model.conclusion.note));
+  } else if (model.status.settled) {
+    facts.append(el('span', 'review-card-note', '审查者没有声明总体结论；这不等于没有问题。'));
+  }
+  facts.append(el('span', 'review-card-counts', model.countsText));
+  body.append(facts);
+  if (model.live) {
+    const live = [];
+    if (model.live.tool) live.push(`最近工具 ${model.live.tool}`);
+    if (model.live.elapsedMs) live.push(`已用时 ${Math.round(model.live.elapsedMs / 1000)}s`);
+    if (model.live.inputTokens || model.live.outputTokens) live.push(`输入 ${model.live.inputTokens} · 输出 ${model.live.outputTokens}`);
+    if (model.live.active === false && !live.length) live.push('等待 Runtime 更新');
+    body.append(el('div', 'review-card-live', live.join(' · ')));
+  }
+  if (model.failure) body.append(el('div', 'review-card-failure', `失败原因：${model.failure}`));
+  else if (model.stopDetail) body.append(el('div', 'review-card-failure', `中止原因：${model.stopDetail}`));
+  const notices = [];
+  if (model.objectChanged) notices.push('审查期间审查对象发生了变化；报告描述的是变化前的对象。');
+  if (model.modifiedSource) notices.push('审查者修改了工作区文件，违反了只读约定；请核对这些改动。');
+  if (model.reportStale) notices.push('提交的报告没有覆盖最新证据。');
+  if (model.status.settled && !model.hasFormalReport) notices.push('审查者没有提交正式报告；卡片只反映执行状态与已记录的问题。');
+  if (notices.length) body.append(el('div', 'review-card-notice', notices.join(' ')));
+  if (!model.status.settled && model.status.tone !== 'muted') {
+    body.append(el('div', 'review-card-note', '审查运行期间不开放结果；终态到达前不会显示“已完成”。'));
+  }
+
+  const actions = node.querySelector('.review-card-actions');
+  actions.replaceChildren();
+  if (model.status.settled) {
+    const open = el('button', 'button secondary small', '查看报告');
+    open.type = 'button';
+    open.addEventListener('click', event => { event.stopPropagation(); openReviewReport(model.id); });
+    actions.append(open);
+  } else {
+    actions.append(el('span', 'review-card-usage', model.usageText));
+  }
+  node.addEventListener('click', event => {
+    if (event.target.closest('button')) return;
+    if (reviewStatusView(review.summary?.status).settled) openReviewReport(model.id);
+  }, { once: false });
+  return node;
+}
+
+function reviewDetailView(tab) {
+  const view = el('div', 'review-report');
+  const card = reviewCardById(tab.reviewId);
+  if (!card) {
+    view.append(el('div', 'right-empty', '找不到这次审查的持久化记录。'));
+    return view;
+  }
+  const report = card.report ? reviewReportView(card.report) : null;
+  const model = reviewCardModel(card.summary, card.live);
+  const header = el('div', 'review-report-head');
+  header.append(
+    el('span', `review-state tone-${model.status.tone}`, model.status.label),
+    el('span', 'review-report-title', `审查 · ${model.scopeText}`),
+  );
+  if (model.canCancel) {
+    const cancel = el('button', 'button secondary small', '取消审查');
+    cancel.type = 'button';
+    cancel.addEventListener('click', () => { cancel.disabled = true; requestCancelReview(model.id); });
+    header.append(cancel);
+  }
+  view.append(header);
+  const meta = el('div', 'provider-facts');
+  const fact = (label, value) => {
+    const row = el('div', 'provider-fact');
+    row.append(el('span', undefined, label), el('span', undefined, value));
+    meta.append(row);
+  };
+  if (model.focus) fact('审查重点', model.focus);
+  fact('状态', model.status.label);
+  if (model.conclusion) fact('结论', model.conclusion.label);
+  fact('问题统计', model.countsText);
+  if (model.model) fact('模型', model.model);
+  if (model.usageText) fact('用量', model.usageText);
+  if (model.createdAt) fact('发起时间', `${model.createdAt}${model.finishedAt ? ` → ${model.finishedAt}` : ''}`);
+  fact('审查 ID', model.id);
+  view.append(meta);
+  if (model.failure) view.append(el('div', 'review-card-failure', `失败原因：${model.failure}`));
+  else if (model.stopDetail) view.append(el('div', 'review-card-failure', `中止原因：${model.stopDetail}`));
+
+  if (!model.status.settled) {
+    view.append(el('div', 'review-report-status', '审查仍在进行；结果以 Runtime 的终态为准。'));
+    return view;
+  }
+  if (!report) {
+    view.append(el('div', 'review-report-status', '正在读取持久化报告…'));
+    ensureReviewReport(model.id);
+    return view;
+  }
+
+  const object = el('section', 'review-report-section');
+  object.append(el('h3', undefined, '审查对象'));
+  const objectFacts = el('div', 'provider-facts');
+  const objectFact = (label, value) => {
+    const row = el('div', 'provider-fact');
+    row.append(el('span', undefined, label), el('span', undefined, value));
+    objectFacts.append(row);
+  };
+  if (report.object.workspace) objectFact('工作区', report.object.workspace);
+  if (report.object.head) objectFact('HEAD', report.object.head.slice(0, 12));
+  objectFact('工作区状态', report.object.dirty ? '有未提交变更' : '无未提交变更');
+  if (report.object.revision) objectFact('固定版本', report.object.revision);
+  if (report.object.files.length) objectFact('文件', `${report.object.files.length} 个${report.object.untracked.length ? `（未跟踪 ${report.object.untracked.length}）` : ''}`);
+  if (report.object.capturedAt) objectFact('采集时间', report.object.capturedAt);
+  object.append(objectFacts);
+  view.append(object);
+
+  const verdict = el('section', 'review-report-section');
+  verdict.append(el('h3', undefined, '总体结论'));
+  if (report.conclusion) {
+    verdict.append(el('span', `review-chip tone-${report.conclusion.tone}`, report.conclusion.label));
+    verdict.append(el('p', 'settings-note', report.conclusion.note));
+  } else {
+    verdict.append(el('p', 'settings-note', '审查者没有声明总体结论；这不等于没有问题。'));
+  }
+  view.append(verdict);
+
+  const coverage = el('section', 'review-report-section');
+  coverage.append(el('h3', undefined, '覆盖情况'));
+  if (!report.coverage.length) coverage.append(el('p', 'settings-note', '审查者没有声明覆盖情况；未声明的维度不代表已审查。'));
+  else {
+    const list = el('div', 'review-coverage');
+    for (const item of report.coverage) {
+      const row = el('div', 'review-coverage-row');
+      row.dataset.tone = item.tone;
+      row.append(el('span', 'review-coverage-dim', item.dimension), el('span', `review-chip tone-${item.tone}`, item.status));
+      if (item.scope) row.append(el('span', 'review-coverage-note', item.scope));
+      if (item.evidenceRefs.length) row.append(el('span', 'review-coverage-note', `证据：${item.evidenceRefs.join('、')}`));
+      if (item.limitations) row.append(el('span', 'review-coverage-note', item.limitations));
+      list.append(row);
+    }
+    coverage.append(list);
+  }
+  view.append(coverage);
+
+  if (report.limitations.length) {
+    const limitations = el('section', 'review-report-section');
+    limitations.append(el('h3', undefined, '限制与未验证内容'));
+    for (const item of report.limitations) {
+      limitations.append(el('div', 'review-limitation', `[${item.source}/${item.kind}] ${item.detail}`));
+    }
+    view.append(limitations);
+  }
+
+  const findings = el('section', 'review-report-section');
+  findings.append(el('h3', undefined, `正式问题（${report.formal.length}）`));
+  if (!report.formal.length) {
+    findings.append(el('p', 'settings-note',
+      report.decided.length ? '没有正式问题；存在未采纳的候选，见下方。' : '审查者没有记录正式问题。这不代表项目已被证明正确或安全。'));
+  }
+  for (const finding of report.formal) findings.append(reviewFindingNode(finding));
+  view.append(findings);
+
+  if (report.decided.length) {
+    const decided = el('section', 'review-report-section');
+    decided.append(el('h3', undefined, `候选与已处置（${report.decided.length}）`));
+    for (const finding of report.decided) decided.append(reviewFindingNode(finding));
+    view.append(decided);
+  }
+
+  const narrative = el('section', 'review-report-section');
+  narrative.append(el('h3', undefined, '审查报告正文'));
+  if (report.reportText.trim()) {
+    const markdown = el('div', 'markdown review-report-markdown');
+    renderMarkdown(markdown, report.reportText, { onLink: openMessageLink });
+    narrative.append(markdown);
+  } else if (report.finalMessage.trim()) {
+    narrative.append(el('p', 'settings-note', '审查者没有提交正式报告正文；以下是它的最后一条消息，仅作为说明。'));
+    narrative.append(el('pre', 'review-final-message', report.finalMessage));
+  } else narrative.append(el('p', 'settings-note', '审查者没有提交报告正文。'));
+  view.append(narrative);
+  return view;
+}
+
+function reviewFindingNode(finding) {
+  const node = el('article', 'review-finding');
+  node.dataset.severity = finding.severity?.tone === 'danger' ? 'high' : finding.severity?.tone === 'warn' ? 'medium' : 'low';
+  const head = el('div', 'review-finding-head');
+  head.append(el('span', 'review-finding-title', finding.title));
+  if (finding.severity) head.append(el('span', `review-chip tone-${finding.severity.tone}`, finding.severity.label));
+  if (finding.dimension) head.append(el('span', 'review-chip tone-muted', finding.dimension));
+  if (finding.confidence) head.append(el('span', 'review-chip tone-muted', finding.confidence));
+  if (finding.disposition && finding.disposition !== 'adopted') head.append(el('span', 'review-chip tone-muted', finding.dispositionLabel));
+  node.append(head);
+  if (finding.file) {
+    const location = el('button', 'review-finding-location');
+    location.type = 'button';
+    const suffix = finding.line ? `:${finding.line}` : '';
+    location.textContent = `${finding.file}${suffix}`;
+    location.dataset.tooltip = '在文件预览中打开';
+    location.addEventListener('click', () => openPreviewForPath(finding.file, null, { line: finding.line ?? null }));
+    node.append(location);
+  } else if (finding.symbol) {
+    node.append(el('div', 'review-finding-location', finding.symbol));
+  }
+  const detail = (label, value) => {
+    if (!value) return;
+    const row = el('div', 'review-finding-row');
+    row.append(el('span', 'review-finding-label', label), el('span', undefined, value));
+    node.append(row);
+  };
+  detail('问题', finding.summary !== finding.title ? finding.summary : '');
+  detail('触发条件 / 证据', finding.evidence);
+  detail('影响', finding.impact);
+  detail('修复建议', finding.recommendation);
+  detail('处置理由', finding.dispositionReason);
+  detail('重复于', finding.duplicateOf);
+  if (finding.reproduced) node.append(el('div', 'review-finding-reproduced', '审查者声明已复现'));
+  return node;
+}
+
 /* ---------------------------------------------------------------- rightbar */
 
 const RIGHT_KEY = 'codeleveler.rightbar.v1';
@@ -5310,7 +5933,7 @@ function changesTabTitle() {
 
 const TAB_TITLES = {
   start: '开始', files: '文件', terminal: '终端', browser: '浏览器', changes: '变更',
-  preview: '预览', plan: '计划', subagent: '子智能体', 'tool-output': '完整输出',
+  preview: '预览', plan: '计划', subagent: '子智能体', review: '审查', 'tool-output': '完整输出',
 };
 
 function tabTitle(kind, extra = {}) {
@@ -5339,8 +5962,10 @@ function openRightbarTab(kind, extra = {}) {
     ? Object.values(rightbarTabs).find(tab => tab.kind === 'preview' && tab.path === extra.path && !rightbarFloats.some(float => float.tabId === tab.id))
     : kind === 'tool-output'
       ? Object.values(rightbarTabs).find(tab => tab.kind === 'tool-output' && tab.callId === extra.callId && !rightbarFloats.some(float => float.tabId === tab.id))
-      : ['files', 'changes', 'plan', 'subagent'].includes(kind)
-        ? Object.values(rightbarTabs).find(tab => tab.kind === kind && !rightbarFloats.some(float => float.tabId === tab.id)) : null;
+      : kind === 'review'
+        ? Object.values(rightbarTabs).find(tab => tab.kind === 'review' && tab.reviewId === extra.reviewId && !rightbarFloats.some(float => float.tabId === tab.id))
+        : ['files', 'changes', 'plan', 'subagent'].includes(kind)
+          ? Object.values(rightbarTabs).find(tab => tab.kind === kind && !rightbarFloats.some(float => float.tabId === tab.id)) : null;
   const tab = reusable ?? newTabRecord(kind, extra);
   if (kind === 'changes') {
     const previous = { source: tab.source ?? 'workspace', toolIds: JSON.stringify(tab.toolIds ?? []) };
@@ -5792,6 +6417,7 @@ function renderTabView(tab, pane) {
   if (tab.kind === 'tool-output') return toolOutputView(tab);
   if (tab.kind === 'plan') return planView();
   if (tab.kind === 'subagent') return subagentView();
+  if (tab.kind === 'review') return reviewDetailView(tab);
   return startView();
 }
 
@@ -8289,6 +8915,45 @@ function consumeSkillEvent(frame) {
   return false;
 }
 
+function consumeReviewEvent(frame) {
+  const owner = current?.session?.id;
+  if (!owner || frame?.event !== 'runtime') return false;
+  const data = frame.data;
+  const type = String(data?.type ?? '');
+  if (!type.startsWith('review_') || frame.session_id !== owner) return false;
+  if (type === 'review_scopes_loaded') {
+    if (!reviewFacts || reviewFacts.owner !== owner || reviewFacts.id !== data.query_id) return true;
+    if (reviewFacts.timer) clearTimeout(reviewFacts.timer);
+    const facts = data.facts ?? {};
+    // The recommendation is only valid for the workspace it was read from.
+    reviewFacts = { owner, id: data.query_id, status: 'confirmed', facts, error: null, timer: null };
+    paintReviewDialog();
+    return true;
+  }
+  if (type === 'review_report_loaded') {
+    for (const [queryId, pending] of reviewReportQueries) {
+      if (pending.owner !== owner || pending.reviewId !== data.report?.summary?.id) continue;
+      clearTimeout(pending.timer);
+      reviewReportQueries.delete(queryId);
+    }
+    return false; // the report itself is applied to the conversation state
+  }
+  if (type === 'review_history_loaded') {
+    // One outstanding index query at a time: an answer to a superseded query
+    // is not applied, so two session opens cannot interleave.
+    if (!reviewHistoryQueryId || data.query_id !== reviewHistoryQueryId) return true;
+    reviewHistoryQueryId = null;
+    return false; // reconciled into the conversation state by applyEvent
+  }
+  if (type === 'review_scope_required') {
+    // Only a bare/auto request reaches this. The words the person typed ride
+    // along; the dialog re-issues the same focus against a chosen object.
+    openReviewDialog({ focus: String(data.focus ?? '') });
+    return true;
+  }
+  return false;
+}
+
 function paintSkills() {
   if ($('settings-dialog').open && settingsSection === 'presets') renderSettings();
 }
@@ -10162,6 +10827,7 @@ api.onEvent(frame => {
   if (consumeMcpEvent(frame)) return;
   if (consumeScheduleEvent(frame)) return;
   if (consumeSkillEvent(frame)) return;
+  if (consumeReviewEvent(frame)) return;
   consumeSettingsEvent(frame);
   if (frame.event === 'connection') { applyConnection(frame); return; }
   if (frame.event === 'restored') {
@@ -10278,6 +10944,10 @@ api.onEvent(frame => {
     renderConversation();
     if (rightbarOpen) renderRightbar();
     if (activeView === 'trajectory') renderTrajectory();
+    // The replay places settled reviews by their conversation notices. The
+    // durable list is the index that also carries a row written before that
+    // mechanism, so a reopened session reaches every review it owns.
+    requestReviews();
     return;
   }
   if (event.type === 'session_opened') {
@@ -10362,6 +11032,10 @@ api.onEvent(frame => {
   const statusBefore = current.status;
   const activityBefore = current.activity;
   current = applyEvent(current, event);
+  // A review card and the report tab both read the conversation projection.
+  // The terminal arrives here (not through a query), so the pane is repainted
+  // from the durable fact instead of a local guess.
+  if (typeof event.type === 'string' && event.type.startsWith('review_') && rightbarOpen) renderRightbar();
   // The header and composer read status/activity; when an event changes either
   // they must be refreshed here, not only on the next full render.
   if (current.status !== statusBefore || current.activity !== activityBefore) { renderHeader(); renderComposerMeta(); }
@@ -10618,6 +11292,10 @@ function boot() {
   $('model-picker').addEventListener('click', event => openModelMenu(event.currentTarget));
   $('mode-picker').addEventListener('click', event => openCollaborationMenu(event.currentTarget));
   $('permission-picker').addEventListener('click', event => openPermissionMenu(event.currentTarget));
+  // The one manual review entry. It only opens the confirmation dialog; the
+  // review itself starts on an explicit "开始审查" and is confirmed by the
+  // runtime's own event.
+  $('review-entry').addEventListener('click', () => openReviewDialog());
   $('attachment-add').addEventListener('click', () => {
     if (document.querySelector('#command-popover')) closeComposerPopovers();
     else openCommandMenu();
