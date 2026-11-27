@@ -12069,6 +12069,12 @@ async function submitComposer(complement = false) {
       renderComposerDocks();
       return;
     }
+    if (steer && refs.length) {
+      // A steer carries text only. Sending it would silently drop the image
+      // the person attached, so ask them to choose explicitly instead.
+      composerError('运行中插话不支持附件；请移除附件或等待回合结束');
+      return;
+    }
     if (steer) {
       await deliver({ type: 'steer_current_turn', session_id: current.session.id, content });
       // A steer is queued for the running turn's next model call; no message

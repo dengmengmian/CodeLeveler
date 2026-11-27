@@ -17,6 +17,8 @@ await mkdir(home, { recursive: true });
 await mkdir(workspace, { recursive: true });
 await mkdir(output, { recursive: true });
 await writeFile(path.join(workspace, 'a.txt'), 'alpha\n');
+const imagePath = path.join(temporary, 'attach.png');
+await writeFile(imagePath, Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64'));
 
 const requests = [];
 const providerErrors = [];
@@ -133,6 +135,23 @@ try {
   const steerRequest = requests.slice(seedRequests).find(item => item.userTexts.some(text => text.includes('STEER_NOW')));
   assert.ok(steerRequest, 'the runtime must carry the steer into the next model call');
   evidence.steer = { typed_command: true, reached_model: true };
+
+  // A steer carries text only: an attached image must be refused with a
+  // visible reason, never silently dropped.
+  await send('RUN_SLOW attachment steer case');
+  await page.waitForFunction(() => document.querySelector('#stop') && !document.querySelector('#stop').hidden, null, { timeout: 10000 });
+  await app.evaluate(({ dialog }, file) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [file] }); }, imagePath);
+  await page.locator('#attachment-add').click();
+  await page.getByRole('option', { name: '添加图片', exact: true }).click();
+  await page.waitForFunction(() => document.querySelector('.attachment-chip[data-attachment-status="ready"]'));
+  await page.locator('#message').fill('STEER_WITH_ATTACH');
+  await page.locator('#message').press('Enter');
+  await page.waitForFunction(() => document.querySelector('#composer-error')?.textContent?.includes('插话不支持附件'));
+  assert.equal(await page.locator('.attachment-chip').count(), 1, 'the refused attachment stays in the composer');
+  assert.equal(await page.locator('.queue-dock').count(), 0);
+  await page.locator('.attachment-chip .attachment-remove').click();
+  await page.waitForFunction(() => [...document.querySelectorAll('.message.assistant .markdown')].some(node => node.textContent.includes('RUN_SLOW_DONE')), null, { timeout: 60000 });
+  evidence.steer_with_attachment = { refused: true, attachment_kept: true };
 
   // Cancel: the stop control ends the running turn, keeps the draft and the
   // session remains usable for the next real turn.
