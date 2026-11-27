@@ -1,5 +1,5 @@
 const {SNAPSHOT_VERSIONED_COMMANDS}=require('./command-policy.gen.cjs');
-const allowed=new Set(['btw','cancel_btw','recap','restore_checkpoint','acknowledge_crash_window','query_diagnostics','submit_message','submit_user_input','steer_current_turn','steer_user_input','cancel_current_turn','cancel_task','resume_task','approval_decision','answer_clarification','definition_trust_decision','capture_secret','revoke_secret','query_session_history','query_tool_output','request_diff','list_agents','get_agent','list_skills','get_skill','query_context','query_observability','select_model','set_permission_profile','set_product_axes','rename_session','run_goal','set_thinking_level','archive_session','unarchive_session','fork_session','compact_context','cancel_background_task','manage_schedule','manage_mcp','run_review','cancel_review','query_review_report','list_reviews','query_review_scopes']);
+const allowed=new Set(['btw','cancel_btw','recap','restore_checkpoint','acknowledge_crash_window','query_diagnostics','query_memory','read_memory_file','remember_memory','run_memory_dream','flush_memory','toggle_memory','forget_memory','submit_message','submit_user_input','steer_current_turn','steer_user_input','cancel_current_turn','cancel_task','resume_task','approval_decision','answer_clarification','definition_trust_decision','capture_secret','revoke_secret','query_session_history','query_tool_output','request_diff','list_agents','get_agent','list_skills','get_skill','query_context','query_observability','select_model','set_permission_profile','set_product_axes','rename_session','run_goal','set_thinking_level','archive_session','unarchive_session','fork_session','compact_context','cancel_background_task','manage_schedule','manage_mcp','run_review','cancel_review','query_review_report','list_reviews','query_review_scopes']);
 const decisions=new Set(['approve_once','approve_session','approve_always','deny']);
 const {validRef}=require('./attachment-ingress.cjs');
 function string(value,max=256){return typeof value==='string'&&value.length>0&&value.length<=max;}
@@ -112,6 +112,24 @@ function reviewScope(value){
     }
   }
   return false;
+}
+// Cross-session memory. The runtime projects two scopes; a file is addressed
+// by the scope-relative `/` spelling its listing produced. The store re-checks
+// the path, the byte bound and the BLAKE3 digest, so this boundary only refuses
+// shapes a listing could never contain.
+const MEMORY_SCOPES=new Set(['global','workspace']);
+function memoryScope(value){return MEMORY_SCOPES.has(value);}
+function memoryPath(value){
+  return typeof value==='string'&&value.length>0&&value.length<=1024
+    &&!value.startsWith('/')&&!value.includes('\\')&&!/[\u0000-\u001f\u007f]/.test(value)
+    &&value.split('/').every(part=>part.length>0&&part!=='.'&&part!=='..');
+}
+// A forget carries the exact 64-hex digest of the previewed bytes. The store
+// refuses a changed file; a malformed digest could never bind to one.
+function memoryHash(value){return typeof value==='string'&&/^[0-9a-fA-F]{64}$/.test(value);}
+function memoryQuery(command,keys,sessionId){
+  return exactKeys(command,keys)&&nonblank(command.session_id)&&command.session_id===sessionId
+    &&string(command.query_id,256)&&command.query_id.trim().length>0;
 }
 function validateEnvelope(envelope,authorizeAttachment){
   if(!envelope||!string(envelope.command_id)||!string(envelope.session_id)||typeof envelope.issued_at!=='string'||!Number.isFinite(Date.parse(envelope.issued_at)))throw new Error('Invalid command envelope');
@@ -238,6 +256,27 @@ function validateEnvelope(envelope,authorizeAttachment){
   if(command.type==='query_diagnostics'){
     const keys=['type','requester_session_id','query_id',...(Object.hasOwn(command,'locale')?['locale']:[])];
     if(!exactKeys(command,keys)||!nonblank(command.requester_session_id)||command.requester_session_id!==envelope.session_id||!string(command.query_id,256)||(Object.hasOwn(command,'locale')&&!['zh','en'].includes(command.locale)))throw new Error('Invalid diagnostics query');
+  }
+  // Cross-session memory: reads project durable state, writes are the
+  // runtime's typed management commands. Only the selected session's stream
+  // carries the answer, so a command for another session is not representable.
+  if(command.type==='query_memory'||command.type==='flush_memory'){
+    if(!memoryQuery(command,['type','session_id','query_id'],envelope.session_id))throw new Error('Invalid memory query');
+  }
+  if(command.type==='read_memory_file'){
+    if(!memoryQuery(command,['type','session_id','query_id','scope','path'],envelope.session_id)||!memoryScope(command.scope)||!memoryPath(command.path))throw new Error('Invalid memory file read');
+  }
+  if(command.type==='remember_memory'){
+    if(!memoryQuery(command,['type','session_id','query_id','content'],envelope.session_id)||typeof command.content!=='string'||!command.content.trim()||utf8Bytes(command.content)>64*1024)throw new Error('Invalid memory note');
+  }
+  if(command.type==='run_memory_dream'){
+    if(!memoryQuery(command,['type','session_id','query_id','batch'],envelope.session_id)||typeof command.batch!=='boolean')throw new Error('Invalid memory dream');
+  }
+  if(command.type==='toggle_memory'){
+    if(!memoryQuery(command,['type','session_id','query_id','enabled'],envelope.session_id)||typeof command.enabled!=='boolean')throw new Error('Invalid memory toggle');
+  }
+  if(command.type==='forget_memory'){
+    if(!memoryQuery(command,['type','session_id','query_id','scope','path','content_hash'],envelope.session_id)||!memoryScope(command.scope)||!memoryPath(command.path)||!memoryHash(command.content_hash))throw new Error('Invalid memory forget');
   }
   // The product mode is a durable session fact written by the Runtime. The
   // renderer never states whether the switch succeeded — only which of the

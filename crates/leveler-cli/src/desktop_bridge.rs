@@ -233,6 +233,37 @@ fn validate_command(session: &SessionId, command: &ClientCommand) -> anyhow::Res
             && locale
                 .as_ref()
                 .is_none_or(|locale| matches!(locale.as_str(), "zh" | "en")) => {}
+        // Cross-session memory. Reads are content-free projections and one-file
+        // previews; the path is the scope-relative spelling the runtime listed.
+        // Writes are the runtime's own typed commands; the bridge only bounds
+        // their shape, and the store revalidates the scope, path and hash.
+        ClientCommand::QueryMemory { query_id, .. } if valid_desktop_query_id(query_id) => {}
+        ClientCommand::ReadMemoryFile {
+            query_id,
+            scope,
+            path,
+            ..
+        } if valid_desktop_query_id(query_id)
+            && valid_desktop_memory_scope(scope)
+            && valid_desktop_memory_path(path) => {}
+        ClientCommand::RememberMemory {
+            query_id, content, ..
+        } if valid_desktop_query_id(query_id)
+            && !content.trim().is_empty()
+            && content.len() <= MAX_DESKTOP_MEMORY_NOTE_BYTES => {}
+        ClientCommand::RunMemoryDream { query_id, .. } if valid_desktop_query_id(query_id) => {}
+        ClientCommand::FlushMemory { query_id, .. } if valid_desktop_query_id(query_id) => {}
+        ClientCommand::ToggleMemory { query_id, .. } if valid_desktop_query_id(query_id) => {}
+        ClientCommand::ForgetMemory {
+            query_id,
+            scope,
+            path,
+            content_hash,
+            ..
+        } if valid_desktop_query_id(query_id)
+            && valid_desktop_memory_scope(scope)
+            && valid_desktop_memory_path(path)
+            && valid_desktop_memory_hash(content_hash) => {}
         ClientCommand::SteerCurrentTurn { .. }
         | ClientCommand::CancelCurrentTurn { .. }
         | ClientCommand::CancelTask { .. }
@@ -285,6 +316,39 @@ fn valid_desktop_tool_call_id(call_id: &str) -> bool {
 
 fn valid_desktop_command_id(id: &leveler_core::CommandId) -> bool {
     !id.as_str().trim().is_empty() && id.as_str().len() <= 256
+}
+
+/// The memory store's own accept budget for one `/remember` note. The store
+/// refuses a larger observation; refusing here names the field earlier.
+const MAX_DESKTOP_MEMORY_NOTE_BYTES: usize = 64 * 1024;
+
+/// The two scope names the runtime projects. Anything else is not a memory
+/// scope rather than a path the store might resolve.
+fn valid_desktop_memory_scope(scope: &str) -> bool {
+    matches!(scope, "global" | "workspace")
+}
+
+/// A memory path is the scope-relative `/`-separated spelling the runtime's
+/// listing produced. The runtime revalidates with its own `safe_relative`; this
+/// boundary refuses shapes a listing can never contain (absolute, traversal,
+/// empty or doubled segments, control characters).
+fn valid_desktop_memory_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= 1024
+        && !path.starts_with('/')
+        && !path.contains('\\')
+        && !path
+            .chars()
+            .any(|character| character == '\0' || character.is_control())
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
+/// A forget binds to the BLAKE3 hex digest the preview was read with. The
+/// store compares it to the file's current bytes and refuses a changed file.
+fn valid_desktop_memory_hash(hash: &str) -> bool {
+    hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// The runtime's own focus bound (`FOCUS_MAX_BYTES`). The Desktop composer is
@@ -1330,6 +1394,137 @@ mod tests {
             *session_id = SessionId::new("another");
         }
         assert!(validate_command(&session, &other_session).is_err());
+    }
+
+    #[test]
+    fn memory_commands_admit_only_listed_shapes_and_the_selected_session() {
+        let session = SessionId::new("desktop-session");
+        let query = || leveler_core::CommandId::new("memory-q1");
+        let hash = "a".repeat(64);
+        let read = |scope: &str, path: &str| ClientCommand::ReadMemoryFile {
+            session_id: session.clone(),
+            query_id: Some(query()),
+            scope: scope.to_owned(),
+            path: path.to_owned(),
+        };
+        let forget = |scope: &str, path: &str, hash: &str| ClientCommand::ForgetMemory {
+            session_id: session.clone(),
+            query_id: Some(query()),
+            scope: scope.to_owned(),
+            path: path.to_owned(),
+            content_hash: hash.to_owned(),
+        };
+        // Every command the Desktop can issue passes on the selected session.
+        for command in [
+            ClientCommand::QueryMemory {
+                session_id: session.clone(),
+                query_id: Some(query()),
+            },
+            read("global", "topics/preferences.md"),
+            read("workspace", "observations/_inbox/observation-1.md"),
+            ClientCommand::RememberMemory {
+                session_id: session.clone(),
+                query_id: Some(query()),
+                content: "使用 pnpm，不要用 npm".to_owned(),
+            },
+            ClientCommand::RunMemoryDream {
+                session_id: session.clone(),
+                query_id: Some(query()),
+                batch: true,
+            },
+            ClientCommand::FlushMemory {
+                session_id: session.clone(),
+                query_id: Some(query()),
+            },
+            ClientCommand::ToggleMemory {
+                session_id: session.clone(),
+                query_id: Some(query()),
+                enabled: false,
+            },
+            forget("workspace", "topics/build.md", &hash),
+        ] {
+            assert!(validate_command(&session, &command).is_ok(), "{command:?}");
+            assert!(
+                validate_command(&SessionId::new("other-session"), &command).is_err(),
+                "{command:?}"
+            );
+        }
+        // Scopes are a closed vocabulary; paths are exactly what a listing can
+        // spell; a forget carries the preview's 64-hex digest.
+        for path in [
+            "",
+            "/etc/passwd",
+            "../global/MEMORY.md",
+            "topics/../MEMORY.md",
+            "topics//build.md",
+            "topics\\build.md",
+            "topics/build.md\u{0}",
+            &"a".repeat(1025),
+        ] {
+            assert!(
+                validate_command(&session, &read("global", path)).is_err(),
+                "{path:?}"
+            );
+            assert!(
+                validate_command(&session, &forget("global", path, &hash)).is_err(),
+                "{path:?}"
+            );
+        }
+        for scope in ["", "Global", "project", "global/../workspace"] {
+            assert!(
+                validate_command(&session, &read(scope, "topics/build.md")).is_err(),
+                "{scope:?}"
+            );
+        }
+        for hash in ["", "abc", &"a".repeat(63), &"g".repeat(64), &"a".repeat(65)] {
+            assert!(
+                validate_command(&session, &forget("global", "topics/build.md", hash)).is_err(),
+                "{hash:?}"
+            );
+        }
+        // A query id is the answer's correlation token: one must be present.
+        for command in [
+            ClientCommand::QueryMemory {
+                session_id: session.clone(),
+                query_id: None,
+            },
+            ClientCommand::FlushMemory {
+                session_id: session.clone(),
+                query_id: None,
+            },
+            ClientCommand::RunMemoryDream {
+                session_id: session.clone(),
+                query_id: None,
+                batch: false,
+            },
+        ] {
+            assert!(validate_command(&session, &command).is_err(), "{command:?}");
+        }
+        // A note is bounded by the store's own accept budget and never empty.
+        for content in [String::new(), "   \n".to_owned(), "a".repeat(64 * 1024 + 1)] {
+            assert!(
+                validate_command(
+                    &session,
+                    &ClientCommand::RememberMemory {
+                        session_id: session.clone(),
+                        query_id: Some(query()),
+                        content
+                    }
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            validate_command(
+                &session,
+                &ClientCommand::RememberMemory {
+                    session_id: session.clone(),
+                    query_id: Some(query()),
+                    content: "a".repeat(64 * 1024)
+                }
+            )
+            .is_ok()
+        );
     }
 
     #[test]

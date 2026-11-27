@@ -276,3 +276,39 @@ test('Review queries and cancellation are session-bound and id-shaped',()=>{
    {type:'query_review_scopes',session_id:'s1',query_id:'q1',scope:{kind:'workspace'}},
  ])assert.throws(()=>security.validateEnvelope(envelope(bad)),undefined,JSON.stringify(bad));
 });
+
+test('memory commands are session-bound, path-bounded and digest-shaped',()=>{
+ const hash='a'.repeat(64);
+ const note={type:'remember_memory',session_id:'s1',query_id:'q1',content:'使用 pnpm，不要用 npm'};
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'query_memory',session_id:'s1',query_id:'q1'})));
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'flush_memory',session_id:'s1',query_id:'q1'})));
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'read_memory_file',session_id:'s1',query_id:'q1',scope:'global',path:'topics/preferences.md'})));
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'read_memory_file',session_id:'s1',query_id:'q1',scope:'workspace',path:'observations/_inbox/observation-1.md'})));
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope(note)));
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'run_memory_dream',session_id:'s1',query_id:'q1',batch:false})));
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'toggle_memory',session_id:'s1',query_id:'q1',enabled:true})));
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'forget_memory',session_id:'s1',query_id:'q1',scope:'workspace',path:'topics/build.md',content_hash:hash})));
+ for(const bad of [
+   {...note,session_id:'s2'},
+   {...note,content:''},
+   {...note,content:'   '},
+   {...note,content:'a'.repeat(64*1024+1)},
+   {...note,content:42},
+   {...note,extra:1},
+   {...note,query_id:''},
+   {type:'query_memory',session_id:'s1'},
+   {type:'query_memory',session_id:'s1',query_id:' '},
+   {type:'read_memory_file',session_id:'s1',query_id:'q1',scope:'project',path:'topics/a.md'},
+   {type:'read_memory_file',session_id:'s1',query_id:'q1',scope:'global',path:'/etc/passwd'},
+   {type:'read_memory_file',session_id:'s1',query_id:'q1',scope:'global',path:'../MEMORY.md'},
+   {type:'read_memory_file',session_id:'s1',query_id:'q1',scope:'global',path:'topics//a.md'},
+   {type:'read_memory_file',session_id:'s1',query_id:'q1',scope:'global',path:'topics\\a.md'},
+   {type:'read_memory_file',session_id:'s1',query_id:'q1',scope:'global',path:'a'.repeat(1025)},
+   {type:'read_memory_file',session_id:'s2',query_id:'q1',scope:'global',path:'topics/a.md'},
+   {type:'run_memory_dream',session_id:'s1',query_id:'q1',batch:'yes'},
+   {type:'toggle_memory',session_id:'s1',query_id:'q1',enabled:1},
+   {type:'forget_memory',session_id:'s1',query_id:'q1',scope:'global',path:'topics/a.md',content_hash:'abc'},
+   {type:'forget_memory',session_id:'s1',query_id:'q1',scope:'global',path:'topics/a.md',content_hash:'g'.repeat(64)},
+   {type:'forget_memory',session_id:'s1',query_id:'q1',scope:'global',path:'../a.md',content_hash:hash},
+ ])assert.throws(()=>security.validateEnvelope(envelope(bad)),undefined,JSON.stringify(bad));
+});
