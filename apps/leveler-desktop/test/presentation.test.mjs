@@ -252,6 +252,13 @@ test('an unrecognized tool keeps the reference wording and never claims to execu
   assert.equal(toolLabel({ name: 'browser_scroll' }), '浏览器操作');
 });
 
+test('an MCP tool card names the server and the remote tool, not only a display string', async () => {
+  const { toolLabel } = await import('../src/presentation.mjs');
+  assert.equal(toolLabel({ name: 'mcp__github__create_issue' }), 'MCP · github / create_issue');
+  assert.equal(toolLabel({ name: 'mcp__a.b_server__read_file' }), 'MCP · a.b_server / read_file');
+  assert.equal(toolLabel({ name: 'mcp__broken' }), '工具调用');
+});
+
 test('the task dock reports per-status counts in the reference order', async () => {
   const { planProgressLabel } = await import('../src/presentation.mjs');
   const steps = [

@@ -19,7 +19,12 @@ const toolNames={
  git_diff:'查看变更',git_status:'查看状态',diagnostics:'运行诊断',blast_radius:'分析影响面',
 };
 /** @param {ToolProjection} tool @returns {string} */
-export function toolLabel(tool){return toolNames[tool.name??'']??(tool.name?.startsWith('browser_')?'浏览器操作':'工具调用');}
+export function toolLabel(tool){
+  const name=tool.name??'';
+  const mcp=/^mcp__(.+?)__(.+)$/.exec(name);
+  if(mcp)return `MCP · ${mcp[1]} / ${mcp[2]}`;
+  return toolNames[name]??(name.startsWith('browser_')?'浏览器操作':'工具调用');
+}
 /** @param {ToolProjection} tool @returns {string} */
 export function toolTarget(tool){try{const args=typeof tool.arguments==='string'?JSON.parse(tool.arguments):tool.arguments;if(!args||typeof args!=='object')return '';for(const key of ['path','command','cmd','pattern','query','url'])if(typeof args[key]==='string')return args[key];if(typeof args.program==='string')return [args.program,...(Array.isArray(args.args)?args.args.filter(/** @param {unknown} a */ a=>typeof a==='string'):[])].join(' ');return '';}catch{return '';}}
 /** @param {ToolProjection} tool */

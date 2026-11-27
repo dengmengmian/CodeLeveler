@@ -39,6 +39,12 @@ import {
   setupGuidance, configurationUsable, providerCredentialText, connectionPresentation,
   providerFormError, providerContext, runtimeConfigState,
 } from './provider-settings.mjs';
+import {
+  emptyMcpView, mcpStateView, mcpStateDetail, mcpTransportLabel, mcpAdmissionView,
+  mcpCounts, mcpToolRequired, mcpToolSchemaText, mcpFailureCategory,
+  specFromForm, formFromSpec, mcpIntentLabel, mcpAnswer, mcpRows, mcpResponseError,
+  mcpListAnswerIsCurrent, mcpServerByName,
+} from './mcp-settings.mjs';
 
 const api = window.desktop;
 const $ = id => document.getElementById(id);
@@ -125,6 +131,15 @@ let scheduleMutation = null;
 let scheduleBulkOutstanding = 0;
 let scheduleRefreshQueued = false;
 let schedulePollTimer = null;
+// MCP management projection. The runtime's answer is the only row source; a
+// configured server is never promoted to "connected" here.
+let mcpBoard = emptyMcpView();
+const mcpPending = new Map();
+let mcpMutation = null;
+let mcpPollTimer = null;
+// The last list answer's row projection. A poll that changed nothing must not
+// rebuild the page and steal focus from the row the reader is using.
+let mcpRowsSignature = null;
 let headerSubagentButton = null;
 let headerJobsButton = null;
 let wideSidebarCollapsed = false;
@@ -381,6 +396,10 @@ function controls() {
 // One visible state, sourced from the bridge's real transport lifecycle.
 function applyConnection(frame) {
   connectionState = { ...frame };
+  // An MCP request that was in flight when the stream dropped has an unknown
+  // outcome. Release its latch and say so; reconnecting reads the authority.
+  if (frame.state !== 'connected') mcpTransportLost();
+  else if (settingsSection === 'mcp' && $('settings-dialog').open) refreshMcp();
   // Old drafts are rescanned only once the host bridge answers; retry on a
   // later connection instead of leaving them permanently unpersisted.
   if (frame.state === 'connected' && legacyDrafts.size) void migrateLegacyDrafts();
@@ -2283,6 +2302,7 @@ function liveThoughtNode(existing, text) {
 
 function toolKind(name) {
   const value = String(name ?? '').toLowerCase();
+  if (value.startsWith('mcp__')) return 'mcp';
   if (/bash|shell|command|run_command|exec|terminal/.test(value)) return 'command';
   if (/read|cat|view/.test(value)) return 'read';
   if (/write|edit|patch/.test(value)) return 'edit';
@@ -2318,6 +2338,7 @@ function toolCopyButton(text) {
 
 function toolIconName(tool) {
   const name = String(tool.name ?? '').toLowerCase();
+  if (name.startsWith('mcp__')) return 'plugins';
   if (/bash|shell|command|run/.test(name)) return 'terminal';
   if (/read|cat|open|view/.test(name)) return 'eye';
   if (/write|edit|patch/.test(name)) return 'edit';
@@ -2348,6 +2369,9 @@ function toolNode(existing, tool) {
   const status = contractToolStatus(tool.status);
   row.dataset.status = status;
   row.dataset.kind = toolKind(tool.name);
+  // The structured model-facing name, for a client that must identity a tool
+  // by server + remote name rather than by its display label.
+  row.dataset.toolName = String(tool.name ?? '');
   const waiting = current?.approvals.some(item => item.call_id === tool.id);
   const lead = row.querySelector('.tool-status');
   lead.replaceChildren(iconNode(toolIconName(tool), { size: 14 }));
@@ -4651,6 +4675,7 @@ async function newSession() {
   }
   dismissPage();
   resetScheduleProjection();
+  resetMcpForSessionChange();
   stashDraft();
   selection = null;
   current = null;
@@ -4692,6 +4717,7 @@ async function createTask() {
   currentSource = result.source_id ?? null;
   current = attachExtras(projectSnapshot(result.session), result.session);
   resetScheduleProjection();
+  resetMcpForSessionChange();
   lastEventSeq = result.session.last_sequence ?? 0;
   activeView = 'chat';
   liveTrajectory = [];
@@ -4753,6 +4779,7 @@ async function openTask(task) {
   currentSource = result.source_id ?? task.source_id;
   current = attachExtras(projectSnapshot(result.session), result.session);
   resetScheduleProjection();
+  resetMcpForSessionChange();
   lastEventSeq = result.session.last_sequence ?? 0;
   activeView = 'chat';
   liveTrajectory = [];
@@ -7069,6 +7096,8 @@ function closeNarrowSidebar() {
 function openSettings(section = 'general') {
   settingsSection = section;
   if (section === 'models') void refreshProviders({ quiet: true });
+  if (section === 'mcp') openMcpPage();
+  else stopMcpPolling();
   renderSettings();
   if (!$('settings-dialog').open) $('settings-dialog').showModal();
   $('settings-nav-list').querySelector('[aria-current="page"]')?.focus();
@@ -7076,6 +7105,7 @@ function openSettings(section = 'general') {
   scheduleBrowserSurface();
 }
 function closeSettings() {
+  stopMcpPolling();
   $('settings-dialog').close();
   $('settings-content').dataset.section = '';
   scheduleBrowserSurface();
@@ -7127,13 +7157,19 @@ function settingsNav() {
   nav.replaceChildren();
   for (const [id, label, icon] of [
     ['general', '通用设置', 'settings'], ['models', '模型与 Provider', 'layers'],
+    ['mcp', 'MCP 服务', 'plugins'],
     ['presets', 'Agent 与技能', 'bot'],
   ]) {
     const button = el('button');
     button.type = 'button';
     button.setAttribute('aria-current', settingsSection === id ? 'page' : 'false');
     button.append(iconNode(icon, { size: 16 }), el('span', undefined, label));
-    button.addEventListener('click', () => { settingsSection = id; renderSettings(); });
+    button.addEventListener('click', () => {
+      settingsSection = id;
+      if (id === 'mcp') openMcpPage();
+      else stopMcpPolling();
+      renderSettings();
+    });
     nav.append(button);
   }
 }
@@ -7147,6 +7183,7 @@ function renderSettings() {
   content.dataset.section = settingsSection;
   if (settingsSection === 'general') renderGeneralSettings(content);
   else if (settingsSection === 'models') renderModelSettings(content);
+  else if (settingsSection === 'mcp') renderMcpSettings(content);
   else renderPresetSettings(content);
   content.scrollTop = sameSection ? priorScroll : 0;
 }
@@ -9135,6 +9172,650 @@ function openScheduleEditor(source = null) {
   name.focus();
 }
 
+/* --------------------------------------------------------------- MCP page */
+
+// Every row, state, tool and failure here comes from one ManageMcp answer on
+// the selected session. Configuration is one input; a configured server is
+// never painted as connected and a stale answer never overwrites a newer one.
+
+const MCP_QUERY_TIMEOUT_MS = 45000;
+
+function mcpSession() {
+  return current?.session.id ?? null;
+}
+
+function resetMcpProjection() {
+  const mutation = mcpMutation;
+  for (const pending of mcpPending.values()) clearTimeout(pending.timer);
+  mcpPending.clear();
+  mcpMutation = null;
+  // A session switch must not leave a caller awaiting a promise nobody owns.
+  if (mutation) mutation.reject(new Error('会话已切换，MCP 操作结果未确认'));
+  mcpBoard = emptyMcpView();
+  mcpRowsSignature = null;
+}
+
+/** Rebind the projection when the selected session changed. The rows belong to
+ *  the session's runtime, so they must not survive a switch. */
+function syncMcpSession() {
+  const sessionId = mcpSession();
+  if (mcpBoard.sessionId === sessionId) return false;
+  resetMcpProjection();
+  mcpBoard.sessionId = sessionId;
+  return true;
+}
+
+function resetMcpForSessionChange() {
+  resetMcpProjection();
+  mcpBoard.sessionId = mcpSession();
+  if ($('settings-dialog').open && settingsSection === 'mcp') {
+    paintMcp();
+    if (mcpBoard.sessionId) readMcp({ silent: true });
+  }
+}
+
+function paintMcp() {
+  if ($('settings-dialog').open && settingsSection === 'mcp') renderSettings();
+}
+
+function stopMcpPolling() {
+  if (!mcpPollTimer) return;
+  clearInterval(mcpPollTimer);
+  mcpPollTimer = null;
+}
+
+function openMcpPage() {
+  syncMcpSession();
+  if (!mcpSession()) {
+    paintMcp();
+    return;
+  }
+  if (!mcpPollTimer) {
+    mcpPollTimer = setInterval(() => {
+      if (settingsSection !== 'mcp' || !$('settings-dialog').open || document.hidden) return;
+      if (mcpBoard.busy || mcpBoard.listOutstanding > 0) return;
+      readMcp({ silent: mcpBoard.loaded });
+    }, 5000);
+  }
+  if (!mcpBoard.loaded && mcpBoard.listOutstanding === 0) readMcp({ silent: true });
+}
+
+function readMcp({ silent = false } = {}) {
+  syncMcpSession();
+  if (!mcpSession()) return;
+  if (!silent) {
+    mcpBoard.loading = true;
+    mcpBoard.error = null;
+    paintMcp();
+  }
+  void sendMcpRequest({ action: 'list' }, { kind: 'list' });
+}
+
+function refreshMcp() {
+  if (syncMcpSession()) {
+    if ($('settings-dialog').open && settingsSection === 'mcp' && mcpSession()) readMcp({ silent: true });
+    return;
+  }
+  if (!mcpSession()) return;
+  if (mcpBoard.busy || mcpBoard.listOutstanding > 0) {
+    mcpBoard.refreshQueued = true;
+    return;
+  }
+  readMcp({ silent: mcpBoard.loaded });
+}
+
+function mcpSendFailure(queryId, message) {
+  const pending = mcpPending.get(queryId);
+  if (pending) {
+    clearTimeout(pending.timer);
+    mcpPending.delete(queryId);
+  }
+  const mutation = mcpMutation?.queryId === queryId ? mcpMutation : null;
+  if (mutation) {
+    mcpMutation = null;
+    mcpBoard.busy = null;
+    mcpBoard.actionError = message;
+    mutation.reject(new Error(message));
+  }
+  if (pending?.kind === 'list') {
+    mcpBoard.listOutstanding = Math.max(0, mcpBoard.listOutstanding - 1);
+    mcpBoard.loading = false;
+    mcpBoard.error = message;
+  }
+  paintMcp();
+}
+
+async function sendMcpRequest(request, { kind = 'list', intent = null, queryId = crypto.randomUUID() } = {}) {
+  const sessionId = mcpSession();
+  if (!sessionId) {
+    mcpBoard.error = '先打开一个会话：MCP 管理通过该会话所属的 Runtime 执行。';
+    paintMcp();
+    return null;
+  }
+  if (kind === 'list') {
+    mcpBoard.lastListQuery = queryId;
+    mcpBoard.listOutstanding += 1;
+  }
+  const pending = { kind, intent, queryId, timer: null };
+  pending.timer = setTimeout(() => {
+    mcpSendFailure(queryId, 'Runtime 未回答这次 MCP 请求，结果未知；请刷新后再试。');
+  }, MCP_QUERY_TIMEOUT_MS);
+  mcpPending.set(queryId, pending);
+  const command = {
+    type: 'manage_mcp',
+    requester_session_id: sessionId,
+    query_id: queryId,
+    request,
+  };
+  try {
+    const result = await api.deliver(commandEnvelope(sessionId, command, current.session.last_sequence ?? 0));
+    if (!result?.ok) mcpSendFailure(queryId, result?.error?.message ?? 'Runtime 拒绝了这次 MCP 请求');
+    return queryId;
+  } catch (error) {
+    mcpSendFailure(queryId, error?.message ?? 'MCP 请求发送失败');
+    return null;
+  }
+}
+
+function manageMcp(request, intent, { target = null } = {}) {
+  if (mcpBoard.busy) return Promise.reject(new Error('上一个 MCP 操作还在处理中。'));
+  const sessionId = mcpSession();
+  if (!sessionId) return Promise.reject(new Error('先打开一个会话：MCP 管理通过该会话所属的 Runtime 执行。'));
+  mcpBoard.busy = { intent };
+  mcpBoard.error = null;
+  mcpBoard.actionError = null;
+  mcpBoard.notice = null;
+  paintMcp();
+  const queryId = crypto.randomUUID();
+  return new Promise((resolve, reject) => {
+    mcpMutation = { queryId, intent, target, resolve, reject };
+    void sendMcpRequest(request, { kind: 'mutation', intent, queryId });
+  });
+}
+
+function consumeMcpEvent(frame) {
+  const answer = mcpAnswer(frame, mcpSession());
+  if (!answer) return false;
+  const pending = mcpPending.get(answer.queryId);
+  if (!pending) return false;
+  clearTimeout(pending.timer);
+  mcpPending.delete(answer.queryId);
+  const response = answer.response;
+  const rows = mcpRows(response);
+  const responseError = mcpResponseError(response);
+  if (pending.kind === 'list') {
+    mcpBoard.listOutstanding = Math.max(0, mcpBoard.listOutstanding - 1);
+    if (mcpListAnswerIsCurrent(mcpBoard, answer.queryId)) {
+      const firstPaint = !mcpBoard.loaded;
+      const wasLoading = mcpBoard.loading;
+      const signature = JSON.stringify(rows.map(server => [
+        server.name, server.state, server.enabled, server.generation,
+        server.tool_count, server.last_error ?? null, server.protocol ?? null,
+        (server.tools ?? []).map(tool => tool.exposed_name),
+      ]));
+      const rowsChanged = signature !== mcpRowsSignature;
+      const errorChanged = mcpBoard.error !== responseError;
+      mcpRowsSignature = signature;
+      mcpBoard.servers = rows;
+      mcpBoard.loaded = true;
+      mcpBoard.loading = false;
+      mcpBoard.error = responseError;
+      if (mcpBoard.selected && !mcpServerByName(rows, mcpBoard.selected)) mcpBoard.selected = null;
+      if (mcpBoard.refreshQueued) {
+        mcpBoard.refreshQueued = false;
+        refreshMcp();
+      }
+      if (firstPaint || rowsChanged || errorChanged || wasLoading) paintMcp();
+      return true;
+    }
+    paintMcp();
+    return true;
+  }
+  const mutation = mcpMutation?.queryId === answer.queryId ? mcpMutation : null;
+  if (mutation) {
+    mcpMutation = null;
+    mcpBoard.busy = null;
+    if (responseError) {
+      mcpBoard.actionError = responseError;
+      mutation.reject(new Error(responseError));
+    } else {
+      const target = mutation.intent === 'reconnect' && mutation.target
+        ? mcpServerByName(rows, mutation.target)
+        : null;
+      mcpBoard.servers = rows;
+      mcpBoard.loaded = true;
+      if (target && target.state !== 'connected') {
+        // The management action completed, but the connection it asked for did
+        // not. The runtime's row is the fact; never toast a failure as success.
+        mcpBoard.actionError = target.last_error
+          ? `连接测试失败：${target.last_error}`
+          : '连接测试失败：Runtime 没有建立连接';
+        mutation.reject(new Error(mcpBoard.actionError));
+      } else {
+        mcpBoard.actionError = null;
+        mcpBoard.notice = mcpIntentLabel(mutation.intent);
+        mutation.resolve(response);
+      }
+    }
+  } else {
+    // A mutation answer whose page state was replaced is still the runtime's
+    // latest authority; applying it is not an optimistic update.
+    mcpBoard.servers = rows;
+    mcpBoard.loaded = true;
+    mcpBoard.actionError = responseError;
+  }
+  if (mcpBoard.selected && !mcpServerByName(mcpBoard.servers, mcpBoard.selected)) mcpBoard.selected = null;
+  if (mcpBoard.refreshQueued) {
+    mcpBoard.refreshQueued = false;
+    refreshMcp();
+  }
+  paintMcp();
+  return true;
+}
+
+/** A transport loss makes every in-flight MCP request outcome-unknown. Never
+ *  leave a mutation latched as busy or a list as loading forever. */
+function mcpTransportLost() {
+  const hadWork = mcpPending.size > 0 || mcpMutation;
+  for (const pending of mcpPending.values()) clearTimeout(pending.timer);
+  mcpPending.clear();
+  const mutation = mcpMutation;
+  mcpMutation = null;
+  mcpBoard.busy = null;
+  mcpBoard.loading = false;
+  mcpBoard.listOutstanding = 0;
+  if (mutation) {
+    mcpBoard.actionError = 'Runtime 连接中断；MCP 操作结果未确认。';
+    mutation.reject(new Error('Runtime 连接中断，MCP 操作结果未知'));
+  }
+  if (hadWork) {
+    mcpBoard.error = 'Runtime 连接中断；MCP 状态与操作结果未确认。重新连接后会重新读取。';
+    paintMcp();
+  }
+}
+
+function mcpMetaLine() {
+  const counts = mcpCounts(mcpBoard.servers);
+  const source = mcpBoard.servers.find(server => server.source)?.source;
+  const meta = el('div', 'provider-config-meta');
+  meta.append(el('span', 'provider-config-path', `配置：${source || '全局 config.toml（与 CLI/TUI 共享）'}`));
+  meta.append(el('span', 'provider-runtime', `${counts.configured} 个服务 · ${counts.connected} 个已连接 · ${counts.tools} 个工具`));
+  if (connectionState.state !== 'connected') {
+    meta.append(el('span', 'mcp-runtime-state warn', 'Runtime 未连接：连接状态暂不可确认'));
+  }
+  return meta;
+}
+
+function renderMcpSettings(content) {
+  const changed = syncMcpSession();
+  content.append(el('h2', undefined, 'MCP 服务'));
+  const head = el('div', 'provider-page-head');
+  const add = el('button', 'button primary small', '添加服务');
+  add.type = 'button';
+  add.disabled = !mcpSession();
+  add.addEventListener('click', () => openMcpEditor(null));
+  const refresh = el('button', 'button ghost small', '刷新');
+  refresh.type = 'button';
+  refresh.disabled = !mcpSession() || Boolean(mcpBoard.busy);
+  refresh.addEventListener('click', () => readMcp());
+  const reload = el('button', 'button ghost small', '重新加载配置');
+  reload.type = 'button';
+  reload.disabled = !mcpSession() || Boolean(mcpBoard.busy);
+  reload.addEventListener('click', () => {
+    manageMcp({ action: 'reload' }, 'reload')
+      .then(() => toast('已请求 Runtime 重新加载 MCP 配置', { tone: 'success', holdMs: 2400 }))
+      .catch(error => toast(`重新加载失败：${error.message}`, { tone: 'error', holdMs: 5200 }));
+  });
+  head.append(add, refresh, reload);
+  content.append(head);
+
+  if (!mcpSession()) {
+    const empty = el('div', 'settings-card');
+    empty.append(
+      el('h3', undefined, '先打开一个会话'),
+      el('p', undefined, 'MCP 管理通过该会话所属的 Runtime 执行：配置、连接状态和工具目录只有它一个权威来源。请在主页选择工作区并开始一个会话；这里不会为你创建隐藏会话。'),
+    );
+    const actions = el('div', 'settings-actions');
+    const back = el('button', 'button primary small', '返回主页');
+    back.type = 'button';
+    back.addEventListener('click', () => closeSettings());
+    actions.append(back);
+    empty.append(actions);
+    content.append(empty);
+    return;
+  }
+
+  if (!current?.session.repository) {
+    content.append(el('div', 'settings-note', '当前会话没有工作区：可以查看和编辑全局 MCP 配置，但 Runtime 无法在这个会话启动 stdio Server，连接测试会如实失败。'));
+  }
+
+  if (changed && !mcpBoard.loading && mcpBoard.listOutstanding === 0) {
+    // A tab switch onto this page after the selection changed: read once the
+    // render completes instead of mutating while settings are being painted.
+    setTimeout(() => {
+      if ($('settings-dialog').open && settingsSection === 'mcp' && mcpSession()) readMcp({ silent: true });
+    }, 0);
+  }
+
+  content.append(mcpMetaLine());
+  if (mcpBoard.error) {
+    const error = el('div', 'schedule-banner error');
+    error.setAttribute('role', 'alert');
+    error.textContent = mcpBoard.error;
+    content.append(error);
+  }
+  if (mcpBoard.actionError) {
+    const error = el('div', 'schedule-banner error');
+    error.setAttribute('role', 'alert');
+    error.textContent = mcpBoard.actionError;
+    content.append(error);
+  }
+  if (mcpBoard.notice) content.append(el('div', 'schedule-banner notice', mcpBoard.notice));
+  if (!mcpBoard.loaded && mcpBoard.loading) {
+    content.append(el('div', 'settings-note', '正在从 Runtime 读取 MCP 服务…'));
+    return;
+  }
+  if (mcpBoard.loaded && mcpBoard.servers.length === 0) {
+    const empty = el('div', 'settings-card');
+    empty.append(
+      el('h3', undefined, '还没有 MCP 服务'),
+      el('p', undefined, '添加后由 Runtime 连接和发现工具。配置只写入全局 config.toml；不会自动安装任何程序。'),
+    );
+    content.append(empty);
+    return;
+  }
+  for (const server of mcpBoard.servers) content.append(mcpServerCard(server));
+  content.append(el('div', 'settings-note', '工具是否出现在 Agent 会话中还取决于该会话的 external_tools 能力；启用状态与连接状态都由 Runtime 决定。'));
+}
+
+function mcpFact(label, value, code = false) {
+  const field = el('div', 'schedule-field');
+  field.append(el('div', 'schedule-field-label', label));
+  field.append(el('div', `schedule-field-value${code ? ' provider-fact' : ''}`, value || '—'));
+  return field;
+}
+
+function mcpServerCard(server) {
+  const card = el('div', 'settings-card mcp-card');
+  card.dataset.server = server.name;
+  const view = mcpStateView(server);
+  const head = el('div', 'mcp-card-head');
+  const stateDot = el('span', `mcp-state ${view.tone}`);
+  stateDot.setAttribute('aria-hidden', 'true');
+  head.append(stateDot, el('span', 'mcp-name', server.name), el('span', 'provider-tag', mcpTransportLabel(server.transport)));
+  head.append(el('span', 'provider-tag', server.enabled ? '已启用' : '已停用'));
+  if (Number.isInteger(server.tool_count) && server.state === 'connected') {
+    head.append(el('span', 'provider-tag', `${server.tool_count} 个工具`));
+  }
+  head.append(el('span', `mcp-state-label ${view.tone}`, view.label));
+  const toggle = switchControl(server.enabled, value => void toggleMcpServer(server, value), { disabled: Boolean(mcpBoard.busy) });
+  toggle.querySelector('input')?.setAttribute('aria-label', `${server.name} 启用`);
+  head.append(toggle);
+  card.append(head);
+  const detail = el('div', 'mcp-state-detail', mcpStateDetail(server));
+  card.append(detail);
+  const facts = el('div', 'provider-facts');
+  facts.append(el('span', 'provider-fact', `端点：${server.endpoint || '未设置'}`));
+  if (server.source) facts.append(el('span', 'provider-fact', `来源：${server.source}`));
+  if (server.protocol) facts.append(el('span', 'provider-fact', `协议：${server.protocol}`));
+  if (server.last_attempt_at) facts.append(el('span', 'provider-fact', `最近尝试：${formatDateTime(server.last_attempt_at)}`));
+  if (server.connected_at) facts.append(el('span', 'provider-fact', `连接于：${formatDateTime(server.connected_at)}`));
+  card.append(facts);
+  if (server.last_error) {
+    const category = mcpFailureCategory(server.last_error);
+    const error = el('div', 'schedule-banner error mcp-error');
+    error.append(el('strong', undefined, category ?? '连接失败'), document.createTextNode(` ${server.last_error}`));
+    card.append(error);
+  }
+
+  const actions = el('div', 'settings-actions provider-actions');
+  const connectLabel = server.state === 'connected' ? '重新连接' : '连接测试';
+  const connect = el('button', 'button secondary small', mcpBoard.busy ? '处理中…' : connectLabel);
+  connect.type = 'button';
+  connect.disabled = !server.enabled || Boolean(mcpBoard.busy) || server.state === 'connecting';
+  connect.addEventListener('click', () => void reconnectMcp(server));
+  const selected = mcpBoard.selected === server.name;
+  const tools = el('button', 'button ghost small', selected ? '收起工具' : `工具${Number.isInteger(server.tool_count) ? `（${server.tool_count}）` : ''}`);
+  tools.type = 'button';
+  tools.addEventListener('click', () => {
+    mcpBoard.selected = selected ? null : server.name;
+    paintMcp();
+  });
+  const edit = el('button', 'button ghost small', '编辑');
+  edit.type = 'button';
+  edit.disabled = Boolean(mcpBoard.busy);
+  edit.addEventListener('click', () => openMcpEditor(server));
+  const remove = el('button', 'button ghost small provider-danger', '删除');
+  remove.type = 'button';
+  remove.disabled = Boolean(mcpBoard.busy);
+  remove.addEventListener('click', () => void removeMcpServer(server));
+  actions.append(connect, tools, edit, remove);
+  card.append(actions);
+  if (selected) card.append(mcpServerDetail(server));
+  return card;
+}
+
+function mcpNameRefs(label, refs, emptyText) {
+  const wrap = el('div', 'mcp-name-refs');
+  wrap.append(el('div', 'schedule-field-label', label));
+  if (!refs?.length) {
+    wrap.append(el('div', 'schedule-field-value', emptyText));
+    return wrap;
+  }
+  for (const reference of refs) {
+    // Only names. The runtime resolves the value at launch; it never travels
+    // to a client.
+    wrap.append(el('code', 'mcp-ref', reference.key === reference.source ? reference.key : `${reference.key} ← ${reference.source}`));
+  }
+  return wrap;
+}
+
+function mcpServerDetail(server) {
+  const wrap = el('div', 'mcp-detail');
+  const fields = el('div', 'schedule-fields mcp-fields');
+  fields.append(
+    mcpFact('传输', mcpTransportLabel(server.transport)),
+    mcpFact('端点', server.endpoint, true),
+    mcpFact('配置来源', server.source || '全局配置', true),
+    mcpFact('连接代次', String(server.generation ?? 0)),
+    mcpFact('最近尝试', server.last_attempt_at ? formatDateTime(server.last_attempt_at) : '—'),
+    mcpFact('连接时间', server.connected_at ? formatDateTime(server.connected_at) : '—'),
+  );
+  wrap.append(fields);
+  if (server.transport === 'stdio') {
+    if (server.spec?.args?.length) {
+      wrap.append(el('div', 'schedule-field-label', '启动参数'));
+      const args = el('pre', 'mcp-schema mcp-args');
+      args.textContent = server.spec.args.join('\n');
+      wrap.append(args);
+    }
+    wrap.append(mcpNameRefs('环境变量（名称引用）', server.spec?.env ?? [], '未配置环境变量'));
+  } else {
+    wrap.append(mcpNameRefs('请求 Header（名称引用）', server.spec?.headers ?? [], '未配置请求 Header'));
+    wrap.append(mcpNameRefs('Bearer Token', server.spec?.bearer_token_env ? [{ key: 'bearer_token_env', source: server.spec.bearer_token_env }] : [], '未配置 Bearer Token'));
+  }
+
+  const toolHead = el('div', 'mcp-tools-head');
+  const known = Number.isInteger(server.tool_count) ? server.tool_count : 0;
+  toolHead.append(el('h3', undefined, `工具（${server.state === 'connected' ? known : '未连接'}）`));
+  if (server.tools_truncated) toolHead.append(el('span', 'provider-tag', '目录已截断'));
+  wrap.append(toolHead);
+  if (server.state !== 'connected') {
+    wrap.append(el('div', 'settings-note', '连接成功后显示 Runtime 通过 tools/list 实际发现的工具；配置里的名称不代表工具存在。'));
+  } else if (!server.tools?.length) {
+    wrap.append(el('div', 'settings-note', '已连接，但 Server 没有声明任何工具。'));
+  } else {
+    for (const tool of server.tools) wrap.append(mcpToolRow(server, tool));
+    if (server.tools_truncated) {
+      wrap.append(el('div', 'settings-note', `Runtime 对单个服务的工具目录做了截断；总数以 ${known} 为准。`));
+    }
+  }
+  return wrap;
+}
+
+function mcpToolRow(server, tool) {
+  const details = el('details', 'mcp-tool');
+  const summary = el('summary', 'mcp-tool-summary');
+  summary.append(el('code', 'mcp-tool-name', tool.exposed_name));
+  summary.append(el('span', 'provider-tag', `远程名 ${tool.remote_name}`));
+  const admission = mcpAdmissionView(tool.admission);
+  summary.append(el('span', `schedule-chip tone-${admission.tone}`, admission.label));
+  if (tool.risk) summary.append(el('span', 'provider-tag', `风险 ${tool.risk}`));
+  const required = mcpToolRequired(tool);
+  if (required.length) summary.append(el('span', 'provider-tag', `必填 ${required.join(', ')}`));
+  details.append(summary);
+  const body = el('div', 'mcp-tool-body');
+  body.append(el('div', 'schedule-field-label', `所属服务：${server.name}`));
+  if (tool.description) body.append(el('p', 'mcp-tool-desc', tool.description));
+  body.append(el('div', 'schedule-field-label', '输入 Schema'));
+  const schema = el('pre', 'mcp-schema');
+  schema.textContent = mcpToolSchemaText(tool);
+  body.append(schema);
+  if (tool.truncated) body.append(el('div', 'settings-note', 'Runtime 截断了这个工具的元数据；完整定义不可用。'));
+  details.append(body);
+  return details;
+}
+
+function mcpActionToast(prefix, error) {
+  toast(`${prefix}：${error.message}`, { tone: 'error', holdMs: 5200 });
+}
+
+function reconnectMcp(server) {
+  manageMcp({ action: 'reconnect', server: server.name }, 'reconnect', { target: server.name })
+    .then(() => toast(`${server.name}：${mcpIntentLabel('reconnect')}`, { tone: 'success', holdMs: 2600 }))
+    .catch(error => mcpActionToast(`连接 ${server.name} 失败`, error));
+}
+
+function toggleMcpServer(server, enabled) {
+  manageMcp({ action: 'set_enabled', server: server.name, enabled }, 'set_enabled')
+    .then(() => toast(`${server.name} 已${enabled ? '启用' : '停用'}`, { tone: 'success', holdMs: 2400 }))
+    .catch(error => mcpActionToast(`${enabled ? '启用' : '停用'} ${server.name} 失败`, error));
+}
+
+async function removeMcpServer(server) {
+  const ok = await confirmDialog({
+    title: `删除 MCP 服务 ${server.name}？`,
+    body: '只删除全局配置中的这条声明：不会卸载任何程序，也不会删除 Server 自己的数据。正在使用的连接会被关闭。',
+    confirm: '删除',
+    danger: true,
+  });
+  if (!ok) return;
+  try {
+    await manageMcp({ action: 'remove', server: server.name }, 'remove');
+    if (mcpBoard.selected === server.name) mcpBoard.selected = null;
+    toast(`${server.name}：${mcpIntentLabel('remove')}`, { tone: 'success', holdMs: 2600 });
+    paintMcp();
+  } catch (error) {
+    mcpActionToast(`删除 ${server.name} 失败`, error);
+  }
+}
+
+function mcpEditorInput(value, { placeholder = '', maxLength = 4096 } = {}) {
+  const input = el('input', 'provider-editor-input');
+  input.value = value ?? '';
+  input.placeholder = placeholder;
+  input.maxLength = maxLength;
+  input.autocomplete = 'off';
+  input.spellcheck = false;
+  return input;
+}
+
+function mcpEditorTextarea(value, { placeholder = '', rows = 3, maxLength = 65536 } = {}) {
+  const area = el('textarea', 'provider-editor-input mcp-editor-textarea');
+  area.value = value ?? '';
+  area.placeholder = placeholder;
+  area.rows = rows;
+  area.maxLength = maxLength;
+  area.spellcheck = false;
+  return area;
+}
+
+function openMcpEditor(server) {
+  const editing = Boolean(server);
+  const form = server ? formFromSpec(server.spec ?? {}) : {
+    name: '', transport: 'stdio', command: '', argsText: '', envText: '',
+    url: '', headersText: '', bearerTokenEnv: '', enabled: true,
+  };
+  const body = el('div', 'provider-editor-body');
+  const name = mcpEditorInput(form.name, { placeholder: '例如 filesystem', maxLength: 64 });
+  name.disabled = false;
+  const transport = editorSelect([['stdio', 'stdio（本地进程）'], ['streamable_http', 'Streamable HTTP（远程）']], form.transport);
+  const enabled = switchControl(form.enabled, () => {});
+  const command = mcpEditorInput(form.command, { placeholder: '例如 npx 或 /usr/local/bin/my-mcp-server' });
+  const args = mcpEditorTextarea(form.argsText, { placeholder: '每行一个参数', rows: 3 });
+  const env = mcpEditorTextarea(form.envText, { placeholder: '每行一个 KEY=ENV_VAR；只写名称，不写密钥', rows: 3 });
+  const url = mcpEditorInput(form.url, { placeholder: 'https://example.com/mcp', maxLength: 2048 });
+  const headers = mcpEditorTextarea(form.headersText, { placeholder: '每行一个 Header=ENV_VAR；只写名称', rows: 3 });
+  const bearer = mcpEditorInput(form.bearerTokenEnv, { placeholder: '例如 SERVICE_TOKEN', maxLength: 256 });
+  const stdioGroup = el('div', 'mcp-editor-group');
+  stdioGroup.append(
+    editorField('启动命令', command, '按原样执行，不经过 shell；用户参数不会被拼接成命令。'),
+    editorField('参数', args, '每行一个参数。'),
+    editorField('环境变量', env, '格式 KEY=环境变量名。CodeLeveler 只保存名称引用，启动时从进程环境解析；不保存密钥值。'),
+  );
+  const httpGroup = el('div', 'mcp-editor-group');
+  httpGroup.append(
+    editorField('URL', url, '只支持 http(s)；不要带用户信息或查询参数。'),
+    editorField('Headers', headers, '格式 Header=环境变量名；Authorization 请使用下面的 Bearer Token。'),
+    editorField('Bearer Token 环境变量', bearer, '只填写环境变量名，不填写 Token 本身。'),
+  );
+  const showTransport = () => {
+    stdioGroup.hidden = transport.value !== 'stdio';
+    httpGroup.hidden = transport.value !== 'streamable_http';
+  };
+  transport.addEventListener('change', showTransport);
+  showTransport();
+  body.append(
+    editorField('服务名', name, editing ? '改名会替换旧声明，并关闭旧连接。' : '用于模型侧的 mcp__<服务名>__<工具名> 前缀。'),
+    editorField('传输', transport, '只列出 Runtime 实际支持的传输方式。'),
+    editorField('启用', enabled),
+    stdioGroup,
+    httpGroup,
+  );
+  providerEditorDialog({
+    title: editing ? `编辑 MCP 服务 ${server.name}` : '添加 MCP 服务',
+    body,
+    saveLabel: editing ? '保存' : '添加',
+    onSave: async ({ error, save, close }) => {
+      error.hidden = true;
+      const built = specFromForm({
+        name: name.value,
+        transport: transport.value,
+        command: command.value,
+        argsText: args.value,
+        envText: env.value,
+        url: url.value,
+        headersText: headers.value,
+        bearerTokenEnv: bearer.value,
+        enabled: enabled.querySelector('input')?.checked !== false,
+      });
+      if (built.error) {
+        error.textContent = built.error;
+        error.hidden = false;
+        return;
+      }
+      save.disabled = true;
+      const previousSelection = mcpBoard.selected;
+      try {
+        await manageMcp(
+          editing
+            ? { action: 'update', original_name: server.name, spec: built.spec }
+            : { action: 'add', spec: built.spec },
+          editing ? 'update' : 'add',
+        );
+        mcpBoard.selected = previousSelection === server?.name || !editing ? built.spec.name : previousSelection;
+        close();
+        toast(`${built.spec.name}：${mcpIntentLabel(editing ? 'update' : 'add')}`, { tone: 'success', holdMs: 2600 });
+        paintMcp();
+      } catch (failure) {
+        error.textContent = failure.message;
+        error.hidden = false;
+        save.disabled = false;
+      }
+    },
+  });
+}
+
 /* ------------------------------------------------------------ event stream */
 
 function consumeSettingsEvent(frame) {
@@ -9146,6 +9827,7 @@ function consumeSettingsEvent(frame) {
 }
 
 api.onEvent(frame => {
+  if (consumeMcpEvent(frame)) return;
   if (consumeScheduleEvent(frame)) return;
   consumeSettingsEvent(frame);
   if (frame.event === 'connection') { applyConnection(frame); return; }
@@ -9159,6 +9841,7 @@ api.onEvent(frame => {
     history = [];
     current = attachExtras(projectSnapshot(session, history), session);
     resetScheduleProjection();
+  resetMcpForSessionChange();
     lastEventSeq = session.last_sequence ?? 0;
     activeView = 'chat';
     liveTrajectory = [];
@@ -9272,6 +9955,7 @@ api.onEvent(frame => {
     history = [];
     current = attachExtras(projectSnapshot(event.session, history), event.session);
     current.contextUsage = priorContext;
+    resetMcpForSessionChange();
     liveTrajectory = [];
     liveTurnStartAt = null;
     liveTurnClosed = false;
