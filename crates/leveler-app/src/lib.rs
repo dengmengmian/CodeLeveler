@@ -2581,9 +2581,7 @@ fn merge_run_limits(
     leveler_project::RunLimitsConfig {
         max_model_tokens: project.max_model_tokens.or(global.max_model_tokens),
         max_cost_usd_micros: project.max_cost_usd_micros.or(global.max_cost_usd_micros),
-        max_duration_seconds: project
-            .max_duration_seconds
-            .or(global.max_duration_seconds),
+        max_duration_seconds: project.max_duration_seconds.or(global.max_duration_seconds),
     }
 }
 
