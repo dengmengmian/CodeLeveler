@@ -129,6 +129,7 @@ SQLite WAL/ACL/PowerShell 子进程/MCP stdio/剪贴板图片/输入法/拖放/�
 ## 15. 自动化与性能
 
 - Desktop：282/282 unit、typecheck、lint、build PASS。
+- `cargo fmt --all -- --check` PASS；`cargo check --workspace --all-features --locked` PASS。
 - Rust workspace：**9931 passed / 0 failed / 114 ignored（374 个测试二进制，EXIT 0）**。
   首轮全量在 `background_crash_matrix::b9_...` 出现 1 次失败（仅在全量并行负载下）；该测试单独 10/10、整套 5/5 PASS，完整重跑 EXIT 0。归类为 **FLAKY_UNRESOLVED（负载下）**，不是已证实的投放缺陷，也没有被隐藏。
 - Memory integration：22/22 PASS。
@@ -174,9 +175,10 @@ SQLite WAL/ACL/PowerShell 子进程/MCP stdio/剪贴板图片/输入法/拖放/�
 | `1537abbb` | `style(app): format the top-level limit merge` |
 | `ce74f201` | `fix(desktop): make the macOS RC bundle reproducible` |
 | `8bde10ca` | `test(cli): pass the budget slot to the terminal projection` |
+| `docs(r6)` | 报告与证据归档（docs-only；哈希见 `git log -- docs/dev/desktop-r6-rc-2026-11-28`） |
 
 
-未 push、未 tag、未 release。
+未 push、未 tag、未 release。产物由 `8bde10ca`（干净工作树）构建；其后的 `595dbbeb` 只新增本报告与证据，不改变 Runtime。
 
 ## 21. Git / Tag / Release 状态
 
