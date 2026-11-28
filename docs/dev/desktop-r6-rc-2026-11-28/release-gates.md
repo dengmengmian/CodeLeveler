@@ -18,7 +18,7 @@
 | 更新 | 安全更新/失败回滚 | **BLOCKED** | Desktop 无更新器；CLI 更新器不覆盖 Desktop |
 | 签名 | macOS/Windows 签名 | **BLOCKED** | 本机 0 个 codesigning identity；无 Windows 证书 |
 | 性能 | 启动/内存/长会话/资源 | NOT VERIFIED（无 v1.0.29 Desktop 对照） | 只有原始测量，无正式对比 |
-| 自动化 | Rust/Desktop/E2E | PASS（附 1 flake） | Rust 9931/0/114；Desktop 282/0；1 次全量负载 flake，重跑绿 |
+| 自动化 | Rust/Desktop/E2E | PASS（附 1 flake） | Rust 9931/0/114；Desktop 282/0；clippy/fmt/all-features check PASS；1 次全量负载 flake，重跑绿 |
 | 交付 | 安装包/哈希/报告/证据 | PARTIAL | macOS 未签名 RC + manifest；Windows 无产物 |
 
 ## 2. 阻断分级

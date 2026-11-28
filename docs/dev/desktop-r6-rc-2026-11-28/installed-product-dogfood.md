@@ -10,16 +10,16 @@
 - Runtime 进程实际命令：
   `/Users/.../CodeLeveler R6 RC.app/Contents/Resources/runtime/leveler ... serve ...`
   → 证明不是 `target/debug/leveler`，也不是 PATH 里的 Homebrew 旧版；
-- Runtime build：`1.0.29 (8bde10ca66e6)`，`dirty=false`；
+- Runtime build：`1.0.29 (199334406950)`，`dirty=false`；
 - 真实 HOME/config/provider/Runtime/Desktop/文件系统；临时 workspace、Electron profile；
-- 测试 Session `524f3c2a-...` 已按 id 删除；临时 Memory note `observations/_inbox/remember-gCBQoJ.md`
+- 测试 Session `db9da08c-...` 已按 id 删除；临时 Memory note `observations/_inbox/remember-nEyZyE.md`
   已用 `memory forget --hash` 清理；配置 SHA 前后一致。
 
 ## 2. 结果
 
 | # | 场景 | 结果 | 证据 |
 | --- | --- | --- | --- |
-| 1 | 安装并启动 | PASS | App 版本 1.0.29；启动到 UI 约 1.24s |
+| 1 | 安装并启动 | PASS | App 版本 1.0.29；启动到 UI 约 1.47s |
 | 2 | Runtime 身份 | PASS | `runtime_info.pid` 的 `ps` 命令位于 app bundle 内 |
 | 3 | 真实 Provider/Model | PASS | `deepseek/deepseek-v4.1-flash-1017` |
 | 4 | 多文件任务 | PASS | 创建 `hello.txt`、修改 `sum.mjs`、新增 `sum.test.mjs` |

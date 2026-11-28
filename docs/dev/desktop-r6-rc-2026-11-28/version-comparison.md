@@ -6,8 +6,8 @@
 
 | 项 | 上一正式版 | 当前 RC 候选 |
 | --- | --- | --- |
-| 版本/tag | `v1.0.29` | 未发布；Cargo 仍 `1.0.29`，git `de1c8c36` + 本轮改动 |
-| 源码 | `f972f9f6` | `de1c8c36` + dirty |
+| 版本/tag | `v1.0.29` | 未发布；Cargo 仍 `1.0.29`，git `199334406950`（干净） |
+| 源码 | `f972f9f6` | `199334406950` |
 | 产物 | CLI 归档（macOS/Linux/Windows） | CLI RC + macOS Desktop `.app/.zip/.dmg`（未签名） |
 | Desktop | **无**（仅源码） | 新增安装包 |
 | 平台 | CLI：三平台；Desktop：源码 macOS 验证 | Desktop：macOS 构建/验收中；Windows **BLOCKED** |

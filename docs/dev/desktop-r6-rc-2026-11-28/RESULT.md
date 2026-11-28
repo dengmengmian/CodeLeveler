@@ -1,7 +1,7 @@
 # R6 最终报告
 
 日期：2026-11-28
-候选源码：`8bde10ca66e6`（干净工作树）
+候选源码：`199334406950`（干净工作树）
 上一正式版：`v1.0.29`（`f972f9f6`，CLI-only）
 
 ## 1. 总体结论
@@ -22,9 +22,9 @@
 | 项 | 值 |
 | --- | --- |
 | Cargo 版本 | 1.0.29（未改版本号） |
-| Runtime build | `1.0.29 (8bde10ca66e6)`，dirty=false |
+| Runtime build | `1.0.29 (199334406950)`，dirty=false |
 | 安装产物 | `CodeLeveler-1.0.29-macOS-arm64.{zip,dmg}` |
-| 产物源码 HEAD | `8bde10ca66e6f8c134d6728ce77ec2b3737d192f`，dirty=0 |
+| 产物源码 HEAD | `19933440695095aa1e2cbb30195258c8e62ddb4a`，dirty=0 |
 | 测试修复 | 另有一个 test-only 提交（`real_session_corpus` 调用新签名），不改变 Runtime 行为 |
 | 上一正式 tag | `v1.0.29` = `f972f9f613db` |
 | 距上一 tag | 96 个提交 + 本轮 4 个提交 |
@@ -129,7 +129,7 @@ SQLite WAL/ACL/PowerShell 子进程/MCP stdio/剪贴板图片/输入法/拖放/�
 ## 15. 自动化与性能
 
 - Desktop：282/282 unit、typecheck、lint、build PASS。
-- `cargo fmt --all -- --check` PASS；`cargo check --workspace --all-features --locked` PASS。
+- `cargo fmt --all -- --check` PASS；`cargo check --workspace --all-features --locked` PASS；`cargo dod-clippy`（workspace all-targets all-features `-D warnings`）PASS。
 - Rust workspace：**9931 passed / 0 failed / 114 ignored（374 个测试二进制，EXIT 0）**。
   首轮全量在 `background_crash_matrix::b9_...` 出现 1 次失败（仅在全量并行负载下）；该测试单独 10/10、整套 5/5 PASS，完整重跑 EXIT 0。归类为 **FLAKY_UNRESOLVED（负载下）**，不是已证实的投放缺陷，也没有被隐藏。
 - Memory integration：22/22 PASS。
@@ -152,12 +152,12 @@ SQLite WAL/ACL/PowerShell 子进程/MCP stdio/剪贴板图片/输入法/拖放/�
 
 | 产物 | SHA-256 |
 | --- | --- |
-| zip | `30d2bee222fbbaaf20b160ba9ad445ed99e5afa6024085cc72369d1f5b8e45c1` |
-| dmg | `f1586dc15d0312d6e9b72e3948bd32a2954363d84db9e13df0f79421aa5647e7` |
-| Runtime | `16f97ce34bcff53d232abaa45e3bdaa9d48f236f7fb74709bf6bfa49e730d97d` |
-| Bundle CDHash | `ce01160d627c264a307f671acc948dc012c1efa9`（adhoc） |
+| zip | `6f626ab582aa8a5e95b59900c5e077fc459701a08a3efa9b6adf80656f0aa2b6` |
+| dmg | `d7a5509c67300bb1989926a4358f5917800549b31cf498ca29f9b27bb5b919c7` |
+| Runtime | `e4ee9ab45af7da6172ee351c5f8212a7751d4346bac1576b7a34e6b1925c16c9` |
+| Bundle CDHash | `44272c200982d0818778ca6a06868825a1626645`（adhoc） |
 
-最终产物由 `8bde10ca` 的干净工作树构建；完整清单见 `artifacts-manifest.json`。
+最终产物由 `19933440` 的干净工作树构建；完整清单见 `artifacts-manifest.json`。
 
 ## 19. P0 / P1 / P2
 
@@ -175,10 +175,12 @@ SQLite WAL/ACL/PowerShell 子进程/MCP stdio/剪贴板图片/输入法/拖放/�
 | `1537abbb` | `style(app): format the top-level limit merge` |
 | `ce74f201` | `fix(desktop): make the macOS RC bundle reproducible` |
 | `8bde10ca` | `test(cli): pass the budget slot to the terminal projection` |
-| `docs(r6)` | 报告与证据归档（docs-only；哈希见 `git log -- docs/dev/desktop-r6-rc-2026-11-28`） |
+| `80c6e942` | `style: satisfy the workspace clippy gate` |
+| `19933440` | `docs(r6): align the audit with the final gate state` |
+| 后续 docs | 报告与证据归档（docs-only；哈希见 `git log -- docs/dev/desktop-r6-rc-2026-11-28`） |
 
 
-未 push、未 tag、未 release。产物由 `8bde10ca`（干净工作树）构建；其后的 `595dbbeb` 只新增本报告与证据，不改变 Runtime。
+未 push、未 tag、未 release。产物由 `19933440`（干净工作树）构建；其后的 docs-only 提交只更新本报告与证据，不改变 Runtime。
 
 ## 21. Git / Tag / Release 状态
 

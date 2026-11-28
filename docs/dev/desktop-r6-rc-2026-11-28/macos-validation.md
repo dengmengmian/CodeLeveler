@@ -26,10 +26,10 @@
 
 | 产物 | SHA-256 |
 | --- | --- |
-| zip | `30d2bee222fbbaaf20b160ba9ad445ed99e5afa6024085cc72369d1f5b8e45c1` |
-| dmg | `f1586dc15d0312d6e9b72e3948bd32a2954363d84db9e13df0f79421aa5647e7` |
-| Runtime | `16f97ce34bcff53d232abaa45e3bdaa9d48f236f7fb74709bf6bfa49e730d97d` |
-| Bundle CDHash | `ce01160d627c264a307f671acc948dc012c1efa9`（adhoc） |
+| zip | `6f626ab582aa8a5e95b59900c5e077fc459701a08a3efa9b6adf80656f0aa2b6` |
+| dmg | `d7a5509c67300bb1989926a4358f5917800549b31cf498ca29f9b27bb5b919c7` |
+| Runtime | `e4ee9ab45af7da6172ee351c5f8212a7751d4346bac1576b7a34e6b1925c16c9` |
+| Bundle CDHash | `44272c200982d0818778ca6a06868825a1626645`（adhoc） |
 
 完整清单见 `artifacts-manifest.json`。
 

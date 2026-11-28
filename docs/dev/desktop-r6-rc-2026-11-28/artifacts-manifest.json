@@ -3,11 +3,11 @@
   "status": "NOT_RELEASED",
   "candidate": {
     "version": "1.0.29",
-    "source_head": "8bde10ca66e6f8c134d6728ce77ec2b3737d192f",
+    "source_head": "19933440695095aa1e2cbb30195258c8e62ddb4a",
     "source_dirty": 0,
-    "runtime_version": "1.0.29 (8bde10ca66e6)",
-    "runtime_sha256": "16f97ce34bcff53d232abaa45e3bdaa9d48f236f7fb74709bf6bfa49e730d97d",
-    "built_at": "2026-11-28T03:51:16.070Z",
+    "runtime_version": "1.0.29 (199334406950)",
+    "runtime_sha256": "e4ee9ab45af7da6172ee351c5f8212a7751d4346bac1576b7a34e6b1925c16c9",
+    "built_at": "2026-11-28T04:25:36.188Z",
     "host": {
       "os": "Darwin Kernel Version 25.6.0: Fri Jul 31 19:18:29 PDT 2026; root:xnu-12377.161.14~5/RELEASE_ARM64_T8122",
       "arch": "arm64",
@@ -18,7 +18,7 @@
     "path": "/Users/mengmian/Develop/app/CodeLeveler/target/desktop-rc/CodeLeveler-darwin-arm64/CodeLeveler.app",
     "bundle_id": "com.codeleveler.desktop",
     "info_version": "1.0.29",
-    "cdhash": "ce01160d627c264a307f671acc948dc012c1efa9",
+    "cdhash": "44272c200982d0818778ca6a06868825a1626645",
     "signing": {
       "status": "AD_HOC",
       "developer_id": false,
@@ -34,12 +34,12 @@
     {
       "kind": "zip",
       "path": "/Users/mengmian/Develop/app/CodeLeveler/target/desktop-rc/CodeLeveler-1.0.29-macOS-arm64.zip",
-      "sha256": "30d2bee222fbbaaf20b160ba9ad445ed99e5afa6024085cc72369d1f5b8e45c1"
+      "sha256": "6f626ab582aa8a5e95b59900c5e077fc459701a08a3efa9b6adf80656f0aa2b6"
     },
     {
       "kind": "dmg",
       "path": "/Users/mengmian/Develop/app/CodeLeveler/target/desktop-rc/CodeLeveler-1.0.29-macOS-arm64.dmg",
-      "sha256": "f1586dc15d0312d6e9b72e3948bd32a2954363d84db9e13df0f79421aa5647e7"
+      "sha256": "d7a5509c67300bb1989926a4358f5917800549b31cf498ca29f9b27bb5b919c7"
     }
   ],
   "windows": {
