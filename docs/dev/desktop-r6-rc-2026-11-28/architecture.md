@@ -45,11 +45,11 @@ CodeLeveler.app/
 
 | 项 | 值 |
 | --- | --- |
-| 当前源码 HEAD | `de1c8c36` + 本轮未提交改动 |
+| 当前源码 HEAD | `8bde10ca66e6`（候选构建；文档提交 `a6329dbd` 在其后） |
 | Cargo workspace | `1.0.29` |
 | 上一正式 tag | `v1.0.29` = `f972f9f6` |
 | 距上一 tag | 96 个提交（23 feat / 27 fix / 27 test / 其余 docs/chore/style/merge） |
-| 本轮候选产物 | `target/desktop-rc/`（未签名、本地 RC，不是正式发布） |
+| 本轮候选产物 | `target/desktop-rc/`（ad-hoc 本地 RC，未签名/未公证，不是正式发布） |
 | Windows Runtime 产物 | 仅 CI 构建的 CLI zip；**没有** Desktop 安装器或真机验收 |
 
 版本决策：本轮**不**改 Cargo 版本、不 tag、不 release。RC 产物信息以
