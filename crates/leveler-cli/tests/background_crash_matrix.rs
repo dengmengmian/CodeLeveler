@@ -264,6 +264,22 @@ async fn ready(path: &Path, child: &mut ManagedChild) {
     }
 }
 
+/// Kills a test workload and its process group when the test unwinds.
+///
+/// A panic before the explicit `stop_workload` used to leave a `sleep 300`
+/// behind. The guard is the same cleanup on every exit path.
+struct WorkloadGuard(u32);
+
+impl Drop for WorkloadGuard {
+    fn drop(&mut self) {
+        let pid = self.0.to_string();
+        let _ = Command::new("kill")
+            .args(["-KILL", &format!("-{pid}")])
+            .status();
+        let _ = Command::new("kill").args(["-KILL", &pid]).status();
+    }
+}
+
 fn alive(pid: u32) -> bool {
     Command::new("kill")
         .args(["-0", &pid.to_string()])
@@ -976,7 +992,21 @@ fn h4_host_crash_after_exit_before_result_is_unknown_not_completed() {
             assert_eq!(tasks.len(), 1, "{tasks:?}");
             let task = &tasks[0];
             assert_eq!(task["snapshot"]["id"], task_id.as_str());
-            assert_eq!(task["snapshot"]["status"], "Running");
+            // The runtime may run its own recovery pass before this read. Both
+            // durable shapes prove the same fact: the host died BEFORE the
+            // completion record, so the task is either still Running or was
+            // converged from Running to Unknown — never completed.
+            let shape = task["snapshot"]["status"].as_str().unwrap_or_default();
+            assert!(
+                shape == "Running" || shape == "Unknown",
+                "the pre-terminal shape is Running or a recovery-converged Unknown: {task}"
+            );
+            if shape == "Unknown" {
+                assert_eq!(
+                    task["loss"]["previous"], "Running",
+                    "a converged record must have been live before the host was lost: {task}"
+                );
+            }
             assert!(
                 task["result"].is_null(),
                 "the completion record was never durable: {task}"
@@ -1544,6 +1574,7 @@ fn b7_b8_stop_request_is_unconfirmed_until_the_host_observes_the_signal() {
             submit(&client, &session, "Start the long background command.").await;
             let (task_id, pid) = wait_hosted_task(&client, &session).await;
             let pid = pid.expect("pid");
+            let _workload = WorkloadGuard(pid);
             let host_state = env.host_state();
             let host = host_pid(&host_state);
             wait_archived(
@@ -1648,6 +1679,7 @@ fn b9_start_identity_mismatch_never_signals_the_unrelated_live_process() {
             submit(&client, &session, "Start the long background command.").await;
             let (task_id, pid) = wait_hosted_task(&client, &session).await;
             let pid = pid.expect("pid");
+            let _workload = WorkloadGuard(pid);
             let host_state = env.host_state();
             let host = host_pid(&host_state);
             wait_archived(
@@ -1710,6 +1742,44 @@ fn b9_start_identity_mismatch_never_signals_the_unrelated_live_process() {
             assert!(
                 journal_settlement(&env, &task_id).is_none_or(|value| value.is_null()),
                 "the uncertain workload keeps its write reservation"
+            );
+            // The runtime's hosted monitor reconnects to the replacement host
+            // and reads the archived `Unknown` fact. That terminal publication
+            // is not proof of exit: wait for the durable finished fact it
+            // publishes, which orders the monitor's whole terminal path before
+            // this assertion, then require the reservation to have survived it.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let published = finished_events(&env.db(), &session)
+                    .await
+                    .iter()
+                    .any(|row| {
+                        row["payload"]
+                            .as_str()
+                            .and_then(|payload| {
+                                serde_json::from_str::<serde_json::Value>(payload).ok()
+                            })
+                            .is_some_and(|payload| {
+                                payload["payload"]["task_id"] == task_id.as_str()
+                            })
+                    });
+                if published {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    let tasks = host_tasks(&host_state);
+                    let settlement = journal_settlement(&env, &task_id);
+                    panic!(
+                        "the runtime never published the recovered terminal fact; \
+                         tasks={tasks:?} settlement={settlement:?}"
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(
+                journal_settlement(&env, &task_id).is_none_or(|value| value.is_null()),
+                "a terminal publication must not settle an unproven exit; the write reservation \
+                 must survive the runtime observing the archived Unknown fact"
             );
             eprintln!(
                 "B9 PASS task={task_id} host_pid={host} live_pid={pid} injected_token=macos:1:1 \

@@ -1408,15 +1408,19 @@ pub(crate) async fn persist_background_task_finished(
     };
     if modified.is_none() && task_id.starts_with("host-") {
         // The owning runtime may have died before it observed the exit, so the
-        // journal settlement was never committed. The archived terminal fact
-        // proves the exit; reconcile is idempotent and keeps the change set
-        // durable with that fact.
-        if let Err(error) = registry.reconcile_settlement(task_id).await {
-            tracing::warn!(
-                %error,
-                task = task_id,
-                "could not reconcile the hosted task settlement"
-            );
+        // journal settlement was never committed. Only a durable record that
+        // proves the exit authorizes the diff: an `Unknown` fact whose process
+        // may still exist keeps its write reservation, so this publication must
+        // not settle it (and its change set is honestly unknown).
+        match registry.reconcile_settlement(task_id).await {
+            Ok(Some(_)) | Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    task = task_id,
+                    "could not reconcile the hosted task settlement"
+                );
+            }
         }
         modified = match registry
             .settlement_changes_for(task_id, session_id.as_str(), false)

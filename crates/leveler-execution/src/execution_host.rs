@@ -495,6 +495,25 @@ fn lock(path: &Path) -> Result<std::fs::File, String> {
     try_lock(path)?.ok_or_else(|| "Execution Host lifecycle lock is busy".to_string())
 }
 
+/// Take a lifecycle lock a start is allowed to wait a moment for.
+///
+/// A replacement host can race a runtime recovery pass, which holds the host
+/// lock only while it rewrites durable state. A live host holds it for its
+/// whole life, so the wait is bounded: past the budget the lock is still
+/// reported busy rather than blocking a start behind a healthy owner.
+fn lock_with_wait(path: &Path, budget: std::time::Duration) -> Result<std::fs::File, String> {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        if let Some(file) = try_lock(path)? {
+            return Ok(file);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("Execution Host lifecycle lock is busy".to_string());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// Take the lock when it is free, so a caller can tell "held by a live owner"
 /// from "I may act". A lock error that is not contention is also reported as
 /// held: unknown ownership is never guessed at either.
@@ -2394,7 +2413,10 @@ pub async fn serve_with_idle_timeout(
         })?;
     #[cfg(windows)]
     std::mem::forget(process_tree);
-    let _owner = lock(&config.state_dir.join("host.lock"))?;
+    let _owner = lock_with_wait(
+        &config.state_dir.join("host.lock"),
+        std::time::Duration::from_secs(2),
+    )?;
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|e| e.to_string())?;

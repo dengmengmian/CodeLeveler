@@ -545,6 +545,37 @@ struct RuntimeBootBinding {
     probe: Arc<dyn BootLivenessProbe>,
 }
 
+/// The one settlement gate for a hosted task's write reservation.
+///
+/// A terminal status does not prove the workload stopped. Only the host's own
+/// exit fact (`Exited`/`Killed`) or recovery's `Gone` evidence authorizes the
+/// one-time diff; an `Unknown` record whose process may still exist — including
+/// the same fact re-observed after a replacement host starts — keeps the
+/// reservation. A recovery-proven exit settles with the loss note attached.
+///
+/// This is a free function rather than a method so the runtime's hosted monitor
+/// can apply the same gate without retaining the registry (and its KillOnDrop)
+/// for the life of a remote monitor.
+async fn settle_proven_hosted_record(
+    config: &crate::execution_host::ExecutionHostConfig,
+    task_id: &str,
+) -> Result<Option<BackgroundSettlement>, String> {
+    let records = crate::execution_host::HostRecords::read(&config.state_dir)?;
+    let Some(record) = records.task(task_id) else {
+        return Ok(None);
+    };
+    if !record.settlement_proven() {
+        return Ok(None);
+    }
+    let journal = crate::host_settlement::SettlementJournal::open(&config.semantic_dir())?;
+    let settlement = if record.loss.is_some() {
+        journal.reconcile_lost(task_id).await?
+    } else {
+        journal.reconcile(task_id).await?
+    };
+    Ok(Some(settlement))
+}
+
 impl Default for BackgroundTaskRegistry {
     fn default() -> Self {
         Self::with_environment(Arc::new(leveler_core::environment().clone()))
@@ -854,20 +885,9 @@ impl BackgroundTaskRegistry {
             .execution_host
             .as_ref()
             .ok_or("persistent execution is not configured")?;
-        let records = crate::execution_host::HostRecords::read(&config.state_dir)?;
-        let Some(record) = records.task(task_id) else {
-            return Ok(false);
-        };
-        if !record.settlement_proven() {
-            return Ok(false);
-        }
-        let journal = self.journal()?;
-        if record.loss.is_some() {
-            journal.reconcile_lost(task_id).await?;
-        } else {
-            journal.reconcile(task_id).await?;
-        }
-        Ok(true)
+        Ok(settle_proven_hosted_record(config, task_id)
+            .await?
+            .is_some())
     }
 
     /// Reconcile process facts without launching a new host.
@@ -1647,20 +1667,22 @@ impl BackgroundTaskRegistry {
                 let result: Result<bool, String> = async {
                     let client =
                         crate::execution_host::ExecutionHostClient::connect(config.clone()).await?;
-                    let journal =
-                        crate::host_settlement::SettlementJournal::open(&config.semantic_dir())?;
                     let observation = client
                         .observe_owned(&id, &owner, cursor, 64 * 1024, Duration::from_secs(1))
                         .await?;
                     let mut terminal_snapshot = None;
                     if observation.snapshot.status.is_terminal() {
-                        // Any failure leaves the terminal unpublished and its
-                        // namespace reserved. Retry, including concurrent commit.
-                        journal.reconcile(&id).await?;
+                        // A terminal observation is not proof of exit. The
+                        // archived `Unknown` fact a replacement host serves
+                        // keeps its write reservation; only a proven exit is
+                        // settled and acknowledged. Any failure leaves the
+                        // terminal unpublished and its namespace reserved.
+                        if settle_proven_hosted_record(&config, &id).await?.is_some() {
+                            client.acknowledge(&id, &owner).await?;
+                        }
                         // Exit events carry the complete retained log, not the
                         // last observation page which could omit its tail.
                         terminal_snapshot = Some(client.get_owned(&id, &owner).await?);
-                        client.acknowledge(&id, &owner).await?;
                     }
                     cursor = Some(observation.next_cursor);
                     if observation.dropped_bytes > 0 {
@@ -2978,20 +3000,28 @@ impl BackgroundTaskRegistry {
         Some(settlement)
     }
 
-    /// Commit the settlement of a terminal hosted task whose owning runtime
-    /// died before it observed the exit. Idempotent: an existing settlement is
-    /// returned unchanged.
+    /// Settle a terminal hosted task's write reservation when its durable
+    /// record proves the exit; `Ok(None)` keeps the reservation.
     ///
     /// Hosted tasks settle through the semantic journal because the process
-    /// outlives the runtime that admitted it. Local tasks settle in their own
-    /// reaper, so they have no journal entry to reconcile.
-    pub async fn reconcile_settlement(&self, id: &str) -> Result<BackgroundSettlement, String> {
+    /// outlives the runtime that admitted it. This is the registry-level entry
+    /// for callers outside the process paths (for example publishing a durable
+    /// terminal fact): a terminal status alone never authorizes the diff, so an
+    /// `Unknown` record whose process may still exist is not settled here.
+    pub async fn reconcile_settlement(
+        &self,
+        id: &str,
+    ) -> Result<Option<BackgroundSettlement>, String> {
         if !id.starts_with("host-") {
             return Err(format!(
                 "task `{id}` is not hosted; it settles in its reaper"
             ));
         }
-        self.journal()?.reconcile(id).await
+        let config = self
+            .execution_host
+            .as_ref()
+            .ok_or("persistent execution is not configured")?;
+        settle_proven_hosted_record(config, id).await
     }
 
     /// The workspace paths this still-running task has changed since its spawn
