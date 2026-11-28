@@ -352,7 +352,7 @@ async fn replay_session(
                 ..
             } => {
                 r.task_outcome = Some(format!("{outcome:?}"));
-                stop.map(|s| turn_end_event(s, reason.clone()))
+                stop.map(|s| turn_end_event(s, reason.clone(), None))
             }
             _ => None,
         };
