@@ -35,6 +35,7 @@ import {
   copyText, trapTab,
 } from './ui.mjs';
 import { captureDraft, persistableDrafts, secretReferences } from './secret-review.mjs';
+import { createMemoryActionTracker, MEMORY_ACTION_SETTLE_MS } from './memory-action.mjs';
 import {
   setupGuidance, configurationUsable, providerCredentialText, connectionPresentation,
   providerFormError, providerContext, runtimeConfigState,
@@ -194,7 +195,10 @@ function emptyMemoryView() {
 let memoryView = emptyMemoryView();
 // The one management request this client is waiting on. It lives outside the
 // dialog so closing the page does not forget an outcome the runtime still owes.
-let memoryActionPending = null; // { queryId, label, timer }
+// The single pending memory action. The tracker owns the decision (including
+// the 35-minute unknown-result bound); the timer only schedules the report.
+const memoryActions = createMemoryActionTracker();
+let memoryActionTimer = null;
 let headerSubagentButton = null;
 let headerJobsButton = null;
 let wideSidebarCollapsed = false;
@@ -465,11 +469,11 @@ function applyConnection(frame) {
     mcpTransportLost();
     // A memory request in flight when the stream dropped has an unknown
     // outcome; releasing its latch says so instead of leaving a false "pending".
-    if (memoryActionPending) {
-      clearTimeout(memoryActionPending.timer);
-      const label = memoryActionPending.label;
-      memoryActionPending = null;
-      toast(`连接中断：${label}的结果未知；重新连接后请刷新记忆状态。`, { tone: 'warning', holdMs: 6000 });
+    const lostMemoryLabel = memoryActions.drop();
+    if (lostMemoryLabel) {
+      clearTimeout(memoryActionTimer);
+      memoryActionTimer = null;
+      toast(`连接中断：${lostMemoryLabel}的结果未知；重新连接后请刷新记忆状态。`, { tone: 'warning', holdMs: 6000 });
       if (memoryView.dialog) { memoryView.error = '连接中断；上个记忆操作结果未知。'; paintMemoryDialog(); }
     }
     if (skillRead?.status === 'pending') {
@@ -1849,7 +1853,9 @@ function renderComposerDocks() {
   // in-conversation plan surface, and the right panel owns the full list.
   const execution = current?.session?.execution_task ?? null;
   const goalStop = current ? goalStops.get(current.session.id) ?? null : null;
-  if (!current || (isHome() && !execution && !goalStop)) { host.hidden = true; queuedMessages = queuedMessages.filter(item => item.sessionId === current?.session.id); return; }
+  const budget = current?.budget ?? null;
+  const budgetVisible = !!budget && (!!execution || (budget.level ?? 'normal') !== 'normal');
+  if (!current || (isHome() && !execution && !goalStop && !budgetVisible)) { host.hidden = true; queuedMessages = queuedMessages.filter(item => item.sessionId === current?.session.id); return; }
   queuedMessages = queuedMessages.filter(item => item.sessionId === current.session.id);
   host.hidden = false;
   // The runtime stopped opening empty Goal windows. This is a policy stop,
@@ -1898,6 +1904,10 @@ function renderComposerDocks() {
     row.append(el('span', 'composer-dock-text', execution.objective));
     dock.append(row);
     host.append(dock);
+  }
+  if (budgetVisible) {
+    const dock = budgetDockNode(budget);
+    if (dock) host.append(dock);
   }
   // The transcript owns the single lightweight plan summary; a second
   // expandable step list here would repeat the same Runtime plan facts.
@@ -2069,6 +2079,81 @@ function refreshContextUsage() {
   api.deliver(commandEnvelope(sessionId, { type: 'query_context', session_id: sessionId, query_id: queryId }, current.session.last_sequence ?? 0))
     .then(result => { if (!result.ok) throw new Error(result.error.message); })
     .catch(() => { /* no accounting yet is not a visible failure */ });
+}
+
+/* ----------------------------------------------------------- goal budget */
+
+// The runtime recomputes this from the durable progress ledger on every query.
+// The renderer never adds token counts itself: it replaces the whole status, so
+// a retry, a reconnect or a restart cannot double count.
+let budgetQueryId = null;
+let budgetQueriedAt = 0;
+
+function refreshBudget({ force = true } = {}) {
+  if (!current) return;
+  const now = Date.now();
+  if (!force && now - budgetQueriedAt < 1000) return;
+  budgetQueriedAt = now;
+  const sessionId = current.session.id;
+  const queryId = crypto.randomUUID();
+  budgetQueryId = queryId;
+  api.deliver(commandEnvelope(sessionId, { type: 'query_budget', session_id: sessionId, query_id: queryId }, current.session.last_sequence ?? 0))
+    .then(result => { if (!result.ok) throw new Error(result.error.message); })
+    .catch(() => { /* an older runtime has no budget projection; it is not a visible failure */ });
+}
+
+function budgetTokenText(value) { return new Intl.NumberFormat('zh-CN').format(value ?? 0); }
+function budgetCostText(micros) { return `$${((micros ?? 0) / 1_000_000).toFixed(4)}`; }
+function budgetDurationText(ms) {
+  const total = Math.max(0, Math.round((ms ?? 0) / 1000));
+  if (total < 60) return `${total}秒`;
+  const minutes = Math.floor(total / 60);
+  if (minutes < 60) return `${minutes}分${String(total % 60).padStart(2, '0')}秒`;
+  return `${Math.floor(minutes / 60)}小时${String(minutes % 60).padStart(2, '0')}分`;
+}
+
+function budgetSummaryText(budget) {
+  const limits = budget.limits ?? {};
+  const tokens = [`Token ${budgetTokenText(budget.model_tokens)}`];
+  if (budget.estimated_model_tokens > 0) tokens.push(`含估算 ${budgetTokenText(budget.estimated_model_tokens)}`);
+  if (limits.max_model_tokens != null) tokens.push(`上限 ${budgetTokenText(limits.max_model_tokens)}`);
+  const parts = [tokens.join(' · ')];
+  const costLimit = limits.max_cost_usd_micros;
+  if (budget.cost_known) {
+    parts.push(costLimit != null ? `费用 ${budgetCostText(budget.cost_usd_micros)} / ${budgetCostText(costLimit)}` : `费用 ${budgetCostText(budget.cost_usd_micros)}`);
+  } else {
+    parts.push(costLimit != null ? '费用未知（模型缺少价格，费用上限无法生效）' : '费用未知（模型缺少价格）');
+  }
+  parts.push(limits.max_duration_ms != null
+    ? `时长 ${budgetDurationText(budget.duration_ms)} / ${budgetDurationText(limits.max_duration_ms)}`
+    : `时长 ${budgetDurationText(budget.duration_ms)}`);
+  if (limits.max_model_tokens == null && costLimit == null && limits.max_duration_ms == null) parts.push('未设置预算上限');
+  return parts.join(' · ');
+}
+
+function budgetDockNode(budget) {
+  if (!budget) return null;
+  const level = budget.level ?? 'normal';
+  const dock = el('div', `composer-dock budget-dock budget-${level}`);
+  const head = el('div', 'composer-dock-head');
+  const title = level === 'exhausted' ? '预算 · 已达上限'
+    : level === 'warning' ? `预算 · 接近上限（提醒阈值 ${budget.limits?.soft_limit_percent ?? 80}%）`
+      : '预算 · 本目标用量';
+  head.append(iconNode(level === 'normal' ? 'sliders' : 'alert', { size: 16 }), el('span', 'todo-title', title));
+  dock.append(head);
+  const row = el('div', 'composer-dock-row');
+  row.append(el('span', 'composer-dock-text', budgetSummaryText(budget)));
+  dock.append(row);
+  if (level === 'warning') {
+    const note = el('div', 'composer-dock-row');
+    note.append(el('span', 'composer-dock-note', '只是提醒：Agent 会继续执行，不会因软阈值停止。'));
+    dock.append(note);
+  } else if (level === 'exhausted') {
+    const note = el('div', 'composer-dock-row');
+    note.append(el('span', 'composer-dock-note', '硬限制已到：下一次模型调用会被预算停止。提高上限后说「继续」。'));
+    dock.append(note);
+  }
+  return dock;
 }
 
 function render() {
@@ -3628,11 +3713,6 @@ const MEMORY_KIND_LABELS = { manifest: '索引', topic: '主题', observation: '
 const MEMORY_ACTIVITY_LABELS = { idle: '空闲', capturing: '正在捕获', dreaming: '正在整理', failed: '上次记忆任务失败' };
 /** The runtime answers a memory query immediately; a missed answer is unknown. */
 const MEMORY_STATUS_TIMEOUT_MS = 15000;
-/**
- * A batch Dream may run for the store's 30-minute budget. Past this bound the
- * command's outcome is unknown, never silently promoted to a success.
- */
-const MEMORY_ACTION_SETTLE_MS = 35 * 60 * 1000;
 const MEMORY_POLL_INTERVAL_MS = 4000;
 
 function memorySessionId() {
@@ -3662,11 +3742,11 @@ function stopMemoryPolling() {
 function resetMemoryForSessionChange() {
   stopMemoryPolling();
   clearMemoryTimers();
-  if (memoryActionPending) {
+  if (memoryActions.drop()) {
     // The outcome arrives on the old session's stream; this page can no longer
     // observe it, so it is unknown here rather than assumed to have finished.
-    clearTimeout(memoryActionPending.timer);
-    memoryActionPending = null;
+    clearTimeout(memoryActionTimer);
+    memoryActionTimer = null;
     toast('已切换会话；上一个记忆操作的结果未在本页确认。', { tone: 'warning', holdMs: 5000 });
   }
   if (memoryView.dialog) {
@@ -3816,42 +3896,45 @@ function onMemoryFileLoaded(queryId, file) {
 function sendMemoryAction(command, label) {
   const sessionId = memorySessionId();
   if (!sessionId) { composerError('请先选择或新建会话'); return; }
-  if (memoryActionPending) {
+  if (memoryActions.current()) {
     const busy = '上一个记忆操作仍在进行，请稍候。';
     memoryView.error = busy;
     if (memoryView.dialog) paintMemoryDialog(); else composerError(busy);
     return;
   }
   const queryId = crypto.randomUUID();
-  memoryActionPending = {
-    queryId,
-    label,
-    timer: setTimeout(() => {
-      if (memoryActionPending?.queryId !== queryId) return;
-      memoryActionPending = null;
-      const unknown = '长时间未收到运行结果，结果未知。请刷新记忆状态确认。';
-      if (memoryView.dialog) { memoryView.notice = null; memoryView.error = unknown; paintMemoryDialog(); }
-      toast(unknown, { tone: 'warning', holdMs: 6000 });
-    }, MEMORY_ACTION_SETTLE_MS),
-  };
+  memoryActions.begin(queryId, label);
+  memoryActionTimer = setTimeout(() => {
+    // The bound is a report, not a cancellation: the tracker keeps the action
+    // pending until the runtime answers, and a late answer is still real.
+    if (!memoryActions.expired()) return;
+    memoryActions.drop();
+    memoryActionTimer = null;
+    const unknown = '长时间未收到运行结果，结果未知。请刷新记忆状态确认。';
+    if (memoryView.dialog) { memoryView.notice = null; memoryView.error = unknown; paintMemoryDialog(); }
+    toast(unknown, { tone: 'warning', holdMs: 6000 });
+  }, MEMORY_ACTION_SETTLE_MS);
   toast(`已提交${label}，等待运行时结果…`, { tone: 'info', holdMs: 2600 });
   if (memoryView.dialog) paintMemoryDialog();
   deliver({ ...command, session_id: sessionId, query_id: queryId }).catch(error => {
-    if (memoryActionPending?.queryId !== queryId) return;
-    clearTimeout(memoryActionPending.timer);
-    memoryActionPending = null;
+    const pending = memoryActions.current();
+    if (pending?.queryId !== queryId) return;
+    memoryActions.settle(queryId);
+    clearTimeout(memoryActionTimer);
+    memoryActionTimer = null;
     toast(`记忆操作未送达：${error.message}`, { tone: 'error', holdMs: 5000 });
     if (memoryView.dialog) { memoryView.notice = null; memoryView.error = error.message; paintMemoryDialog(); }
   });
 }
 
 function onMemoryActionFinished(queryId, result) {
-  const pending = memoryActionPending?.queryId === queryId ? memoryActionPending : null;
-  if (pending) {
-    clearTimeout(pending.timer);
-    memoryActionPending = null;
+  const settled = memoryActions.settle(queryId);
+  if (settled?.duplicate) return; // one outcome per command, even on a repeat
+  if (settled) {
+    clearTimeout(memoryActionTimer);
+    memoryActionTimer = null;
   }
-  const label = pending?.label ?? '记忆操作';
+  const label = settled?.label ?? '记忆操作';
   const message = `${label}${result.ok ? '完成' : '失败'} · ${result.message}`;
   toast(message, { tone: result.ok ? 'success' : 'error', holdMs: result.ok ? 3800 : 6500 });
   if (!memoryView.dialog) return;
@@ -3990,7 +4073,7 @@ function currentMemorySignature() {
     } : null,
     previewLoading: view.previewLoading,
     previewError: view.previewError,
-    action: memoryActionPending?.queryId ?? null,
+    action: memoryActions.current()?.queryId ?? null,
   });
 }
 
@@ -4069,9 +4152,10 @@ function paintMemoryDialog({ force = false } = {}) {
 
   if (memoryView.error) body.append(el('div', 'memory-error', memoryView.error));
   else if (memoryView.notice) body.append(el('div', 'memory-notice', memoryView.notice));
-  if (memoryActionPending) body.append(el('div', 'memory-notice', `正在等待运行时完成${memoryActionPending.label}…`));
+  const pendingMemoryAction = memoryActions.current();
+  if (pendingMemoryAction) body.append(el('div', 'memory-notice', `正在等待运行时完成${pendingMemoryAction.label}…`));
 
-  const busy = !!memoryActionPending;
+  const busy = !!memoryActions.current();
   const statusKnown = !!status;
   const canAct = !!status?.enabled && !busy;
   const refresh = memoryButton('刷新', () => requestMemoryStatus(), { disabled: memoryView.loading || busy });
@@ -4124,7 +4208,7 @@ function paintMemoryPreview(host) {
   }
   const file = memoryFileFor(selected.scope, selected.path);
   if (file?.deletable && !preview.truncated && preview.content_hash) {
-    const forget = memoryButton('遗忘此文件', () => forgetMemoryFile(), { disabled: !!memoryActionPending });
+    const forget = memoryButton('遗忘此文件', () => forgetMemoryFile(), { disabled: !!memoryActions.current() });
     host.append(forget);
   }
 }
@@ -4212,7 +4296,7 @@ function updateScrollBottom() {
 /* ------------------------------------------------------------- trajectory */
 
 const TRAJECTORY_LIVE_ONLY = new Set([
-  'token_usage', 'context_usage', 'context_loaded', 'agent_activity', 'command_progress',
+  'token_usage', 'context_usage', 'context_loaded', 'budget_loaded', 'agent_activity', 'command_progress',
   'notification', 'session_opened', 'session_updated', 'session_history_loaded',
   'agents_loaded', 'agent_loaded', 'agent_mutated', 'skills_loaded', 'skill_loaded', 'global_tasks_loaded',
   'observability_loaded', 'session_list', 'runtime_ready', 'model_retrying',
@@ -6006,6 +6090,7 @@ async function createTask() {
   }
   $('message').focus();
   setTimeout(refreshContextUsage, 80);
+  setTimeout(() => refreshBudget(), 100);
 }
 
 async function createTaskInWorkspace(path) {
@@ -6057,6 +6142,7 @@ async function openTask(task) {
   void refreshProviders({ quiet: true });
   await loadHistory();
   setTimeout(refreshContextUsage, 80);
+  setTimeout(() => refreshBudget(), 100);
   $('conversation-scroll').scrollTop = $('conversation-scroll').scrollHeight;
   closeNarrowSidebar();
 }
@@ -9185,6 +9271,7 @@ function settingsNav() {
   for (const [id, label, icon] of [
     ['general', '通用设置', 'settings'], ['models', '模型与 Provider', 'layers'],
     ['search', '搜索', 'search'],
+    ['budget', '资源预算', 'sliders'],
     ['mcp', 'MCP 服务', 'plugins'],
     ['presets', 'Agent 与技能', 'bot'],
   ]) {
@@ -9197,6 +9284,7 @@ function settingsNav() {
       if (id === 'mcp') openMcpPage();
       else stopMcpPolling();
       if (id === 'search') { searchForm = null; searchSaveNote = null; void refreshSearchSettings(); }
+      if (id === 'budget') { budgetForm = null; budgetSettingsView = null; budgetNote = null; void refreshBudgetSettings(); }
       if (id === 'presets') { agentOptionsForm = null; agentOptionsNote = null; void refreshAgentOptions(); }
       renderSettings();
     });
@@ -9214,6 +9302,7 @@ function renderSettings() {
   if (settingsSection === 'general') renderGeneralSettings(content);
   else if (settingsSection === 'models') renderModelSettings(content);
   else if (settingsSection === 'search') renderSearchSettings(content);
+  else if (settingsSection === 'budget') renderBudgetSettings(content);
   else if (settingsSection === 'mcp') renderMcpSettings(content);
   else renderPresetSettings(content);
   content.scrollTop = sameSection ? priorScroll : 0;
@@ -9402,6 +9491,156 @@ function renderGeneralSettings(content) {
       if (footer.isConnected && current?.session.id === sessionId) runtimeVersion.textContent = ' · Runtime：读取失败';
     });
   }
+}
+
+
+/* ------------------------------------------------------------ budget settings */
+
+let budgetSettingsView = null;
+let budgetForm = null;
+let budgetNote = null;
+
+async function refreshBudgetSettings() {
+  try {
+    budgetSettingsView = await api.budgetSettings();
+    const global = budgetSettingsView.global ?? {};
+    budgetForm = {
+      max_model_tokens: global.max_model_tokens == null ? '' : String(global.max_model_tokens),
+      max_cost_usd: global.max_cost_usd_micros == null ? '' : String(global.max_cost_usd_micros / 1_000_000),
+      max_duration_minutes: global.max_duration_seconds == null ? '' : String(global.max_duration_seconds / 60),
+      soft_limit_percent: global.soft_limit_percent == null ? '' : String(global.soft_limit_percent),
+    };
+  } catch (error) {
+    budgetSettingsView = { error: error.message };
+    budgetForm = null;
+  }
+  if (settingsSection === 'budget') renderSettings();
+}
+
+function budgetScopeText(view, key) {
+  const label = { max_model_tokens: 'Token', max_cost_usd_micros: '费用', max_duration_seconds: '时长', soft_limit_percent: '提醒阈值' }[key];
+  const fmt = value => key === 'max_cost_usd_micros'
+    ? budgetCostText(value)
+    : key === 'max_duration_seconds' ? budgetDurationText((value ?? 0) * 1000)
+      : key === 'soft_limit_percent' ? `${value}%` : budgetTokenText(value);
+  const effective = view.effective?.[key];
+  const global = view.global?.[key];
+  const project = view.project?.[key];
+  const source = project != null ? '项目覆盖' : global != null ? '全局默认' : '未设置';
+  return `${label}：${effective == null ? '未设置（不限制）' : fmt(effective)} · 来源 ${source}`;
+}
+
+function budgetNumberField(key, label, unit, placeholder, step = '1') {
+  const wrap = el('div', 'budget-number');
+  const input = el('input', 'settings-input budget-input');
+  input.type = 'number';
+  input.min = '0';
+  input.step = step;
+  input.value = budgetForm?.[key] ?? '';
+  input.placeholder = placeholder;
+  input.setAttribute('aria-label', label);
+  input.addEventListener('input', () => { if (budgetForm) budgetForm[key] = input.value; });
+  wrap.append(input, el('span', 'budget-unit', unit));
+  return wrap;
+}
+
+function budgetDraftFromForm() {
+  const parse = (key, scale = 1) => {
+    const raw = String(budgetForm?.[key] ?? '').trim();
+    if (!raw) return null;
+    const value = Number(raw);
+    if (!Number.isFinite(value) || value < 0) throw new Error('预算数值必须是非负数或留空');
+    const scaled = Math.round(value * scale);
+    if (!Number.isSafeInteger(scaled) || scaled > 1e12) throw new Error('预算数值过大');
+    return scaled;
+  };
+  const draft = {
+    max_model_tokens: parse('max_model_tokens'),
+    max_cost_usd_micros: parse('max_cost_usd', 1_000_000),
+    max_duration_seconds: parse('max_duration_minutes', 60),
+    soft_limit_percent: parse('soft_limit_percent'),
+  };
+  if (draft.soft_limit_percent != null && (draft.soft_limit_percent < 1 || draft.soft_limit_percent > 100)) {
+    throw new Error('提醒阈值必须在 1 到 100 之间');
+  }
+  return draft;
+}
+
+async function saveBudgetSettings({ reset = false } = {}) {
+  if (!budgetForm) return;
+  try {
+    const draft = reset
+      ? { max_model_tokens: null, max_cost_usd_micros: null, max_duration_seconds: null, soft_limit_percent: null }
+      : budgetDraftFromForm();
+    const result = await api.saveBudget(draft);
+    budgetSettingsView = result;
+    const global = result.global ?? {};
+    budgetForm = {
+      max_model_tokens: global.max_model_tokens == null ? '' : String(global.max_model_tokens),
+      max_cost_usd: global.max_cost_usd_micros == null ? '' : String(global.max_cost_usd_micros / 1_000_000),
+      max_duration_minutes: global.max_duration_seconds == null ? '' : String(global.max_duration_seconds / 60),
+      soft_limit_percent: global.soft_limit_percent == null ? '' : String(global.soft_limit_percent),
+    };
+    budgetNote = {
+      tone: 'success',
+      text: result.runtime_reload
+        ? '已保存。预算在下一回合读取；Runtime 已按你的请求重新加载配置。'
+        : '已保存。预算在下一回合读取；运行时将在下次启动时读取新配置。',
+    };
+    toast('预算设置已保存', { tone: 'success', holdMs: 1800 });
+    refreshBudget();
+  } catch (error) {
+    budgetNote = { tone: 'error', text: error.message };
+  }
+  renderSettings();
+}
+
+function renderBudgetSettings(content) {
+  const intro = el('p', 'settings-note', '目标与长任务资源预算。达到硬限制时 Runtime 在模型调用准入处停止该次运行（Goal 不会结算，可提高上限后继续）；软阈值只提醒，不会停止 Agent。保存后从下一回合开始生效，不会修改正在运行的一回合。');
+  content.append(intro);
+  if (!budgetForm) {
+    if (budgetSettingsView?.error) content.append(el('p', 'settings-note settings-error', `读取预算设置失败：${budgetSettingsView.error}`));
+    else content.append(el('p', 'settings-note', '读取中…'));
+    return;
+  }
+  const view = budgetSettingsView ?? {};
+  const group = el('div', 'settings-group');
+  group.append(el('h3', 'settings-group-title', '全局默认上限（任何项目未覆盖时生效）'));
+  group.append(settingRow('Token 上限', '输入 + 输出 token 总数；留空表示不限制', budgetNumberField('max_model_tokens', 'Token 上限', 'tokens', '不限制')));
+  group.append(settingRow('费用上限', '需要模型配置价格；留空表示不限制', budgetNumberField('max_cost_usd', '费用上限', 'USD', '不限制', '0.000001')));
+  group.append(settingRow('时长上限', '单次运行的累计执行时长；留空表示不限制', budgetNumberField('max_duration_minutes', '时长上限', '分钟', '不限制')));
+  group.append(settingRow('软提醒阈值', '达到上限的该百分比时提醒，不停止运行；留空使用默认 80%', budgetNumberField('soft_limit_percent', '软提醒阈值', '%', '默认 80')));
+  content.append(group);
+
+  const effective = el('div', 'settings-group');
+  effective.append(el('h3', 'settings-group-title', '当前生效值'));
+  for (const key of ['max_model_tokens', 'max_cost_usd_micros', 'max_duration_seconds', 'soft_limit_percent']) {
+    const row = el('div', 'budget-effective-row');
+    row.append(el('span', 'budget-effective-text', budgetScopeText(view, key)));
+    effective.append(row);
+  }
+  if (view.project_invalid) {
+    effective.append(el('p', 'settings-note settings-error', `项目配置无法解析，Runtime 会退回全局默认：${view.project_config_path ?? '.leveler/config.yaml'}`));
+  } else if (view.project_present) {
+    const overridden = ['max_model_tokens', 'max_cost_usd_micros', 'max_duration_seconds', 'soft_limit_percent']
+      .filter(key => view.project?.[key] != null).length;
+    effective.append(el('p', 'settings-note', `当前工作区 ${overridden ? `有 ${overridden} 项项目覆盖（优先于全局）` : '没有项目覆盖'}：${view.project_config_path ?? '.leveler/config.yaml'}。项目覆盖只读展示，直接在项目配置文件中修改。`));
+  } else {
+    effective.append(el('p', 'settings-note', '当前工作区没有 .leveler/config.yaml 的预算覆盖。'));
+  }
+  if (view.global_error) effective.append(el('p', 'settings-note settings-error', `全局配置无法解析：${view.global_error}`));
+  if (budgetNote) effective.append(el('p', `settings-note ${budgetNote.tone === 'error' ? 'settings-error' : 'settings-success'}`, budgetNote.text));
+  content.append(effective);
+
+  const actions = el('div', 'settings-actions');
+  const save = el('button', 'button primary', '保存');
+  save.type = 'button';
+  save.addEventListener('click', () => { void saveBudgetSettings(); });
+  const reset = el('button', 'button secondary', '恢复默认（清除全局上限）');
+  reset.type = 'button';
+  reset.addEventListener('click', () => { void saveBudgetSettings({ reset: true }); });
+  actions.append(save, reset);
+  content.append(actions);
 }
 
 function showShortcuts() {
@@ -12655,6 +12894,7 @@ api.onEvent(frame => {
     render();
     applyConnection({ event: 'connection', state: 'connected', resumed: true });
     reloadHistory();
+    refreshBudget();
     // A reconnect is where a settlement this client missed becomes visible.
     requestReviews();
     refreshTasks();
@@ -12775,6 +13015,7 @@ api.onEvent(frame => {
     liveTurnClosed = false;
     render();
     reloadHistory();
+    refreshBudget();
     // A session's durable review index is read when the session is opened:
     // the replay carries the reviews its notices name, and this list also
     // reaches a row written before that mechanism. Terminal-time history
@@ -12805,6 +13046,14 @@ api.onEvent(frame => {
   }
   if (event.type === 'context_usage') { current = { ...current, contextUsage: event.accounting }; renderContextMeter(); return; }
   if (event.type === 'context_loaded') { current = { ...current, contextUsage: event.accounting ?? current.contextUsage }; renderContextMeter(); return; }
+  if (event.type === 'budget_loaded') {
+    // A query answer, not conversation state. A stale correlation is dropped:
+    // the status belongs to the session/epoch the client is showing now.
+    if (budgetQueryId && event.query_id && event.query_id !== budgetQueryId) return;
+    current = { ...current, budget: event.status ?? null };
+    renderComposerDocks();
+    return;
+  }
   if (event.type.startsWith('sub_agent_')) {
     current = applySubagentEvent(current, event);
     renderHeader();
@@ -12939,7 +13188,8 @@ api.onEvent(frame => {
   }
   if (['approval_requested', 'approval_resolved', 'clarification_requested', 'clarification_resolved', 'definition_trust_requested', 'definition_trust_resolved'].includes(event.type)) renderInteractions();
   if ($('settings-dialog').open && settingsSection === 'presets') renderSettings();
-  if (terminalEvents.has(event.type)) action(async () => { await refreshSnapshot(); await loadHistory(); await refreshTasks(); });
+  if (event.type === 'turn_progress') refreshBudget({ force: false });
+  if (terminalEvents.has(event.type)) action(async () => { await refreshSnapshot(); await loadHistory(); await refreshTasks(); refreshBudget(); });
   if (terminalEvents.has(event.type) && rightbarOpen) renderRightbar();
   if (event.type === 'turn_failed') showError(event.failure?.message || event.error || 'Runtime 执行失败');
 });

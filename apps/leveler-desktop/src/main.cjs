@@ -138,7 +138,7 @@ async function createWindow(){
   await window.loadURL('leveler-desktop://desktop/index.html');
 }
 app.whenReady().then(async()=>{
-  const assets=new Set(['index.html','terminal.mjs','renderer.mjs','state.mjs','presentation.mjs','markdown.mjs','trajectory.mjs','styles.css','command-policy.gen.mjs','icons.mjs','ui.mjs','schedules.mjs','secret-review.mjs','provider-settings.mjs','mcp-settings.mjs','skills-settings.mjs','review.mjs']);
+  const assets=new Set(['index.html','terminal.mjs','renderer.mjs','state.mjs','presentation.mjs','markdown.mjs','trajectory.mjs','styles.css','command-policy.gen.mjs','icons.mjs','ui.mjs','schedules.mjs','secret-review.mjs','provider-settings.mjs','mcp-settings.mjs','skills-settings.mjs','review.mjs','memory-action.mjs']);
   protocol.handle('leveler-desktop',request=>{const url=new URL(request.url);const name=url.pathname.slice(1);if(url.hostname!=='desktop')return new Response('Not found',{status:404});if(name==='packages/conversation-presentation/conversation.mjs')return net.fetch(pathToFileURL(path.join(__dirname,'../../../packages/conversation-presentation/conversation.mjs')).toString());if(name==='node_modules/marked/lib/marked.esm.js')return net.fetch(pathToFileURL(path.join(__dirname,'../node_modules/marked/lib/marked.esm.js')).toString());if(['node_modules/@xterm/xterm/lib/xterm.mjs','node_modules/@xterm/xterm/css/xterm.css','node_modules/@xterm/addon-fit/lib/addon-fit.mjs'].includes(name))return net.fetch(pathToFileURL(path.join(__dirname,'..',name)).toString());if(!assets.has(name))return new Response('Not found',{status:404});return net.fetch(pathToFileURL(path.join(__dirname,name)).toString());});
   session.defaultSession.setPermissionRequestHandler((_contents,_permission,callback)=>callback(false));
   session.defaultSession.setPermissionCheckHandler(()=>false);
@@ -319,6 +319,28 @@ app.whenReady().then(async()=>{
     const levels=['auto','off','minimal','low','medium','high','max'];
     if(request.level!==null&&!levels.includes(request.level))throw new Error('Invalid Thinking setting');
     return bridge.request('thinking_settings_save',{level:request.level});
+  });
+  // Goal resource budget. Main bounds the numeric draft; the host validates
+  // ranges and writes the one locked global `[limits]` table. Project
+  // overrides are read back, never written from here.
+  const budgetNumber=(value,max)=>{
+    if(value===null||value===undefined)return null;
+    if(!Number.isSafeInteger(value)||value<0||value>max)throw new Error('Invalid budget value');
+    return value;
+  };
+  handle('desktop:budget-settings',()=>bridge.request('budget_settings',{}));
+  handle('desktop:budget-save',request=>{
+    if(!request||typeof request!=='object'||Array.isArray(request))throw new Error('Invalid budget settings');
+    const keys=['max_model_tokens','max_cost_usd_micros','max_duration_seconds','soft_limit_percent'];
+    if(Object.keys(request).some(key=>!keys.includes(key)))throw new Error('Invalid budget settings');
+    const draft={
+      max_model_tokens:budgetNumber(request.max_model_tokens,1e12),
+      max_cost_usd_micros:budgetNumber(request.max_cost_usd_micros,1e12),
+      max_duration_seconds:budgetNumber(request.max_duration_seconds,31536000),
+      soft_limit_percent:budgetNumber(request.soft_limit_percent,100),
+    };
+    if(draft.soft_limit_percent!==null&&draft.soft_limit_percent<1)throw new Error('Invalid budget settings');
+    return bridge.request('budget_save',draft);
   });
   // The Agent browser product is an open vocabulary owned by the runtime's
   // BrowserProduct parser; Main bounds it to the four real ids.

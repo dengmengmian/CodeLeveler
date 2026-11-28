@@ -327,7 +327,11 @@ function toolOrder(tool,messages,index){
  * Project one turn's messages and tool rows onto the contract's items.
  * @param {ProjectionMessage[]} messages @param {ExecutionToolRow[]} tools @param {boolean} turnEnded
  */
-export function projectTurn(messages,tools,turnEnded){
+/**
+ * @param {ProjectionMessage[]} messages @param {ExecutionToolRow[]} tools
+ * @param {boolean} turnEnded @param {string|null} [deliveredText]
+ */
+export function projectTurn(messages,tools,turnEnded,deliveredText=null){
  /** @type {Array<{seq:number,message?:ProjectionMessage,tool?:ExecutionToolRow}>} */ const entries=[];
  let start=0;
  for(let i=messages.length-1;i>=0;i-=1){if(messageKind(messages[i])==='user'){start=i;break;}}
@@ -354,9 +358,20 @@ export function projectTurn(messages,tools,turnEnded){
   if(last&&last.kind==='round'&&!startsNewRound(last.round,tool)){last.round.tools.push(tool);}
   else nodes.push({kind:'round',seq:entry.seq,round:{modelStep:tool.modelStep??null,tools:[tool],status:'running',allOk:false,batches:[]}});
  }
+ // Exactly one assistant block is the answer. The runtime's published
+ // delivery names it when available (exact trimmed equality); otherwise the
+ // last block after the final tool is the only candidate. Earlier prose is
+ // narration, never a second final answer.
+ const candidates=nodes.filter(node=>node.kind==='assistant'&&!node.demoted);
+ let finalNode=candidates.length?candidates[candidates.length-1]:null;
+ if(deliveredText!=null){
+  const wanted=String(deliveredText).trim();
+  const named=[...candidates].reverse().find(node=>node.text.trim()===wanted);
+  if(named)finalNode=named;
+ }
  /** @type {any[]} */ const items=[];
  for(const node of nodes){
-  if(node.kind==='assistant'){items.push({seq:node.seq,kind:turnEnded&&!node.demoted?'final_answer':'assistant_text',text:node.text,message:node.message});continue;}
+  if(node.kind==='assistant'){items.push({seq:node.seq,kind:turnEnded&&node===finalNode?'final_answer':'assistant_text',text:node.text,message:node.message});continue;}
   node.round.status=roundStatus(node.round.tools);
   node.round.allOk=node.round.tools.length>0&&node.round.tools.every(/** @param {ExecutionToolRow} row */ row=>contractToolStatus(row.status)==='ok');
   node.round.batches=roundBatches(node.round.tools);
@@ -368,9 +383,9 @@ export function projectTurn(messages,tools,turnEnded){
  * The turn's committed answer, or null when it ended without one.
  * @param {ProjectionMessage[]} messages @param {ExecutionToolRow[]} tools
  */
-export function committedFinalAnswer(messages,tools){
+export function committedFinalAnswer(messages,tools,deliveredText=null){
  let answer=null;
- for(const item of projectTurn(messages,tools,true))if(item.kind==='final_answer')answer=item.text;
+ for(const item of projectTurn(messages,tools,true,deliveredText))if(item.kind==='final_answer')answer=item.text;
  return answer;
 }
 /**
@@ -378,11 +393,11 @@ export function committedFinalAnswer(messages,tools){
  * committed answer reads no_final_answer instead of a green completion.
  * @param {string} type @param {ProjectionMessage[]} messages @param {ExecutionToolRow[]} tools
  */
-export function turnTerminalFromEvent(type,messages,tools){
+export function turnTerminalFromEvent(type,messages,tools,deliveredText=null){
  if(type==='turn_completed'||type==='turn_answered'){
-  return committedFinalAnswer(messages,tools)===null?'no_final_answer':(type==='turn_answered'?'answered':'completed');
+  return committedFinalAnswer(messages,tools,deliveredText)===null?'no_final_answer':(type==='turn_answered'?'answered':'completed');
  }
- if(type==='turn_completed_partially_unverified')return committedFinalAnswer(messages,tools)===null?'no_final_answer':'completed_partially_unverified';
+ if(type==='turn_completed_partially_unverified')return committedFinalAnswer(messages,tools,deliveredText)===null?'no_final_answer':'completed_partially_unverified';
  if(type==='turn_completed_with_warnings')return 'completed_with_warnings';
  if(type==='turn_truncated')return 'truncated';
  if(type==='turn_incomplete')return 'incomplete';
@@ -788,7 +803,7 @@ export function executionStatusLabel(view) {
  * array. Classification (final vs narration, edit vs tools, receipt status)
  * happens here, never in the renderer.
  *
- * @param {{messages?:ProjectionMessage[],tools?:ExecutionToolRow[],thoughts?:any[],reviews?:any[],reasoning?:string,turnTerminals?:any[],turnErrors?:any[],approvals?:any[],streamingMessageId?:string|null,status?:string}} state
+ * @param {{messages?:ProjectionMessage[],tools?:ExecutionToolRow[],thoughts?:any[],reviews?:any[],reasoning?:string,turnTerminals?:any[],turnErrors?:any[],approvals?:any[],streamingMessageId?:string|null,status?:string,deliveryText?:string|null,deliverySeq?:number|null}} state
  */
 export function conversationItems(state) {
   /** @param {{seq?:number}|null|undefined} entry @param {number} index @returns {number} */
@@ -829,7 +844,11 @@ export function conversationItems(state) {
     const terminalRecord = terminals.filter(inSegment).at(-1) ?? null;
     const terminalStatus = terminalRecord?.status ?? null;
     const endedWithAnswer = terminalStatus !== null && terminalStatus !== 'no_final_answer';
-    const projected = projectTurn(turnMessages, turnTools, endedWithAnswer);
+    const segmentDelivery = state.deliveryText != null
+      && typeof state.deliverySeq === 'number'
+      && state.deliverySeq >= segment.start && state.deliverySeq < segment.end
+      ? state.deliveryText : null;
+    const projected = projectTurn(turnMessages, turnTools, endedWithAnswer, segmentDelivery);
     /** @type {ExecutionRoundView[]} */
     const rounds = [];
     for (const item of projected) {

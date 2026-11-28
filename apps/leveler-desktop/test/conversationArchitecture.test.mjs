@@ -410,3 +410,76 @@ test('a snapshot active context is not promoted into the transcript once history
   const empty = mergeRestoredConversation(projectSnapshot({ id: 's', messages: [] }, []), placeholder);
   assert.deepEqual(empty.messages.map(message => message.id), ['snapshot-u', 'snapshot-m']);
 });
+
+test('only the runtime-delivered block is the final answer', () => {
+  // Two assistant blocks after the last tool is a shape a retrying/closeout
+  // model produces. The runtime's DeliveryCommitted names the answer; the
+  // other block is narration, not a second final answer.
+  let s = send(state(), 'user_message_added', { message: { id: 'u1', role: 'user', text: 'q' } });
+  s = assistant(s, 'm2', 'answer');
+  s = assistant(s, 'm3', 'closing note');
+  s = send(s, 'delivery_committed', { text: 'answer' });
+  s = send(s, 'turn_answered');
+  const items = conversationItems(s);
+  const finals = items.filter(item => item.kind === 'final');
+  assert.equal(finals.length, 1, 'the turn has exactly one final answer');
+  assert.equal(finals[0].text, 'answer', 'the runtime named this block, not the last one');
+  assert.ok(items.some(item => item.kind === 'narration' && item.text === 'closing note'),
+    'the closing note stays visible as narration');
+});
+
+test('without a delivery fact the last assistant block is the only final', () => {
+  // Legacy logs and turns whose delivery event was not persisted still must
+  // not present two final answers.
+  let s = send(state(), 'user_message_added', { message: { id: 'u1', role: 'user', text: 'q' } });
+  s = assistant(s, 'm2', 'note');
+  s = assistant(s, 'm3', 'answer');
+  s = send(s, 'turn_answered');
+  const finals = conversationItems(s).filter(item => item.kind === 'final');
+  assert.equal(finals.length, 1);
+  assert.equal(finals[0].text, 'answer');
+});
+
+test('a replayed delivery names the same answer', () => {
+  const replayed = projectSnapshot({ id: 's', messages: [], task_status: 'answered' }, [
+    { event: { type: 'user_message_added', message: { id: 'u1', role: 'user', text: 'q' } } },
+    { event: { type: 'assistant_message_started', message_id: 'm2' } },
+    { event: { type: 'assistant_text_delta', message_id: 'm2', delta: 'note' } },
+    { event: { type: 'assistant_message_started', message_id: 'm3' } },
+    { event: { type: 'assistant_text_delta', message_id: 'm3', delta: 'answer' } },
+    { event: { type: 'delivery_committed', text: 'answer' } },
+    { event: { type: 'turn_answered' } },
+  ]);
+  const finals = conversationItems(replayed).filter(item => item.kind === 'final');
+  assert.equal(finals.length, 1);
+  assert.equal(finals[0].text, 'answer');
+});
+
+test('a terminal-time history reload does not duplicate the turn error', () => {
+  // The live error is keyed by the live seq; the replay re-numbers every event
+  // by log index. Merging by id alone rendered the same failure twice.
+  let live = send(state(), 'user_message_added', { message: { id: 'u1', role: 'user', text: 'q' } });
+  live = assistant(live, 'm1', 'partial answer');
+  live = send(live, 'turn_failed', { error: 'provider exploded' });
+  const replayed = projectSnapshot({ id: 's', messages: [], task_status: 'failed' }, [
+    { event: { type: 'user_message_added', message: { id: 'u1', role: 'user', text: 'q' } } },
+    { event: { type: 'assistant_message_started', message_id: 'm1' } },
+    { event: { type: 'assistant_text_delta', message_id: 'm1', delta: 'partial answer' } },
+    { event: { type: 'assistant_message_completed', message_id: 'm1' } },
+    { event: { type: 'turn_failed', error: 'provider exploded' } },
+  ]);
+  const merged = mergeRestoredConversation(replayed, live);
+  const errors = conversationItems(merged).filter(item => item.kind === 'turn_error');
+  assert.equal(errors.length, 1, 'the same durable failure appears once');
+  assert.equal(errors[0].error.text, 'provider exploded');
+});
+
+test('the same error text in a different turn is a different failure', () => {
+  let s = send(state(), 'user_message_added', { message: { id: 'u1', role: 'user', text: 'q1' } });
+  s = send(s, 'turn_failed', { error: 'provider exploded' });
+  s = send(s, 'user_message_added', { message: { id: 'u2', role: 'user', text: 'q2' } });
+  s = send(s, 'turn_failed', { error: 'provider exploded' });
+  const errors = conversationItems(s).filter(item => item.kind === 'turn_error');
+  assert.equal(errors.length, 2, 'two turns, two failures');
+  assert.deepEqual(errors.map(item => item.error.turn), [1, 2]);
+});

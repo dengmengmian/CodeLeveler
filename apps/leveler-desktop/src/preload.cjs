@@ -49,6 +49,8 @@ contextBridge.exposeInMainWorld('desktop',Object.freeze({
   saveSearch:request=>invoke('desktop:search-save',request),
   thinkingSettings:()=>invoke('desktop:thinking-settings'),
   saveThinkingSettings:request=>invoke('desktop:thinking-settings-save',request),
+  budgetSettings:()=>invoke('desktop:budget-settings'),
+  saveBudget:request=>invoke('desktop:budget-save',request),
   browserSettings:()=>invoke('desktop:browser-settings'),
   saveBrowserSettings:request=>invoke('desktop:browser-settings-save',request),
   reloadRuntime:()=>invoke('desktop:runtime-reload'),

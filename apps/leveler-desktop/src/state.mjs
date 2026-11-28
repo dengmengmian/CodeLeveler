@@ -15,7 +15,7 @@ import {
 } from './presentation.mjs';
 
 export function projectSnapshot(snapshot, history = []) {
-  let state = {session:snapshot, messages:[], reviews:[], nextSeq:0, status:snapshot.task_status ?? snapshot.status ?? 'unknown', tools:[], thoughts:[], reasoning:'', reasoningSuperseded:false, approvals:[], clarifications:[], definitionTrust:[], btw:null, activity:'', activityElapsedMs:null, plan:snapshot.plan??null,diff:snapshot.diff??null,diffError:null,streamingMessageId:null,lastTerminal:null,turnErrors:[],turnTerminals:[],turnStartedAt:null};
+  let state = {session:snapshot, messages:[], reviews:[], nextSeq:0, status:snapshot.task_status ?? snapshot.status ?? 'unknown', tools:[], thoughts:[], reasoning:'', reasoningSuperseded:false, approvals:[], clarifications:[], definitionTrust:[], btw:null, activity:'', activityElapsedMs:null, plan:snapshot.plan??null,diff:snapshot.diff??null,diffError:null,streamingMessageId:null,lastTerminal:null,turnErrors:[],turnTerminals:[],turnStartedAt:null,budget:null,deliveryText:null,deliverySeq:null};
   if (history.length > 0) {
     // The durable log is the conversation; the snapshot's `messages` are the
     // ACTIVE MODEL CONTEXT (`/compact` leaves one summary row there). Replaying
@@ -229,10 +229,20 @@ export function mergeRestoredConversation(restored, live) {
     turnTerminals.push(adopt(terminal));
   }
   const errorIds = new Set(restored.turnErrors.map(error => error.id));
+  const errorKeys = new Set(restored.turnErrors.map(error => `${error.turn ?? ''}\u0000${error.text ?? ''}`));
+  const errorKey = error => `${error.turn ?? ''}\u0000${error.text ?? ''}`;
   const turnErrors = [...restored.turnErrors];
-  for (const error of live.turnErrors ?? []) if (!errorIds.has(error.id)) turnErrors.push(adopt(error));
+  for (const error of live.turnErrors ?? []) {
+    // The replay assigns its own seq-derived id to the same durable failure.
+    // The turn ordinal plus the message text is the stable identity; merging
+    // by id alone rendered the error twice after the terminal reload.
+    if (errorIds.has(error.id) || errorKeys.has(errorKey(error))) continue;
+    turnErrors.push(adopt(error));
+  }
   return {
     ...live,
+    deliveryText: live.deliveryText ?? restored.deliveryText ?? null,
+    deliverySeq: live.deliverySeq ?? restored.deliverySeq ?? null,
     messages,
     tools,
     thoughts,
@@ -269,11 +279,21 @@ export function applyEvent(state,event) {
   if(event.type==='assistant_message_completed'&&state.streamingMessageId===event.message_id)next.streamingMessageId=null;
   if(terminalEvents.has(event.type)||event.type==='assistant_attempt_reset')next.streamingMessageId=null;
   if(event.type==='plan_updated') next.plan=event.plan?{...event.plan,state:'active'}:null;
+  if(event.type==='delivery_committed'){
+    // The runtime names the block that IS the answer, by exact trimmed
+    // equality. Durable: a replay carries the same fact.
+    next.deliveryText=String(event.text??'');
+    next.deliverySeq=event.seq??next.nextSeq;
+  }
   if(event.type==='turn_failed'){
     const text=event.failure?.message||event.error||'Runtime 执行失败';
     const anchor=event.anchor??[...next.messages].reverse().find(message=>message.role==='user')?.id??null;
     const seq=event.seq??next.nextSeq++;
-    next.turnErrors=[...(state.turnErrors??[]),{id:`turn-error-${seq}`,text,anchor,seq}];
+    // A stable turn identity: the count of user messages consumed so far is
+    // the same live and in a replay, so the merge below can recognise the
+    // same error even though the synthetic seq/id differ.
+    const turn=next.messages.filter(message=>message.role==='user').length;
+    next.turnErrors=[...(state.turnErrors??[]),{id:`turn-error-${seq}`,text,anchor,turn,seq}];
   }
   if(event.type==='context_compacted'){
     // The compaction is a durable conversation fact, not only a toast: a
@@ -366,9 +386,9 @@ export function applyEvent(state,event) {
     next.activityElapsedMs = null;
     // The turn's committed answer, recorded on its own message: a frozen turn
     // must not look like it never answered.
-    const answer=committedFinalAnswer(next.messages,next.tools);
+    const answer=committedFinalAnswer(next.messages,next.tools,next.deliveryText);
     if(answer!==null)for(let i=next.messages.length-1;i>=0;i-=1){const message=next.messages[i];if(message.role==='assistant'&&message.text===answer){message.final=true;break;}}
-    const status=turnTerminalFromEvent(event.type,next.messages,next.tools);
+    const status=turnTerminalFromEvent(event.type,next.messages,next.tools,next.deliveryText);
     let detail = event.reason ?? event.error ?? event.failure?.message ?? null;
     if (status === 'completed_partially_unverified') {
       const [first, ...remaining] = event.requirements;

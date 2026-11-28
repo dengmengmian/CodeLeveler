@@ -312,3 +312,13 @@ test('memory commands are session-bound, path-bounded and digest-shaped',()=>{
    {type:'forget_memory',session_id:'s1',query_id:'q1',scope:'global',path:'../a.md',content_hash:hash},
  ])assert.throws(()=>security.validateEnvelope(envelope(bad)),undefined,JSON.stringify(bad));
 });
+
+test('the epoch budget query is session-bound and exact',()=>{
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'query_budget',session_id:'s1',query_id:'q1'})));
+ for(const bad of [
+   {type:'query_budget',session_id:'s1'},
+   {type:'query_budget',session_id:'s1',query_id:' '},
+   {type:'query_budget',session_id:'s2',query_id:'q1'},
+   {type:'query_budget',session_id:'s1',query_id:'q1',extra:1},
+ ])assert.throws(()=>security.validateEnvelope(envelope(bad)),undefined,JSON.stringify(bad));
+});

@@ -3073,3 +3073,16 @@ button.message-image-tile:hover { border-color: var(--border-l3); }
 .composer-card.drop-target .drop-hint { display: flex; }
 .drop-hint-title { color: var(--text-primary); font-size: 13px; font-weight: 500; }
 .drop-hint-detail { color: var(--text-tertiary); font-size: 11px; }
+
+/* ------------------------------------------------ goal budget (R6-A2) */
+.settings-group-title { margin: 18px 0 6px; color: var(--text-primary); font-size: 13px; line-height: 20px; font-weight: 500; }
+.settings-error { color: var(--error); }
+.settings-success { color: var(--text-secondary); }
+.budget-number { display: flex; align-items: center; gap: 6px; }
+.budget-number .budget-input { width: 130px; }
+.budget-unit { color: var(--text-tertiary); font-size: 12px; line-height: 18px; }
+.budget-effective-row { padding: 4px 0; }
+.budget-effective-text { color: var(--text-secondary); font-size: 12px; line-height: 18px; }
+.composer-dock-note { flex: 1; min-width: 0; color: var(--text-tertiary); font-size: 11px; line-height: 16px; white-space: normal; }
+.budget-warning { border-color: color-mix(in srgb, var(--warning, #b58900) 45%, var(--border-l2)); }
+.budget-exhausted { border-color: color-mix(in srgb, var(--error) 45%, var(--border-l2)); }

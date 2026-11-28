@@ -78,6 +78,23 @@ function pureChat(session) {
   assistant('chat-1', '这是纯聊天回答。');
   finish();
 }
+// Two assistant blocks after the last tool, with the runtime naming the real
+// answer. Only the named block may render as final.
+function duplicateAnswer(session) {
+  assistant('dup-1', '这是一句过渡说明。');
+  assistant('dup-2', '这是唯一的最终答案。');
+  record(session, { type: 'delivery_committed', text: '这是唯一的最终答案。' });
+  finish();
+}
+// A failed turn whose terminal triggers the history reload. The replayed
+// failure must merge with the live one.
+function failingTurn(session) {
+  assistant('fail-1', '部分输出后失败。');
+  status = 'failed';
+  record(session, { type: 'turn_failed', error: 'synthetic provider exploded' });
+  sequence += 1;
+  event(sessionId, { type: 'session_updated', session: snapshot() });
+}
 function investigation(session) {
   assistant('inv-1', '我先检查配置和测试。');
   toolStarted('r1', 'read_file', { path: 'src/config.ts' }, 1, 'bookkeeping');
@@ -155,6 +172,8 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
       status = 'running';
       record(session, { type: 'user_message_added', message: { id: `u-${entries.length}`, role: 'user', text } });
       if (text.includes('纯聊天')) pureChat(session);
+      else if (text.includes('重复答案')) duplicateAnswer(session);
+      else if (text.includes('失败重载')) failingTurn(session);
       else if (text.includes('调查')) investigation(session);
       else if (text.includes('审批')) approvalTurn(session);
       else if (text.includes('运行中')) runningTurn(session);
