@@ -43,6 +43,11 @@ pub struct RunLimitsConfig {
     pub max_cost_usd_micros: Option<u64>,
     #[serde(default)]
     pub max_duration_seconds: Option<u64>,
+    /// Soft reminder threshold as a percentage of a configured cap. A
+    /// reminder only: it never stops a run and never invents a cap. Absent
+    /// means the runtime's product default.
+    #[serde(default)]
+    pub soft_limit_percent: Option<u8>,
 }
 
 impl VerifySpec {

@@ -1703,6 +1703,9 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.context.loaded = accounting;
             crate::context::clamp(&mut state.context);
         }
+        // The Desktop's epoch-budget query. The terminal has no budget
+        // surface, so the answer is ignored rather than projected into one.
+        RuntimeEvent::BudgetLoaded { .. } => {}
         RuntimeEvent::UsageLoaded { query_id, report } => {
             // Same correlation as the Context answer: a replay, another
             // client's answer, or an answer to a scope the user already left.

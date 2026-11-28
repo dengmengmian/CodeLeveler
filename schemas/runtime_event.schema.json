@@ -3304,6 +3304,41 @@
       }
     },
     {
+      "description": "Result of [`crate::ClientCommand::QueryBudget`]. The runtime's own accounting for the session's current task epoch, plus the configured caps. `None` means no task epoch has durable progress yet (a new or fully cleared session); it is never a zero spend.",
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "query_id": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiBudgetStatus"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "budget_loaded"
+          ]
+        }
+      }
+    },
+    {
       "description": "Result of [`crate::ClientCommand::QueryMemory`]. Read-only projection of both memory scopes. The file list carries no contents; a page asks for one file at a time with `ReadMemoryFile`.",
       "type": "object",
       "required": [
@@ -8552,6 +8587,41 @@
           }
         },
         {
+          "description": "Result of [`crate::ClientCommand::QueryBudget`]. The runtime's own accounting for the session's current task epoch, plus the configured caps. `None` means no task epoch has durable progress yet (a new or fully cleared session); it is never a zero spend.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "query_id": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CommandId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "status": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/UiBudgetStatus"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "budget_loaded"
+              ]
+            }
+          }
+        },
+        {
           "description": "Result of [`crate::ClientCommand::QueryMemory`]. Read-only projection of both memory scopes. The file list carries no contents; a page asks for one file at a time with `ReadMemoryFile`.",
           "type": "object",
           "required": [
@@ -10339,6 +10409,131 @@
           ]
         }
       ]
+    },
+    "UiBudgetDimension": {
+      "description": "A configurable hard-budget dimension.",
+      "type": "string",
+      "enum": [
+        "model_tokens",
+        "cost",
+        "duration"
+      ]
+    },
+    "UiBudgetLevel": {
+      "description": "How close the current epoch is to a configured hard cap.\n\n`warning` is a reminder only: the run continues. `exhausted` means a hard cap has been reached, so the next admission would stop; the task's own terminal state still decides whether it is still running.",
+      "type": "string",
+      "enum": [
+        "normal",
+        "warning",
+        "exhausted"
+      ]
+    },
+    "UiBudgetLimits": {
+      "description": "The caps that govern a top-level run, in the enforcer's units.",
+      "type": "object",
+      "required": [
+        "soft_limit_percent"
+      ],
+      "properties": {
+        "max_cost_usd_micros": {
+          "description": "Auditable model cost in micro-USD. Requires model pricing.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "max_duration_ms": {
+          "description": "Wall-clock run duration in milliseconds.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "max_model_tokens": {
+          "description": "Provider-reported + estimated model tokens. `None` = no token cap.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "soft_limit_percent": {
+          "description": "The resolved soft reminder percentage (1..=100).",
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0.0
+        }
+      }
+    },
+    "UiBudgetStatus": {
+      "description": "One session's current budget epoch: what the enforcer counted and the caps it counts against.",
+      "type": "object",
+      "required": [
+        "cost_known",
+        "cost_usd_micros",
+        "duration_ms",
+        "estimated_model_tokens",
+        "level",
+        "limits",
+        "model_tokens",
+        "scope"
+      ],
+      "properties": {
+        "cost_known": {
+          "description": "False when at least one attempt had no auditable price.",
+          "type": "boolean"
+        },
+        "cost_usd_micros": {
+          "description": "Known priced spend in micro-USD. A lower bound when `cost_known` is false; never present it as a total in that case.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "dimension": {
+          "description": "The dimension the level was decided by, when any cap exists.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiBudgetDimension"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "duration_ms": {
+          "description": "Accumulated drive duration for this epoch.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "estimated_model_tokens": {
+          "description": "The share of `model_tokens` no provider reported.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "level": {
+          "$ref": "#/definitions/UiBudgetLevel"
+        },
+        "limits": {
+          "$ref": "#/definitions/UiBudgetLimits"
+        },
+        "model_tokens": {
+          "description": "Enforcer-accounted model tokens (reported + estimated).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "scope": {
+          "description": "The budget scope this epoch belongs to: the goal id when the turn is goal-bound, else the root turn id. Opaque to clients.",
+          "type": "string"
+        }
+      }
     },
     "UiCheckpoint": {
       "description": "A conversation restore point (spec §68).\n\nRestoring truncates the transcript back to `ordinal` AND (for a git workspace) rolls the working tree back to the checkpoint's captured tree, including deleting files created after it. Clients must say so before executing it; see the two-step confirmation in the TUI.",

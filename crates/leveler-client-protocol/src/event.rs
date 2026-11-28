@@ -1188,6 +1188,16 @@ pub enum RuntimeEvent {
         query_id: Option<CommandId>,
         report: Box<crate::UiUsageReport>,
     },
+    /// Result of [`crate::ClientCommand::QueryBudget`]. The runtime's own
+    /// accounting for the session's current task epoch, plus the configured
+    /// caps. `None` means no task epoch has durable progress yet (a new or
+    /// fully cleared session); it is never a zero spend.
+    BudgetLoaded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<Box<crate::UiBudgetStatus>>,
+    },
     /// Result of [`crate::ClientCommand::QueryMemory`]. Read-only projection
     /// of both memory scopes. The file list carries no contents; a page asks
     /// for one file at a time with `ReadMemoryFile`.
@@ -1985,6 +1995,36 @@ mod tests {
                 report: Box::new(report.clone()),
             },
             "usage_loaded",
+        );
+        roundtrip(
+            RuntimeEvent::BudgetLoaded {
+                query_id: Some(CommandId::new("q-budget")),
+                status: Some(Box::new(crate::UiBudgetStatus {
+                    scope: "goal-1".into(),
+                    model_tokens: 1_200,
+                    estimated_model_tokens: 200,
+                    cost_usd_micros: 4_200,
+                    cost_known: true,
+                    duration_ms: 90_000,
+                    limits: crate::UiBudgetLimits {
+                        max_model_tokens: Some(2_000),
+                        max_cost_usd_micros: None,
+                        max_duration_ms: Some(600_000),
+                        soft_limit_percent: 80,
+                    },
+                    level: crate::UiBudgetLevel::Warning,
+                    dimension: Some(crate::UiBudgetDimension::ModelTokens),
+                })),
+            },
+            "budget_loaded",
+        );
+        // No epoch is absence, not a zero spend.
+        roundtrip(
+            RuntimeEvent::BudgetLoaded {
+                query_id: None,
+                status: None,
+            },
+            "budget_loaded",
         );
         // The absent reasoning figure survives as absence, not as zero.
         let json = serde_json::to_string(&RuntimeEvent::UsageLoaded {

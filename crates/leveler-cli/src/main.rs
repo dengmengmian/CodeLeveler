@@ -15,6 +15,7 @@ mod completions_cmd;
 mod crash;
 mod desktop_bridge;
 mod desktop_browser;
+mod desktop_budget;
 mod desktop_options;
 mod desktop_provider;
 mod desktop_search;

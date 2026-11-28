@@ -10,6 +10,8 @@ mod active_turns;
 pub mod agent_options;
 pub mod agents;
 pub mod browser_config;
+mod budget;
+pub mod budget_config;
 mod checkpoints;
 mod children;
 mod collaboration;
@@ -1970,6 +1972,34 @@ impl Application {
     }
 
     pub(crate) fn top_level_limits(&self) -> leveler_agent::StepLimits {
+        let mut limits = top_level_limits_from_config(&self.effective_run_limits());
+        // The one place a top-level run's model-step safety ceiling is pinned.
+        // `None` here means "this application pins no ceiling" (the
+        // interactive UI), not "unbounded by accident".
+        limits.max_model_steps = self.model_step_ceiling;
+        limits
+    }
+
+    /// The resource caps in force for a top-level run, without the model-step
+    /// safety ceiling. This is what the budget status shows and what the
+    /// budget gate admits on; the ceiling is a circuit breaker, not a task
+    /// budget.
+    pub(crate) fn top_level_resource_limits(&self) -> leveler_agent::StepLimits {
+        top_level_limits_from_config(&self.effective_run_limits())
+    }
+
+    /// The soft reminder threshold in force, as a percentage of each
+    /// configured cap. It is resolved from the same project/global merge the
+    /// hard caps use; absent everywhere means the product default. A reminder
+    /// never stops a run.
+    pub(crate) fn top_level_soft_limit_percent(&self) -> u8 {
+        self.effective_run_limits()
+            .soft_limit_percent
+            .map(|percent| percent.clamp(1, 100))
+            .unwrap_or(leveler_client_protocol::DEFAULT_SOFT_LIMIT_PERCENT)
+    }
+
+    fn effective_run_limits(&self) -> leveler_project::RunLimitsConfig {
         let project = self.project_config().limits;
         // A project's explicit cap wins; `[limits]` in the global config fills
         // only the dimensions the project left unset. Both absent means no
@@ -1977,13 +2007,7 @@ impl Application {
         let global = crate::global_config::GlobalConfig::load()
             .map(|config| config.limits())
             .unwrap_or_default();
-        let effective = merge_run_limits(&project, global);
-        let mut limits = top_level_limits_from_config(&effective);
-        // The one place a top-level run's model-step safety ceiling is pinned.
-        // `None` here means "this application pins no ceiling" (the
-        // interactive UI), not "unbounded by accident".
-        limits.max_model_steps = self.model_step_ceiling;
-        limits
+        merge_run_limits(&project, global)
     }
 
     /// Connect to the configured MCP servers once and cache their tools.
@@ -2582,6 +2606,7 @@ fn merge_run_limits(
         max_model_tokens: project.max_model_tokens.or(global.max_model_tokens),
         max_cost_usd_micros: project.max_cost_usd_micros.or(global.max_cost_usd_micros),
         max_duration_seconds: project.max_duration_seconds.or(global.max_duration_seconds),
+        soft_limit_percent: project.soft_limit_percent.or(global.soft_limit_percent),
     }
 }
 
@@ -3009,6 +3034,7 @@ mod merge_tests {
             max_model_tokens: Some(200_000),
             max_cost_usd_micros: Some(500_000),
             max_duration_seconds: Some(7200),
+            soft_limit_percent: None,
         });
         assert_eq!(limits.max_model_tokens, Some(200_000));
         assert_eq!(limits.max_cost_usd_micros, Some(500_000));
@@ -3026,11 +3052,13 @@ mod merge_tests {
             max_model_tokens: Some(200_000),
             max_cost_usd_micros: None,
             max_duration_seconds: Some(7200),
+            soft_limit_percent: None,
         };
         let global = crate::global_config::GlobalLimits {
             max_model_tokens: Some(999),
             max_cost_usd_micros: Some(500_000),
             max_duration_seconds: Some(1),
+            soft_limit_percent: Some(90),
         };
         let merged = merge_run_limits(&project, global);
         assert_eq!(merged.max_model_tokens, Some(200_000), "project wins");

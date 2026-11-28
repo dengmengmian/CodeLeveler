@@ -67,6 +67,10 @@ fn validate_command(session: &SessionId, command: &ClientCommand) -> anyhow::Res
             utc_offset_minutes,
             ..
         } if valid_desktop_query_id(query_id) && (-1440..=1440).contains(utc_offset_minutes) => {}
+        // The same epoch-budget projection the runtime computes for any
+        // client: durable spend plus the configured caps. Read-only and
+        // session-scoped.
+        ClientCommand::QueryBudget { query_id, .. } if valid_desktop_query_id(query_id) => {}
         ClientCommand::GetAgent { query_id, name, .. }
             if valid_desktop_query_id(query_id)
                 && leveler_agent::agent_registry::validate_agent_name(name).is_ok() => {}
@@ -1039,6 +1043,14 @@ impl Bridge {
             "thinking_settings" => crate::desktop_thinking::view(&self.home),
             "thinking_settings_save" => {
                 crate::desktop_thinking::save(&self.home, self.client.as_ref(), &params).await
+            }
+            // Goal resource budget: the same global `[limits]` contract the
+            // runtime resolves for a run, with project overrides reported
+            // read-only. A save is in force from the next run.
+            "budget_settings" => crate::desktop_budget::view(self.layout.as_ref()),
+            "budget_save" => {
+                crate::desktop_budget::save(self.layout.as_ref(), self.client.as_ref(), &params)
+                    .await
             }
             "browser_settings" => crate::desktop_browser::view(&self.home),
             "browser_settings_save" => {

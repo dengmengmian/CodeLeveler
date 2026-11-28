@@ -121,6 +121,10 @@ pub struct GlobalLimits {
     pub max_cost_usd_micros: Option<u64>,
     #[serde(default)]
     pub max_duration_seconds: Option<u64>,
+    /// Soft reminder threshold (percentage of each configured cap). A
+    /// reminder only; it never stops a run and never invents a cap.
+    #[serde(default)]
+    pub soft_limit_percent: Option<u8>,
 }
 
 /// The parsed global config.
@@ -2264,6 +2268,7 @@ mod tests {
                 max_model_tokens: Some(200_000),
                 max_cost_usd_micros: Some(500_000),
                 max_duration_seconds: Some(7_200),
+                soft_limit_percent: None,
             }
         );
     }

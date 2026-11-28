@@ -623,6 +623,18 @@ pub enum ClientCommand {
         /// runtime host's. Range is validated by the runtime (`-1440..=1440`).
         utc_offset_minutes: i32,
     },
+    /// Read-only budget status for the session's current task epoch.
+    ///
+    /// Answers with [`crate::RuntimeEvent::BudgetLoaded`]. The figures are
+    /// recomputed from the durable progress ledger on every call, so a
+    /// reconnect or a second client sees the same spend. It never drives a
+    /// model request and nothing on the wire is accumulated.
+    QueryBudget {
+        session_id: SessionId,
+        /// Correlation token for [`crate::RuntimeEvent::BudgetLoaded`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+    },
     /// Read-only memory status: the two scope manifests' counters and the
     /// files a page may list. Answers with [`crate::RuntimeEvent::MemoryLoaded`].
     /// Opens no model turn and mutates nothing.
@@ -661,8 +673,10 @@ pub enum ClientCommand {
         query_id: Option<CommandId>,
         batch: bool,
     },
-    /// Promote observations captured under RecordOnly/Shadow into the
-    /// visible manifest. Idempotent. Answers with
+    /// Drain this session's capture queue now, then run the normal
+    /// promotion/maintenance follow-ups. A failed extraction is reported as a
+    /// failure (never as an empty queue); an already drained queue is a
+    /// success with no new observations. Answers with
     /// [`crate::RuntimeEvent::MemoryActionFinished`].
     FlushMemory {
         session_id: SessionId,
@@ -967,6 +981,7 @@ impl ClientCommand {
             | ClientCommand::DeleteAgent { session_id, .. }
             | ClientCommand::QueryObservability { session_id, .. }
             | ClientCommand::QueryUsage { session_id, .. }
+            | ClientCommand::QueryBudget { session_id, .. }
             | ClientCommand::QueryMemory { session_id, .. }
             | ClientCommand::ReadMemoryFile { session_id, .. }
             | ClientCommand::RememberMemory { session_id, .. }

@@ -38,6 +38,8 @@
 
 mod agents;
 mod approval;
+/// The runtime's resource-budget status for the current task epoch.
+mod budget;
 mod client;
 mod command;
 mod command_envelope;
@@ -76,6 +78,9 @@ pub mod tool_output;
 /// Durable usage reporting: the runtime's own model-call ledger, projected.
 mod usage;
 mod version;
+pub use budget::{
+    DEFAULT_SOFT_LIMIT_PERCENT, UiBudgetDimension, UiBudgetLevel, UiBudgetLimits, UiBudgetStatus,
+};
 pub use terminal::{TerminalOperation, TerminalRequest, TerminalState};
 pub use tool_output::{
     TOOL_OUTPUT_PAGE_DEFAULT_BYTES, TOOL_OUTPUT_PAGE_MAX_BYTES, UiToolOutput, UiToolOutputPart,

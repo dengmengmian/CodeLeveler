@@ -9173,6 +9173,33 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     });
                 Ok(())
             }
+            ClientCommand::QueryBudget {
+                session_id,
+                query_id,
+            } => {
+                // Read-only: durable progress plus the configured caps. It
+                // opens no turn and reaches no provider, so it answers while a
+                // turn runs. `None` means no epoch has durable progress yet.
+                let db = self
+                    .app
+                    .open_database()
+                    .await
+                    .map_err(|e| ClientError::Runtime(e.to_string()))?;
+                let ledger = crate::budget::latest_ledger(&db, &session_id)
+                    .await
+                    .map_err(|error| ClientError::Runtime(error.to_string()))?;
+                let status = ledger.map(|ledger| {
+                    Box::new(crate::budget::status_from_ledger(
+                        &ledger,
+                        &self.app.top_level_resource_limits(),
+                        self.app.top_level_soft_limit_percent(),
+                    ))
+                });
+                let _ = self
+                    .events_for(&session_id)
+                    .send(RuntimeEvent::BudgetLoaded { query_id, status });
+                Ok(())
+            }
             ClientCommand::QueryMemory {
                 session_id,
                 query_id,
