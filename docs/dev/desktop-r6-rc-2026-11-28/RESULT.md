@@ -122,7 +122,7 @@ SQLite WAL/ACL/PowerShell 子进程/MCP stdio/剪贴板图片/输入法/拖放/�
 ## 14. 两平台真实 Dogfood
 
 - macOS 安装版：运行中 Steer、多文件实现、独立 `node --test` 2 passed、`/remember` +
-  `/memory`、重启恢复 4 条消息、config 恢复；全部 PASS。详见 `installed-product-dogfood.md`。
+  `/memory`、重启恢复 7 条消息、config 恢复；全部 PASS。详见 `installed-product-dogfood.md`。
 - Windows：**BLOCKED**。
 - 安装版未逐项重跑 MCP/Skills/Review/Plan/Goal/图片/Diff/搜索/定时任务；不得宣称完整 D2。
 
