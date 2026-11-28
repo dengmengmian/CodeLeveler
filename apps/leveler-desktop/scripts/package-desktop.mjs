@@ -18,7 +18,7 @@ import {
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import packager from '@electron/packager';
+import { packager } from '@electron/packager';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '../../..');
@@ -44,6 +44,7 @@ if (!existsSync(binary)) throw new Error(`release runtime missing: ${binary}`);
 const runtimeVersion = run(binary, ['--version']);
 const runtimeHash = sha(binary);
 const runtimeDirty = runtimeVersion.includes('UNTRUSTED');
+const adhocSign = args.includes('--adhoc');
 
 rmSync(out, { recursive: true, force: true });
 mkdirSync(out, { recursive: true });
@@ -78,14 +79,14 @@ if (existsSync(path.join(path.dirname(binary), 'leveler-confine.exe'))) {
 }
 
 // ── Electron bundle ─────────────────────────────────────────────────────────
-const [appPath] = await packager({
+await packager({
   dir: DESKTOP,
   out,
   name: 'CodeLeveler',
   appBundleId: 'com.codeleveler.desktop',
   appVersion: version,
   buildVersion: version,
-  icon,
+  icon: icon.replace(/\.icns$/, ''),
   platform: 'darwin',
   arch: process.arch === 'arm64' ? 'arm64' : 'x64',
   overwrite: true,
@@ -101,6 +102,19 @@ const [appPath] = await packager({
     /^\/eslint\.config\.mjs$/,
   ],
 });
+const appPath = (() => {
+  const stack = [{ dir: out, depth: 0 }];
+  while (stack.length) {
+    const { dir, depth } = stack.shift();
+    if (depth > 3) continue;
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory() && entry.name.endsWith('.app')) return full;
+      if (entry.isDirectory()) stack.push({ dir: full, depth: depth + 1 });
+    }
+  }
+  return null;
+})();
 if (!appPath || !existsSync(appPath)) throw new Error('packager did not produce an .app');
 
 // The renderer and protocol handler resolve this sibling from
@@ -113,7 +127,12 @@ cpSync(
   { recursive: true },
 );
 
+// Packager's icon handling is not reliable for a path whose basename already
+// carries .icns. Place the generated icon explicitly and point Info.plist at
+// it; this happens before signing.
 const resources = path.join(appPath, 'Contents/Resources');
+copyFileSync(icon, path.join(resources, 'CodeLeveler.icns'));
+run('plutil', ['-replace', 'CFBundleIconFile', '-string', 'CodeLeveler.icns', path.join(appPath, 'Contents/Info.plist')]);
 const bundledRuntime = path.join(resources, 'runtime/leveler');
 const checks = {
   runtime_present: existsSync(bundledRuntime),
@@ -135,14 +154,30 @@ if (checks.info_version !== version) {
   throw new Error(`bundle version ${checks.info_version} != requested ${version}`);
 }
 
-// Signing state is reported, never guessed. `codesign -dv` fails for an
-// unsigned bundle; a self-signed/ad-hoc identity is not a Developer ID.
-let signing = { status: 'UNSIGNED', detail: 'no Developer ID identity available' };
-try {
-  const detail = run('codesign', ['-dv', '--verbose=4', appPath], { stdio: ['ignore', 'pipe', 'pipe'] });
-  signing = { status: 'SIGNED_UNVERIFIED', detail };
-} catch (error) {
-  signing = { status: 'UNSIGNED', detail: String(error.stderr || error.message).trim() };
+// Signing state is reported, never guessed. A Developer ID signature requires
+// a real identity and notarization; this script can only produce an ad-hoc
+// local signature for a testable RC, and says so explicitly.
+let signing;
+if (adhocSign) {
+  try {
+    run('codesign', ['--force', '--deep', '--sign', '-', appPath], { stdio: ['ignore', 'pipe', 'pipe'] });
+    run('codesign', ['--verify', '--deep', '--strict', appPath], { stdio: ['ignore', 'pipe', 'pipe'] });
+    signing = {
+      status: 'AD_HOC',
+      developer_id: false,
+      notarized: false,
+      detail: 'local ad-hoc signature for testing only; not a Developer ID and not notarized',
+    };
+  } catch (error) {
+    signing = { status: 'AD_HOC_FAILED', developer_id: false, notarized: false, detail: String(error.stderr || error.message).trim() };
+  }
+} else {
+  try {
+    const detail = run('codesign', ['-dv', '--verbose=4', appPath], { stdio: ['ignore', 'pipe', 'pipe'] });
+    signing = { status: 'SIGNED_UNVERIFIED', developer_id: false, notarized: false, detail };
+  } catch (error) {
+    signing = { status: 'UNSIGNED', developer_id: false, notarized: false, detail: String(error.stderr || error.message).trim() };
+  }
 }
 let gatekeeper = { status: 'NOT_ASSESSED' };
 try {
