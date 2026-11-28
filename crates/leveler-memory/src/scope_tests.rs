@@ -778,3 +778,121 @@ fn regeneration_atomically_replaces_existing_manifest() {
     assert!(manifest.content.contains("Fact"));
     assert!(manifest.content.contains('�'));
 }
+
+/// Two workspaces under one memory root share the global scope but own
+/// disjoint workspace scopes. A topic written for A must never be listed or
+/// readable from B, while a global note is visible to both.
+#[test]
+fn two_workspaces_share_global_but_not_workspace_memory() {
+    // A durable workspace: the system temp directory is deliberately treated
+    // as ephemeral and gets no workspace scope. Keep the fixture under the
+    // workspace build directory instead.
+    let target_tmp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/tmp-memory-scope-tests");
+    std::fs::create_dir_all(&target_tmp).unwrap();
+    let temp = tempfile::Builder::new()
+        .prefix("scope-isolation-")
+        .tempdir_in(&target_tmp)
+        .unwrap();
+    let root = temp.path().join("memory");
+    let ws_a = temp.path().join("ws-a");
+    let ws_b = temp.path().join("ws-b");
+    std::fs::create_dir_all(&ws_a).unwrap();
+    std::fs::create_dir_all(&ws_b).unwrap();
+    // Distinct remotes make distinct workspace identities. Without one, git
+    // would report the repository that ENCLOSES this build directory for both.
+    for (dir, url) in [
+        (&ws_a, "https://github.com/org-a/repo.git"),
+        (&ws_b, "https://github.com/org-b/repo.git"),
+    ] {
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .arg(dir)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .current_dir(dir)
+                .args(["remote", "add", "origin", url])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let a = crate::MemoryStorage::for_workspace(&ws_a, &root);
+    let b = crate::MemoryStorage::for_workspace(&ws_b, &root);
+    assert_ne!(a.workspace_dir(), b.workspace_dir());
+    assert_eq!(a.global_dir(), b.global_dir());
+    a.ensure_initialized().unwrap();
+    b.ensure_initialized().unwrap();
+
+    std::fs::write(
+        a.workspace_dir().join("topics/private-a.md"),
+        "# A\nOnly workspace A knows this.",
+    )
+    .unwrap();
+    regenerate_scope_manifest(
+        a.workspace_dir(),
+        MemoryScope::Workspace,
+        ManifestBudget::compact(),
+    )
+    .unwrap();
+    let a_manifest = std::fs::read_to_string(a.workspace_dir().join("MEMORY.md")).unwrap();
+    assert!(a_manifest.contains("topics/private-a.md"));
+    let b_manifest = std::fs::read_to_string(b.workspace_dir().join("MEMORY.md")).unwrap();
+    assert!(
+        !b_manifest.contains("private-a"),
+        "workspace B must not list workspace A's topic: {b_manifest}"
+    );
+    assert!(!b.workspace_dir().join("topics/private-a.md").exists());
+
+    // The global scope is one store; a note published there is visible from
+    // either workspace's storage handle.
+    std::fs::write(
+        a.global_dir().join("topics/global-note.md"),
+        "# Global\nShared by every workspace.",
+    )
+    .unwrap();
+    regenerate_scope_manifest(
+        a.global_dir(),
+        MemoryScope::Global,
+        ManifestBudget::compact(),
+    )
+    .unwrap();
+    let global_from_b = std::fs::read_to_string(b.global_dir().join("MEMORY.md")).unwrap();
+    assert!(global_from_b.contains("topics/global-note.md"));
+}
+
+/// Same repo name under two different remotes is two workspace identities;
+/// the normalized remote (not the directory name) is what separates them.
+#[test]
+fn two_remotes_with_the_same_repo_name_get_distinct_workspace_names() {
+    let git = |dir: &std::path::Path, url: &str| {
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .arg(dir)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .current_dir(dir)
+                .args(["remote", "add", "origin", url])
+                .status()
+                .unwrap()
+                .success()
+        );
+    };
+    let a = TempDir::new().unwrap();
+    let b = TempDir::new().unwrap();
+    git(a.path(), "https://github.com/org-a/repo.git");
+    git(b.path(), "https://github.com/org-b/repo.git");
+    let name_a = crate::storage::workspace_dir_name(a.path());
+    let name_b = crate::storage::workspace_dir_name(b.path());
+    assert_ne!(name_a, name_b, "different remotes are different workspaces");
+}

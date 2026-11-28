@@ -983,7 +983,7 @@ async fn an_automatic_dream_runs_when_the_oldest_pending_observation_is_old() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_capture_provider_failure_is_retried_and_never_breaks_the_turn() {
+async fn a_capture_provider_failure_keeps_the_job_retryable_and_never_breaks_the_turn() {
     let harness = harness(vec![
         text_response("the answer stands"),
         MockResponse::Status {
@@ -994,35 +994,37 @@ async fn a_capture_provider_failure_is_retried_and_never_breaks_the_turn() {
     ])
     .await;
     let _ = harness.submit("answer anyway").await;
-    // The first extraction fails and the same job is retried; wait for the
-    // settled range instead of treating the intermediate failure as final.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    loop {
-        let activity = harness.app.memory().activity(harness.session.as_str());
-        if activity.last_captured_range.is_some() && !activity.active {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "capture never settled after the retry: {activity:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    // The first extraction fails; the turn itself settled and the failure is
+    // visible. One provider outage must not consume the whole bounded retry
+    // budget inside a single pass: the job stays retryable for the next
+    // trigger.
+    let state = wait_for_capture_failure(&harness).await;
+    assert!(
+        state.last_error.is_some(),
+        "the provider failure stays durable on the job: {state:?}"
+    );
+    assert!(
+        harness.inbox_notes().is_empty(),
+        "a failed extraction stores no observation"
+    );
+    // The next explicit trigger retries the same job and settles it once.
+    let flush = harness
+        .action(ClientCommand::FlushMemory {
+            session_id: harness.session.clone(),
+            query_id: None,
+        })
+        .await;
+    assert!(flush.ok, "{flush:?}");
     let bodies = harness.capture_bodies().await;
     assert_eq!(
         bodies.len(),
         2,
-        "the failed extraction was retried once: {}",
+        "the failed extraction was retried exactly once: {}",
         bodies.len()
     );
     assert!(
         harness.inbox_notes().is_empty(),
         "the retry settled on a no-op, not a fabricated observation"
-    );
-    let activity = harness.app.memory().activity(harness.session.as_str());
-    assert!(
-        activity.last_error.is_some(),
-        "the provider failure stays visible in the activity: {activity:?}"
     );
 }
 
@@ -2186,4 +2188,571 @@ async fn normal_quits_do_not_exhaust_the_capture_retry_budget() {
     );
     let notes = harness.inbox_notes();
     assert_eq!(notes.len(), 1, "exactly one observation, not a duplicate");
+}
+
+// ---------------------------------------------------------------------------
+// A4: `/flush` owns a real, non-empty queue.
+// ---------------------------------------------------------------------------
+
+/// The session's durable capture queue state. The worker's activity is a
+/// transient projection; a test that is about to claim the worker slot must
+/// read the queue itself.
+async fn capture_work_state(harness: &Harness) -> leveler_memory::CaptureWorkState {
+    let dir = harness.workspace_memory();
+    let session = harness.session.as_str().to_owned();
+    tokio::task::spawn_blocking(move || {
+        let store =
+            CaptureStore::open(&dir, MemoryScope::Workspace).map_err(|error| error.to_string())?;
+        store
+            .work_state(&session, u32::MAX)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .unwrap()
+    .unwrap()
+}
+
+/// Wait until the worker has settled one failed job and released the slot.
+async fn wait_for_capture_failure(harness: &Harness) -> leveler_memory::CaptureWorkState {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let state = capture_work_state(harness).await;
+        if state.failed >= 1 && state.running == 0 && state.pending == 0 {
+            return state;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the failed capture job never settled: {state:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A failed automatic capture leaves the range retryable. `/flush` then owns a
+/// genuinely non-empty queue: it claims the failed job, calls the provider and
+/// commits the observation — it is not reporting an already-drained queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_non_empty_flush_drains_the_retryable_queue_exactly_once() {
+    let harness = harness(vec![
+        text_response("first answer"),
+        MockResponse::Status {
+            code: 400,
+            body: r#"{"error":{"message":"capture upstream rejected the request"}}"#.to_owned(),
+        },
+        capture_response(observation("The fixture verifies with cargo test.")),
+    ])
+    .await;
+    harness.submit("first turn").await;
+    wait_for_capture_failure(&harness).await;
+    assert!(
+        harness.inbox_notes().is_empty(),
+        "the failed automatic attempt stored nothing"
+    );
+
+    let flush = harness
+        .action(ClientCommand::FlushMemory {
+            session_id: harness.session.clone(),
+            query_id: None,
+        })
+        .await;
+    assert!(flush.ok, "{flush:?}");
+    assert!(
+        flush.message.contains("Captured the settled turns waiting"),
+        "flush reports that it drained the queue: {flush:?}"
+    );
+    let notes = harness.inbox_notes();
+    assert_eq!(
+        notes.len(),
+        1,
+        "the non-empty flush stored exactly one observation"
+    );
+
+    // A second flush has nothing left. It must not duplicate the observation.
+    let again = harness
+        .action(ClientCommand::FlushMemory {
+            session_id: harness.session.clone(),
+            query_id: None,
+        })
+        .await;
+    assert!(again.ok, "{again:?}");
+    assert!(
+        again.message.contains("drained"),
+        "a drained queue is reported honestly: {again:?}"
+    );
+    assert_eq!(harness.inbox_notes().len(), 1);
+    assert_eq!(
+        harness.capture_bodies().await.len(),
+        2,
+        "exactly one failed attempt and one flush attempt reached the provider"
+    );
+}
+
+/// A queue that cannot be drained is a failure, never a success message. Once
+/// the retry budget is exhausted, later flushes must still report the durable
+/// terminal failure instead of "queue drained".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_undrainable_queue_is_reported_instead_of_drained() {
+    let failure = || MockResponse::Status {
+        code: 400,
+        body: r#"{"error":{"message":"capture upstream rejected the request"}}"#.to_owned(),
+    };
+    let harness = harness(vec![
+        text_response("first answer"),
+        failure(),
+        failure(),
+        failure(),
+    ])
+    .await;
+    harness.submit("first turn").await;
+    wait_for_capture_failure(&harness).await;
+
+    for attempt in 1..=2 {
+        let flush = harness
+            .action(ClientCommand::FlushMemory {
+                session_id: harness.session.clone(),
+                query_id: None,
+            })
+            .await;
+        assert!(
+            !flush.ok,
+            "flush attempt {attempt} reports the real failure: {flush:?}"
+        );
+        assert!(
+            flush
+                .message
+                .contains("capture upstream rejected the request"),
+            "flush attempt {attempt} names the provider failure: {flush:?}"
+        );
+        assert!(
+            !flush.message.contains("drained"),
+            "a failed drain is never called drained: {flush:?}"
+        );
+    }
+    // The retry budget is now exhausted. A later flush finds no claimable job
+    // but the durable terminal failure still owns the turn's memory.
+    let terminal = harness
+        .action(ClientCommand::FlushMemory {
+            session_id: harness.session.clone(),
+            query_id: None,
+        })
+        .await;
+    assert!(
+        !terminal.ok,
+        "a terminally failed queue is not success: {terminal:?}"
+    );
+    assert!(
+        terminal
+            .message
+            .contains("capture upstream rejected the request"),
+        "the terminal failure keeps its real reason: {terminal:?}"
+    );
+    assert!(
+        terminal.message.contains("failed"),
+        "the message says the flush failed: {terminal:?}"
+    );
+    assert!(harness.inbox_notes().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// A4: two clients over one store — concurrent writes, races and reads.
+// ---------------------------------------------------------------------------
+
+/// Send one memory management command and wait for the answer that carries
+/// THIS query id. Two concurrent actions must not consume each other's result.
+async fn correlated_action(
+    client: &Arc<InProcessRuntimeClient>,
+    command: ClientCommand,
+    query_id: leveler_core::CommandId,
+) -> UiMemoryActionResult {
+    let mut rx = client.subscribe();
+    client.send(command).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(left, rx.recv()).await {
+            Ok(Ok(RuntimeEvent::MemoryActionFinished {
+                query_id: answered,
+                result,
+            })) if answered.as_ref() == Some(&query_id) => return result,
+            Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+            Ok(Err(_)) => panic!("memory action stream closed"),
+            Err(_) => panic!("memory action {query_id:?} never finished"),
+        }
+    }
+}
+
+async fn correlated_status(
+    client: &Arc<InProcessRuntimeClient>,
+    session: &SessionId,
+    query_id: leveler_core::CommandId,
+) -> leveler_client_protocol::UiMemoryStatus {
+    let mut rx = client.subscribe();
+    client
+        .send(ClientCommand::QueryMemory {
+            session_id: session.clone(),
+            query_id: Some(query_id.clone()),
+        })
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(left, rx.recv()).await {
+            Ok(Ok(RuntimeEvent::MemoryLoaded {
+                query_id: answered,
+                status,
+            })) if answered.as_ref() == Some(&query_id) => return *status,
+            Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+            Ok(Err(_)) => panic!("memory status stream closed"),
+            Err(_) => panic!("memory status {query_id:?} never arrived"),
+        }
+    }
+}
+
+async fn correlated_file(
+    client: &Arc<InProcessRuntimeClient>,
+    session: &SessionId,
+    scope: &str,
+    path: &str,
+    query_id: leveler_core::CommandId,
+) -> leveler_client_protocol::UiMemoryFileContent {
+    let mut rx = client.subscribe();
+    client
+        .send(ClientCommand::ReadMemoryFile {
+            session_id: session.clone(),
+            query_id: Some(query_id.clone()),
+            scope: scope.to_owned(),
+            path: path.to_owned(),
+        })
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(left, rx.recv()).await {
+            Ok(Ok(RuntimeEvent::MemoryFileLoaded {
+                query_id: answered,
+                file,
+            })) if answered.as_ref() == Some(&query_id) => return file,
+            Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+            Ok(Err(_)) => panic!("memory file stream closed"),
+            Err(_) => panic!("memory file {query_id:?} never arrived"),
+        }
+    }
+}
+
+/// Two sessions write a global note at the same time. Neither may overwrite
+/// the other, and both must be readable from the same store afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_remember_from_two_sessions_keeps_both_notes() {
+    let harness = harness(vec![]).await;
+    let second = harness
+        .app
+        .create_session(&harness.models[0], "second session")
+        .await
+        .unwrap();
+    let q1 = leveler_core::CommandId::generate();
+    let q2 = leveler_core::CommandId::generate();
+    let (first, other) = tokio::join!(
+        correlated_action(
+            &harness.client,
+            ClientCommand::RememberMemory {
+                session_id: harness.session.clone(),
+                query_id: Some(q1.clone()),
+                content: "alpha: the team ships on Fridays.".into(),
+            },
+            q1,
+        ),
+        correlated_action(
+            &harness.client,
+            ClientCommand::RememberMemory {
+                session_id: second,
+                query_id: Some(q2.clone()),
+                content: "beta: the fixture uses pnpm.".into(),
+            },
+            q2,
+        ),
+    );
+    assert!(first.ok, "first remember: {first:?}");
+    assert!(other.ok, "second remember: {other:?}");
+
+    let global = harness.memory_storage().global_dir().to_path_buf();
+    let notes: Vec<_> = std::fs::read_dir(global.join("observations/_inbox"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(notes.len(), 2, "two distinct notes, no overwrite");
+    let mut texts: Vec<String> = notes
+        .iter()
+        .map(|path| std::fs::read_to_string(path).unwrap())
+        .collect();
+    texts.sort();
+    assert!(
+        texts
+            .iter()
+            .any(|text| text.contains("alpha: the team ships on Fridays."))
+    );
+    assert!(
+        texts
+            .iter()
+            .any(|text| text.contains("beta: the fixture uses pnpm."))
+    );
+}
+
+/// Two concurrent Dream runs over one non-empty workspace inbox: at most one
+/// consolidation runs, and the observation is archived once, not twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_dreams_consolidate_one_observation_once() {
+    let harness = harness(vec![]).await;
+    let evidence = seed_observation(
+        &harness,
+        "race-seed",
+        CaptureRange::try_new(1, 1).unwrap(),
+        "The fixture builds with `just build`.",
+        leveler_core::now().timestamp(),
+    );
+    harness
+        .server()
+        .push(dream_response(serde_json::json!({"operations": [{
+            "op": "create",
+            "path": "topics/build.md",
+            "content": "# Build\nHow the fixture is built.\n\n## Commands\n- Run `just build`.",
+            "evidence": [evidence]
+        }]})))
+        .await;
+    let second = harness
+        .app
+        .create_session(&harness.models[0], "second session")
+        .await
+        .unwrap();
+    let q1 = leveler_core::CommandId::generate();
+    let q2 = leveler_core::CommandId::generate();
+    let (first, other) = tokio::join!(
+        correlated_action(
+            &harness.client,
+            ClientCommand::RunMemoryDream {
+                session_id: harness.session.clone(),
+                query_id: Some(q1.clone()),
+                batch: false,
+            },
+            q1,
+        ),
+        correlated_action(
+            &harness.client,
+            ClientCommand::RunMemoryDream {
+                session_id: second,
+                query_id: Some(q2.clone()),
+                batch: false,
+            },
+            q2,
+        ),
+    );
+    assert!(
+        first.ok || other.ok,
+        "one Dream must be able to run: {first:?} / {other:?}"
+    );
+    let dream_calls = harness
+        .server()
+        .request_bodies()
+        .await
+        .iter()
+        .filter(|body| body.contains("record_memory_plan"))
+        .count();
+    assert!(
+        dream_calls <= 1,
+        "a concurrent Dream never runs a second consolidation: {dream_calls}"
+    );
+    let topic = harness.workspace_memory().join("topics/build.md");
+    let rendered = std::fs::read_to_string(&topic).expect("the Dream created the topic once");
+    assert!(rendered.contains("just build"));
+    assert!(
+        harness.inbox_notes().is_empty(),
+        "the observation was archived exactly once"
+    );
+}
+
+/// The preview hash is the safety boundary: a file changed after the user saw
+/// it is refused, and a concurrent second forget cannot delete it twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forget_refuses_changed_evidence_and_a_second_concurrent_forget() {
+    let harness = harness(vec![]).await;
+    seed_topic(
+        &harness,
+        "topics/preferences.md",
+        "# Preferences\n- Use pnpm, not npm.\n",
+    );
+    let read = correlated_file(
+        &harness.client,
+        &harness.session,
+        "workspace",
+        "topics/preferences.md",
+        leveler_core::CommandId::generate(),
+    )
+    .await;
+    assert!(!read.truncated, "a full preview carries the binding hash");
+    // Another writer changes the bytes after the preview.
+    std::fs::write(
+        harness.workspace_memory().join("topics/preferences.md"),
+        "# Preferences\n- Use npm.\n",
+    )
+    .unwrap();
+    let stale_id = leveler_core::CommandId::generate();
+    let stale = correlated_action(
+        &harness.client,
+        ClientCommand::ForgetMemory {
+            session_id: harness.session.clone(),
+            query_id: Some(stale_id.clone()),
+            scope: "workspace".into(),
+            path: "topics/preferences.md".into(),
+            content_hash: read.content_hash.clone(),
+        },
+        stale_id,
+    )
+    .await;
+    // The correlated helper is given a fresh id by this call; re-read the
+    // answer through the same shape instead of trusting the first attempt.
+    assert!(!stale.ok, "changed evidence is refused: {stale:?}");
+    assert!(stale.message.contains("forget refused"), "{stale:?}");
+    let kept = std::fs::read_to_string(harness.workspace_memory().join("topics/preferences.md"))
+        .expect("the changed file was not deleted");
+    assert!(kept.contains("Use npm."));
+
+    // A fresh preview now matches the current bytes; two concurrent forgets
+    // with that hash delete the file exactly once and the loser is refused.
+    let current = correlated_file(
+        &harness.client,
+        &harness.session,
+        "workspace",
+        "topics/preferences.md",
+        leveler_core::CommandId::generate(),
+    )
+    .await;
+    let q1 = leveler_core::CommandId::generate();
+    let q2 = leveler_core::CommandId::generate();
+    let (first, other) = tokio::join!(
+        correlated_action(
+            &harness.client,
+            ClientCommand::ForgetMemory {
+                session_id: harness.session.clone(),
+                query_id: Some(q1.clone()),
+                scope: "workspace".into(),
+                path: "topics/preferences.md".into(),
+                content_hash: current.content_hash.clone(),
+            },
+            q1,
+        ),
+        correlated_action(
+            &harness.client,
+            ClientCommand::ForgetMemory {
+                session_id: harness.session.clone(),
+                query_id: Some(q2.clone()),
+                scope: "workspace".into(),
+                path: "topics/preferences.md".into(),
+                content_hash: current.content_hash.clone(),
+            },
+            q2,
+        ),
+    );
+    assert!(
+        first.ok || other.ok,
+        "at least one forget settles: {first:?} / {other:?}"
+    );
+    // The losing operation is idempotent: it either observes the tombstone
+    // ("already been forgotten") or is refused for evidence that no longer
+    // matches. Either way it never reports a second deletion.
+    for outcome in [&first, &other] {
+        assert!(!outcome.message.contains("failed"), "{outcome:?}");
+    }
+    assert!(
+        !harness
+            .workspace_memory()
+            .join("topics/preferences.md")
+            .exists(),
+        "the forgotten file is gone"
+    );
+}
+
+/// A Dream holding the consolidation lease refuses a concurrent forget; the
+/// target file stays. This is the product-level dream/forget race.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forget_is_refused_while_a_dream_holds_the_lease() {
+    let harness = harness(vec![MockResponse::NeverResponds]).await;
+    seed_topic(
+        &harness,
+        "topics/preferences.md",
+        "# Preferences\n- Use pnpm.\n",
+    );
+    let evidence = seed_observation(
+        &harness,
+        "dream-race",
+        CaptureRange::try_new(1, 1).unwrap(),
+        "The fixture uses pnpm.",
+        leveler_core::now().timestamp(),
+    );
+    let _ = evidence;
+    let read = correlated_file(
+        &harness.client,
+        &harness.session,
+        "workspace",
+        "topics/preferences.md",
+        leveler_core::CommandId::generate(),
+    )
+    .await;
+
+    // Start the Dream and let it claim the store lease; its model call never
+    // answers, which is exactly the overlap window under test.
+    let dream_rx = harness.client.subscribe();
+    harness
+        .client
+        .send(ClientCommand::RunMemoryDream {
+            session_id: harness.session.clone(),
+            query_id: Some(leveler_core::CommandId::generate()),
+            batch: false,
+        })
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let status = correlated_status(
+            &harness.client,
+            &harness.session,
+            leveler_core::CommandId::generate(),
+        )
+        .await;
+        if status.workspace.dream_lease == "active" {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the Dream never claimed its lease: {}",
+            status.workspace.dream_lease
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let refused_id = leveler_core::CommandId::generate();
+    let refused = correlated_action(
+        &harness.client,
+        ClientCommand::ForgetMemory {
+            session_id: harness.session.clone(),
+            query_id: Some(refused_id.clone()),
+            scope: "workspace".into(),
+            path: "topics/preferences.md".into(),
+            content_hash: read.content_hash.clone(),
+        },
+        refused_id,
+    )
+    .await;
+    assert!(!refused.ok, "{refused:?}");
+    assert!(
+        refused.message.contains("active Dream lease"),
+        "{refused:?}"
+    );
+    assert!(
+        harness
+            .workspace_memory()
+            .join("topics/preferences.md")
+            .exists(),
+        "the race must not delete a file under consolidation"
+    );
+    drop(dream_rx); // the never-answering Dream dies with the test harness
 }

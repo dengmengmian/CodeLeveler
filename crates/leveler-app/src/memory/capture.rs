@@ -291,6 +291,14 @@ impl MemoryRuntime {
         model: ModelRef,
         config: Arc<ConfigManager>,
     ) {
+        // TEST-ONLY, debug builds: hold the automatic worker so a real runtime
+        // can be driven to `/flush` a genuinely non-empty queue. The queue is
+        // still produced by a real settled turn; only its automatic drain is
+        // paused. A release build ignores this variable entirely.
+        #[cfg(debug_assertions)]
+        if std::env::var_os("LEVELER_MEMORY_TEST_PAUSE_CAPTURE_KICK").is_some() {
+            return;
+        }
         let key = session_id.as_str().to_owned();
         let Some(cancel) = self.try_begin_capture_worker(&key) else {
             // A running worker claims newly queued jobs before it exits.
@@ -298,9 +306,10 @@ impl MemoryRuntime {
         };
         let runtime = self.clone();
         tokio::spawn(async move {
-            let produced =
+            let report =
                 run_capture_worker(&runtime, &config, &db, &session_id, &model, cancel.clone())
                     .await;
+            let produced = report.produced;
             runtime.finish_capture_worker(&key);
             // A pause or global disable that landed while this job was in
             // flight must not start another automatic model call. The job
@@ -341,14 +350,30 @@ impl MemoryRuntime {
             self.finish_capture_worker(&key);
             return FlushOutcome::Failed(error);
         }
-        let produced =
-            run_capture_worker(self, config, db, session_id, model, cancel.clone()).await;
+        let report = run_capture_worker(self, config, db, session_id, model, cancel.clone()).await;
         self.finish_capture_worker(&key);
         if !cancel.is_cancelled() && self.config_for(Some(session_id.as_str())).can_capture() {
-            self.run_capture_followups(config, db, session_id, model, produced)
+            self.run_capture_followups(config, db, session_id, model, report.produced)
                 .await;
         }
-        FlushOutcome::Flushed { produced }
+        match report.drain {
+            CaptureDrain::Drained => FlushOutcome::Flushed {
+                produced: report.produced,
+                warning: None,
+            },
+            CaptureDrain::Cancelled if report.produced => FlushOutcome::Flushed {
+                produced: true,
+                warning: Some("capture was interrupted before the queue drained".to_owned()),
+            },
+            CaptureDrain::Cancelled => {
+                FlushOutcome::Failed("memory capture was interrupted".to_owned())
+            }
+            CaptureDrain::Failed { detail, .. } if report.produced => FlushOutcome::Flushed {
+                produced: true,
+                warning: Some(detail),
+            },
+            CaptureDrain::Failed { detail, .. } => FlushOutcome::Failed(detail),
+        }
     }
 
     /// Post-capture work, shared by the background worker and `/flush`:
@@ -416,12 +441,21 @@ impl MemoryRuntime {
 }
 
 /// What `/flush` did.
+///
+/// `Flushed` means the worker itself stopped in a defined state; `warning`
+/// carries a real failure that happened after some observations were already
+/// committed, so a partial drain never reads as complete success. With no
+/// observations produced, a failure is [`Self::Failed`]: a provider outage or a
+/// terminal capture failure must never be reported as "queue drained".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FlushOutcome {
     Disabled,
     WorkspaceEphemeral,
     Busy,
-    Flushed { produced: bool },
+    Flushed {
+        produced: bool,
+        warning: Option<String>,
+    },
     Failed(String),
 }
 
@@ -435,12 +469,25 @@ impl FlushOutcome {
             Self::Disabled => "Memory capture is disabled by the current configuration.".to_owned(),
             Self::WorkspaceEphemeral => super::WORKSPACE_EPHEMERAL_MESSAGE.to_owned(),
             Self::Busy => "This session's memory capture worker is already running.".to_owned(),
-            Self::Flushed { produced: true } => {
-                "Captured the settled turns waiting in this session's queue.".to_owned()
-            }
-            Self::Flushed { produced: false } => {
-                "Capture queue drained; no new observations were stored.".to_owned()
-            }
+            Self::Flushed {
+                produced: true,
+                warning: None,
+            } => "Captured the settled turns waiting in this session's queue.".to_owned(),
+            Self::Flushed {
+                produced: true,
+                warning: Some(warning),
+            } => format!(
+                "Captured the settled turns waiting in this session's queue; a later capture \
+                 job still failed: {warning}"
+            ),
+            Self::Flushed {
+                produced: false,
+                warning: None,
+            } => "Capture queue drained; no new observations were stored.".to_owned(),
+            Self::Flushed {
+                produced: false,
+                warning: Some(warning),
+            } => format!("Capture queue drained; a capture job failed: {warning}"),
             Self::Failed(error) => format!("Memory capture flush failed: {error}"),
         }
     }
@@ -508,9 +555,33 @@ fn apply_capture_plan(
     Ok(enqueued)
 }
 
-/// Drain this session's claimable capture jobs. Returns whether any committed
-/// outcome contained observations (the only condition that can make Dream
-/// eligible).
+/// Why a capture drain stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CaptureDrain {
+    /// No claimable job remained.
+    Drained,
+    /// A shutdown or a pause interrupted the pass; the queue was not drained.
+    Cancelled,
+    /// A job or the store failed. `terminal` says the job's retry budget is
+    /// exhausted; a non-terminal failure leaves a retryable job for a later
+    /// pass.
+    Failed { detail: String, terminal: bool },
+}
+
+/// What one capture pass did.
+pub(crate) struct CaptureWorkerReport {
+    /// Whether any committed outcome contained observations (the only
+    /// condition that can make Dream eligible).
+    pub produced: bool,
+    pub drain: CaptureDrain,
+}
+
+/// Drain this session's claimable capture jobs.
+///
+/// A retryable failure ends the pass instead of re-claiming the same job
+/// immediately: the bounded retry budget is meant to span separate triggers
+/// (a later turn, `/flush`, a restart), not to burn every attempt in one
+/// provider outage.
 async fn run_capture_worker(
     runtime: &MemoryRuntime,
     config: &Arc<ConfigManager>,
@@ -518,9 +589,16 @@ async fn run_capture_worker(
     session_id: &SessionId,
     model: &ModelRef,
     cancel: CancellationToken,
-) -> bool {
+) -> CaptureWorkerReport {
+    let stopped = |detail: String, terminal: bool| CaptureWorkerReport {
+        produced: false,
+        drain: CaptureDrain::Failed { detail, terminal },
+    };
     if !runtime.config_for(Some(session_id.as_str())).can_capture() {
-        return false;
+        return CaptureWorkerReport {
+            produced: false,
+            drain: CaptureDrain::Cancelled,
+        };
     }
     let storage = runtime.storage.clone();
     let scope = session_id.as_str().to_owned();
@@ -539,33 +617,40 @@ async fn run_capture_worker(
             Ok(Ok(store)) => store,
             Ok(Err(error)) => {
                 tracing::warn!(%error, "memory capture store unavailable");
+                let detail = format!("memory capture store unavailable: {error}");
                 runtime.record_activity(
                     &scope,
                     MemoryActivity {
                         kind: MemoryActivityKind::Failed,
-                        last_error: Some(error),
+                        last_error: Some(detail.clone()),
                         ..Default::default()
                     },
                 );
-                return false;
+                return stopped(detail, false);
             }
             Err(error) => {
                 tracing::warn!(%error, "memory capture store task failed");
-                return false;
+                return stopped(format!("memory capture store task failed: {error}"), false);
             }
         }
     };
 
     let owner = format!("{}-{}", std::process::id(), leveler_core::new_uuid_string());
     let mut produced = false;
+    // The first real failure is the one a later caller reports: a terminal
+    // failure is not overwritten by a clean claim boundary after it.
+    let mut failure: Option<(String, bool)> = None;
+    let mut interrupted = false;
     loop {
         if cancel.is_cancelled() {
+            interrupted = true;
             break;
         }
         // A page toggle pauses capture at the worker's next claim boundary.
         // The request already in flight is allowed to settle; nothing new is
         // claimed after the user turns memory off.
         if !runtime.config_for(Some(session_id.as_str())).can_capture() {
+            interrupted = true;
             break;
         }
         let claim_store = store.clone();
@@ -584,10 +669,16 @@ async fn run_capture_worker(
             Ok(Ok(None)) => break,
             Ok(Err(error)) => {
                 tracing::warn!(%error, "memory capture claim failed");
+                failure.get_or_insert_with(|| {
+                    (format!("memory capture claim failed: {error}"), false)
+                });
                 break;
             }
             Err(error) => {
                 tracing::warn!(%error, "memory capture claim task failed");
+                failure.get_or_insert_with(|| {
+                    (format!("memory capture claim task failed: {error}"), false)
+                });
                 break;
             }
         };
@@ -645,21 +736,26 @@ async fn run_capture_worker(
                     }
                     Ok(Err(error)) => {
                         tracing::warn!(%error, "memory capture commit failed");
-                        fail_lease(&store, &lease, &error.to_string(), false).await;
+                        let detail = error.to_string();
+                        fail_lease(&store, &lease, &detail, false).await;
                         runtime.record_activity(
                             &scope,
                             MemoryActivity {
                                 kind: MemoryActivityKind::Failed,
                                 active: false,
-                                last_error: Some(error.to_string()),
+                                last_error: Some(detail.clone()),
                                 ..Default::default()
                             },
                         );
+                        failure.get_or_insert((detail, false));
+                        break;
                     }
                     Err(error) => {
                         let detail = format!("memory capture commit task failed: {error}");
                         tracing::warn!(%detail);
                         fail_lease(&store, &lease, &detail, false).await;
+                        failure.get_or_insert((detail, false));
+                        break;
                     }
                 }
             }
@@ -670,25 +766,35 @@ async fn run_capture_worker(
                     "memory capture interrupted by shutdown"
                 );
                 release_cancelled(&store, &lease).await;
+                interrupted = true;
+                break;
             }
-            Err(ExtractionError::Failure(failure)) => {
+            Err(ExtractionError::Failure(extraction)) => {
                 tracing::warn!(
                     from_turn = range.start_turn(),
                     through_turn = range.through_turn(),
                     attempt = lease.job.attempt,
-                    %failure.detail,
+                    detail = %extraction.detail,
                     "memory capture extraction failed"
                 );
-                fail_lease(&store, &lease, &failure.detail, failure.terminal).await;
+                fail_lease(&store, &lease, &extraction.detail, extraction.terminal).await;
                 runtime.record_activity(
                     &scope,
                     MemoryActivity {
                         kind: MemoryActivityKind::Failed,
                         active: false,
-                        last_error: Some(failure.detail),
+                        last_error: Some(extraction.detail.clone()),
                         ..Default::default()
                     },
                 );
+                let terminal = extraction.terminal || lease.job.attempt >= MAX_CAPTURE_ATTEMPTS;
+                failure.get_or_insert((extraction.detail, terminal));
+                if !terminal {
+                    // One provider outage must not consume the whole bounded
+                    // retry budget: leave the job retryable for the next
+                    // trigger instead of claiming it again immediately.
+                    break;
+                }
             }
         }
     }
@@ -700,7 +806,25 @@ async fn run_capture_worker(
             ..Default::default()
         },
     );
-    produced
+    // A job that exhausted its retry budget before this pass (or during it,
+    // terminally) is still an undrained range. The queue must not report
+    // "drained" while a terminal failure owns a turn's memory.
+    if failure.is_none()
+        && let Ok(work) = store.work_state(&scope, u32::MAX)
+        && work.failed > 0
+    {
+        failure = Some((
+            work.last_error
+                .unwrap_or_else(|| "one or more capture jobs exhausted their retry budget".into()),
+            true,
+        ));
+    }
+    let drain = match failure {
+        Some((detail, terminal)) => CaptureDrain::Failed { detail, terminal },
+        None if interrupted => CaptureDrain::Cancelled,
+        None => CaptureDrain::Drained,
+    };
+    CaptureWorkerReport { produced, drain }
 }
 
 struct ExtractionFailure {

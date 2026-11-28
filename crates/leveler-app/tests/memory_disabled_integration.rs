@@ -334,3 +334,39 @@ async fn explicit_remember_is_the_one_write_that_survives_an_off_rollout() {
         "the note is not advertised while the rollout is off"
     );
 }
+
+/// `off` is the configuration's authority. The session toggle can pause an
+/// enabled rollout, but it must never promote `off` — and the refusal must
+/// leave the store untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_off_rollout_cannot_be_promoted_by_the_session_toggle() {
+    let harness = harness().await;
+    let toggled = harness
+        .action(ClientCommand::ToggleMemory {
+            session_id: harness.session.clone(),
+            query_id: None,
+            enabled: true,
+        })
+        .await;
+    assert!(!toggled.ok, "off cannot be promoted: {toggled:?}");
+    assert!(
+        toggled.message.contains("rollout = \"off\"") || toggled.message.contains("disabled"),
+        "the refusal names the configuration: {toggled:?}"
+    );
+    // Pausing an already-off rollout is a no-op, not an error.
+    let paused = harness
+        .action(ClientCommand::ToggleMemory {
+            session_id: harness.session.clone(),
+            query_id: None,
+            enabled: false,
+        })
+        .await;
+    assert!(
+        paused.ok || paused.message.contains("disabled"),
+        "a pause is harmless: {paused:?}"
+    );
+    assert!(
+        !harness.root.path().join("memory").exists(),
+        "no memory store is created by either toggle"
+    );
+}
