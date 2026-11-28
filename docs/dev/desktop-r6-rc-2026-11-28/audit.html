@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CodeLeveler Desktop R6 RC</title>
+<style>
+:root{color-scheme:light dark;--bg:#f6f7f9;--panel:#fff;--ink:#17181c;--muted:#5d6069;--line:#dcdee5;--accent:#2457c5;--ok:#16794a;--warn:#8a5a00;--bad:#b4231f;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+@media(prefers-color-scheme:dark){:root{--bg:#111216;--panel:#191b21;--ink:#ececf1;--muted:#a6a9b5;--line:#2e313a;--accent:#93adf2;--ok:#5fd197;--warn:#e5b85f;--bad:#f08a84}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+main{max-width:1080px;margin:0 auto;padding:32px 20px 72px}h1{font-size:27px;margin:0 0 6px}h2{font-size:18px;margin:34px 0 12px;padding-bottom:6px;border-bottom:1px solid var(--line)}h3{font-size:15px;margin:20px 0 8px;color:var(--muted)}
+p{margin:6px 0}.sub{color:var(--muted)}a{color:var(--accent)}code{font-family:var(--mono);font-size:12.5px;overflow-wrap:anywhere}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin:16px 0}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:13px 15px}.card .k{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}.card .v{font-size:17px;font-weight:650;margin:5px 0 2px}.card .n{font-size:12px;color:var(--muted)}
+.badge{display:inline-block;padding:1px 8px;border-radius:999px;border:1px solid currentColor;font-size:12px;font-weight:650;white-space:nowrap}.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.muted{color:var(--muted)}
+.scroll{overflow-x:auto;border:1px solid var(--line);border-radius:10px;background:var(--panel)}table{border-collapse:collapse;width:100%;font-size:13.5px}th,td{padding:8px 12px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}th{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);font-weight:650}tbody tr:last-child td{border-bottom:none}
+ul{margin:6px 0;padding-left:20px}li{margin:3px 0}.meta{display:flex;flex-wrap:wrap;gap:8px 22px;margin-top:10px;font-size:13px;color:var(--muted)}.meta b{color:var(--ink)}
+.note{background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--warn);border-radius:8px;padding:12px 14px;margin:14px 0}
+footer{margin-top:44px;font-size:12.5px;color:var(--muted)}
+</style>
+</head>
+<body>
+<main>
+<h1>CodeLeveler Desktop R6 — Release Candidate</h1>
+<p class="sub">双平台正式发布前工程闭环 · 2026-11-28 · <b>NOT A RELEASE</b></p>
+<div class="meta">
+  <span>版本 <b>1.0.29</b>（候选，未改版本号）</span>
+  <span>源码 <b><code>8bde10ca66e6</code></b>（dirty 0）</span>
+  <span>上一正式版 <b>v1.0.29</b>（仅 CLI）</span>
+  <span>平台 <b>macOS arm64</b> / Windows 无</span>
+</div>
+
+<div class="cards">
+  <div class="card"><div class="k">总体结论</div><div class="v bad">NO-GO</div><div class="n">正式发布门禁未满足</div></div>
+  <div class="card"><div class="k">macOS 安装版</div><div class="v ok">PASS</div><div class="n">真实 Provider 核心闭环</div></div>
+  <div class="card"><div class="k">Windows</div><div class="v bad">BLOCKED</div><div class="n">无真机/无安装器/无 GUI CI</div></div>
+  <div class="card"><div class="k">签名 / 公证</div><div class="v bad">BLOCKED</div><div class="n">仅 ad-hoc 本地签名</div></div>
+  <div class="card"><div class="k">P0</div><div class="v ok">0</div><div class="n">未发现（非证明不存在）</div></div>
+</div>
+
+<div class="note"><b>发布判断：</b>本轮达到可验证的 macOS RC 与真实安装版 Dogfood，但不满足“双平台正式发布”的门禁。Windows、Developer ID/公证、更新与回滚、上一正式版升级均为阻断项。不得把本页或产物描述为已发布版本。</div>
+
+<h2>门禁摘要</h2>
+<div class="scroll"><table>
+<thead><tr><th>类别</th><th>状态</th><th>依据</th></tr></thead>
+<tbody>
+<tr><td>macOS 安装产物 Dogfood</td><td><span class="badge ok">PASS</span></td><td>安装到 ~/Applications；真实 Provider/多文件/测试/Steer/Memory/重启</td></tr>
+<tr><td>Windows 真机 + 安装产物</td><td><span class="badge bad">BLOCKED</span></td><td>无 Windows 主机；无 Desktop 安装器；CI 仅 CLI</td></tr>
+<tr><td>macOS 签名/公证</td><td><span class="badge bad">BLOCKED</span></td><td>0 个 codesigning identity；ad-hoc 签名；spctl rejected</td></tr>
+<tr><td>更新/回滚</td><td><span class="badge bad">BLOCKED</span></td><td>Desktop 无更新器；CLI 更新器不覆盖 Desktop</td></tr>
+<tr><td>上一正式版升级</td><td><span class="badge bad">BLOCKED</span></td><td>上一正式版无 Desktop；RC 未发布</td></tr>
+<tr><td>长任务 + Steer</td><td><span class="badge ok">PASS</span></td><td>真实 Provider 59s；steer consumed；1 turn；5050 交付</td></tr>
+<tr><td>图片媒体生命周期</td><td><span class="badge ok">PASS (macOS)</span></td><td>22 单测 + 真实 daemon：引用保留/孤儿删除/损坏 fail-closed</td></tr>
+<tr><td>Memory</td><td><span class="badge warn">PARTIAL</span></td><td>22/22 集成测试 + R6-0 真机；并发/35min/非空 flush 有缺口</td></tr>
+<tr><td>Goal 资源治理</td><td><span class="badge warn">PARTIAL</span></td><td>全局 [limits]、预算终态文案；无 Desktop 预算 UI/软提醒</td></tr>
+<tr><td>全量自动化</td><td><span class="badge warn">见 RESULT</span></td><td>Rust workspace / Desktop / E2E 实际结果见下文链接</td></tr>
+</tbody></table></div>
+
+<h2>关键证据</h2>
+<div class="scroll"><table>
+<thead><tr><th>项</th><th>值</th></tr></thead>
+<tbody>
+<tr><td>A1 Steer</td><td>steer journal <code>consumed</code>, ordinal 3; 11 次 steer 后模型调用；turn_count 1；最终回答同含 5050 与 marker</td></tr>
+<tr><td>A1 耗时</td><td>59 s（R5 观察窗 240s；原始 Session 已删除，历史根因 UNKNOWN）</td></tr>
+<tr><td>安装版 Runtime</td><td><code>CodeLeveler R6 RC.app/Contents/Resources/runtime/leveler</code>，1.0.29 (8bde10ca66e6)</td></tr>
+<tr><td>安装版任务</td><td>hello.txt + sum.mjs + sum.test.mjs；独立 node --test 2 passed；steer consumed；turn 1</td></tr>
+<tr><td>安装版重启</td><td>同一 Session 恢复，状态 completed，版本 v1.0.29 · 桌面</td></tr>
+<tr><td>媒体 daemon</td><td>live=73B kept; orphan removed 73B; remaining 146B; over_budget warned</td></tr>
+</tbody></table></div>
+
+<h2>产物与 SHA-256</h2>
+<div class="scroll"><table>
+<thead><tr><th>产物</th><th>SHA-256</th><th>状态</th></tr></thead>
+<tbody>
+<tr><td><code>CodeLeveler-1.0.29-macOS-arm64.zip</code></td><td><code>30d2bee222fbbaaf20b160ba9ad445ed99e5afa6024085cc72369d1f5b8e45c1</code></td><td>ad-hoc 本地 RC</td></tr>
+<tr><td><code>CodeLeveler-1.0.29-macOS-arm64.dmg</code></td><td><code>f1586dc15d0312d6e9b72e3948bd32a2954363d84db9e13df0f79421aa5647e7</code></td><td>ad-hoc 本地 RC</td></tr>
+<tr><td>Runtime binary</td><td><code>16f97ce34bcff53d232abaa45e3bdaa9d48f236f7fb74709bf6bfa49e730d97d</code></td><td>1.0.29 (8bde10ca66e6)</td></tr>
+<tr><td>Bundle CDHash</td><td><code>ce01160d627c264a307f671acc948dc012c1efa9</code></td><td>Signature=adhoc / TeamIdentifier=not set</td></tr>
+</tbody></table></div>
+<p class="sub">完整清单：<a href="artifacts-manifest.json">artifacts-manifest.json</a>。产物目录 <code>target/desktop-rc/</code> 未进入 Git；哈希与 manifest 在此归档。</p>
+
+<h2>交付文档</h2>
+<ul>
+<li><a href="RESULT.md">RESULT.md</a> · 总体结论与最终六问</li>
+<li><a href="reliability.md">reliability.md</a> · A1 Steer 与长任务</li>
+<li><a href="goal-resource-governance.md">goal-resource-governance.md</a> · A2</li>
+<li><a href="media-storage.md">media-storage.md</a> · A3</li>
+<li><a href="memory-reliability.md">memory-reliability.md</a> · A4</li>
+<li><a href="security.md">security.md</a> · A5/A6</li>
+<li><a href="windows-validation.md">windows-validation.md</a> · B（BLOCKED）</li>
+<li><a href="macos-validation.md">macos-validation.md</a> · C2</li>
+<li><a href="packaging.md">packaging.md</a> · C1/C3</li>
+<li><a href="upgrade-migration.md">upgrade-migration.md</a> · C4/C5（BLOCKED）</li>
+<li><a href="installed-product-dogfood.md">installed-product-dogfood.md</a> · D</li>
+<li><a href="version-comparison.md">version-comparison.md</a> · 上一正式版对比</li>
+<li><a href="performance.md">performance.md</a> · 性能原始测量</li>
+<li><a href="release-gates.md">release-gates.md</a> · 门禁与 P0/P1/P2</li>
+<li><a href="remaining-issues.md">remaining-issues.md</a> · 剩余问题</li>
+</ul>
+
+<h2>历史版本</h2>
+<div class="scroll"><table>
+<thead><tr><th>版本</th><th>日期</th><th>类型</th><th>结论</th><th>备注</th></tr></thead>
+<tbody>
+<tr><td>R6 RC（本页）</td><td>2026-11-28</td><td>候选</td><td><span class="badge bad">NO-GO</span></td><td>macOS 安装版 PASS；Windows/签名/更新 BLOCKED</td></tr>
+<tr><td><a href="../../releases/v1.0.29/index.html">v1.0.29</a></td><td>2026-11-25</td><td>正式</td><td><span class="badge ok">RELEASED</span></td><td>CLI 三平台；无 Desktop</td></tr>
+<tr><td><a href="../../releases/v1.0.28/index.html">v1.0.28</a></td><td>2026-11-22</td><td>正式</td><td><span class="badge ok">RELEASED</span></td><td>CLI 三平台；无 Desktop</td></tr>
+</tbody></table></div>
+
+<footer>Generated 2026-11-28 from the recorded evidence in this directory. This page is a release-candidate audit, not a published release. No online services; all numbers are from the recorded runs.</footer>
+</main>
+</body>
+</html>

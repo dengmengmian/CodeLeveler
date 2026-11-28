@@ -74,6 +74,17 @@ leveler-chat-*.md
 !/docs/dev/
 /docs/dev/*
 !/docs/dev/permission-model-v2/
+# The R6 release-candidate audit is a durable pre-release record: keep the
+# report, HTML, manifests and small structured evidence, but not screenshots or
+# raw logs (those stay local under the same directory).
+!/docs/dev/desktop-r6-rc-2026-11-28/
+!/docs/dev/desktop-r6-rc-2026-11-28/*.md
+!/docs/dev/desktop-r6-rc-2026-11-28/*.html
+!/docs/dev/desktop-r6-rc-2026-11-28/*.json
+!/docs/dev/desktop-r6-rc-2026-11-28/evidence/
+!/docs/dev/desktop-r6-rc-2026-11-28/evidence/*.json
+/docs/dev/desktop-r6-rc-2026-11-28/evidence/*.png
+/docs/dev/desktop-r6-rc-2026-11-28/evidence/*.mjs
 /docs/ARCHITECTURE.md
 /docs/ARCHITECTURE.zh-CN.md
 /docs/CUA_IMPLEMENTATION.md
