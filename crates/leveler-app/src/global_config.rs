@@ -34,6 +34,17 @@
 //! auto_update = true           # optional; check + install stable releases at start-up
 //! check_interval_hours = 0     # optional; 0 = check on every start
 //!
+//! [storage]
+//! tool_cache_max_bytes = 1073741824 # optional; cache GC budget
+//! ephemeral_ttl_hours = 24          # optional; crash residue TTL
+//! media_max_bytes = 2147483648      # optional soft media budget (never deletes live images)
+//! media_grace_hours = 24            # optional unreferenced-image grace before a sweep
+//!
+//! [limits]                     # optional global budget fallbacks; project config wins
+//! max_model_tokens = 2000000
+//! max_cost_usd_micros = 5000000
+//! max_duration_seconds = 7200
+//!
 //! [providers.deepseek]
 //! base_url = "https://api.deepseek.com"
 //! api_key_env = "DEEPSEEK_API_KEY"
@@ -93,6 +104,23 @@ pub(crate) fn safe_toml_parse_error(
         .map(|line| line.chars().count() + 1)
         .unwrap_or(1);
     format!("TOML parse error at line {line}, column {column}: {message}")
+}
+
+/// `[limits]` — user-global defaults for the top-level task budget.
+///
+/// A project's own `.leveler/config.yaml` value wins when set; these fill the
+/// gaps for every project that does not. Every field defaults to absent, which
+/// means no hard cap: the runtime never invents a spend limit on the user's
+/// behalf. Units match the project config: tokens, micro-USD, seconds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GlobalLimits {
+    #[serde(default)]
+    pub max_model_tokens: Option<u64>,
+    #[serde(default)]
+    pub max_cost_usd_micros: Option<u64>,
+    #[serde(default)]
+    pub max_duration_seconds: Option<u64>,
 }
 
 /// The parsed global config.
@@ -158,6 +186,11 @@ pub struct GlobalConfig {
     /// note the user asked for, so it survives a later re-enable.
     #[serde(default)]
     memory: GlobalMemory,
+    /// Resource limits applied to every project that does not set its own
+    /// `.leveler/config.yaml` value. Absent means no hard budget; a long task
+    /// is bounded by progress guards, not by a default spend cap.
+    #[serde(default)]
+    limits: GlobalLimits,
 }
 
 /// `[memory]`: the cross-session memory pipeline.
@@ -254,6 +287,16 @@ struct GlobalStorage {
     /// Hours a crash-orphaned ephemeral run must sit before it is reclaimed.
     #[serde(default)]
     ephemeral_ttl_hours: Option<u64>,
+    /// Soft budget for `<state_dir>/media`. Reachable objects are never
+    /// deleted to meet it; exceeding it is reported and asks the user to
+    /// remove sessions. Absent uses the built-in 2 GiB policy.
+    #[serde(default)]
+    media_max_bytes: Option<u64>,
+    /// Hours an unreferenced media object must sit before a sweep may remove
+    /// it. Protects a just-staged attachment with no durable reference yet.
+    /// Absent uses the built-in 24-hour window.
+    #[serde(default)]
+    media_grace_hours: Option<u64>,
 }
 
 /// `[update]`. Whether CodeLeveler keeps itself current, and how often it
@@ -489,7 +532,7 @@ struct GlobalMcpServer {
     enabled: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GlobalProvider {
     #[serde(default = "default_protocol")]
@@ -512,6 +555,26 @@ struct GlobalProvider {
     /// contributor to R006's window-boundary timeout, R6-P3).
     #[serde(default)]
     timeouts: Option<leveler_provider::Timeouts>,
+}
+
+impl std::fmt::Debug for GlobalProvider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GlobalProvider")
+            .field("protocol", &self.protocol)
+            .field("base_url", &self.base_url)
+            .field("api_key_env", &self.api_key_env)
+            .field(
+                "api_key",
+                &self
+                    .api_key
+                    .as_ref()
+                    .map(|_| leveler_core::SECRET_PLACEHOLDER),
+            )
+            .field("headers", &self.headers.keys().collect::<Vec<_>>())
+            .field("timeouts", &self.timeouts)
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1023,6 +1086,21 @@ impl GlobalConfig {
     /// `[storage].ephemeral_ttl_hours` — the crash-residue TTL, when set.
     pub fn ephemeral_ttl_hours(&self) -> Option<u64> {
         self.storage.ephemeral_ttl_hours
+    }
+
+    /// `[storage].media_max_bytes` — the media-store soft budget, when set.
+    pub fn media_max_bytes(&self) -> Option<u64> {
+        self.storage.media_max_bytes
+    }
+
+    /// `[storage].media_grace_hours` — the unreferenced-object grace, when set.
+    pub fn media_grace_hours(&self) -> Option<u64> {
+        self.storage.media_grace_hours
+    }
+
+    /// `[limits]` — global fallbacks for a project that sets no own cap.
+    pub fn limits(&self) -> GlobalLimits {
+        self.limits
     }
 }
 
@@ -2156,12 +2234,52 @@ mod tests {
         let cfg: GlobalConfig = toml::from_str("default_model = \"mock/m\"\n").unwrap();
         assert_eq!(cfg.tool_cache_max_bytes(), None);
         assert_eq!(cfg.ephemeral_ttl_hours(), None);
+        assert_eq!(cfg.media_max_bytes(), None);
+        assert_eq!(cfg.media_grace_hours(), None);
 
-        let cfg: GlobalConfig =
-            toml::from_str("[storage]\ntool_cache_max_bytes = 123\nephemeral_ttl_hours = 6\n")
-                .unwrap();
+        let cfg: GlobalConfig = toml::from_str(
+            "[storage]\ntool_cache_max_bytes = 123\nephemeral_ttl_hours = 6\n\
+             media_max_bytes = 456\nmedia_grace_hours = 12\n",
+        )
+        .unwrap();
         assert_eq!(cfg.tool_cache_max_bytes(), Some(123));
         assert_eq!(cfg.ephemeral_ttl_hours(), Some(6));
+        assert_eq!(cfg.media_max_bytes(), Some(456));
+        assert_eq!(cfg.media_grace_hours(), Some(12));
+    }
+
+    #[test]
+    fn global_limits_are_optional_and_do_not_invent_a_budget() {
+        let cfg: GlobalConfig = toml::from_str("default_model = \"mock/m\"\n").unwrap();
+        assert_eq!(cfg.limits(), GlobalLimits::default());
+
+        let cfg: GlobalConfig = toml::from_str(
+            "[limits]\nmax_model_tokens = 200000\n\
+             max_cost_usd_micros = 500000\nmax_duration_seconds = 7200\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.limits(),
+            GlobalLimits {
+                max_model_tokens: Some(200_000),
+                max_cost_usd_micros: Some(500_000),
+                max_duration_seconds: Some(7_200),
+            }
+        );
+    }
+
+    /// Config Debug output reaches logs and bug reports. A plaintext provider
+    /// key must never be part of it, even though the config owns one.
+    #[test]
+    fn global_config_debug_never_prints_a_plaintext_provider_key() {
+        let cfg: GlobalConfig = toml::from_str(
+            "[providers.p]\nbase_url = \"https://example.test/v1\"\n\
+             api_key = \"sk-live-canary-value\"\n",
+        )
+        .unwrap();
+        let rendered = format!("{cfg:?}");
+        assert!(!rendered.contains("sk-live-canary-value"), "{rendered}");
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
     }
 
     /// Reopening a session through the daemon leaves the client without a

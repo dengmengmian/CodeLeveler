@@ -585,6 +585,37 @@ impl<'a> MessageRepository<'a> {
         Ok(rows.into_iter().map(|(p,)| p).collect())
     }
 
+    /// Every durable payload that may reference a media-store object, across
+    /// all sessions.
+    ///
+    /// This is a conservative superset built from the places an image can be
+    /// persisted: transcript rows, the write-ahead turn row (which survives
+    /// `/compact` and `/clear`), tool-image events (content hashes), and event
+    /// payloads that inline a message such as a context snapshot. The app layer
+    /// parses each payload and derives the hashes; storage stays the one owner
+    /// of SQL access.
+    ///
+    /// The filter is deliberately textual and over-inclusive: a missed payload
+    /// could make a live image look unreferenced and get it deleted, while a
+    /// false positive only costs a parse. A payload that cannot be parsed must
+    /// make the caller skip the sweep, never treat the object as unowned.
+    pub async fn media_reference_payloads(&self) -> Result<Vec<String>, StorageError> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT payload FROM session_messages \
+               WHERE payload LIKE '%\"base64\"%' AND payload LIKE '%\"image\"%' \
+             UNION ALL \
+             SELECT payload FROM turns \
+               WHERE payload LIKE '%\"base64\"%' AND payload LIKE '%\"image\"%' \
+             UNION ALL \
+             SELECT payload FROM events \
+               WHERE type = 'tool_call_images' \
+                  OR (payload LIKE '%\"base64\"%' AND payload LIKE '%\"image\"%')",
+        )
+        .fetch_all(self.db.pool())
+        .await?;
+        Ok(rows.into_iter().map(|(payload,)| payload).collect())
+    }
+
     /// The payloads of this session's review-settlement notices, in order.
     ///
     /// The notice row is the durable record that a settled review's result was
@@ -1379,5 +1410,70 @@ mod tests {
         assert_eq!(stored.len(), 1);
         assert!(!stored[0].contains("message-secret-value"), "{stored:?}");
         assert!(stored[0].contains("[REDACTED]"), "{stored:?}");
+    }
+
+    #[tokio::test]
+    async fn media_reference_payloads_cover_transcript_turn_and_event_sources() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let session = SessionRecord::new("/r", "g", "m", leveler_core::now());
+        SessionRepository::new(&db).create(&session).await.unwrap();
+        let id = SessionId::new(session.id);
+        let image_message = r#"{"role":"user","content":[{"type":"image","source":{"kind":"base64","media_type":"image/png","data":"aGk="}}]}"#;
+        let plain_message =
+            r#"{"role":"assistant","content":[{"type":"text","text":"no image here"}]}"#;
+        let turn_payload = r#"{"initiating_message":{"role":"user","content":[{"type":"image","source":{"kind":"base64","media_type":"image/png","data":"aGk="}}]}}"#;
+        crate::TurnRepository::new(&db)
+            .start(&id, "user", Some(turn_payload), leveler_core::now())
+            .await
+            .unwrap();
+        let repo = MessageRepository::new(&db);
+        repo.append(
+            &id,
+            &[image_message.to_string(), plain_message.to_string()],
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
+        let events = crate::EventRepository::new(&db);
+        events
+            .append(
+                &id,
+                None,
+                "tool_call_images",
+                r#"{"payload":{"images":[{"sha256":"abababababababababababababababababababababababababababababababab","mime_type":"image/png"}]},"type":"tool_call_images"}"#,
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        events
+            .append(
+                &id,
+                None,
+                "context_snapshot",
+                r#"{"payload":{"messages":[{"role":"user","content":[{"type":"image","source":{"kind":"base64","media_type":"image/png","data":"aGk="}}]}]},"type":"context_snapshot"}"#,
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+
+        let payloads = repo.media_reference_payloads().await.unwrap();
+        assert_eq!(payloads.len(), 4, "{payloads:?}");
+        assert_eq!(
+            payloads
+                .iter()
+                .filter(|payload| payload.contains("\"base64\""))
+                .count(),
+            3
+        );
+        assert!(
+            payloads
+                .iter()
+                .any(|payload| payload.contains("tool_call_images"))
+        );
+        assert!(
+            !payloads
+                .iter()
+                .any(|payload| payload.contains("no image here"))
+        );
     }
 }

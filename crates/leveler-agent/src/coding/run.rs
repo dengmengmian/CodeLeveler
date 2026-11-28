@@ -510,6 +510,10 @@ pub struct TaskReport {
     pub stop_reason: StopReason,
     /// The executor's concrete reason for a non-success stop, when available.
     pub stop_detail: Option<String>,
+    /// When the stop was a resource-budget cutoff, which cap fired and the
+    /// spent/cap values. Kept structured so a client never has to parse the
+    /// human or machine detail string to know what happened.
+    pub budget_exhaustion: Option<leveler_agent_core::BudgetExhaustion>,
     /// Model steps this task's turn started — a mechanical iteration count,
     /// never a measure of how much of the task is done.
     pub model_steps: u32,
@@ -546,6 +550,7 @@ impl TaskReport {
             modified_files,
             stop_reason,
             stop_detail: None,
+            budget_exhaustion: None,
             model_steps,
             execution_duration_ms: 0,
             windows: 1,
@@ -574,6 +579,7 @@ fn report_from_agent_outcome(
         outcome.model_steps,
     )
     .with_stop_detail(outcome.stop_detail);
+    report.budget_exhaustion = outcome.budget_exhaustion;
     report.execution_duration_ms = execution_duration_ms;
     report.completion_warnings = outcome.completion_warnings;
     report.verification = outcome.verification;

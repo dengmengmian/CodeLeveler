@@ -9,9 +9,12 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Cursor;
+use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -206,11 +209,9 @@ impl MediaStore {
     pub fn import_bytes(&self, bytes: &[u8]) -> Result<StoredImage, MediaError> {
         let processed = process_image(bytes)?;
         let sha256 = hex(&Sha256::digest(&processed.png));
-        fs::create_dir_all(&self.root).map_err(|e| MediaError::Io(e.to_string()))?;
+        self.ensure_root()?;
         let path = self.root.join(format!("{sha256}.png"));
-        if !path.exists() {
-            fs::write(&path, &processed.png).map_err(|e| MediaError::Io(e.to_string()))?;
-        }
+        self.store_object(&path, &processed.png, &sha256)?;
 
         Ok(StoredImage {
             sha256,
@@ -267,14 +268,11 @@ impl MediaStore {
             return Err(MediaError::TooLarge(len));
         }
         let sha256 = hex(&Sha256::digest(bytes));
-        fs::create_dir_all(&self.root).map_err(|e| MediaError::Io(e.to_string()))?;
+        self.ensure_root()?;
         let path = self.root.join(&sha256);
-        if !path.exists() {
-            fs::write(&path, bytes).map_err(|e| MediaError::Io(e.to_string()))?;
-            let mime = sanitize_mime(mime_type);
-            fs::write(self.root.join(format!("{sha256}.mime")), mime)
-                .map_err(|e| MediaError::Io(e.to_string()))?;
-        }
+        self.store_object(&path, bytes, &sha256)?;
+        let mime = sanitize_mime(mime_type);
+        self.write_text_if_changed(&self.root.join(format!("{sha256}.mime")), &mime)?;
         Ok((sha256, len))
     }
 
@@ -297,22 +295,424 @@ impl MediaStore {
             return Err(MediaError::InvalidId);
         }
         let png = self.root.join(format!("{sha256}.png"));
-        if png.is_file() {
-            let bytes = fs::read(&png).map_err(|e| MediaError::Io(e.to_string()))?;
+        if let Some(bytes) = read_regular_file(&png) {
             return Ok(("image/png".to_string(), bytes));
         }
         let blob = self.root.join(sha256);
-        if blob.is_file() {
-            let mime = fs::read_to_string(self.root.join(format!("{sha256}.mime")))
-                .ok()
+        if let Some(bytes) = read_regular_file(&blob) {
+            let mime = read_regular_file(&self.root.join(format!("{sha256}.mime")))
+                .and_then(|raw| String::from_utf8(raw).ok())
                 .map(|value| sanitize_mime(value.trim()))
                 .filter(|value| !value.is_empty())
                 .unwrap_or_else(|| "application/octet-stream".to_string());
-            let bytes = fs::read(&blob).map_err(|e| MediaError::Io(e.to_string()))?;
             return Ok((mime, bytes));
         }
         Err(MediaError::NotFound)
     }
+
+    /// Create the store root if needed and make it owner-only.
+    ///
+    /// A root that exists as anything but a real directory is refused rather
+    /// than followed: writing through a symlinked root would put user images
+    /// outside the store.
+    fn ensure_root(&self) -> Result<(), MediaError> {
+        match fs::symlink_metadata(&self.root) {
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(MediaError::Io("media root is not a directory".to_string()));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir_all(&self.root).map_err(|e| MediaError::Io(e.to_string()))?;
+            }
+            Err(error) => return Err(MediaError::Io(error.to_string())),
+        }
+        restrict_dir(&self.root).map_err(|e| MediaError::Io(e.to_string()))
+    }
+
+    /// Store a content-addressed object atomically and privately.
+    ///
+    /// An existing regular object is trusted only after its bytes still hash to
+    /// the name; a truncated object from an older non-atomic writer is repaired
+    /// instead of being served forever. A symlink or directory under the object
+    /// name is refused, never followed or replaced.
+    fn store_object(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        expected_sha256: &str,
+    ) -> Result<(), MediaError> {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_file() => {
+                if let Ok(existing) = fs::read(path) {
+                    if hex(&Sha256::digest(&existing)) == expected_sha256 {
+                        restrict_file(path).map_err(|e| MediaError::Io(e.to_string()))?;
+                        return Ok(());
+                    }
+                }
+            }
+            Ok(_) => {
+                return Err(MediaError::Io(
+                    "refusing a non-regular media object".to_string(),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(MediaError::Io(error.to_string())),
+        }
+        self.write_atomic(path, bytes)
+    }
+
+    fn write_text_if_changed(&self, path: &Path, value: &str) -> Result<(), MediaError> {
+        if let Some(existing) = read_regular_file(path) {
+            if existing == value.as_bytes() {
+                restrict_file(path).map_err(|e| MediaError::Io(e.to_string()))?;
+                return Ok(());
+            }
+        }
+        self.write_atomic(path, value.as_bytes())
+    }
+
+    /// Write a sibling temp file, fsync it, then rename it over the target. The
+    /// rename is the publish point, so a reader never observes a partial object
+    /// even if this process dies mid-import.
+    fn write_atomic(&self, path: &Path, bytes: &[u8]) -> Result<(), MediaError> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| MediaError::Io("media object has no parent directory".to_string()))?;
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| MediaError::Io("media object name is not valid UTF-8".to_string()))?;
+        let mut temp = None;
+        for _ in 0..8 {
+            let nonce = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let candidate = parent.join(format!(".{name}.{}.{nonce}.tmp", std::process::id()));
+            let options = private_create_options();
+            match options.open(&candidate) {
+                Ok(file) => {
+                    temp = Some((candidate, file));
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(MediaError::Io(error.to_string())),
+            }
+        }
+        let Some((temp_path, mut file)) = temp else {
+            return Err(MediaError::Io(
+                "could not create a unique media temp file".to_string(),
+            ));
+        };
+        let written = (|| -> std::io::Result<()> {
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            drop(file);
+            restrict_file(&temp_path)?;
+            fs::rename(&temp_path, path)?;
+            restrict_file(path)?;
+            Ok(())
+        })();
+        if let Err(error) = written {
+            let _ = fs::remove_file(&temp_path);
+            return Err(MediaError::Io(error.to_string()));
+        }
+        Ok(())
+    }
+}
+
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn private_create_options() -> fs::OpenOptions {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+}
+
+#[cfg(unix)]
+fn restrict_file(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn restrict_file(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn restrict_dir(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Read a path only when it is a regular file. `Path::is_file` follows a
+/// symlink; a planted link inside the store must not become readable media.
+fn read_regular_file(path: &Path) -> Option<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    fs::read(path).ok()
+}
+
+/// Age and size policy for [`MediaStore::sweep`].
+///
+/// Deletion is reference-aware: only objects absent from the caller's live set
+/// are candidates, and only after `min_age`. `max_bytes` is a soft budget for
+/// the whole store; reachable objects are never deleted to satisfy it, so an
+/// over-budget report asks the user to remove sessions instead of silently
+/// discarding history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SweepPolicy {
+    pub max_bytes: Option<u64>,
+    pub min_age: Duration,
+}
+
+impl Default for SweepPolicy {
+    fn default() -> Self {
+        Self {
+            // Enough for a large active workspace; not a hard cap on history.
+            max_bytes: Some(2 * 1024 * 1024 * 1024),
+            // A turn may hold a just-imported object before its message row is
+            // durable. One day is far longer than any single import window.
+            min_age: Duration::from_secs(24 * 60 * 60),
+        }
+    }
+}
+
+/// What one [`MediaStore::sweep`] removed, kept, or failed to remove.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SweepReport {
+    /// Bytes of objects present in the caller's live set.
+    pub live_bytes: u64,
+    /// Bytes of unreachable objects kept because they are younger than the
+    /// grace window.
+    pub unreferenced_kept_bytes: u64,
+    /// Objects fully removed by this sweep.
+    pub removed_objects: u64,
+    /// Bytes removed by this sweep.
+    pub removed_bytes: u64,
+    /// Files under the store root that are not content-addressed objects,
+    /// including symlinks. They are reported, never deleted.
+    pub unknown_files: u64,
+    /// Per-object removal failures. A failure is reported, never counted as a
+    /// successful removal; the next sweep retries it.
+    pub failures: Vec<String>,
+    /// Bytes left under the root after the sweep.
+    pub remaining_bytes: u64,
+    /// True when `remaining_bytes` exceeds `max_bytes`. Reachable data is never
+    /// deleted to clear this.
+    pub over_budget: bool,
+}
+
+impl MediaStore {
+    /// Delete store objects that no live session references and that are older
+    /// than the grace window. Unknown files and symlinks are left untouched.
+    ///
+    /// The caller's `live` set must be an authoritative snapshot taken with no
+    /// turn that could add a reference. The runtime runs this before accepting
+    /// work; a failed reference query must skip the sweep rather than pass an
+    /// empty set.
+    pub fn sweep(
+        &self,
+        live: &HashSet<String>,
+        now: SystemTime,
+        policy: SweepPolicy,
+    ) -> Result<SweepReport, MediaError> {
+        let root_metadata = match fs::symlink_metadata(&self.root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(SweepReport::default());
+            }
+            Err(error) => return Err(MediaError::Io(error.to_string())),
+        };
+        if !root_metadata.is_dir() {
+            return Err(MediaError::Io("media root is not a directory".to_string()));
+        }
+        restrict_dir(&self.root).map_err(|e| MediaError::Io(e.to_string()))?;
+
+        let mut objects: HashMap<String, SweepObject> = HashMap::new();
+        let mut temp_files: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
+        let mut unknown_files = 0u64;
+        let mut total_bytes = 0u64;
+        let entries = fs::read_dir(&self.root).map_err(|e| MediaError::Io(e.to_string()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| MediaError::Io(e.to_string()))?;
+            let path = entry.path();
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(MediaError::Io(error.to_string())),
+            };
+            let size = metadata.len();
+            total_bytes = total_bytes.saturating_add(size);
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                unknown_files += 1;
+                continue;
+            };
+            if is_temp_object_name(&name) {
+                let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                temp_files.push((path, size, modified));
+                continue;
+            }
+            if !metadata.file_type().is_file() {
+                unknown_files += 1;
+                continue;
+            }
+            let Some(hash) = object_hash(&name) else {
+                unknown_files += 1;
+                continue;
+            };
+            let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            let object = objects
+                .entry(hash.to_owned())
+                .or_insert_with(|| SweepObject {
+                    files: Vec::new(),
+                    size: 0,
+                    newest: SystemTime::UNIX_EPOCH,
+                });
+            object.size = object.size.saturating_add(size);
+            if modified > object.newest {
+                object.newest = modified;
+            }
+            object.files.push((path, size, modified));
+        }
+
+        let mut report = SweepReport {
+            unknown_files,
+            ..SweepReport::default()
+        };
+        // Existing objects may predate the private-mode writer. Tighten them
+        // even when they are live; never follow a symlink (not in `objects`).
+        for (path, _, _) in objects.values().flat_map(|object| &object.files) {
+            if let Err(error) = restrict_file(path) {
+                report
+                    .failures
+                    .push(format!("restrict {}: {error}", path.display()));
+            }
+        }
+
+        let mut vanished_bytes = 0u64;
+        for (hash, object) in &objects {
+            if live.contains(hash) {
+                report.live_bytes = report.live_bytes.saturating_add(object.size);
+                continue;
+            }
+            let age = now.duration_since(object.newest).unwrap_or(Duration::ZERO);
+            if age < policy.min_age {
+                report.unreferenced_kept_bytes =
+                    report.unreferenced_kept_bytes.saturating_add(object.size);
+                continue;
+            }
+            // Remove companions first; the content object itself last. A
+            // partially removed object is retried by the next sweep.
+            let mut files = object.files.clone();
+            files.sort_by_key(|(path, _, _)| {
+                if path.extension().and_then(|ext| ext.to_str()) == Some("mime") {
+                    0usize
+                } else {
+                    1usize
+                }
+            });
+            let mut all_removed = true;
+            for (path, size, _) in files {
+                match fs::remove_file(&path) {
+                    Ok(()) => {
+                        report.removed_bytes = report.removed_bytes.saturating_add(size);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        vanished_bytes = vanished_bytes.saturating_add(size);
+                    }
+                    Err(error) => {
+                        all_removed = false;
+                        report
+                            .failures
+                            .push(format!("remove {}: {error}", path.display()));
+                    }
+                }
+            }
+            if all_removed {
+                report.removed_objects += 1;
+            }
+        }
+
+        for (path, size, modified) in temp_files {
+            let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
+            if age < policy.min_age {
+                continue;
+            }
+            match fs::remove_file(&path) {
+                Ok(()) => {
+                    report.removed_bytes = report.removed_bytes.saturating_add(size);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    vanished_bytes = vanished_bytes.saturating_add(size);
+                }
+                Err(error) => report
+                    .failures
+                    .push(format!("remove {}: {error}", path.display())),
+            }
+        }
+
+        report.remaining_bytes = total_bytes
+            .saturating_sub(report.removed_bytes)
+            .saturating_sub(vanished_bytes);
+        report.over_budget = policy
+            .max_bytes
+            .is_some_and(|max| report.remaining_bytes > max);
+        Ok(report)
+    }
+}
+
+struct SweepObject {
+    files: Vec<(PathBuf, u64, SystemTime)>,
+    size: u64,
+    newest: SystemTime,
+}
+
+/// The content hash a store-owned file belongs to.
+fn object_hash(name: &str) -> Option<&str> {
+    if is_sha256_hex(name) {
+        return Some(name);
+    }
+    for suffix in [".png", ".mime"] {
+        if let Some(hash) = name.strip_suffix(suffix)
+            && is_sha256_hex(hash)
+        {
+            return Some(hash);
+        }
+    }
+    None
+}
+
+/// True only for the temp names [`MediaStore::write_atomic`] creates. Anything
+/// else that merely ends in `.tmp` is unknown and left alone.
+fn is_temp_object_name(name: &str) -> bool {
+    let Some(rest) = name
+        .strip_prefix('.')
+        .and_then(|name| name.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let mut parts = rest.split('.');
+    let (Some(hash), Some(pid), Some(nonce), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    is_sha256_hex(hash)
+        && !pid.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && !nonce.is_empty()
+        && nonce.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn is_sha256_hex(value: &str) -> bool {
@@ -511,5 +911,246 @@ mod tests {
         let sha = "ab".repeat(32);
         let err = store.load_bytes(&sha).unwrap_err();
         assert!(matches!(err, MediaError::NotFound));
+    }
+
+    fn live(hashes: &[&str]) -> HashSet<String> {
+        hashes.iter().map(|hash| (*hash).to_owned()).collect()
+    }
+
+    fn age_file(path: &Path, age: Duration) {
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(SystemTime::now() - age))
+            .unwrap();
+    }
+
+    fn policy(min_age_secs: u64, max_bytes: Option<u64>) -> SweepPolicy {
+        SweepPolicy {
+            max_bytes,
+            min_age: Duration::from_secs(min_age_secs),
+        }
+    }
+
+    #[test]
+    fn sweep_removes_unreferenced_objects_after_grace_and_keeps_live_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MediaStore::new(dir.path());
+        let kept = store.import_bytes(&png_bytes(2, 2)).unwrap();
+        let removed = store.import_bytes(&png_bytes(3, 2)).unwrap();
+        age_file(&kept.path, Duration::from_secs(3600));
+        age_file(&removed.path, Duration::from_secs(3600));
+
+        let report = store
+            .sweep(
+                &live(&[kept.sha256.as_str()]),
+                SystemTime::now(),
+                policy(60, None),
+            )
+            .unwrap();
+
+        assert!(kept.path.exists());
+        assert!(!removed.path.exists());
+        assert_eq!(report.removed_objects, 1);
+        assert_eq!(report.removed_bytes, removed.size_bytes);
+        assert_eq!(report.live_bytes, kept.size_bytes);
+        assert!(report.failures.is_empty());
+        assert!(!report.over_budget);
+    }
+
+    #[test]
+    fn sweep_keeps_unreferenced_objects_inside_the_grace_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MediaStore::new(dir.path());
+        let recent = store.import_bytes(&png_bytes(4, 4)).unwrap();
+
+        let report = store
+            .sweep(&HashSet::new(), SystemTime::now(), policy(3600, None))
+            .unwrap();
+
+        assert!(recent.path.exists());
+        assert_eq!(report.removed_objects, 0);
+        assert_eq!(report.unreferenced_kept_bytes, recent.size_bytes);
+    }
+
+    #[test]
+    fn sweep_never_deletes_reachable_objects_to_meet_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MediaStore::new(dir.path());
+        let live_image = store.import_bytes(&png_bytes(5, 4)).unwrap();
+        age_file(&live_image.path, Duration::from_secs(3600));
+
+        let report = store
+            .sweep(
+                &live(&[live_image.sha256.as_str()]),
+                SystemTime::now(),
+                policy(60, Some(1)),
+            )
+            .unwrap();
+
+        assert!(live_image.path.exists());
+        assert_eq!(report.removed_objects, 0);
+        assert!(
+            report.over_budget,
+            "the report must not hide an over-budget store"
+        );
+    }
+
+    #[test]
+    fn sweep_removes_an_orphaned_mime_companion() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MediaStore::new(dir.path());
+        let (sha, _) = store.put_blob(b"# note\n", "text/markdown").unwrap();
+        let blob = dir.path().join(&sha);
+        let mime = dir.path().join(format!("{sha}.mime"));
+        fs::remove_file(&blob).unwrap();
+        age_file(&mime, Duration::from_secs(3600));
+
+        let report = store
+            .sweep(&HashSet::new(), SystemTime::now(), policy(60, None))
+            .unwrap();
+
+        assert!(!mime.exists());
+        assert_eq!(report.removed_objects, 1);
+        assert!(report.failures.is_empty());
+    }
+
+    #[test]
+    fn sweep_leaves_unknown_files_and_symlinks_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MediaStore::new(dir.path());
+        fs::create_dir_all(dir.path()).unwrap();
+        let notes = dir.path().join("notes.txt");
+        fs::write(&notes, b"user data").unwrap();
+        let outside = dir.path().join("outside.bin");
+        fs::write(&outside, b"do not read through me").unwrap();
+        let link = dir.path().join(format!("{}.png", "cd".repeat(32)));
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let report = store
+            .sweep(&HashSet::new(), SystemTime::now(), policy(0, None))
+            .unwrap();
+
+        assert!(notes.exists());
+        #[cfg(unix)]
+        {
+            assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+            assert_eq!(fs::read(&outside).unwrap(), b"do not read through me");
+            let err = store.load_bytes(&"cd".repeat(32)).unwrap_err();
+            assert!(matches!(err, MediaError::NotFound));
+        }
+        assert!(report.unknown_files >= 1);
+    }
+
+    #[test]
+    fn sweep_removes_its_own_stale_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MediaStore::new(dir.path());
+        let temp = dir
+            .path()
+            .join(format!(".{}.{}.{}.tmp", "ef".repeat(32), 123, 7));
+        fs::write(&temp, b"partial").unwrap();
+        age_file(&temp, Duration::from_secs(3600));
+
+        let report = store
+            .sweep(&HashSet::new(), SystemTime::now(), policy(60, None))
+            .unwrap();
+
+        assert!(!temp.exists());
+        assert_eq!(report.removed_bytes, 7);
+    }
+
+    #[test]
+    fn sweep_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MediaStore::new(dir.path());
+        let kept = store.import_bytes(&png_bytes(2, 2)).unwrap();
+        let removed = store.import_bytes(&png_bytes(6, 4)).unwrap();
+        age_file(&kept.path, Duration::from_secs(3600));
+        age_file(&removed.path, Duration::from_secs(3600));
+        let live = live(&[kept.sha256.as_str()]);
+        let first = store
+            .sweep(&live, SystemTime::now(), policy(60, None))
+            .unwrap();
+        let second = store
+            .sweep(&live, SystemTime::now(), policy(60, None))
+            .unwrap();
+
+        assert_eq!(first.removed_objects, 1);
+        assert_eq!(second.removed_objects, 0);
+        assert_eq!(first.remaining_bytes, second.remaining_bytes);
+    }
+
+    #[test]
+    fn import_repairs_a_truncated_object_under_the_same_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MediaStore::new(dir.path());
+        let source = png_bytes(7, 5);
+        let stored = store.import_bytes(&source).unwrap();
+        fs::write(&stored.path, b"truncated").unwrap();
+
+        let again = store.import_bytes(&source).unwrap();
+
+        assert_eq!(again.sha256, stored.sha256);
+        let fresh_dir = tempfile::tempdir().unwrap();
+        let fresh = MediaStore::new(fresh_dir.path())
+            .import_bytes(&source)
+            .unwrap();
+        // The processed PNG is deterministic, so the repaired object must be
+        // exactly the bytes a fresh import produces.
+        assert_eq!(
+            fs::read(&again.path).unwrap(),
+            fs::read(&fresh.path).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn imported_images_and_their_directory_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("media");
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        let store = MediaStore::new(&root);
+        let stored = store.import_bytes(&png_bytes(3, 3)).unwrap();
+
+        assert_eq!(
+            fs::metadata(&stored.path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn concurrent_imports_leave_one_complete_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("media");
+        let store = std::sync::Arc::new(MediaStore::new(&root));
+        let source = std::sync::Arc::new(png_bytes(9, 6));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let store = store.clone();
+                let source = source.clone();
+                std::thread::spawn(move || store.import_bytes(&source).unwrap())
+            })
+            .collect();
+        let hashes: HashSet<String> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap().sha256)
+            .collect();
+
+        assert_eq!(hashes.len(), 1);
+        let (_, bytes) = store.load_bytes(hashes.iter().next().unwrap()).unwrap();
+        assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        let object_files = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".png"))
+            .count();
+        assert_eq!(object_files, 1);
     }
 }

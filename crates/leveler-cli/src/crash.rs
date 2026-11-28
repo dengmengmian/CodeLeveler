@@ -103,13 +103,17 @@ fn render(info: &std::panic::PanicHookInfo<'_>, version: &str) -> String {
 
 fn panic_message(info: &std::panic::PanicHookInfo<'_>) -> String {
     let payload = info.payload();
-    if let Some(s) = payload.downcast_ref::<&str>() {
+    let raw = if let Some(s) = payload.downcast_ref::<&str>() {
         (*s).to_string()
     } else if let Some(s) = payload.downcast_ref::<String>() {
         s.clone()
     } else {
         "non-string panic payload".to_string()
-    }
+    };
+    // This record is meant to be attachable to a bug report. A panic message is
+    // attacker/model-influenced text and may quote a credential, so it crosses
+    // the same redaction boundary as model-visible output before it is written.
+    leveler_core::sanitize_model_visible(&raw).0
 }
 
 /// Write one record and prune old ones.
@@ -256,6 +260,29 @@ mod tests {
         // Whatever else changes, the record must stay a diagnosis, not a dump.
         assert!(!rendered.contains("api_key"), "{rendered}");
         assert!(!rendered.contains("sk-"), "{rendered}");
+    }
+
+    /// A panic message is untrusted text. If it quotes a credential, the
+    /// record must carry the redacted form, not the secret.
+    #[test]
+    fn a_panic_message_is_redacted_before_it_reaches_the_record() {
+        let rendered = std::panic::catch_unwind(|| {
+            let hook = std::panic::take_hook();
+            let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+            let sink = captured.clone();
+            std::panic::set_hook(Box::new(move |info| {
+                *sink.lock().unwrap() = render(info, "9.9.9");
+            }));
+            let _ = std::panic::catch_unwind(|| {
+                panic!("provider rejected api_key=sk-live-canary-value")
+            });
+            std::panic::set_hook(hook);
+            captured.lock().unwrap().clone()
+        })
+        .unwrap();
+
+        assert!(!rendered.contains("sk-live-canary-value"), "{rendered}");
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
     }
 
     /// A normal stderr still receives the fatal report.

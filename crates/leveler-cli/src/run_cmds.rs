@@ -1663,6 +1663,10 @@ pub(crate) async fn cmd_serve(
     .await?;
     let mut bound = prepared.bound;
     let runtime_id = prepared.runtime_id;
+    // Media objects have no separate ref table; their live set is derived from
+    // durable transcripts/turns/events. Run after ownership is established and
+    // before any transport serves work, so no import can race the sweep.
+    app.sweep_media_store().await;
     // The daemon is the workspace's runtime for every attached client. Resume
     // capture work a previous process left claimable; without this the daemon
     // would only retry it when the original session ran another turn.

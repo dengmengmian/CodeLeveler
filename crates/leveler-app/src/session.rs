@@ -315,7 +315,7 @@ fn report_to_result(report: TaskReport) -> Result<AgentOutcome, AppError> {
         modified_files: report.modified_files,
         stop_reason: report.stop_reason,
         stop_detail: report.stop_detail,
-        budget_exhaustion: None,
+        budget_exhaustion: report.budget_exhaustion,
         progress: Default::default(),
         objective: leveler_lifecycle::ObjectiveAnchor::from_user_message(""),
         completion_warnings: report.completion_warnings,

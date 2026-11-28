@@ -148,7 +148,11 @@ pub(crate) fn ui_plan(steps: Vec<leveler_lifecycle::PlanStep>) -> UiPlan {
 
 pub(crate) fn turn_runtime_event(result: Result<AgentOutcome, AppError>) -> RuntimeEvent {
     match result {
-        Ok(outcome) => turn_end_event(outcome.stop_reason, outcome.stop_detail),
+        Ok(outcome) => turn_end_event(
+            outcome.stop_reason,
+            outcome.stop_detail,
+            outcome.budget_exhaustion.as_ref(),
+        ),
         Err(AppError::Agent(AgentError::Cancelled)) => RuntimeEvent::TurnCancelled,
         Err(AppError::Agent(AgentError::Model(error)))
             if error.kind == leveler_model::ModelErrorKind::Truncated =>
@@ -311,7 +315,11 @@ pub fn ui_failure_from_model(error: &leveler_model::ModelError) -> UiFailure {
 /// through this code rather than a second copy of the mapping. Terminal state
 /// is where "blocked" is told apart from "done", so a replay that cannot reach
 /// it cannot check the one thing that matters most.
-pub fn turn_end_event(stop: StopReason, stop_detail: Option<String>) -> RuntimeEvent {
+pub fn turn_end_event(
+    stop: StopReason,
+    stop_detail: Option<String>,
+    budget: Option<&leveler_agent::BudgetExhaustion>,
+) -> RuntimeEvent {
     let detail = stop_detail.filter(|s| !s.trim().is_empty());
     match stop {
         StopReason::Completed => RuntimeEvent::TurnCompleted,
@@ -334,7 +342,7 @@ pub fn turn_end_event(stop: StopReason, stop_detail: Option<String>) -> RuntimeE
         // /goal is the profile that grants further work-windows instead
         // of stopping at one round budget.
         StopReason::BudgetExhausted => RuntimeEvent::TurnIncomplete {
-            reason: detail.unwrap_or_else(|| "预算用尽 · 说「继续」或 /goal 接着做".into()),
+            reason: budget_exhausted_reason(detail.as_deref(), budget),
         },
         // A pinned round ceiling fired: bounded work reached its edge.
         // The runtime's own `stop_detail` here is a machine token
@@ -360,6 +368,78 @@ pub fn turn_end_event(stop: StopReason, stop_detail: Option<String>) -> RuntimeE
         // A person stopped this turn. The task stays resumable, but the
         // terminal is theirs, not an unclean exit's.
         StopReason::Cancelled => RuntimeEvent::TurnCancelled,
+    }
+}
+
+/// Product wording for a resource-budget cutoff.
+///
+/// The structured value from the executor is authoritative. A replayed
+/// `TaskFinished` row predates that field, so its documented machine detail
+/// (`budget_exhausted dimension=… spent=… cap=…`) is parsed for the same
+/// numbers. Anything else falls back to the short "continue or /goal" line —
+/// a machine token is never shown to the user.
+fn budget_exhausted_reason(
+    detail: Option<&str>,
+    budget: Option<&leveler_agent::BudgetExhaustion>,
+) -> String {
+    let facts = budget
+        .map(|budget| (budget.dimension.as_str(), budget.spent, budget.cap))
+        .or_else(|| detail.and_then(parse_budget_detail));
+    let Some((dimension, spent, cap)) = facts else {
+        return "预算用尽 · 说「继续」或 /goal 接着做".to_string();
+    };
+    let suffix = " · 说「继续」或 /goal 接着做";
+    match dimension {
+        "cost" => format!(
+            "费用预算用尽（已用 ${:.4} / 上限 ${:.4}）{suffix}",
+            spent as f64 / 1_000_000.0,
+            cap as f64 / 1_000_000.0
+        ),
+        "duration" => format!(
+            "时长预算用尽（已用 {} / 上限 {}）{suffix}",
+            duration_label(spent),
+            duration_label(cap)
+        ),
+        "commands" => format!("命令调用预算用尽（已用 {spent} / 上限 {cap}）{suffix}"),
+        "modified_files" => format!("修改文件预算用尽（已用 {spent} / 上限 {cap}）{suffix}"),
+        "model_tokens" => format!("模型 token 预算用尽（已用 {spent} / 上限 {cap}）{suffix}"),
+        _ => format!("预算用尽（已用 {spent} / 上限 {cap}）{suffix}"),
+    }
+}
+
+/// Parse `budget_exhausted dimension=<name> spent=<n> cap=<n>`. Display-only:
+/// the control decision already came from the typed `StopReason`.
+fn parse_budget_detail(detail: &str) -> Option<(&str, u64, u64)> {
+    if !detail.starts_with("budget_exhausted") {
+        return None;
+    }
+    let mut dimension = None;
+    let mut spent = None;
+    let mut cap = None;
+    for part in detail.split_whitespace() {
+        if let Some(value) = part.strip_prefix("dimension=") {
+            dimension = Some(value);
+        } else if let Some(value) = part.strip_prefix("spent=") {
+            spent = value.parse().ok();
+        } else if let Some(value) = part.strip_prefix("cap=") {
+            cap = value.parse().ok();
+        }
+    }
+    Some((dimension?, spent?, cap?))
+}
+
+fn duration_label(milliseconds: u64) -> String {
+    let seconds = milliseconds.div_ceil(1000);
+    if seconds < 60 {
+        format!("{seconds} 秒")
+    } else {
+        let minutes = seconds / 60;
+        let rest = seconds % 60;
+        if rest == 0 {
+            format!("{minutes} 分")
+        } else {
+            format!("{minutes} 分 {rest} 秒")
+        }
     }
 }
 
@@ -433,7 +513,7 @@ fn task_finished_event(
         // review/verification warning must not turn it into a completed or
         // unregistered terminal: the goal still owes the withheld work, and
         // either warning terminal would settle the wrong lifecycle.
-        return turn_end_event(StopReason::Answered, reason);
+        return turn_end_event(StopReason::Answered, reason, None);
     }
     if outcome == leveler_lifecycle::TaskOutcome::Completed
         && (!warnings.is_empty() || unregistered_task)
@@ -469,7 +549,7 @@ fn task_finished_event(
         return RuntimeEvent::TurnCompleted;
     }
     if let Some(stop) = stop {
-        return turn_end_event(stop, reason);
+        return turn_end_event(stop, reason, None);
     }
     match outcome {
         leveler_lifecycle::TaskOutcome::Interrupted => RuntimeEvent::TurnInterrupted,
@@ -2940,12 +3020,13 @@ mod bridge_tests {
         let paused = turn_end_event(
             StopReason::Answered,
             Some(leveler_agent::closeout::user_pause_detail()),
+            None,
         );
         assert!(
             matches!(paused, RuntimeEvent::TurnPaused { .. }),
             "the pause must survive replay: {paused:?}"
         );
-        let plain = turn_end_event(StopReason::Answered, Some("done".to_string()));
+        let plain = turn_end_event(StopReason::Answered, Some("done".to_string()), None);
         assert!(matches!(plain, RuntimeEvent::TurnAnswered));
     }
 
@@ -2955,7 +3036,11 @@ mod bridge_tests {
     /// mapping, so both paths must agree.
     #[test]
     fn a_blocked_goal_projects_as_blocked_with_its_declared_reason() {
-        let event = turn_end_event(StopReason::Blocked, Some("dead-letter data missing".into()));
+        let event = turn_end_event(
+            StopReason::Blocked,
+            Some("dead-letter data missing".into()),
+            None,
+        );
         assert!(
             matches!(
                 &event,
@@ -2980,7 +3065,7 @@ mod bridge_tests {
 
         // Legacy rows carry no reason. The typed terminal still stands, and
         // the client can tell the goal is resumable without the model's words.
-        let bare = turn_end_event(StopReason::Blocked, None);
+        let bare = turn_end_event(StopReason::Blocked, None, None);
         assert!(matches!(bare, RuntimeEvent::TurnBlocked { .. }));
         let legacy = task_finished_event(
             leveler_lifecycle::TaskOutcome::Blocked,
@@ -3006,6 +3091,36 @@ mod bridge_tests {
             reason.contains("/goal") && reason.contains("继续"),
             "point at how to resume: {reason}"
         );
+    }
+
+    /// The live structured value and the replayed machine detail must produce
+    /// the same product wording, with the real dimension and amounts. A raw
+    /// `budget_exhausted dimension=…` token must never reach the user.
+    #[test]
+    fn a_budget_cutoff_names_the_dimension_and_amounts() {
+        let mut live = outcome(StopReason::BudgetExhausted);
+        live.budget_exhaustion = Some(leveler_agent::BudgetExhaustion::new(
+            leveler_agent::BudgetDimension::ModelTokens,
+            1_000,
+            1_000,
+        ));
+        let RuntimeEvent::TurnIncomplete { reason } = turn_runtime_event(Ok(live)) else {
+            panic!("a budget cutoff is an incomplete turn");
+        };
+        assert!(reason.contains("模型 token"), "{reason}");
+        assert!(reason.contains("1000"), "{reason}");
+        assert!(!reason.contains("dimension="), "{reason}");
+
+        let RuntimeEvent::TurnIncomplete { reason } = turn_end_event(
+            StopReason::BudgetExhausted,
+            Some("budget_exhausted dimension=cost spent=250000 cap=250000".into()),
+            None,
+        ) else {
+            panic!("a replayed budget cutoff is an incomplete turn");
+        };
+        assert!(reason.contains("费用预算"), "{reason}");
+        assert!(reason.contains("$0.2500"), "{reason}");
+        assert!(!reason.contains("dimension="), "{reason}");
     }
 }
 

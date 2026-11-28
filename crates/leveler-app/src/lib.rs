@@ -32,6 +32,7 @@ mod interactive;
 mod live_view;
 pub mod mcp_config;
 mod mcp_service;
+mod media_gc;
 pub mod memory;
 pub mod observability;
 mod parallel;
@@ -1678,6 +1679,78 @@ impl Application {
         Ok(db)
     }
 
+    /// Remove media objects no durable payload references.
+    ///
+    /// Runs at a daemon startup boundary: the daemon owns the workspace and no
+    /// turn can import an object concurrently. Any uncertainty — a failed
+    /// query, an unreadable payload, a failed store walk — skips the sweep
+    /// instead of treating a live object as an orphan. Failures are logged and
+    /// retried at the next startup; they never fail the runtime.
+    pub async fn sweep_media_store(&self) {
+        let root = self.layout.state_dir.join("media");
+        if !root.is_dir() {
+            return;
+        }
+        let db = match self.open_database().await {
+            Ok(db) => db,
+            Err(error) => {
+                tracing::warn!(%error, "media sweep skipped: session database unavailable");
+                return;
+            }
+        };
+        let payloads = match leveler_storage::MessageRepository::new(&db)
+            .media_reference_payloads()
+            .await
+        {
+            Ok(payloads) => payloads,
+            Err(error) => {
+                tracing::warn!(%error, "media sweep skipped: reference query failed");
+                return;
+            }
+        };
+        let references = media_gc::collect_media_references(&payloads);
+        if references.unreadable > 0 {
+            tracing::warn!(
+                unreadable = references.unreadable,
+                "media sweep skipped: a durable payload could not be read"
+            );
+            return;
+        }
+        let policy = media_gc::sweep_policy();
+        let result =
+            tokio::task::spawn_blocking(move || media_gc::sweep(root, &references, policy)).await;
+        match result {
+            Ok(Ok(report)) => {
+                if report.over_budget {
+                    tracing::warn!(
+                        live_bytes = report.live_bytes,
+                        remaining_bytes = report.remaining_bytes,
+                        removed_objects = report.removed_objects,
+                        removed_bytes = report.removed_bytes,
+                        unknown_files = report.unknown_files,
+                        failures = report.failures.len(),
+                        "media store is over its soft budget; reachable objects were kept"
+                    );
+                } else {
+                    tracing::info!(
+                        live_bytes = report.live_bytes,
+                        remaining_bytes = report.remaining_bytes,
+                        removed_objects = report.removed_objects,
+                        removed_bytes = report.removed_bytes,
+                        unknown_files = report.unknown_files,
+                        failures = report.failures.len(),
+                        "media sweep completed"
+                    );
+                }
+                for failure in &report.failures {
+                    tracing::warn!(%failure, "media sweep left an object for the next run");
+                }
+            }
+            Ok(Err(error)) => tracing::warn!(%error, "media sweep skipped"),
+            Err(error) => tracing::warn!(%error, "media sweep task failed"),
+        }
+    }
+
     /// Bind this boot to the background registry without touching the host.
     ///
     /// A hosted goal task is attributed to the boot that admitted it, and a
@@ -1897,7 +1970,15 @@ impl Application {
     }
 
     pub(crate) fn top_level_limits(&self) -> leveler_agent::StepLimits {
-        let mut limits = top_level_limits_from_config(&self.project_config().limits);
+        let project = self.project_config().limits;
+        // A project's explicit cap wins; `[limits]` in the global config fills
+        // only the dimensions the project left unset. Both absent means no
+        // hard budget — progress guards still bound a stalled run.
+        let global = crate::global_config::GlobalConfig::load()
+            .map(|config| config.limits())
+            .unwrap_or_default();
+        let effective = merge_run_limits(&project, global);
+        let mut limits = top_level_limits_from_config(&effective);
         // The one place a top-level run's model-step safety ceiling is pinned.
         // `None` here means "this application pins no ceiling" (the
         // interactive UI), not "unbounded by accident".
@@ -2492,6 +2573,20 @@ pub(crate) fn canonical_work_profile(_raw: &str) -> String {
     "single".to_string()
 }
 
+/// Project caps win per dimension; the global `[limits]` fills only omissions.
+fn merge_run_limits(
+    project: &leveler_project::RunLimitsConfig,
+    global: crate::global_config::GlobalLimits,
+) -> leveler_project::RunLimitsConfig {
+    leveler_project::RunLimitsConfig {
+        max_model_tokens: project.max_model_tokens.or(global.max_model_tokens),
+        max_cost_usd_micros: project.max_cost_usd_micros.or(global.max_cost_usd_micros),
+        max_duration_seconds: project
+            .max_duration_seconds
+            .or(global.max_duration_seconds),
+    }
+}
+
 fn top_level_limits_from_config(
     config: &leveler_project::RunLimitsConfig,
 ) -> leveler_agent::StepLimits {
@@ -2740,8 +2835,8 @@ mod merge_tests {
     use leveler_provider::ProviderConfig;
 
     use super::{
-        WebSearchSettings, merge_providers, provider_secret_env_names, resolve_search_provider,
-        top_level_limits_from_config,
+        WebSearchSettings, merge_providers, merge_run_limits, provider_secret_env_names,
+        resolve_search_provider, top_level_limits_from_config,
     };
     use leveler_tools::search::SearchProviderKind;
 
@@ -2925,6 +3020,32 @@ mod merge_tests {
         );
         assert_eq!(limits.max_commands, None);
         assert_eq!(limits.max_modified_files, None);
+    }
+
+    #[test]
+    fn project_limits_win_and_global_fills_only_omissions() {
+        let project = leveler_project::RunLimitsConfig {
+            max_model_tokens: Some(200_000),
+            max_cost_usd_micros: None,
+            max_duration_seconds: Some(7200),
+        };
+        let global = crate::global_config::GlobalLimits {
+            max_model_tokens: Some(999),
+            max_cost_usd_micros: Some(500_000),
+            max_duration_seconds: Some(1),
+        };
+        let merged = merge_run_limits(&project, global);
+        assert_eq!(merged.max_model_tokens, Some(200_000), "project wins");
+        assert_eq!(merged.max_cost_usd_micros, Some(500_000), "global fills");
+        assert_eq!(merged.max_duration_seconds, Some(7200), "project wins");
+
+        let unset = merge_run_limits(
+            &leveler_project::RunLimitsConfig::default(),
+            crate::global_config::GlobalLimits::default(),
+        );
+        assert_eq!(unset.max_model_tokens, None, "no invented hard budget");
+        assert_eq!(unset.max_cost_usd_micros, None);
+        assert_eq!(unset.max_duration_seconds, None);
     }
 }
 

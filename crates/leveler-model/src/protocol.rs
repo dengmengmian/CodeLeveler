@@ -12,7 +12,7 @@ use crate::response::ModelResponse;
 use crate::runtime::ModelEventStream;
 
 /// Context threaded into protocol encoding/decoding (base url, model id, auth).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ProtocolContext {
     pub base_url: String,
     pub model_id: String,
@@ -37,6 +37,42 @@ pub struct ProtocolContext {
     /// route's protocol and declared compatibility resolve it once, here, so
     /// no adapter decides either question for itself.
     pub reasoning_replay: crate::projection::ReasoningReplayContract,
+}
+
+impl std::fmt::Debug for ProtocolContext {
+    /// A protocol context carries the provider key and per-route auth headers.
+    /// Debug is used in failure paths, so it names the credential's presence
+    /// and header names but never their values.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProtocolContext")
+            .field("base_url", &self.base_url)
+            .field("model_id", &self.model_id)
+            .field(
+                "api_key",
+                &self
+                    .api_key
+                    .as_ref()
+                    .map(|_| leveler_core::SECRET_PLACEHOLDER),
+            )
+            .field(
+                "extra_headers",
+                &self
+                    .extra_headers
+                    .iter()
+                    .map(|(name, _)| name)
+                    .collect::<Vec<_>>(),
+            )
+            .field("reasoning", &self.reasoning)
+            .field("parallel_tool_calls", &self.parallel_tool_calls)
+            .field("supports_temperature", &self.supports_temperature)
+            .field(
+                "thinking_supports_forced_tool_choice",
+                &self.thinking_supports_forced_tool_choice,
+            )
+            .field("reasoning_replay", &self.reasoning_replay)
+            .finish()
+    }
 }
 
 /// A protocol-layer failure. Kept separate from `ModelError` because a protocol
@@ -150,5 +186,24 @@ mod tests {
         assert_eq!(req.path, "/chat/completions");
         assert_eq!(req.body["model"], "gpt-4o");
         assert_eq!(req.headers.len(), 1);
+    }
+
+    #[test]
+    fn protocol_context_debug_never_prints_the_key_or_header_value() {
+        let context = ProtocolContext {
+            base_url: "https://example.test/v1".to_string(),
+            model_id: "m".to_string(),
+            api_key: Some("sk-live-canary-value".to_string()),
+            extra_headers: vec![("x-api-key".to_string(), "header-canary".to_string())],
+            reasoning: ReasoningConfig::default(),
+            parallel_tool_calls: true,
+            supports_temperature: true,
+            thinking_supports_forced_tool_choice: true,
+            reasoning_replay: crate::projection::ReasoningReplayContract::default(),
+        };
+        let rendered = format!("{context:?}");
+        assert!(!rendered.contains("sk-live-canary-value"), "{rendered}");
+        assert!(!rendered.contains("header-canary"), "{rendered}");
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
     }
 }
