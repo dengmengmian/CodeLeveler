@@ -26,6 +26,15 @@ let lastTask=null,restoring=false;
 const allowedRoots=new Set();
 const sessionRoots=new Map();
 const appIcons=new Map();
+// The runtime is an explicit input, never a PATH lookup: an installed CLI must
+// not silently become this Desktop's execution authority. A packaged build
+// carries its matching runtime in Contents/Resources/runtime; a source run
+// keeps the historical target/debug default and the LEVELER_BINARY override.
+function runtimeBinary(){
+  if(process.env.LEVELER_BINARY)return process.env.LEVELER_BINARY;
+  if(app.isPackaged)return path.join(process.resourcesPath,'runtime',process.platform==='win32'?'leveler.exe':'leveler');
+  return path.resolve(__dirname,'../../../target/debug/leveler');
+}
 function addRoot(value){if(typeof value!=='string'||!value||value.length>4096)return;try{allowedRoots.add(realpathSync(value));}catch{/* a missing root is not an authorized path */}}
 function trackSnapshot(snapshot){
   if(!snapshot||typeof snapshot.repository!=='string')return;
@@ -117,7 +126,7 @@ async function restoreSession(){
   }finally{restoring=false;}
 }
 async function createWindow(){
-  bridge=new Bridge(process.env.LEVELER_BINARY || path.resolve(__dirname,'../../../target/debug/leveler'),{onEvent:frame=>{if(frame.session_id===attachments.selected?.sessionId){if(frame.event==='snapshot')attachmentSession(frame.data);if(frame.event==='runtime'&&frame.data?.type==='session_updated')attachmentSession(frame.data.session);}if(frame.event==='snapshot')rememberTask(frame.data);attachments.observe(frame);sendFrame(frame);},onState:state=>{sendFrame(state);if(state.state==='connected'&&state.resumed===true&&lastTask)restoreSession();}});
+  bridge=new Bridge(runtimeBinary(),{onEvent:frame=>{if(frame.session_id===attachments.selected?.sessionId){if(frame.event==='snapshot')attachmentSession(frame.data);if(frame.event==='runtime'&&frame.data?.type==='session_updated')attachmentSession(frame.data.session);}if(frame.event==='snapshot')rememberTask(frame.data);attachments.observe(frame);sendFrame(frame);},onState:state=>{sendFrame(state);if(state.state==='connected'&&state.resumed===true&&lastTask)restoreSession();}});
   window=new BrowserWindow({width:1280,height:820,minWidth:520,minHeight:520,title:'CodeLeveler',...(process.platform==='darwin'?{titleBarStyle:'hiddenInset',trafficLightPosition:{x:16,y:18},vibrancy:'sidebar',visualEffectState:'active',backgroundColor:'#00000000'}:{backgroundColor:'#f9fafb'}),webPreferences:{preload:path.join(__dirname,'preload.cjs'),sandbox:true,contextIsolation:true,nodeIntegration:false,webSecurity:true}});
   browser=new ManualBrowser({window,WebContentsView,session,shell,onState:state=>{if(window&&!window.isDestroyed())window.webContents.send('desktop:browser-event',state);}});
   window.webContents.setWindowOpenHandler(()=>({action:'deny'}));
@@ -138,7 +147,7 @@ app.whenReady().then(async()=>{
   handle('desktop:info',()=>bridge.request('runtime_info'));
   handle('desktop:app-info',()=>({version:app.getVersion()}));
   handle('desktop:update-check',()=>new Promise((resolve,reject)=>{
-    const binary=process.env.LEVELER_BINARY||path.resolve(__dirname,'../../../target/debug/leveler');
+    const binary=runtimeBinary();
     execFile(binary,['update','--check'],{timeout:20000,maxBuffer:1024*1024},(error,stdout)=>{
       const text=String(stdout||'');
       const current=/current:\s*v?([^\s]+)/.exec(text)?.[1];

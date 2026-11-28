@@ -7,6 +7,7 @@
   "scripts": {
     "start": "electron .",
     "build": "node scripts/gen-command-policy.mjs --check && node scripts/check.mjs",
+    "package:mac": "node scripts/package-desktop.mjs",
     "gen:protocol": "node scripts/gen-command-policy.mjs",
     "check:protocol": "node scripts/gen-command-policy.mjs --check",
     "test": "node --test test/*.test.mjs",
@@ -37,6 +38,7 @@
     "test:memory:dogfood": "node scripts/r6-memory-dogfood.mjs"
   },
   "devDependencies": {
+    "@electron/packager": "^20.3.1",
     "electron": "44.5.1",
     "eslint": "^10.11.0",
     "playwright": "1.63.0",
