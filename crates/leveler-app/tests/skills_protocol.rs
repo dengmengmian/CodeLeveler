@@ -130,7 +130,7 @@ fn approve_skills(repo: &Path, names: &[&str]) {
                 .rsplit('/')
                 .next()
                 .unwrap_or(&candidate.identity.display);
-            names.iter().any(|name| directory == *name)
+            names.contains(&directory)
         })
         .filter_map(|candidate| candidate.approval_request().ok())
         .collect();

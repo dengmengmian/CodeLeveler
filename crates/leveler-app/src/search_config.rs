@@ -212,13 +212,13 @@ fn apply(doc: &mut toml_edit::DocumentMut, draft: &SearchDraft) -> Result<(), Se
     }
     if draft.clear_api_key {
         search.remove("api_key");
-    } else if let Some(key) = draft.api_key.as_deref().map(str::trim) {
-        if !key.is_empty() {
-            if key.chars().count() > 16 * 1024 {
-                return Err(SearchConfigError::Rejected("API Key 过长".into()));
-            }
-            search["api_key"] = toml_edit::value(key);
+    } else if let Some(key) = draft.api_key.as_deref().map(str::trim)
+        && !key.is_empty()
+    {
+        if key.chars().count() > 16 * 1024 {
+            return Err(SearchConfigError::Rejected("API Key 过长".into()));
         }
+        search["api_key"] = toml_edit::value(key);
     }
     match draft.base_url.as_deref() {
         None => {}

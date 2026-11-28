@@ -113,7 +113,7 @@ fn read_text(path: &Path) -> Result<String, McpConfigError> {
 fn parse_text(text: &str) -> Result<DocumentMut, McpConfigError> {
     text.parse::<DocumentMut>().map_err(|error| {
         McpConfigError::Parse(crate::global_config::safe_toml_parse_error(
-            &text,
+            text,
             error.message(),
             error.span(),
         ))

@@ -343,11 +343,11 @@ impl MediaStore {
     ) -> Result<(), MediaError> {
         match fs::symlink_metadata(path) {
             Ok(metadata) if metadata.is_file() => {
-                if let Ok(existing) = fs::read(path) {
-                    if hex(&Sha256::digest(&existing)) == expected_sha256 {
-                        restrict_file(path).map_err(|e| MediaError::Io(e.to_string()))?;
-                        return Ok(());
-                    }
+                if let Ok(existing) = fs::read(path)
+                    && hex(&Sha256::digest(&existing)) == expected_sha256
+                {
+                    restrict_file(path).map_err(|e| MediaError::Io(e.to_string()))?;
+                    return Ok(());
                 }
             }
             Ok(_) => {
@@ -362,11 +362,11 @@ impl MediaStore {
     }
 
     fn write_text_if_changed(&self, path: &Path, value: &str) -> Result<(), MediaError> {
-        if let Some(existing) = read_regular_file(path) {
-            if existing == value.as_bytes() {
-                restrict_file(path).map_err(|e| MediaError::Io(e.to_string()))?;
-                return Ok(());
-            }
+        if let Some(existing) = read_regular_file(path)
+            && existing == value.as_bytes()
+        {
+            restrict_file(path).map_err(|e| MediaError::Io(e.to_string()))?;
+            return Ok(());
         }
         self.write_atomic(path, value.as_bytes())
     }
